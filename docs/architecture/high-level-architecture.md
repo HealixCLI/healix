@@ -1,6 +1,8 @@
 # Healix — High-Level Architecture
 
-> Companion to [`../feature-plan.md`](../feature-plan.md). Editable diagram: [`healix-architecture.excalidraw`](./healix-architecture.excalidraw).
+> Companion to [`../feature-plan.md`](../feature-plan.md). Editable source: [`healix-architecture.excalidraw`](./healix-architecture.excalidraw) · Rendered: [`healix-architecture.svg`](./healix-architecture.svg) / [`healix-architecture.png`](./healix-architecture.png).
+
+![Healix high-level architecture](./healix-architecture.png)
 
 Healix is **local-first**. One shared core (`@healix/core`) powers two front-ends (the Electron app and the `healix` CLI). The core orchestrates AI providers through their **subscription CLIs** (plan mode) with **SDK fallback**, drives a single embedded browser for exploration, runs pluggable test engines, and persists everything to **SQLite + the local filesystem**.
 

@@ -1,0 +1,24 @@
+{
+  "name": "@healix/cli",
+  "version": "0.0.0",
+  "description": "Healix CLI — local-first, AI-led testing",
+  "type": "module",
+  "bin": {
+    "healix": "./dist/index.js"
+  },
+  "files": ["dist"],
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "dev": "tsc -p tsconfig.json --watch"
+  },
+  "dependencies": {
+    "@healix/core": "workspace:*",
+    "commander": "^12.1.0",
+    "picocolors": "^1.1.1"
+  },
+  "devDependencies": {
+    "@types/node": "^24.0.0",
+    "typescript": "^5.7.2"
+  }
+}

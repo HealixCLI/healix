@@ -2,7 +2,7 @@
 
 **Local-first, AI-led testing platform** — an Electron desktop app and a `healix` CLI over one shared core. Healix scans a target app (white-box repo or black-box URL), generates and runs regression suites (UI + API) via pluggable engines (**Playwright first**, then Selenium, then others), and keeps **all data local**. AI is driven by **Claude and OpenAI/Codex** through their **subscription CLIs** (plan mode) with **SDK fallback** — **no API keys, ever**.
 
-> Status: **M0 foundations shipped** — monorepo builds; `healix doctor` runs a real Claude health-check; local SQLite storage initializes; Electron app builds. See [`docs/`](./docs/README.md).
+> Status: **M1 shipped** — the full AI-led pipeline runs end-to-end. `healix run` plans (real Claude), detects + launches a white-box app, generates REQ-tagged Playwright specs, executes them for real, triages failures, writes a local report, and exports a standalone runnable suite. See [`docs/`](./docs/README.md).
 
 ## Monorepo layout
 
@@ -38,11 +38,19 @@ pnpm build:desktop  # production build → apps/desktop/out
 
 `pnpm healix doctor` resolves the `claude` binary, runs a real authenticated round-trip, initializes the local SQLite DB at the OS app-data dir, and reports provider readiness.
 
-## What works today (M0)
+## What works today (M1)
 
-- `@healix/core`: app-data resolver · `node:sqlite` storage + migrations · provider adapter interface · **real `ClaudeProvider`** (detect + live auth probe + `plan()` via Claude plan mode) · `OpenAIProvider` (Codex stub) · `ProviderRouter` (best-for-task + fallback) · `doctor()`.
-- `healix` CLI: `doctor`, `providers list|health`.
-- Desktop: Electron main bundles `@healix/core`, typed IPC bridge, React + Tailwind + shadcn-style **providers/health dashboard**.
+- `@healix/core`:
+  - **Providers** — real `ClaudeProvider` (detect + live auth probe + `plan()`/`complete()`), `OpenAIProvider` (Codex stub), `ProviderRouter` (best-for-task + fallback).
+  - **Storage** — `node:sqlite` projects/runs/tests/results/events with transactional cascade delete.
+  - **Target adapter** — repo detect (framework/port/start-cmd) + index + launch (white-box) + URL probe (black-box).
+  - **Browser surface** — one Playwright/CDP Chromium for computer-use + browser-use + live mirror.
+  - **Playwright mode** — scaffold standalone project → AI codegen of REQ-tagged specs → execute (auto-install + run + parse) → artifacts → suite.
+  - **Orchestrator** — resumable plan → approve → launch → generate → execute → triage → report → export.
+  - **Export** — sanitized, standalone runnable Playwright project + zip.
+  - **Triage** — deterministic classifier + two-hypothesis AI analysis.
+- `healix` CLI: `doctor`, `providers`, `project add/list/show/rm`, `scan`, `run` (streamed + plan approval), `report`, `export`.
+- Desktop: Codex-style **Providers / Projects / Runs** views — create projects, start runs, stream events, approve the plan, see results, export — over typed IPC.
 
 ## Docs
 

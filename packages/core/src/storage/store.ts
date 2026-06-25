@@ -1,0 +1,211 @@
+import { nanoid } from 'nanoid';
+import type { DatabaseSync } from 'node:sqlite';
+import { openDb } from './db.js';
+import type {
+  AgentEvent,
+  EventLevel,
+  NewProject,
+  Project,
+  Run,
+  RunStatus,
+  TestCase,
+  TestResult,
+} from './types.js';
+
+/**
+ * Thin synchronous repository over the local SQLite database.
+ * All persistence (projects, runs, tests, results, orchestrator events) flows through here.
+ */
+export class HealixStore {
+  constructor(private readonly db: DatabaseSync) {}
+
+  // ---- projects ----
+  createProject(input: NewProject): Project {
+    const project: Project = {
+      id: `prj_${nanoid(10)}`,
+      name: input.name,
+      mode: input.mode ?? 'playwright',
+      repoPath: input.repoPath ?? null,
+      baseUrl: input.baseUrl ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare('INSERT INTO projects (id, name, mode, repo_path, base_url, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(project.id, project.name, project.mode, project.repoPath, project.baseUrl, project.createdAt);
+    return project;
+  }
+
+  listProjects(): Project[] {
+    return (this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as Array<Record<string, unknown>>).map(
+      rowToProject,
+    );
+  }
+
+  getProject(id: string): Project | null {
+    const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? rowToProject(row) : null;
+  }
+
+  deleteProject(id: string): void {
+    this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+  }
+
+  // ---- runs ----
+  createRun(projectId: string, opts: { provider?: string | null; mode?: string | null } = {}): Run {
+    const run: Run = {
+      id: `run_${nanoid(10)}`,
+      projectId,
+      status: 'pending',
+      provider: (opts.provider ?? null) as Run['provider'],
+      mode: opts.mode ?? null,
+      startedAt: null,
+      finishedAt: null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        'INSERT INTO runs (id, project_id, status, provider, mode, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(run.id, run.projectId, run.status, run.provider, run.mode, run.startedAt, run.finishedAt, run.createdAt);
+    return run;
+  }
+
+  updateRunStatus(id: string, status: RunStatus, patch: { startedAt?: string; finishedAt?: string } = {}): void {
+    const fields: string[] = ['status = ?'];
+    const values: unknown[] = [status];
+    if (patch.startedAt !== undefined) {
+      fields.push('started_at = ?');
+      values.push(patch.startedAt);
+    }
+    if (patch.finishedAt !== undefined) {
+      fields.push('finished_at = ?');
+      values.push(patch.finishedAt);
+    }
+    values.push(id);
+    this.db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  }
+
+  getRun(id: string): Run | null {
+    const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    return row ? rowToRun(row) : null;
+  }
+
+  listRuns(projectId?: string): Run[] {
+    const rows = projectId
+      ? (this.db.prepare('SELECT * FROM runs WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Array<
+          Record<string, unknown>
+        >)
+      : (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Array<Record<string, unknown>>);
+    return rows.map(rowToRun);
+  }
+
+  // ---- tests + results ----
+  insertTest(test: Omit<TestCase, 'id'> & { id?: string }): TestCase {
+    const full: TestCase = { ...test, id: test.id ?? `tst_${nanoid(10)}` };
+    this.db
+      .prepare('INSERT INTO tests (id, run_id, title, req_tag, tier, status) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(full.id, full.runId, full.title, full.reqTag, full.tier, full.status);
+    return full;
+  }
+
+  insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
+    const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
+    this.db
+      .prepare('INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)')
+      .run(full.id, full.testId, full.status, full.durationMs, full.error, full.artifactsJson);
+    return full;
+  }
+
+  listTests(runId: string): TestCase[] {
+    return (this.db.prepare('SELECT * FROM tests WHERE run_id = ?').all(runId) as Array<Record<string, unknown>>).map(
+      rowToTest,
+    );
+  }
+
+  // ---- orchestrator events (resumable checkpoints) ----
+  appendEvent(runId: string, phase: string, message: string, opts: { level?: EventLevel; data?: unknown } = {}): AgentEvent {
+    const evt: AgentEvent = {
+      id: `evt_${nanoid(10)}`,
+      runId,
+      phase,
+      level: opts.level ?? 'info',
+      message,
+      dataJson: opts.data === undefined ? null : JSON.stringify(opts.data),
+      createdAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare('INSERT INTO agent_events (id, run_id, phase, level, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .run(evt.id, evt.runId, evt.phase, evt.level, evt.message, evt.dataJson, evt.createdAt);
+    return evt;
+  }
+
+  listEvents(runId: string): AgentEvent[] {
+    return (
+      this.db.prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToEvent);
+  }
+}
+
+let cached: HealixStore | null = null;
+
+/** Open the store (cached). Returns null when the runtime lacks node:sqlite. */
+export async function getStore(): Promise<HealixStore | null> {
+  if (cached) return cached;
+  const db = await openDb();
+  if (!db) return null;
+  cached = new HealixStore(db);
+  return cached;
+}
+
+function s(v: unknown): string | null {
+  return v === null || v === undefined ? null : String(v);
+}
+
+function rowToProject(r: Record<string, unknown>): Project {
+  return {
+    id: String(r.id),
+    name: String(r.name),
+    mode: String(r.mode),
+    repoPath: s(r.repo_path),
+    baseUrl: s(r.base_url),
+    createdAt: String(r.created_at),
+  };
+}
+
+function rowToRun(r: Record<string, unknown>): Run {
+  return {
+    id: String(r.id),
+    projectId: String(r.project_id),
+    status: String(r.status) as RunStatus,
+    provider: s(r.provider) as Run['provider'],
+    mode: s(r.mode),
+    startedAt: s(r.started_at),
+    finishedAt: s(r.finished_at),
+    createdAt: String(r.created_at),
+  };
+}
+
+function rowToTest(r: Record<string, unknown>): TestCase {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    title: String(r.title),
+    reqTag: s(r.req_tag),
+    tier: s(r.tier),
+    status: s(r.status) as TestCase['status'],
+  };
+}
+
+function rowToEvent(r: Record<string, unknown>): AgentEvent {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    phase: String(r.phase),
+    level: String(r.level) as EventLevel,
+    message: String(r.message),
+    dataJson: s(r.data_json),
+    createdAt: String(r.created_at),
+  };
+}

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 1;
+export const SCHEMA_VERSION = 2;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -40,7 +40,18 @@ CREATE TABLE IF NOT EXISTS results (
   artifacts_json TEXT
 );
 
+CREATE TABLE IF NOT EXISTS agent_events (
+  id          TEXT PRIMARY KEY,
+  run_id      TEXT NOT NULL REFERENCES runs(id),
+  phase       TEXT NOT NULL,
+  level       TEXT NOT NULL DEFAULT 'info',
+  message     TEXT NOT NULL,
+  data_json   TEXT,
+  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_tests_run ON tests(run_id);
 CREATE INDEX IF NOT EXISTS idx_results_test ON results(test_id);
+CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
 `;

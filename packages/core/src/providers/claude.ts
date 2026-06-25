@@ -1,6 +1,8 @@
 import { runCli, which } from '../exec/run-cli.js';
 import type {
   Capability,
+  CompleteOptions,
+  CompletionResult,
   DetectResult,
   HealthOptions,
   HealthResult,
@@ -87,6 +89,34 @@ export class ClaudeProvider implements ProviderAdapter {
         return { ...base, status: 'not-authenticated', detail: 'Not authenticated. Run `claude` once and log in to your subscription.' };
       }
       return { ...base, status: 'error', detail: `Unexpected CLI output: ${(r.stderr || r.stdout).slice(0, 160).trim()}` };
+    }
+  }
+
+  async complete(prompt: string, opts: CompleteOptions = {}): Promise<CompletionResult> {
+    const args = ['-p', prompt, '--output-format', 'json'];
+    if (opts.mode === 'plan') args.push('--permission-mode', 'plan');
+    const r = await runCli(this.bin, args, { timeoutMs: opts.timeoutMs ?? 180_000, cwd: opts.cwd });
+    if (r.timedOut) {
+      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion timed out.' };
+    }
+    try {
+      const json = JSON.parse(r.stdout.trim()) as ClaudeJsonResult;
+      const ok = json.is_error === false;
+      return {
+        provider: this.id,
+        ok,
+        text: String(json.result ?? ''),
+        raw: json,
+        detail: ok ? 'ok' : `error (subtype: ${json.subtype ?? 'unknown'})`,
+      };
+    } catch {
+      return {
+        provider: this.id,
+        ok: false,
+        text: '',
+        raw: r,
+        detail: `Could not parse output: ${(r.stderr || r.stdout).slice(0, 200).trim()}`,
+      };
     }
   }
 

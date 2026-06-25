@@ -1,6 +1,8 @@
 import { runCli, which } from '../exec/run-cli.js';
 import type {
   Capability,
+  CompleteOptions,
+  CompletionResult,
   DetectResult,
   HealthOptions,
   HealthResult,
@@ -58,6 +60,18 @@ export class OpenAIProvider implements ProviderAdapter {
       plan: '',
       raw: null,
       detail: 'OpenAI/Codex plan() is not implemented yet (M0 stub).',
+    };
+  }
+
+  async complete(_prompt: string, _opts: CompleteOptions = {}): Promise<CompletionResult> {
+    void _prompt;
+    void _opts;
+    return {
+      provider: this.id,
+      ok: false,
+      text: '',
+      raw: null,
+      detail: 'OpenAI/Codex complete() is not implemented yet (M0 stub).',
     };
   }
 }

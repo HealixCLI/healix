@@ -30,6 +30,22 @@ export interface PlanResult {
   detail: string;
 }
 
+export interface CompletionResult {
+  provider: ProviderId;
+  ok: boolean;
+  text: string;
+  raw: unknown;
+  detail: string;
+}
+
+export interface CompleteOptions {
+  /** 'plan' runs the provider in plan/approval mode; 'default' executes normally. */
+  mode?: 'default' | 'plan';
+  timeoutMs?: number;
+  /** Working directory to run the provider in (e.g. the target repo for white-box context). */
+  cwd?: string;
+}
+
 export interface HealthOptions {
   /** Perform a live round-trip to verify auth (default true). */
   probe?: boolean;
@@ -43,4 +59,6 @@ export interface ProviderAdapter {
   detect(): Promise<DetectResult>;
   health(opts?: HealthOptions): Promise<HealthResult>;
   plan(task: string, opts?: { timeoutMs?: number }): Promise<PlanResult>;
+  /** General-purpose prompt → text completion (used by test modes, orchestrator, triage). */
+  complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult>;
 }

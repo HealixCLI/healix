@@ -1,0 +1,42 @@
+export interface Point {
+  x: number;
+  y: number;
+}
+
+export interface BrowserSurfaceOptions {
+  headless?: boolean;
+  viewport?: { width: number; height: number };
+  baseUrl?: string;
+}
+
+export interface InteractiveElement {
+  role: string;
+  name: string;
+  selector: string;
+}
+
+export interface DomSnapshot {
+  url: string;
+  title: string;
+  interactiveElements: InteractiveElement[];
+  axTree?: unknown;
+}
+
+/**
+ * Single controllable Chromium (Playwright/CDP) serving BOTH computer-use
+ * (screenshots → coordinate actions) and browser-use (DOM/AX actions),
+ * mirrored live to the UI via onFrame.
+ */
+export interface BrowserSurface {
+  start(opts?: BrowserSurfaceOptions): Promise<void>;
+  goto(url: string): Promise<void>;
+  screenshot(): Promise<Buffer>;
+  snapshot(): Promise<DomSnapshot>;
+  click(selector: string): Promise<void>;
+  clickAt(point: Point): Promise<void>;
+  type(selector: string, text: string): Promise<void>;
+  pressKey(key: string): Promise<void>;
+  /** Subscribe to a live screenshot stream for UI mirroring; returns an unsubscribe fn. */
+  onFrame(cb: (png: Buffer) => void): () => void;
+  stop(): Promise<void>;
+}

@@ -1,0 +1,68 @@
+import { useCallback, useEffect, useState } from 'react';
+import type { NewProject, Project } from '@healix/core';
+
+export interface ProjectsState {
+  projects: Project[];
+  loading: boolean;
+  error: string | null;
+  refresh: () => Promise<void>;
+  create: (input: NewProject) => Promise<Project | null>;
+  remove: (id: string) => Promise<void>;
+}
+
+function toMessage(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Shared CRUD over the persisted project list (backed by IPC -> SQLite store). */
+export function useProjects(): ProjectsState {
+  const [projects, setProjects] = useState<Project[]>([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState<string | null>(null);
+
+  const refresh = useCallback(async (): Promise<void> => {
+    setLoading(true);
+    setError(null);
+    try {
+      setProjects(await window.healix.listProjects());
+    } catch (err) {
+      setError(toMessage(err));
+    } finally {
+      setLoading(false);
+    }
+  }, []);
+
+  useEffect(() => {
+    void refresh();
+  }, [refresh]);
+
+  const create = useCallback(
+    async (input: NewProject): Promise<Project | null> => {
+      setError(null);
+      try {
+        const created = await window.healix.createProject(input);
+        await refresh();
+        return created;
+      } catch (err) {
+        setError(toMessage(err));
+        return null;
+      }
+    },
+    [refresh],
+  );
+
+  const remove = useCallback(
+    async (id: string): Promise<void> => {
+      setError(null);
+      try {
+        await window.healix.deleteProject(id);
+        await refresh();
+      } catch (err) {
+        setError(toMessage(err));
+      }
+    },
+    [refresh],
+  );
+
+  return { projects, loading, error, refresh, create, remove };
+}

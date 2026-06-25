@@ -47,7 +47,31 @@ export class HealixStore {
   }
 
   deleteProject(id: string): void {
-    this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      // 1. results whose test belongs to a test of a run of this project
+      this.db
+        .prepare(
+          'DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?))',
+        )
+        .run(id);
+      // 2. agent_events of runs of this project
+      this.db.prepare('DELETE FROM agent_events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
+      // 3. tests of runs of this project
+      this.db.prepare('DELETE FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
+      // 4. runs of this project
+      this.db.prepare('DELETE FROM runs WHERE project_id = ?').run(id);
+      // 5. the project row itself
+      this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // No active transaction to roll back — keep the original error.
+      }
+      throw err;
+    }
   }
 
   // ---- runs ----
@@ -97,6 +121,28 @@ export class HealixStore {
         >)
       : (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Array<Record<string, unknown>>);
     return rows.map(rowToRun);
+  }
+
+  deleteRun(id: string): void {
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      // 1. results whose test belongs to this run
+      this.db.prepare('DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)').run(id);
+      // 2. agent_events of this run
+      this.db.prepare('DELETE FROM agent_events WHERE run_id = ?').run(id);
+      // 3. tests of this run
+      this.db.prepare('DELETE FROM tests WHERE run_id = ?').run(id);
+      // 4. the run row itself
+      this.db.prepare('DELETE FROM runs WHERE id = ?').run(id);
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        // No active transaction to roll back — keep the original error.
+      }
+      throw err;
+    }
   }
 
   // ---- tests + results ----

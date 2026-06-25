@@ -1,22 +1,25 @@
-import { notImplemented } from '../util/not-implemented.js';
-import type { DetectedProject, LaunchHandle, LaunchOptions, RepoIndex, TargetAdapter, UrlProbe } from './types.js';
+import type { TargetAdapter } from './types.js';
+import { detect } from './detector.js';
+import { indexRepo } from './repo-index.js';
+import { launch } from './launcher.js';
+import { probeUrl } from './http-probe.js';
 
 export * from './types.js';
 
-/** Foundation stub — real detection/launch/index implemented in M1 (target/ module). */
+/**
+ * White-box (repo) + black-box (URL) access to the app under test.
+ *
+ * Composed from focused modules:
+ *  - detector.ts   -> detect(): framework / package manager / start command / port
+ *  - repo-index.ts -> indexRepo(): bounded file list + summary for AI context
+ *  - launcher.ts   -> launch(): spawn + readiness-poll + process-tree teardown
+ *  - http-probe.ts -> probeUrl(): non-throwing HTTP reachability check
+ */
 export function createTargetAdapter(): TargetAdapter {
   return {
-    detect(_repoPath: string): Promise<DetectedProject> {
-      return notImplemented('TargetAdapter.detect');
-    },
-    indexRepo(_repoPath: string, _opts?: { maxFiles?: number }): Promise<RepoIndex> {
-      return notImplemented('TargetAdapter.indexRepo');
-    },
-    launch(_opts: LaunchOptions): Promise<LaunchHandle> {
-      return notImplemented('TargetAdapter.launch');
-    },
-    probeUrl(_url: string, _timeoutMs?: number): Promise<UrlProbe> {
-      return notImplemented('TargetAdapter.probeUrl');
-    },
+    detect,
+    indexRepo,
+    launch,
+    probeUrl,
   };
 }

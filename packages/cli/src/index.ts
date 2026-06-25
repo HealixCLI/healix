@@ -2,6 +2,11 @@
 import { Command } from 'commander';
 import { registerDoctor } from './commands/doctor.js';
 import { registerProviders } from './commands/providers.js';
+import { registerProject } from './commands/project.js';
+import { registerScan } from './commands/scan.js';
+import { registerRun } from './commands/run.js';
+import { registerReport } from './commands/report.js';
+import { registerExport } from './commands/export.js';
 
 const program = new Command();
 
@@ -12,6 +17,11 @@ program
 
 registerDoctor(program);
 registerProviders(program);
+registerProject(program);
+registerScan(program);
+registerRun(program);
+registerReport(program);
+registerExport(program);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(err);

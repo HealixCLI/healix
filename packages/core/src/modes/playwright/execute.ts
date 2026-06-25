@@ -1,0 +1,508 @@
+import { spawn, type ChildProcess } from 'node:child_process';
+import { access, readFile, stat } from 'node:fs/promises';
+import { join } from 'node:path';
+
+import type { TestStatus } from '../../storage/types.js';
+import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestModeContext } from '../types.js';
+
+const EXEC_TIMEOUT_MS = 30 * 60_000; // generous: full suite across three tiers
+const INSTALL_TIMEOUT_MS = 300_000; // generous: npm install for the scaffolded suite
+const MAX_BUFFER = 64 * 1024 * 1024; // 64MB — JSON reporter on stdout can be large
+
+const ANSI_RE = /[\u001b\u009b][[\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+
+function emit(ctx: TestModeContext, message: string, data?: unknown): void {
+  ctx.emit?.('execute', message, data);
+}
+
+function stripAnsi(text: string): string {
+  return (text ?? '').replace(ANSI_RE, '');
+}
+
+interface RawCommand {
+  code: number | null;
+  signal: NodeJS.Signals | null;
+  stdout: string;
+  stderr: string;
+  timedOut: boolean;
+}
+
+/** Spawn the Playwright CLI; capture everything; never reject on test failure. */
+function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
+  return new Promise<RawCommand>((resolve) => {
+    const args = ['playwright', 'test', '--reporter=json'];
+    const env: NodeJS.ProcessEnv = { ...process.env };
+    if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
+
+    let child: ChildProcess;
+    try {
+      child = spawn('npx', args, {
+        cwd: ctx.projectDir,
+        env,
+        detached: process.platform !== 'win32',
+        shell: process.platform === 'win32', // npx resolves to npx.cmd on Windows
+      });
+    } catch (err) {
+      // A synchronous spawn failure (e.g. ENOENT) is NOT a timeout; reserve
+      // timedOut:true for the real setTimeout path so it isn't mislabeled.
+      resolve({ code: null, signal: null, stdout: '', stderr: String(err), timedOut: false });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let timedOut = false;
+
+    const kill = (signal: NodeJS.Signals): void => {
+      if (!child.pid) return;
+      try {
+        if (process.platform === 'win32') {
+          child.kill(signal);
+        } else {
+          process.kill(-child.pid, signal);
+        }
+      } catch {
+        try {
+          child.kill(signal);
+        } catch {
+          /* already exited */
+        }
+      }
+    };
+
+    const timer = setTimeout(() => {
+      timedOut = true;
+      emit(ctx, `Execution exceeded ${EXEC_TIMEOUT_MS}ms; terminating`, { pid: child.pid });
+      kill('SIGTERM');
+    }, EXEC_TIMEOUT_MS);
+    const hardKill = setTimeout(() => {
+      if (timedOut) kill('SIGKILL');
+    }, EXEC_TIMEOUT_MS + 5_000);
+
+    child.stdout?.on('data', (d: Buffer) => {
+      stdoutBytes += d.length;
+      if (stdoutBytes <= MAX_BUFFER) stdout += d.toString();
+    });
+    child.stderr?.on('data', (d: Buffer) => {
+      stderrBytes += d.length;
+      if (stderrBytes <= MAX_BUFFER) stderr += d.toString();
+    });
+
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      clearTimeout(hardKill);
+      resolve({ code: null, signal: null, stdout, stderr: `${stderr}${String(err)}`, timedOut });
+    });
+    child.on('close', (code, signal) => {
+      clearTimeout(timer);
+      clearTimeout(hardKill);
+      resolve({ code, signal: signal as NodeJS.Signals | null, stdout, stderr, timedOut });
+    });
+  });
+}
+
+interface CmdResult {
+  code: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+/** Run a one-off command (npm install / browser install) in the suite dir. */
+function runCommand(
+  ctx: TestModeContext,
+  command: string,
+  args: string[],
+  timeoutMs: number,
+): Promise<CmdResult> {
+  return new Promise<CmdResult>((resolve) => {
+    let child: ChildProcess;
+    try {
+      child = spawn(command, args, {
+        cwd: ctx.projectDir,
+        env: { ...process.env },
+        shell: process.platform === 'win32', // npm/npx resolve to .cmd on Windows
+      });
+    } catch (err) {
+      resolve({ code: null, stdout: '', stderr: String(err) });
+      return;
+    }
+
+    let stdout = '';
+    let stderr = '';
+    let stdoutBytes = 0;
+    let stderrBytes = 0;
+    let settled = false;
+
+    const finish = (res: CmdResult): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(res);
+    };
+
+    const timer = setTimeout(() => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already exited */
+      }
+      finish({ code: null, stdout, stderr: `${stderr}\n[timed out after ${timeoutMs}ms]` });
+    }, timeoutMs);
+
+    child.stdout?.on('data', (d: Buffer) => {
+      stdoutBytes += d.length;
+      if (stdoutBytes <= MAX_BUFFER) stdout += d.toString();
+    });
+    child.stderr?.on('data', (d: Buffer) => {
+      stderrBytes += d.length;
+      if (stderrBytes <= MAX_BUFFER) stderr += d.toString();
+    });
+
+    child.on('error', (err) => finish({ code: null, stdout, stderr: `${stderr}${String(err)}` }));
+    child.on('close', (code) => finish({ code, stdout, stderr }));
+  });
+}
+
+/**
+ * Ensure the scaffolded suite has its node_modules. The Playwright browser
+ * binaries live in the shared global cache, so only the npm deps need
+ * installing here; browsers are handled lazily on a missing-browser failure.
+ */
+async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
+  const marker = join(ctx.projectDir, 'node_modules', '@playwright');
+  try {
+    await access(marker);
+    return; // deps already present
+  } catch {
+    /* fall through to install */
+  }
+
+  emit(ctx, '[execute] installing suite deps…');
+  const res = await runCommand(ctx, 'npm', ['install', '--no-audit', '--no-fund', '--silent'], INSTALL_TIMEOUT_MS);
+  if (res.code === 0) {
+    emit(ctx, '[execute] suite deps installed');
+  } else {
+    const tail = stripAnsi(res.stderr || res.stdout)
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(-8)
+      .join(' | ');
+    emit(ctx, '[execute] npm install did not exit cleanly; continuing', { code: res.code, tail });
+  }
+}
+
+/** Heuristic: did the run fail because a Playwright browser binary is missing? */
+function looksLikeMissingBrowser(cmd: RawCommand): boolean {
+  const text = stripAnsi(`${cmd.stderr}\n${cmd.stdout}`);
+  return /Executable doesn't exist|playwright install|browserType\.launch|Failed to launch|please run the following command/i.test(
+    text,
+  );
+}
+
+// ---- Playwright JSON report shapes (only the fields we read) ----------------
+
+interface PwAttachment {
+  name?: string;
+  path?: string;
+  contentType?: string;
+}
+interface PwError {
+  message?: string;
+  stack?: string;
+  value?: string;
+}
+interface PwResult {
+  status?: string;
+  duration?: number;
+  error?: PwError;
+  errors?: PwError[];
+  attachments?: PwAttachment[];
+}
+interface PwTest {
+  status?: string;
+  projectName?: string;
+  results?: PwResult[];
+}
+interface PwSpec {
+  title?: string;
+  file?: string;
+  tests?: PwTest[];
+}
+interface PwSuite {
+  title?: string;
+  file?: string;
+  specs?: PwSpec[];
+  suites?: PwSuite[];
+}
+interface PwReport {
+  suites?: PwSuite[];
+}
+
+const STATUS_PRIORITY: Record<string, number> = {
+  failed: 5,
+  blocked: 4,
+  flaky: 3,
+  skipped: 2,
+  passed: 1,
+  unknown: 0,
+};
+
+function normalizeStatus(raw: string | undefined): TestStatus {
+  const s = String(raw ?? '').toLowerCase();
+  if (s === 'expected' || s === 'passed') return 'passed';
+  if (s === 'unexpected' || s === 'failed' || s === 'timedout' || s === 'interrupted') return 'failed';
+  if (s === 'flaky') return 'flaky';
+  if (s === 'skipped' || s === 'pending') return 'skipped';
+  return 'pending';
+}
+
+function projectIsTierB(projectName: string | undefined): boolean {
+  return /tierb/i.test(String(projectName ?? ''));
+}
+
+/**
+ * A Tier B failure whose error indicates the login/storageState step never
+ * established a session is a `blocked` outcome (prerequisite failed), not a
+ * genuine assertion failure.
+ */
+function looksLikeAuthBlock(errorText: string): boolean {
+  return /storageState|auth\.setup|authenticate|sign[ -]?in|log[ -]?in|unauthorized|401|403|not authenticated|session/i.test(
+    errorText,
+  );
+}
+
+function errorText(result: PwResult | undefined): string {
+  if (!result) return '';
+  const parts: string[] = [];
+  if (result.error) parts.push(result.error.message ?? '', result.error.stack ?? '', result.error.value ?? '');
+  for (const e of result.errors ?? []) parts.push(e.message ?? '', e.stack ?? '', e.value ?? '');
+  return stripAnsi(parts.filter(Boolean).join('\n')).trim();
+}
+
+function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
+  return (attachments ?? []).map((a) => a.path).filter((p): p is string => typeof p === 'string' && p.length > 0);
+}
+
+interface ParsedReport {
+  results: ExecResultItem[];
+  passed: number;
+  failed: number;
+  blocked: number;
+  flaky: number;
+}
+
+function parseReport(report: PwReport): ParsedReport {
+  const results: ExecResultItem[] = [];
+  let passed = 0;
+  let failed = 0;
+  let blocked = 0;
+  let flaky = 0;
+
+  const processSpec = (spec: PwSpec, suiteTitle: string): void => {
+    const tests = spec.tests ?? [];
+    if (tests.length === 0) return;
+    const title = stripAnsi(spec.title ?? suiteTitle ?? 'Unnamed test').trim();
+
+    let worst: TestStatus = 'pending';
+    let worstError = '';
+    let totalDuration = 0;
+    let artifacts: string[] = [];
+    let isFlaky = false;
+
+    for (const test of tests) {
+      const testResults = test.results ?? [];
+      const last = testResults[testResults.length - 1];
+      totalDuration += last?.duration ?? 0;
+
+      const statuses = testResults.map((r) => String(r.status ?? '').toLowerCase());
+      const hadPass = statuses.some((s) => s === 'passed' || s === 'expected');
+      const hadFail = statuses.some((s) => s === 'failed' || s === 'unexpected' || s === 'timedout');
+      const testLevelFlaky = String(test.status ?? '').toLowerCase() === 'flaky';
+      if (testLevelFlaky || (hadPass && hadFail)) isFlaky = true;
+
+      let status = normalizeStatus(last?.status ?? test.status);
+      const errText = errorText(last);
+
+      if (status === 'failed' && projectIsTierB(test.projectName) && looksLikeAuthBlock(errText)) {
+        status = 'blocked';
+      }
+
+      if ((STATUS_PRIORITY[status] ?? 0) >= (STATUS_PRIORITY[worst] ?? 0)) {
+        worst = status;
+        if (status === 'failed' || status === 'blocked') worstError = errText;
+        const a = collectArtifactPaths(last?.attachments);
+        if (a.length > 0) artifacts = a;
+      }
+    }
+
+    if (isFlaky && worst !== 'failed' && worst !== 'blocked') {
+      worst = 'flaky';
+    }
+
+    const item: ExecResultItem = {
+      title,
+      status: worst,
+      durationMs: totalDuration || undefined,
+      error: worstError || undefined,
+      artifacts: artifacts.length > 0 ? artifacts : undefined,
+    };
+    results.push(item);
+
+    switch (worst) {
+      case 'passed':
+        passed += 1;
+        break;
+      case 'flaky':
+        flaky += 1;
+        passed += 1; // flaky eventually passed — count toward passed headline
+        break;
+      case 'blocked':
+        blocked += 1;
+        break;
+      case 'failed':
+        failed += 1;
+        break;
+      default:
+        // skipped/pending do not move pass/fail headline counters
+        break;
+    }
+  };
+
+  const walk = (suite: PwSuite, parentTitle: string): void => {
+    const suiteTitle = parentTitle ? `${parentTitle} > ${suite.title ?? ''}` : suite.title ?? '';
+    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle);
+    for (const child of suite.suites ?? []) walk(child, suiteTitle);
+  };
+
+  for (const suite of report.suites ?? []) walk(suite, '');
+  return { results, passed, failed, blocked, flaky };
+}
+
+/** Read results.json if present and newer than the run start. */
+async function readResultsJson(projectDir: string, startedAt: number): Promise<PwReport | null> {
+  const candidate = join(projectDir, 'results.json');
+  try {
+    const st = await stat(candidate);
+    // Allow small clock skew; stale file from a prior run is ignored.
+    if (st.mtimeMs + 50 < startedAt) return null;
+    const raw = await readFile(candidate, 'utf-8');
+    return JSON.parse(raw) as PwReport;
+  } catch {
+    return null;
+  }
+}
+
+/** Last-ditch: try to JSON-parse stdout (the json reporter prints to stdout too). */
+function parseStdoutJson(stdout: string): PwReport | null {
+  const text = stdout.trim();
+  // Fast path: stdout is pure JSON.
+  if (text.startsWith('{')) {
+    try {
+      return JSON.parse(text) as PwReport;
+    } catch {
+      // fall through to the embedded-brace search
+    }
+  }
+  // Fallback: the json blob may be preceded by list-reporter lines; locate it.
+  // Match tolerantly — whitespace/newlines differ between Playwright versions.
+  const m = stdout.match(/\{\s*"config"\s*:/);
+  if (m && m.index !== undefined) {
+    try {
+      return JSON.parse(stdout.slice(m.index)) as PwReport;
+    } catch {
+      return null;
+    }
+  }
+  return null;
+}
+
+/** Fallback summary parse from human-readable reporter lines. */
+function parseSummaryText(combined: string): ParsedReport {
+  const text = stripAnsi(combined);
+  const num = (re: RegExp): number => {
+    const m = text.match(re);
+    return m ? parseInt(m[1], 10) : 0;
+  };
+  const passed = num(/(\d+)\s+passed/i);
+  const failed = num(/(\d+)\s+failed/i);
+  const flaky = num(/(\d+)\s+flaky/i);
+  return { results: [], passed, failed, blocked: 0, flaky };
+}
+
+/**
+ * Run the scaffolded suite and parse results into an ExecOutcome. Tier B login
+ * failures become `blocked`. Never throws on test failure — only the outcome
+ * object is returned; infrastructure errors are surfaced via raw + a warning.
+ */
+export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+  emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
+
+  if (specs.length === 0) {
+    emit(ctx, 'No specs to execute; returning empty outcome');
+    return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+  }
+
+  await ensureSuiteDeps(ctx);
+
+  emit(ctx, '[execute] running Playwright suite…');
+  let startedAt = Date.now();
+  let cmd = await runPlaywright(ctx);
+
+  // The browser binaries normally come from the shared global cache; if a run
+  // fails because one is missing, install chromium into the cache and retry once.
+  if (cmd.code !== 0 && looksLikeMissingBrowser(cmd)) {
+    emit(ctx, '[execute] missing browser binary; running npx playwright install chromium…');
+    const browserInstall = await runCommand(ctx, 'npx', ['playwright', 'install', 'chromium'], INSTALL_TIMEOUT_MS);
+    emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
+    startedAt = Date.now();
+    cmd = await runPlaywright(ctx);
+  }
+  emit(ctx, '[execute] Playwright run finished', { exitCode: cmd.code, timedOut: cmd.timedOut });
+
+  let report = await readResultsJson(ctx.projectDir, startedAt);
+  if (!report) report = parseStdoutJson(cmd.stdout);
+
+  let parsed: ParsedReport;
+  if (report) {
+    parsed = parseReport(report);
+  } else {
+    parsed = parseSummaryText(`${cmd.stdout}\n${cmd.stderr}`);
+    if (parsed.results.length === 0 && parsed.passed === 0 && parsed.failed === 0) {
+      const tail = stripAnsi(cmd.stderr || cmd.stdout)
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .slice(-8)
+        .join(' | ');
+      emit(ctx, 'Could not parse Playwright results; suite may have failed to start', {
+        exitCode: cmd.code,
+        timedOut: cmd.timedOut,
+        tail,
+      });
+    }
+  }
+
+  const outcome: ExecOutcome = {
+    passed: parsed.passed,
+    failed: parsed.failed,
+    blocked: parsed.blocked,
+    flaky: parsed.flaky,
+    results: parsed.results,
+    raw: {
+      exitCode: cmd.code,
+      signal: cmd.signal,
+      timedOut: cmd.timedOut,
+      hadJsonReport: report !== null,
+      stderrTail: stripAnsi(cmd.stderr).split(/\r?\n/).filter(Boolean).slice(-20),
+    },
+  };
+
+  emit(ctx, 'Execution complete', {
+    passed: outcome.passed,
+    failed: outcome.failed,
+    blocked: outcome.blocked,
+    flaky: outcome.flaky,
+  });
+  return outcome;
+}

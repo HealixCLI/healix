@@ -46,7 +46,7 @@ const SECRET_PATTERNS: readonly SecretPattern[] = [
     replace: () => '<REDACTED>',
   },
   {
-    regex: /\bsk-ant-[A-Za-z0-9_\-]{8,}/g,
+    regex: /\bsk-ant-[A-Za-z0-9_-]{8,}/g,
     replace: () => '<REDACTED>',
   },
 ];

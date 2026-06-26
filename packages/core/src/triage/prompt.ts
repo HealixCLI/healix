@@ -37,6 +37,14 @@ export function buildTriagePrompt(input: TriageInput): string {
     ? truncate(input.specSource, MAX_SPEC_CHARS)
     : '(spec source unavailable)';
   const reqLine = input.reqTag ? `\nRequirement tag: ${input.reqTag}` : '';
+  // A Playwright trace, when captured, is strong evidence for human review (it
+  // records DOM/network/screenshots). We can't read it here, but noting its
+  // availability tells the model the failure is reproducible/inspectable, which
+  // discourages a lazy `flaky` verdict.
+  const traceLine =
+    typeof input.tracePath === 'string' && input.tracePath.trim().length > 0
+      ? `\nA Playwright trace was captured for this run (available for review at ${input.tracePath.trim()}); treat the failure as reproducible and inspectable.`
+      : '';
 
   return [
     'You are a senior test-failure triage engine. A single automated end-to-end',
@@ -60,7 +68,7 @@ export function buildTriagePrompt(input: TriageInput): string {
     `Allowed verdict values (use EXACTLY one): ${VERDICTS.join(' | ')}.`,
     '',
     '--- FAILED TEST ---',
-    `Title: ${title}${reqLine}`,
+    `Title: ${title}${reqLine}${traceLine}`,
     '',
     '--- ERROR / STACK ---',
     error,
@@ -103,12 +111,46 @@ function clampConfidence(value: unknown): number {
 }
 
 /**
+ * Scan `text` from `start` (which must point at a `{`) for the matching close
+ * brace, tracking string state so braces and backticks inside JSON string
+ * values are ignored. This is what makes extraction robust to a `suggestedPatch`
+ * whose value embeds a nested triple-backtick fence (or literal `{`/`}`): a
+ * regex-only approach truncates at the first inner fence/brace, but a depth
+ * counter that respects strings + escapes closes on the *real* object end.
+ * Returns the index just past the matching `}`, or -1 if unbalanced.
+ */
+function scanBalancedObject(text: string, start: number): number {
+  let depth = 0;
+  let inString = false;
+  for (let i = start; i < text.length; i++) {
+    const ch = text[i];
+    if (inString) {
+      if (ch === '\\') {
+        i++; // skip the escaped char (\" \\ \n …) so it can't end the string
+        continue;
+      }
+      if (ch === '"') inString = false;
+      continue;
+    }
+    if (ch === '"') {
+      inString = true;
+    } else if (ch === '{') {
+      depth++;
+    } else if (ch === '}') {
+      depth--;
+      if (depth === 0) return i + 1;
+    }
+  }
+  return -1;
+}
+
+/**
  * Pull the first plausible JSON object out of a model reply. Handles:
  *   - ```json … ``` fenced blocks (preferred),
  *   - bare ``` … ``` fences,
- *   - fenced blocks whose JSON `suggestedPatch` itself contains a nested
- *     triple-backtick fence (the outer fence is matched greedily so the inner
- *     fence does not truncate the block),
+ *   - replies whose JSON `suggestedPatch` itself contains a nested
+ *     triple-backtick fence — a balanced, string/escape-aware brace scan finds
+ *     the real object end instead of truncating at the inner fence,
  *   - a raw {...} object embedded in surrounding prose.
  * Returns the parsed object or null if nothing parses.
  */
@@ -117,29 +159,37 @@ function extractJsonObject(text: string): Record<string, unknown> | null {
 
   const candidates: string[] = [];
 
-  // Outer fence matched GREEDILY: span from the first ```json/``` opener to the
-  // LAST closing ``` in the reply. This tolerates a nested triple-backtick
-  // fence inside suggestedPatch — the non-greedy variant below would stop at
-  // the inner closing fence and truncate the JSON.
-  const greedyFenceRe = /```(?:json)?\s*([\s\S]*)```/i;
-  const greedy = greedyFenceRe.exec(text);
-  if (greedy && greedy[1]) candidates.push(greedy[1].trim());
+  // Primary strategy: walk every `{` and extract the balanced object that
+  // starts there, respecting strings/escapes. Collecting ALL balanced spans
+  // (not just the first) means a leading prose `{` or a partial object cannot
+  // shadow the real verdict object later in the reply.
+  for (let i = text.indexOf('{'); i !== -1; i = text.indexOf('{', i + 1)) {
+    const end = scanBalancedObject(text, i);
+    if (end !== -1) candidates.push(text.slice(i, end));
+  }
 
-  // Non-greedy fenced blocks (json-tagged first, then any fence) for the common
-  // single-fence case and replies with multiple independent blocks.
+  // Fallback: fenced blocks (json-tagged first, then any fence). Kept for the
+  // rare case where the JSON is malformed mid-object but the fence still
+  // delimits a parseable payload.
   const fenceRe = /```(?:json)?\s*([\s\S]*?)```/gi;
   let m: RegExpExecArray | null;
   while ((m = fenceRe.exec(text)) !== null) {
     if (m[1]) candidates.push(m[1].trim());
   }
 
-  // First balanced-looking {...} span as a fallback.
+  // Last resort: the widest first-brace…last-brace span.
   const firstBrace = text.indexOf('{');
   const lastBrace = text.lastIndexOf('}');
   if (firstBrace !== -1 && lastBrace > firstBrace) {
     candidates.push(text.slice(firstBrace, lastBrace + 1).trim());
   }
 
+  for (const candidate of candidates) {
+    const parsed = tryParse(candidate);
+    if (parsed && isVerdict(parsed.verdict)) return parsed;
+  }
+  // No candidate carried a usable verdict; return the first that parsed as an
+  // object at all so the caller's downstream validation can reject it cleanly.
   for (const candidate of candidates) {
     const parsed = tryParse(candidate);
     if (parsed) return parsed;

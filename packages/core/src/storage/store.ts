@@ -1,6 +1,6 @@
 import { nanoid } from 'nanoid';
 import type { DatabaseSync } from 'node:sqlite';
-import { openDb } from './db.js';
+import { openDb, resetDbForTests } from './db.js';
 import type {
   AgentEvent,
   EventLevel,
@@ -203,6 +203,15 @@ export async function getStore(): Promise<HealixStore | null> {
   if (!db) return null;
   cached = new HealixStore(db);
   return cached;
+}
+
+/**
+ * Test-only seam: clear the cached store and reset the underlying database so the
+ * next getStore() opens a fresh store from the current HEALIX_DATA_DIR.
+ */
+export function resetStoreForTests(): void {
+  cached = null;
+  resetDbForTests();
 }
 
 function s(v: unknown): string | null {

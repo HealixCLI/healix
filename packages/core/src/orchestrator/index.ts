@@ -1,7 +1,7 @@
 import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { projectsDir } from '../env/app-data.js';
-import { getStore } from '../storage/store.js';
+import { getStore, type HealixStore } from '../storage/store.js';
 import type { Project, Run, RunStatus, TestStatus, Tier } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
@@ -9,6 +9,8 @@ import { getTestMode } from '../modes/registry.js';
 import type {
   ExecOutcome,
   GeneratedSpec,
+  SuiteBundle,
+  TestMode,
   TestModeContext,
   TestPlan,
 } from '../modes/types.js';
@@ -16,12 +18,14 @@ import { createTargetAdapter } from '../target/index.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
+import type { TriageInput } from '../triage/types.js';
 import { buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
   OrchestratorHooks,
+  OrchestratorOverrides,
   OrchestratorPhase,
   RunOptions,
   RunSummary,
@@ -29,17 +33,37 @@ import type {
 
 export * from './types.js';
 
-/** Real resumable run state machine for the Healix orchestrator. */
-export function createOrchestrator(): Orchestrator {
+/** Per-call budget for the best-effort AI triage enrichment. */
+const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
+/** How many failures (at most) get escalated to AI triage analysis. */
+const TRIAGE_AI_LIMIT = 3;
+/** Consecutive best-effort store-write failures before we warn that persistence is down. */
+const STORE_FAILURE_WARN_THRESHOLD = 3;
+
+/**
+ * Real resumable run state machine for the Healix orchestrator.
+ *
+ * `overrides` is a dependency-injection seam for testability: each dependency is
+ * resolved as `override ?? current-default`, so `createOrchestrator()` with no
+ * arguments behaves exactly as before.
+ */
+export function createOrchestrator(overrides?: OrchestratorOverrides): Orchestrator {
   return {
     run(opts: RunOptions, hooks?: OrchestratorHooks): Promise<RunSummary> {
-      return runPipeline(opts, hooks);
+      return runPipeline(opts, hooks, overrides);
     },
   };
 }
 
-async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise<RunSummary> {
-  const store = await getStore();
+async function runPipeline(
+  opts: RunOptions,
+  hooks?: OrchestratorHooks,
+  overrides?: OrchestratorOverrides,
+): Promise<RunSummary> {
+  const getMode = overrides?.getMode ?? getTestMode;
+  const makeTarget = overrides?.makeTarget ?? createTargetAdapter;
+  const makeBrowser = overrides?.makeBrowser ?? createBrowserSurface;
+  const store = overrides?.store ?? (await getStore());
   if (!store) {
     // No persistence available — surface as an error summary the caller can act on.
     hooks?.onEvent?.({
@@ -66,12 +90,43 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
 
   // Mutable status mirror so the returned summary always reflects the latest phase.
   let currentStatus: RunStatus = 'pending';
+
+  // Persistence health tracking. Best-effort store writes still swallow their
+  // errors (a DB fault must never abort the run), but we count *consecutive*
+  // failures and surface at least one warn via the DB-independent onEvent path
+  // when persistence appears to be down, so the fault is not lost silently.
+  let consecutiveStoreFailures = 0;
+  let persistenceWarned = false;
+  const noteStoreOk = (): void => {
+    consecutiveStoreFailures = 0;
+  };
+  const noteStoreFailure = (op: string, err: unknown): void => {
+    consecutiveStoreFailures += 1;
+    if (consecutiveStoreFailures >= STORE_FAILURE_WARN_THRESHOLD && !persistenceWarned) {
+      persistenceWarned = true;
+      // Route directly through the DB-independent hook (NOT emit), since emit's
+      // own store write would just fail again and re-enter this path.
+      try {
+        hooks?.onEvent?.({
+          phase: 'report',
+          level: 'warn',
+          message: `Persistence appears unavailable: ${consecutiveStoreFailures} consecutive store writes failed (last: ${op}).`,
+          data: { op, failures: consecutiveStoreFailures, error: errMsg(err) },
+        });
+      } catch {
+        /* never let a hook crash the run */
+      }
+    }
+  };
+
   const setStatus = (status: RunStatus, patch: { startedAt?: string; finishedAt?: string } = {}): void => {
     currentStatus = status;
     try {
       store.updateRunStatus(runId, status, patch);
-    } catch {
+      noteStoreOk();
+    } catch (err) {
       /* persistence best-effort; never abort the pipeline on a status write */
+      noteStoreFailure('updateRunStatus', err);
     }
   };
 
@@ -83,8 +138,10 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
   ): void => {
     try {
       store.appendEvent(runId, String(phase), message, { level, data });
-    } catch {
+      noteStoreOk();
+    } catch (err) {
       /* best-effort */
+      noteStoreFailure('appendEvent', err);
     }
     try {
       hooks?.onEvent?.({ phase, level, message, data });
@@ -113,6 +170,8 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
   let specs: GeneratedSpec[] = [];
   let outcome: ExecOutcome | null = null;
   const triageEntries: ReportTriageEntry[] = [];
+  // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
+  let artifactFiles: string[] = [];
   // Stable key -> testId, so EXECUTE reuses the rows inserted in GENERATE (no duplicates).
   const testIdByKey = new Map<string, string>();
   // The base URL the suite should actually target (may be overridden by a white-box launch).
@@ -124,7 +183,8 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     // ---- 3. PLAN ----
     setStatus('planning');
     emit('plan', 'info', 'Selecting planning provider.');
-    const provider = await resolveProvider(opts.provider);
+    // An injected provider override bypasses the router entirely (used in tests).
+    const provider = overrides?.provider ?? (await resolveProvider(opts.provider));
     if (!provider) {
       emit('plan', 'error', 'No ready provider available for planning.');
       setStatus('error', { finishedAt: nowIso() });
@@ -132,7 +192,8 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     }
     // The auto-select path already guarantees a ready+authenticated provider (router.select).
     // The explicit-provider path (router.get) does not, so verify it here to match that guarantee.
-    if (opts.provider) {
+    // An injected provider is trusted as-is (no extra health gate).
+    if (opts.provider && !overrides?.provider) {
       const health = await provider.health();
       if (health.status !== 'ready' || !health.authenticated) {
         emit(
@@ -172,8 +233,8 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     }
 
     // ---- 5. ctx ----
-    const target = createTargetAdapter();
-    const browser = createBrowserSurface();
+    const target = makeTarget();
+    const browser = makeBrowser();
 
     // ---- 5b. LAUNCH (white-box) ----
     // A white-box project (repoPath set, no baseUrl) has no live URL yet, so detect + launch
@@ -212,7 +273,7 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
       explorationMode: opts.explorationMode ?? 'codegen',
       emit: ctxEmit,
     };
-    const mode = getTestMode(project.mode);
+    const mode = getMode(project.mode);
 
     // ---- 6. EXPLORE (best-effort) ----
     if (effectiveBaseUrl && ctx.explorationMode === 'computer-use') {
@@ -256,7 +317,9 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     } catch (err) {
       emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
-      const summary = await finalizeReport(runDir, run, project, currentStatus, plan, outcome, triageEntries);
+      const summary = await finalizeReport(
+        runDir, run, project, currentStatus, plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+      );
       return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
 
@@ -265,7 +328,7 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     emit('execute', 'info', `Executing ${specs.length} spec(s).`);
     try {
       outcome = await mode.execute(ctx, specs);
-      persistResults(store, runId, specs, outcome, testIdByKey);
+      persistResults(store, runId, specs, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
       emit('execute', 'info', `Execution complete: ${outcome.passed} passed, ${outcome.failed} failed.`, {
         passed: outcome.passed,
         failed: outcome.failed,
@@ -275,24 +338,70 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     } catch (err) {
       emit('execute', 'error', `Execution failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
-      const summary = await finalizeReport(runDir, run, project, currentStatus, plan, outcome, triageEntries);
+      const summary = await finalizeReport(
+        runDir, run, project, currentStatus, plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+      );
       return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
 
+    // ---- 8b. COLLECT ARTIFACTS (best-effort) ----
+    // Gather the mode's artifact files so the report can surface them. A failure
+    // here must not affect the run outcome.
+    try {
+      const collected = await mode.collectArtifacts(ctx);
+      artifactFiles = collected.files;
+      emit('execute', 'info', `Collected ${artifactFiles.length} artifact file(s).`, { dir: collected.dir });
+    } catch (err) {
+      emit('execute', 'warn', `Artifact collection failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+    }
+
     // ---- 9. TRIAGE (best-effort) ----
+    // classify() is the deterministic baseline for EVERY failure. For the first
+    // few failures we additionally try AI analyze() with a short per-call timeout
+    // and merge its verdict/confidence in; analyze() already falls back to
+    // classify() internally, so the baseline is never lost. Triage never aborts.
     setStatus('triaging');
     try {
       const failed = outcome.results.filter((r) => r.status === 'failed');
       if (failed.length > 0) {
         emit('triage', 'info', `Triaging ${failed.length} failure(s).`);
         const engine = createTriageEngine();
+        let aiBudget = TRIAGE_AI_LIMIT;
         for (const r of failed) {
+          // Recover the originating spec (by normalized title) to ground the triage
+          // input with its requirement tag and source.
+          const spec = specs.find(
+            (s) => stableKey(undefined, s.title) === stableKey(undefined, r.title),
+          );
+          const input: TriageInput = {
+            title: r.title,
+            error: r.error ?? '',
+            ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
+            ...(spec?.contents ? { specSource: spec.contents } : {}),
+          };
+          // Deterministic baseline always wins as the starting point and the fallback.
+          let triage: ReportTriageEntry['triage'];
           try {
-            const triage = engine.classify({ title: r.title, error: r.error ?? '' });
-            triageEntries.push({ title: r.title, error: r.error ?? '', triage });
+            triage = engine.classify(input);
           } catch (err) {
-            emit('triage', 'warn', `Triage failed for "${r.title}": ${errMsg(err)}`);
+            emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
+            continue;
           }
+          // Best-effort AI enrichment for the first N failures, bounded per call.
+          if (aiBudget > 0) {
+            aiBudget -= 1;
+            try {
+              const enriched = await withTimeout(
+                engine.analyze(input, provider),
+                TRIAGE_ANALYZE_TIMEOUT_MS,
+              );
+              if (enriched) triage = enriched;
+            } catch (err) {
+              // Timeout / analyze() threw — keep the deterministic baseline.
+              emit('triage', 'debug', `AI triage skipped for "${r.title}": ${errMsg(err)}`);
+            }
+          }
+          triageEntries.push({ title: r.title, error: r.error ?? '', triage });
         }
         emit('triage', 'info', `Triaged ${triageEntries.length} failure(s).`);
       } else {
@@ -306,15 +415,21 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     setStatus('reporting');
     emit('report', 'info', 'Writing report.');
     const reportPath = (
-      await finalizeReport(runDir, run, project, currentStatus, plan, outcome, triageEntries)
+      await finalizeReport(
+        runDir, run, project, currentStatus, plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+      )
     ).reportPath;
 
     // ---- 11. EXPORT (best-effort) ----
+    // Prefer the mode's own export() for the suite bundle; fall back to the
+    // standalone exportSuite() if it throws. Either way, never abort the run.
     let suite: RunSummary['suite'];
     try {
-      emit('export', 'info', 'Exporting standalone suite.');
-      suite = await exportSuite({ suiteDir: ctx.projectDir, outDir: join(runDir, 'export') });
-      emit('export', 'info', `Exported ${suite.files.length} file(s).`, { dir: suite.dir, zipPath: suite.zipPath });
+      emit('export', 'info', 'Exporting suite bundle.');
+      suite = await exportViaMode(mode, ctx, runDir, emit);
+      if (suite) {
+        emit('export', 'info', `Exported ${suite.files.length} file(s).`, { dir: suite.dir, zipPath: suite.zipPath });
+      }
     } catch (err) {
       emit('export', 'warn', `Export failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
     }
@@ -330,7 +445,9 @@ async function runPipeline(opts: RunOptions, hooks?: OrchestratorHooks): Promise
     let reportPath: string | undefined;
     try {
       reportPath = (
-        await finalizeReport(runDir, run, project, 'error', plan, outcome, triageEntries)
+        await finalizeReport(
+          runDir, run, project, 'error', plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+        )
       ).reportPath;
     } catch {
       /* report is best-effort on the failure path */
@@ -393,11 +510,13 @@ async function runPlanPhase(
  * fallback test row so it is still recorded exactly once.
  */
 function persistResults(
-  store: NonNullable<Awaited<ReturnType<typeof getStore>>>,
+  store: HealixStore,
   runId: string,
   specs: GeneratedSpec[],
   outcome: ExecOutcome,
   testIdByKey: Map<string, string>,
+  noteStoreOk: () => void,
+  noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
   for (const r of outcome.results) {
     // Recover the spec by normalized title, then key on the SAME stable key used in GENERATE
@@ -425,8 +544,10 @@ function persistResults(
         error: r.error ?? null,
         artifactsJson: r.artifacts && r.artifacts.length > 0 ? JSON.stringify(r.artifacts) : null,
       });
-    } catch {
+      noteStoreOk();
+    } catch (err) {
       /* best-effort persistence */
+      noteStoreFailure('insertResult', err);
     }
   }
 }
@@ -447,6 +568,9 @@ async function finalizeReport(
   plan: TestPlan | null,
   outcome: ExecOutcome | null,
   triage: ReportTriageEntry[],
+  artifacts: string[],
+  noteStoreOk: () => void,
+  noteStoreFailure: (op: string, err: unknown) => void,
 ): Promise<{ reportPath: string | undefined }> {
   const effectivePlan: TestPlan = plan ?? { summary: 'No plan generated.', items: [] };
   const report = buildReport({
@@ -455,15 +579,54 @@ async function finalizeReport(
     plan: effectivePlan,
     outcome,
     triage,
+    artifacts,
   });
   const reportPath = join(runDir, 'reports', 'report.json');
   try {
     await writeJson(reportPath, report);
     await writeFile(join(runDir, 'reports', 'report.html'), renderReportHtml(report), 'utf8');
+    noteStoreOk();
     return { reportPath };
-  } catch {
+  } catch (err) {
+    noteStoreFailure('finalizeReport', err);
     return { reportPath: undefined };
   }
+}
+
+/**
+ * Produce the suite bundle. Prefers the mode's own export() (when implemented),
+ * falling back to the standalone exportSuite() if it throws. The mode's export()
+ * may legitimately be a no-op default, so an empty/failed result still falls back.
+ */
+async function exportViaMode(
+  mode: TestMode,
+  ctx: TestModeContext,
+  runDir: string,
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<SuiteBundle> {
+  try {
+    return await mode.export(ctx);
+  } catch (err) {
+    emit('export', 'debug', `mode.export() failed; falling back to exportSuite(): ${errMsg(err)}`);
+    return exportSuite({ suiteDir: ctx.projectDir, outDir: join(runDir, 'export') });
+  }
+}
+
+/** Reject after `ms` if `p` has not settled, so a single provider call cannot stall triage. */
+function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    p.then(
+      (v) => {
+        clearTimeout(timer);
+        resolve(v);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
 }
 
 async function writeJson(path: string, value: unknown): Promise<void> {

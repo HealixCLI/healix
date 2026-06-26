@@ -1,3 +1,4 @@
+import { createRequire } from 'node:module';
 import type { DatabaseSync } from 'node:sqlite';
 import { dbPath, ensureAppDataDir } from '../env/app-data.js';
 import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js';
@@ -28,13 +29,26 @@ function suppressSqliteExperimentalWarning(): void {
 }
 
 async function loadDriver(): Promise<typeof DatabaseSync | null> {
+  suppressSqliteExperimentalWarning();
+  // Prefer a native dynamic import (works under plain Node / Electron). Some bundled
+  // test runtimes (e.g. vite-node) don't recognise node:sqlite as a builtin and fail
+  // to resolve it, so fall back to createRequire which bypasses the module graph and
+  // loads the real native module directly.
   try {
-    suppressSqliteExperimentalWarning();
     const mod = await import('node:sqlite');
     return mod.DatabaseSync;
-  } catch (e) {
-    logger.warn('node:sqlite unavailable in this runtime:', (e as { code?: string }).code ?? String(e));
-    return null;
+  } catch {
+    try {
+      const require = createRequire(import.meta.url);
+      const mod = require('node:sqlite') as { DatabaseSync: typeof DatabaseSync };
+      return mod.DatabaseSync;
+    } catch (e) {
+      logger.warn(
+        'node:sqlite unavailable in this runtime:',
+        (e as { code?: string }).code ?? String(e),
+      );
+      return null;
+    }
   }
 }
 
@@ -49,6 +63,17 @@ export async function openDb(): Promise<DatabaseSync | null> {
   migrate(db);
   instance = db;
   return db;
+}
+
+/**
+ * Test-only seam: close the open database (if any) and clear the cached singleton
+ * so a subsequent openDb() re-derives its path from the current HEALIX_DATA_DIR.
+ */
+export function resetDbForTests(): void {
+  if (instance) {
+    instance.close();
+    instance = null;
+  }
 }
 
 function readUserVersion(db: DatabaseSync): number {

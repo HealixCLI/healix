@@ -16,6 +16,8 @@ export interface RunReport {
   plan: TestPlan;
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
+  /** Artifact files collected from the mode after execution (relative paths). */
+  artifacts: string[];
   generatedAt: string;
 }
 
@@ -25,6 +27,7 @@ export function buildReport(input: {
   plan: TestPlan;
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
+  artifacts?: string[];
 }): RunReport {
   return {
     run: input.run,
@@ -32,6 +35,7 @@ export function buildReport(input: {
     plan: input.plan,
     outcome: input.outcome,
     triage: input.triage,
+    artifacts: input.artifacts ?? [],
     generatedAt: new Date().toISOString(),
   };
 }

@@ -1,9 +1,13 @@
 import { homedir, platform } from 'node:os';
-import { join } from 'node:path';
+import { join, resolve } from 'node:path';
 import { mkdirSync } from 'node:fs';
 
 /** Resolve the OS-specific Healix application-data directory (no side effects). */
 export function appDataDir(): string {
+  const override = process.env.HEALIX_DATA_DIR;
+  if (override !== undefined && override !== '') {
+    return resolve(override);
+  }
   const home = homedir();
   const p = platform();
   let base: string;

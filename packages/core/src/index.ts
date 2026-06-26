@@ -11,8 +11,10 @@ export { doctor, type DoctorReport } from './healix.js';
 
 // Storage
 export { openDb, dbInfo, type DbInfo } from './storage/db.js';
+export { resetDbForTests } from './storage/db.js';
 export { SCHEMA_VERSION } from './storage/schema.js';
 export { HealixStore, getStore } from './storage/store.js';
+export { resetStoreForTests } from './storage/store.js';
 export * from './storage/types.js';
 
 // Target adapter (white-box / black-box)

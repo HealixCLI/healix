@@ -1,0 +1,32 @@
+<svg width="1024" height="1024" viewBox="0 0 1024 1024" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="leaf" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#46c878"/>
+      <stop offset="1" stop-color="#1f8f44"/>
+    </linearGradient>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#10261a"/>
+      <stop offset="1" stop-color="#0b0b0f"/>
+    </linearGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="224" fill="url(#bg)"/>
+  <!-- almond leaf: pointed at both ends, tilted; midrib + symmetric side veins on the body -->
+  <g transform="rotate(-32 512 512)">
+    <path d="M512 168
+             C 712 320, 752 560, 512 856
+             C 272 560, 312 320, 512 168 Z"
+          fill="url(#leaf)"/>
+    <!-- midrib -->
+    <path d="M512 200 L 512 824"
+          fill="none" stroke="#0d3a22" stroke-opacity="0.7" stroke-width="22" stroke-linecap="round"/>
+    <!-- side veins -->
+    <g fill="none" stroke="#0d3a22" stroke-opacity="0.55" stroke-width="15" stroke-linecap="round">
+      <path d="M512 340 C 560 360, 600 392, 624 440"/>
+      <path d="M512 340 C 464 360, 424 392, 400 440"/>
+      <path d="M512 470 C 568 494, 612 532, 636 584"/>
+      <path d="M512 470 C 456 494, 412 532, 388 584"/>
+      <path d="M512 600 C 558 622, 596 656, 616 700"/>
+      <path d="M512 600 C 466 622, 428 656, 408 700"/>
+    </g>
+  </g>
+</svg>

@@ -31,12 +31,20 @@ pnpm healix doctor
 pnpm healix doctor --no-probe      # detection only, no token cost
 pnpm healix providers list
 
-# Desktop app (Codex-style UI)
+# CLI — full run loop
+pnpm healix project add --name MyApp --repo /path/to/app   # white-box (or --url for black-box)
+pnpm healix run --project <id> --mode codegen              # plan → approve → generate → run → report → export
+pnpm healix runs list                                      # run history
+pnpm healix runs show <runId>                              # results + report path
+pnpm healix export <runId> --out ./suite                  # standalone runnable Playwright project
+
+# Desktop app (Codex-style UI: Providers / Projects / Runs)
 pnpm dev:desktop    # launches the Electron app in dev
 pnpm build:desktop  # production build → apps/desktop/out
+pnpm --filter @healix/desktop package   # build a local .app/dir via electron-builder (release/)
 ```
 
-`pnpm healix doctor` resolves the `claude` binary, runs a real authenticated round-trip, initializes the local SQLite DB at the OS app-data dir, and reports provider readiness.
+`pnpm healix doctor` resolves the `claude` binary, runs a real authenticated round-trip, initializes the local SQLite DB at the OS app-data dir, and reports provider readiness. The desktop app packages into a signed `Healix.app` (notarization/signed installers need release certs — see [ADR-0017](./docs/adr/0017-update-distribution.md)).
 
 ## What works today (M1)
 

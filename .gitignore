@@ -9,7 +9,6 @@ node_modules/
 # Build output
 dist/
 out/
-build/
 .vite/
 .turbo/
 
@@ -22,3 +21,6 @@ coverage/
 .env
 .env.*
 !.env.example
+
+# packaged app output
+apps/desktop/release/

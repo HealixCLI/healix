@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import { Activity, FolderGit2, PlayCircle } from 'lucide-react';
 import { Badge } from './ui/badge';
+import { Leaf } from './Leaf';
 import { cn } from '../lib/utils';
 
 export type ViewId = 'providers' | 'projects' | 'runs';
@@ -30,6 +31,7 @@ export function Sidebar({
       <div className="drag h-8 w-full" />
       <div className="px-4 pb-4 pt-1">
         <div className="flex items-center gap-2">
+          <Leaf className="h-5 w-5" />
           <span className="font-mono text-lg font-semibold tracking-tight">healix</span>
           <Badge tone="muted">M1</Badge>
         </div>

@@ -2,7 +2,7 @@
 
 **Local-first, AI-led testing platform** — an Electron desktop app and a `healix` CLI over one shared core. Healix scans a target app (white-box repo or black-box URL), generates and runs regression suites (UI + API) via pluggable engines (**Playwright first**, then Selenium, then others), and keeps **all data local**. AI is driven by **Claude and OpenAI/Codex** through their **subscription CLIs** (plan mode) with **SDK fallback** — **no API keys, ever**.
 
-> Status: **M1 shipped** — the full AI-led pipeline runs end-to-end. `healix run` plans (real Claude), detects + launches a white-box app, generates REQ-tagged Playwright specs, executes them for real, triages failures, writes a local report, and exports a standalone runnable suite. See [`docs/`](./docs/README.md).
+> Status: **Usable end-to-end** — both the `healix` CLI and the desktop app drive the full AI-led pipeline. `healix run` plans (real Claude), detects + launches a white-box app, generates REQ-tagged Playwright specs, executes them for real, triages failures, writes a local report, and exports a standalone runnable suite. The desktop app (Providers / Projects / Runs) does the same with a plan-approval gate, streamed run console, live browser view, run history, and one-click suite download — and packages into a green-leaf-branded `Healix.app`. 122 tests, CI, lint/format green. See [`docs/`](./docs/README.md).
 
 ## Monorepo layout
 

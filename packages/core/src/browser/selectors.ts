@@ -127,7 +127,10 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
 
     /** Collapse whitespace and clamp every name source to a stable length. */
     function clamp(value: string): string {
-      return value.trim().replace(/\s+/g, ' ').slice(0, 200);
+      // Collapse first, then clamp to the cap. A trailing trim after the slice
+      // guarantees the cut never leaves a dangling space when the 200-char
+      // boundary lands mid-separator.
+      return value.trim().replace(/\s+/g, ' ').slice(0, 200).trim();
     }
 
     function accessibleName(el: DomElement): string {

@@ -96,6 +96,8 @@ function printSummary(summary: RunSummary): void {
   if (summary.reportPath) console.log(`    ${pc.dim('report')}   ${summary.reportPath}`);
   if (summary.suite?.dir) console.log(`    ${pc.dim('suite')}    ${summary.suite.dir}`);
   console.log('');
+  console.log(pc.dim(`  See full history with \`healix runs show ${summary.runId}\` (or \`healix runs list\`).`));
+  console.log('');
 }
 
 export function registerRun(program: Command): void {

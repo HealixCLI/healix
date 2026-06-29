@@ -39,6 +39,14 @@ export type ApprovalGate = (plan: TestPlan) => Promise<boolean>;
 export interface OrchestratorHooks {
   onEvent?: (e: OrchestratorEvent) => void;
   onPlan?: ApprovalGate;
+  /** Receives live browser frames (PNG) during computer-use exploration, for UI mirroring. */
+  onFrame?: (png: Buffer) => void;
+  /**
+   * Fires once, immediately after the orchestrator creates the canonical run row,
+   * so callers can correlate events/approval to the real runId WITHOUT pre-creating
+   * a duplicate run of their own.
+   */
+  onRunCreated?: (runId: string) => void;
 }
 
 export interface RunSummary {

@@ -9,14 +9,21 @@ export type RunChannelMessage =
   | { channel: 'run:started'; payload: { runId: string; projectId: string } }
   | { channel: 'run:event'; payload: { runId: string; event: unknown } }
   | { channel: 'run:plan'; payload: { runId: string; plan: unknown } }
-  | { channel: 'run:done'; payload: { runId: string; summary: unknown } };
+  | { channel: 'run:done'; payload: { runId: string; summary: unknown } }
+  | { channel: 'run:frame'; payload: { runId: string; pngBase64: string } };
 
-const RUN_CHANNELS = ['run:started', 'run:event', 'run:plan', 'run:done'] as const;
+const RUN_CHANNELS = ['run:started', 'run:event', 'run:plan', 'run:done', 'run:frame'] as const;
 
 const api = {
   // existing
   doctor: (args?: { probe?: boolean }) => ipcRenderer.invoke('healix:doctor', args),
   providers: () => ipcRenderer.invoke('healix:providers'),
+
+  // provider auth
+  providerLogin: (id: 'claude' | 'openai') =>
+    ipcRenderer.invoke('provider:login', { id }),
+  providerHealth: (id: 'claude' | 'openai', probe?: boolean) =>
+    ipcRenderer.invoke('provider:health', { id, probe }),
 
   // projects
   listProjects: () => ipcRenderer.invoke('projects:list'),
@@ -38,6 +45,8 @@ const api = {
   }) => ipcRenderer.invoke('run:start', args),
   approveRun: (runId: string, ok: boolean) =>
     ipcRenderer.invoke('run:approve', { runId, ok }),
+  listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
+  runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
 
   // export / shell
   exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>

@@ -10,6 +10,7 @@ import type {
   RunStatus,
   TestCase,
   TestResult,
+  TestStatus,
 } from './types.js';
 
 /**
@@ -168,6 +169,15 @@ export class HealixStore {
     );
   }
 
+  /** All result rows for a run, joined through tests (results have no run_id of their own). */
+  listResults(runId: string): TestResult[] {
+    return (
+      this.db
+        .prepare('SELECT r.* FROM results r JOIN tests t ON r.test_id = t.id WHERE t.run_id = ?')
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToResult);
+  }
+
   // ---- orchestrator events (resumable checkpoints) ----
   appendEvent(runId: string, phase: string, message: string, opts: { level?: EventLevel; data?: unknown } = {}): AgentEvent {
     const evt: AgentEvent = {
@@ -218,6 +228,10 @@ function s(v: unknown): string | null {
   return v === null || v === undefined ? null : String(v);
 }
 
+function n(v: unknown): number | null {
+  return v === null || v === undefined ? null : Number(v);
+}
+
 function rowToProject(r: Record<string, unknown>): Project {
   return {
     id: String(r.id),
@@ -250,6 +264,17 @@ function rowToTest(r: Record<string, unknown>): TestCase {
     reqTag: s(r.req_tag),
     tier: s(r.tier),
     status: s(r.status) as TestCase['status'],
+  };
+}
+
+function rowToResult(r: Record<string, unknown>): TestResult {
+  return {
+    id: String(r.id),
+    testId: String(r.test_id),
+    status: String(r.status) as TestStatus,
+    durationMs: n(r.duration_ms),
+    error: s(r.error),
+    artifactsJson: s(r.artifacts_json),
   };
 }
 

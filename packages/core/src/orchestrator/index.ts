@@ -86,6 +86,13 @@ async function runPipeline(
 
   const run = store.createRun(project.id, { provider: opts.provider ?? null, mode: project.mode });
   const runId = run.id;
+  // Surface the canonical runId immediately so callers (e.g. the desktop app)
+  // correlate events/approval to THIS run instead of pre-creating a duplicate.
+  try {
+    hooks?.onRunCreated?.(runId);
+  } catch {
+    // a callback fault must never abort the run
+  }
   const runDir = join(projectsDir(), project.id, 'runs', runId);
 
   // Mutable status mirror so the returned summary always reflects the latest phase.
@@ -184,30 +191,19 @@ async function runPipeline(
     setStatus('planning');
     emit('plan', 'info', 'Selecting planning provider.');
     // An injected provider override bypasses the router entirely (used in tests).
-    const provider = overrides?.provider ?? (await resolveProvider(opts.provider));
+    // Otherwise resolveProvider handles BOTH paths and guarantees a ready+authenticated
+    // result: the auto path via router.select('plan'), and the explicit path by probing
+    // the requested provider's health and falling back to the other ready provider when
+    // it is unhealthy (emitting a warn). It returns undefined only when none are ready.
+    const provider = overrides?.provider ?? (await resolveProvider(opts.provider, emit));
     if (!provider) {
       emit('plan', 'error', 'No ready provider available for planning.');
       setStatus('error', { finishedAt: nowIso() });
       return { runId, status: 'error' };
     }
-    // The auto-select path already guarantees a ready+authenticated provider (router.select).
-    // The explicit-provider path (router.get) does not, so verify it here to match that guarantee.
-    // An injected provider is trusted as-is (no extra health gate).
-    if (opts.provider && !overrides?.provider) {
-      const health = await provider.health();
-      if (health.status !== 'ready' || !health.authenticated) {
-        emit(
-          'plan',
-          'error',
-          `Provider "${provider.id}" is not ready (${health.status}, authenticated=${health.authenticated}): ${health.detail}`,
-        );
-        setStatus('error', { finishedAt: nowIso() });
-        return { runId, status: 'error' };
-      }
-    }
     emit('plan', 'info', `Planning with provider "${provider.id}".`);
 
-    plan = await runPlanPhase(provider, project, opts, emit);
+    plan = await runPlanPhase(provider, project, opts, emit, overrides);
     await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
     setStatus('awaiting-approval');
@@ -279,9 +275,20 @@ async function runPipeline(
     if (effectiveBaseUrl && ctx.explorationMode === 'computer-use') {
       setStatus('exploring');
       emit('explore', 'info', `Exploring ${effectiveBaseUrl} (computer-use).`);
+      // Live frame mirroring is best-effort and must never abort the run; the
+      // subscription + browser teardown both happen in this phase's finally.
+      let unsubFrames: (() => void) | null = null;
       try {
         await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
         await browser.goto(effectiveBaseUrl);
+        // Subscribe AFTER start/goto so the UI only mirrors the live page.
+        if (hooks?.onFrame) {
+          try {
+            unsubFrames = browser.onFrame(hooks.onFrame);
+          } catch (err) {
+            emit('explore', 'debug', `Frame subscription failed (continuing): ${errMsg(err)}`);
+          }
+        }
         const snap = await browser.snapshot();
         emit('explore', 'info', `Explored "${snap.title}".`, {
           url: snap.url,
@@ -290,6 +297,14 @@ async function runPipeline(
       } catch (err) {
         emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
       } finally {
+        // Always unsubscribe before stopping the browser, both best-effort.
+        if (unsubFrames) {
+          try {
+            unsubFrames();
+          } catch {
+            /* never let unsubscribe crash the run */
+          }
+        }
         await browser.stop().catch(() => undefined);
       }
     } else {
@@ -467,39 +482,115 @@ async function runPipeline(
   }
 }
 
-/** Resolve the provider: explicit id (router.get) or auto-select for the 'plan' capability. */
-async function resolveProvider(id: RunOptions['provider']): Promise<ProviderAdapter | undefined> {
+/**
+ * Resolve the planning provider with health-gated fallback.
+ *
+ * - Auto path (no explicit id): auto-select the best ready provider for 'plan'.
+ * - Explicit path: probe the requested provider's health. If it is ready+authenticated
+ *   use it; otherwise fall back to the first OTHER ready provider for 'plan' (emitting a
+ *   warn). Returns undefined only when no provider is ready at all.
+ */
+async function resolveProvider(
+  id: RunOptions['provider'],
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<ProviderAdapter | undefined> {
   const router = new ProviderRouter();
-  if (id) {
-    return router.get(id);
+  if (!id) {
+    const selected = await router.select('plan');
+    return selected?.provider;
   }
-  const selected = await router.select('plan');
-  return selected?.provider;
+  // Explicit provider requested — verify it is actually usable before committing.
+  const requested = router.get(id);
+  if (requested) {
+    const health = await requested.health();
+    if (health.status === 'ready' && health.authenticated) {
+      return requested;
+    }
+    // Unhealthy explicit provider: try to fall back to the other ready provider.
+    const fallback = await router.firstReady('plan', { exclude: id });
+    if (fallback) {
+      emit(
+        'plan',
+        'warn',
+        `Provider "${id}" is not ready (${health.status}, authenticated=${health.authenticated}); falling back to "${fallback.id}".`,
+        { requested: id, status: health.status, authenticated: health.authenticated, fallback: fallback.id },
+      );
+      return fallback;
+    }
+    // No fallback available — surface the unhealthy detail so the caller can act.
+    emit(
+      'plan',
+      'warn',
+      `Provider "${id}" is not ready (${health.status}, authenticated=${health.authenticated}) and no fallback is available: ${health.detail}`,
+    );
+    return undefined;
+  }
+  // Unknown explicit id — try any ready provider before giving up.
+  return (await router.firstReady('plan')) ?? undefined;
 }
 
-/** Run the model to obtain a plan, falling back to a synthesized plan on any failure. */
+/**
+ * Run the model to obtain a plan, falling back to a synthesized plan on any failure.
+ *
+ * Provider-level fallback: if the primary provider's complete() throws or returns
+ * ok:false AND a different ready provider exists, we retry the completion ONCE with
+ * that fallback provider before giving up to the synthesized plan. The fallback is
+ * skipped when a provider was injected via overrides (it is trusted as-is and there is
+ * no router to consult).
+ */
 async function runPlanPhase(
   provider: ProviderAdapter,
   project: Project,
   opts: RunOptions,
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+  overrides?: OrchestratorOverrides,
 ): Promise<TestPlan> {
   const prompt = buildPlanPrompt(project, opts);
-  try {
-    const completion = await provider.complete(prompt, {
-      mode: 'plan',
-      cwd: project.repoPath ?? undefined,
-    });
-    if (completion.ok && completion.text) {
-      const parsed = parsePlan(completion.text);
-      if (parsed) return parsed;
-      emit('plan', 'warn', 'Could not parse plan JSON; synthesizing fallback.');
-    } else {
-      emit('plan', 'warn', `Provider returned no usable plan (${completion.detail}); synthesizing fallback.`);
+  // Attempt a single completion with one provider; classifies the outcome so the
+  // caller can decide whether to retry with a fallback.
+  const attempt = async (
+    p: ProviderAdapter,
+  ): Promise<{ plan: TestPlan } | { plan: null; retryable: boolean }> => {
+    try {
+      const completion = await p.complete(prompt, {
+        mode: 'plan',
+        cwd: project.repoPath ?? undefined,
+      });
+      if (completion.ok && completion.text) {
+        const parsed = parsePlan(completion.text);
+        if (parsed) return { plan: parsed };
+        // ok but unparseable — not a provider fault, so don't retry on a different provider.
+        emit('plan', 'warn', 'Could not parse plan JSON; synthesizing fallback.');
+        return { plan: null, retryable: false };
+      }
+      // ok:false is a provider-level failure → eligible for one fallback retry.
+      emit('plan', 'warn', `Provider "${p.id}" returned no usable plan (${completion.detail}).`);
+      return { plan: null, retryable: true };
+    } catch (err) {
+      // A thrown completion is a provider-level failure → eligible for one fallback retry.
+      emit('plan', 'warn', `Planning provider "${p.id}" threw: ${errMsg(err)}.`, { stack: errStack(err) });
+      return { plan: null, retryable: true };
     }
-  } catch (err) {
-    emit('plan', 'warn', `Planning provider threw: ${errMsg(err)}; synthesizing fallback.`, { stack: errStack(err) });
+  };
+
+  const first = await attempt(provider);
+  if (first.plan) return first.plan;
+
+  // One-time provider fallback: only when the failure was provider-level (retryable),
+  // a real router is in play (no injected override), and a DIFFERENT ready provider exists.
+  if (first.retryable && !overrides?.provider) {
+    const fallback = await new ProviderRouter().firstReady('plan', { exclude: provider.id });
+    if (fallback) {
+      emit('plan', 'warn', `Retrying plan with fallback provider "${fallback.id}".`, {
+        primary: provider.id,
+        fallback: fallback.id,
+      });
+      const second = await attempt(fallback);
+      if (second.plan) return second.plan;
+    }
   }
+
+  emit('plan', 'warn', 'Synthesizing fallback plan.');
   return synthesizePlan(project);
 }
 

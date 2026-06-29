@@ -45,4 +45,24 @@ export class ProviderRouter {
     }
     return null;
   }
+
+  /**
+   * First ready+authenticated provider for a capability, or null. Optionally skip
+   * a provider id (e.g. the one that just failed) so callers get a *different* fallback.
+   */
+  async firstReady(
+    cap: Capability,
+    opts?: HealthOptions & { exclude?: ProviderId },
+  ): Promise<ProviderAdapter | null> {
+    for (const id of PREFERENCE[cap]) {
+      if (opts?.exclude && id === opts.exclude) continue;
+      const provider = this.providers.get(id);
+      if (!provider || !provider.capabilities.includes(cap)) continue;
+      const health = await provider.health(opts);
+      if (health.status === 'ready' && health.authenticated) {
+        return provider;
+      }
+    }
+    return null;
+  }
 }

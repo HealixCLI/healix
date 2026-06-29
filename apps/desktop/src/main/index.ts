@@ -1,4 +1,7 @@
-import { join } from 'node:path';
+import { spawn } from 'node:child_process';
+import { readdir, readFile, stat } from 'node:fs/promises';
+import type { Dirent } from 'node:fs';
+import { join, relative, sep } from 'node:path';
 import {
   app,
   BrowserWindow,
@@ -20,6 +23,11 @@ import {
   type ProviderId,
   type TestPlan,
   type RunSummary,
+  type Run,
+  type TestCase,
+  type TestResult,
+  type AgentEvent,
+  type HealthResult,
 } from '@healix/core';
 
 function createWindow(): void {
@@ -37,7 +45,16 @@ function createWindow(): void {
     },
   });
 
-  win.on('ready-to-show', () => win.show());
+  win.on('ready-to-show', () => {
+    win.show();
+    // GUI boot smoke: when HEALIX_SMOKE is set, prove the window mounted, then
+    // quit shortly after so the app can be boot-verified headlessly/briefly.
+    // Guarded so normal launches are entirely unaffected.
+    if (process.env.HEALIX_SMOKE) {
+      console.log('HEALIX_SMOKE_OK');
+      setTimeout(() => app.quit(), 1500);
+    }
+  });
   win.webContents.setWindowOpenHandler(({ url }) => {
     shell.openExternal(url);
     return { action: 'deny' };
@@ -126,21 +143,14 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
   if (!args?.projectId) throw new Error('A projectId is required to start a run.');
   const sender = event.sender;
 
-  // The orchestrator owns the canonical runId, but the approval gate must be
-  // correlated to a stable key the renderer can reference before run() resolves.
-  // We pre-create a run row so renderer + main agree on the id up-front.
+  // The orchestrator owns the canonical runId. We learn it via the onRunCreated
+  // hook (fired right after the run row is created, before any phase event) and
+  // correlate run:started / approval / events to THAT id — no duplicate run row.
   const store = await requireStore();
   const project = store.getProject(args.projectId);
   if (!project) throw new Error(`Project not found: ${args.projectId}`);
 
-  const run = store.createRun(args.projectId, {
-    provider: args.provider ?? null,
-    mode: project.mode,
-  });
-  const runId = run.id;
-
-  // Tell the renderer the run id so it can target approve/subscribe to events.
-  safeSend(sender, 'run:started', { runId, projectId: args.projectId });
+  let runId: string | null = null;
 
   const orchestrator = createOrchestrator();
 
@@ -154,32 +164,42 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
         prd: args.prd,
       },
       {
+        onRunCreated: (id: string) => {
+          runId = id;
+          // Tell the renderer the real run id so it can approve / subscribe.
+          safeSend(sender, 'run:started', { runId: id, projectId: args.projectId });
+        },
         onEvent: (e) => {
-          safeSend(sender, 'run:event', { runId, event: e });
+          if (runId) safeSend(sender, 'run:event', { runId, event: e });
         },
         onPlan: (plan: TestPlan) => {
-          safeSend(sender, 'run:plan', { runId, plan });
+          if (runId) safeSend(sender, 'run:plan', { runId, plan });
           // Auto-approve short-circuits the human gate.
-          if (args.autoApprove) return Promise.resolve(true);
+          if (args.autoApprove || !runId) return Promise.resolve(true);
           return waitForApproval(runId, sender);
+        },
+        // Live browser mirroring for computer-use runs. Throttling (~2fps) is
+        // handled in the browser surface; we only base64-encode + forward.
+        onFrame: (png: Buffer) => {
+          if (runId) safeSend(sender, 'run:frame', { runId, pngBase64: png.toString('base64') });
         },
       },
     )
     .catch((err: unknown) => {
       const message = err instanceof Error ? err.message : String(err);
       safeSend(sender, 'run:event', {
-        runId,
+        runId: runId ?? 'unknown',
         event: { phase: 'error', level: 'error', message },
       });
-      const failed: RunSummary = { runId, status: 'error' };
+      const failed: RunSummary = { runId: runId ?? 'unknown', status: 'error' };
       return failed;
     })
     .finally(() => {
       // Never leak a parked gate if the run ended for any other reason.
-      settleApproval(runId, false);
+      if (runId) settleApproval(runId, false);
     });
 
-  safeSend(sender, 'run:done', { runId, summary });
+  safeSend(sender, 'run:done', { runId: runId ?? summary.runId, summary });
   return summary;
 });
 
@@ -217,7 +237,235 @@ ipcMain.handle('shell:reveal', async (_e, target: string): Promise<{ ok: boolean
   return { ok: err === '' };
 });
 
+// ---- Provider login (open the CLI login flow) ----
+
+export interface ProviderLoginResult {
+  launched: boolean;
+  command: string;
+  detail: string;
+}
+
+/** The interactive command a user runs to authenticate each provider's CLI. */
+const LOGIN_COMMANDS: Record<ProviderId, string> = {
+  // Claude Code authenticates by running `claude` once and signing into the subscription.
+  claude: 'claude',
+  // Codex CLI exposes an explicit login subcommand.
+  openai: 'codex login',
+};
+
+/** Install guidance shown when a provider's CLI is not detected on PATH. */
+const INSTALL_GUIDANCE: Record<ProviderId, string> = {
+  claude: 'Claude Code CLI not found. Install it from https://claude.com/claude-code, then retry login.',
+  openai: 'Codex CLI not found. Install the OpenAI Codex CLI (npm i -g @openai/codex), then retry login.',
+};
+
+ipcMain.handle(
+  'provider:login',
+  async (_e, payload: { id: ProviderId }): Promise<ProviderLoginResult> => {
+    const id = payload?.id;
+    if (!isProviderId(id)) {
+      return { launched: false, command: '', detail: `Unknown provider: ${String(id)}` };
+    }
+    const command = LOGIN_COMMANDS[id];
+    try {
+      const provider = new ProviderRouter().get(id);
+      if (!provider) {
+        return { launched: false, command, detail: `Unknown provider: ${id}` };
+      }
+      const det = await provider.detect();
+      if (!det.installed) {
+        return { launched: false, command, detail: INSTALL_GUIDANCE[id] };
+      }
+      if (process.platform === 'darwin') {
+        // Open Terminal.app and run the interactive login command there, so the
+        // user can complete an OAuth/device flow in a real TTY.
+        const osa = `tell application "Terminal" to do script "${escapeForAppleScript(command)}"`;
+        spawn('osascript', ['-e', osa], { stdio: 'ignore', detached: true }).unref();
+        return {
+          launched: true,
+          command,
+          detail: `Opened Terminal running "${command}". Complete the login there, then re-check health.`,
+        };
+      }
+      // Non-darwin: we can't reliably pop a terminal; hand back the command to run.
+      return {
+        launched: false,
+        command,
+        detail: `Run "${command}" in a terminal to log in, then re-check health.`,
+      };
+    } catch (err) {
+      // Never throw across the IPC boundary — surface as a non-launched result.
+      return { launched: false, command, detail: `Login could not be started: ${errMsg(err)}` };
+    }
+  },
+);
+
+// ---- Provider health (single provider) ----
+
+ipcMain.handle(
+  'provider:health',
+  async (_e, payload: { id: ProviderId; probe?: boolean }): Promise<HealthResult> => {
+    const id = payload?.id;
+    const provider = isProviderId(id) ? new ProviderRouter().get(id) : undefined;
+    if (!provider) {
+      // Shape-compatible "missing" result rather than throwing.
+      return {
+        provider: isProviderId(id) ? id : (String(id) as ProviderId),
+        status: 'error',
+        installed: false,
+        binPath: null,
+        version: null,
+        authenticated: false,
+        model: null,
+        latencyMs: null,
+        detail: `Unknown provider: ${String(id)}`,
+      };
+    }
+    return provider.health({ probe: payload?.probe ?? true });
+  },
+);
+
+// ---- Runs: list + detail (read from store + on-disk run artifacts) ----
+
+ipcMain.handle('runs:list', async (_e, payload: { projectId?: string } | undefined): Promise<Run[]> => {
+  const store = await getStore();
+  if (!store) return [];
+  try {
+    return store.listRuns(payload?.projectId);
+  } catch {
+    return [];
+  }
+});
+
+export interface RunDetail {
+  run: Run | null;
+  tests: TestCase[];
+  results: TestResult[];
+  events: AgentEvent[];
+  report: unknown | null;
+  suiteDir: string | null;
+  artifacts: string[];
+}
+
+ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<RunDetail> => {
+  const empty: RunDetail = {
+    run: null,
+    tests: [],
+    results: [],
+    events: [],
+    report: null,
+    suiteDir: null,
+    artifacts: [],
+  };
+  const runId = payload?.runId;
+  if (!runId) return empty;
+
+  const store = await getStore();
+  if (!store) return empty;
+
+  // Store reads — best-effort, never throw.
+  let run: Run | null = null;
+  let tests: TestCase[] = [];
+  let results: TestResult[] = [];
+  let events: AgentEvent[] = [];
+  try {
+    run = store.getRun(runId);
+  } catch {
+    run = null;
+  }
+  try {
+    tests = store.listTests(runId);
+  } catch {
+    tests = [];
+  }
+  try {
+    results = store.listResults(runId);
+  } catch {
+    results = [];
+  }
+  try {
+    events = store.listEvents(runId);
+  } catch {
+    events = [];
+  }
+
+  // On-disk artifacts live under <projectsDir>/<projectId>/runs/<runId>/...
+  // We need the projectId; prefer the run row, fall back to empty disk reads.
+  let report: unknown | null = null;
+  let suiteDir: string | null = null;
+  let artifacts: string[] = [];
+
+  if (run) {
+    const runDir = join(projectsDir(), run.projectId, 'runs', runId);
+    report = await readJsonIfExists(join(runDir, 'reports', 'report.json'));
+    const suite = join(runDir, 'suite');
+    if (await isDir(suite)) suiteDir = suite;
+    artifacts = await listFilesRecursive(join(runDir, 'suite', 'test-results'));
+  }
+
+  return { run, tests, results, events, report, suiteDir, artifacts };
+});
+
 // ---- helpers ----
+
+/** Parse a JSON file if it exists; return null on any error (missing/malformed). */
+async function readJsonIfExists(path: string): Promise<unknown | null> {
+  try {
+    const raw = await readFile(path, 'utf8');
+    return JSON.parse(raw);
+  } catch {
+    return null;
+  }
+}
+
+/** True if the path exists and is a directory. */
+async function isDir(path: string): Promise<boolean> {
+  try {
+    return (await stat(path)).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Recursively list every file under `root`, returned as paths relative to `root`
+ * with forward slashes. Returns [] when the directory is missing or unreadable.
+ */
+async function listFilesRecursive(root: string): Promise<string[]> {
+  const out: string[] = [];
+  const walk = async (dir: string): Promise<void> => {
+    let entries: Dirent[];
+    try {
+      entries = await readdir(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const entry of entries) {
+      const full = join(dir, entry.name);
+      if (entry.isDirectory()) {
+        await walk(full);
+      } else if (entry.isFile()) {
+        out.push(relative(root, full).split(sep).join('/'));
+      }
+    }
+  };
+  if (await isDir(root)) await walk(root);
+  return out.sort();
+}
+
+function errMsg(err: unknown): string {
+  return err instanceof Error ? err.message : String(err);
+}
+
+/** Narrow an untyped IPC value to a known ProviderId. */
+function isProviderId(v: unknown): v is ProviderId {
+  return v === 'claude' || v === 'openai';
+}
+
+/** Escape a string for safe embedding inside an AppleScript double-quoted literal. */
+function escapeForAppleScript(s: string): string {
+  return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+}
 
 function normalizeOptional(v: string | null | undefined): string | null {
   if (v === null || v === undefined) return null;

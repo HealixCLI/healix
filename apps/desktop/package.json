@@ -11,7 +11,9 @@
     "lint": "eslint src"
   },
   "dependencies": {
-    "@healix/core": "workspace:*"
+    "@healix/core": "workspace:*",
+    "archiver": "^7.0.1",
+    "playwright": "^1.49.1"
   },
   "devDependencies": {
     "@types/node": "^24.0.0",

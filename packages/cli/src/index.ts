@@ -5,6 +5,7 @@ import { registerProviders } from './commands/providers.js';
 import { registerProject } from './commands/project.js';
 import { registerScan } from './commands/scan.js';
 import { registerRun } from './commands/run.js';
+import { registerRuns } from './commands/runs.js';
 import { registerReport } from './commands/report.js';
 import { registerExport } from './commands/export.js';
 
@@ -20,6 +21,7 @@ registerProviders(program);
 registerProject(program);
 registerScan(program);
 registerRun(program);
+registerRuns(program);
 registerReport(program);
 registerExport(program);
 

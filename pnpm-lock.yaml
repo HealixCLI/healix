@@ -44,6 +44,12 @@ importers:
       '@healix/core':
         specifier: workspace:*
         version: link:../../packages/core
+      archiver:
+        specifier: ^7.0.1
+        version: 7.0.1
+      playwright:
+        specifier: ^1.49.1
+        version: 1.61.1
     devDependencies:
       '@types/node':
         specifier: ^24.0.0

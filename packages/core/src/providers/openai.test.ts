@@ -1,13 +1,12 @@
 /**
- * Unit tests for OpenAIProvider (the M0 Codex stub) — fully offline.
+ * Unit tests for OpenAIProvider (real Codex CLI adapter) — fully offline.
  *
- * complete() and plan() are deliberate stubs: they must resolve to ok:false
- * results WITHOUT throwing and without spawning the Codex CLI. detect() may
- * shell out to `which codex` (harmless/fast and works whether or not codex is
- * installed); we only assert it resolves to the documented DetectResult shape.
+ * We never invoke complete()/plan()/health(probe) here: those shell out to
+ * `codex exec` and hit the network. Instead we test the pure JSONL parser
+ * (parseCodexExec) plus the static shape and the offline detect() contract.
  */
 import { describe, expect, it } from 'vitest';
-import { OpenAIProvider } from './openai.js';
+import { OpenAIProvider, parseCodexExec } from './openai.js';
 
 describe('OpenAIProvider static shape', () => {
   const provider = new OpenAIProvider();
@@ -21,44 +20,50 @@ describe('OpenAIProvider static shape', () => {
   });
 });
 
-describe('OpenAIProvider M0 stubs (no CLI, no throw)', () => {
-  const provider = new OpenAIProvider();
-
-  it('complete() returns an ok:false stub result without throwing', async () => {
-    const result = await provider.complete('anything at all');
-    expect(result.provider).toBe('openai');
-    expect(result.ok).toBe(false);
-    expect(result.text).toBe('');
-    expect(result.raw).toBeNull();
-    expect(result.detail).toMatch(/not implemented/i);
+describe('parseCodexExec (codex exec --json output)', () => {
+  it('extracts the final assistant text on success', () => {
+    const out = [
+      '{"type":"turn.started"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"HEALIX_OK"}}',
+      '{"type":"turn.completed"}',
+    ].join('\n');
+    const r = parseCodexExec(out);
+    expect(r.ok).toBe(true);
+    expect(r.text).toBe('HEALIX_OK');
+    expect(r.authError).toBe(false);
   });
 
-  it('complete() ignores options and still stubs out cleanly', async () => {
-    const result = await provider.complete('prompt', { mode: 'plan', timeoutMs: 5, cwd: '/tmp' });
-    expect(result.ok).toBe(false);
-    expect(result.text).toBe('');
+  it('flags an expired/refused session as an auth error (not a generic error)', () => {
+    const out = [
+      '{"type":"turn.started"}',
+      '{"type":"error","message":"Your access token could not be refreshed because your refresh token was already used. Please log out and sign in again."}',
+      '{"type":"turn.failed","error":{"message":"refresh token was already used"}}',
+    ].join('\n');
+    const r = parseCodexExec(out);
+    expect(r.authError).toBe(true);
+    expect(r.ok).toBe(false);
   });
 
-  it('plan() returns an ok:false stub result without throwing', async () => {
-    const result = await provider.plan();
-    expect(result.provider).toBe('openai');
-    expect(result.ok).toBe(false);
-    expect(result.plan).toBe('');
-    expect(result.raw).toBeNull();
-    expect(result.detail).toMatch(/not implemented/i);
+  it('treats empty / non-JSON output as no usable response', () => {
+    expect(parseCodexExec('').ok).toBe(false);
+    expect(parseCodexExec('not json at all\n').ok).toBe(false);
+  });
+
+  it('detects an auth failure surfaced only on stderr', () => {
+    const r = parseCodexExec('', 'error: please sign in again');
+    expect(r.authError).toBe(true);
+    expect(r.ok).toBe(false);
   });
 });
 
-describe('OpenAIProvider.detect (shape only)', () => {
+describe('OpenAIProvider.detect (offline shape)', () => {
   const provider = new OpenAIProvider();
 
   it('resolves to a DetectResult with a boolean installed flag', async () => {
     const det = await provider.detect();
     expect(typeof det.installed).toBe('boolean');
-    // binPath/version are string-or-null regardless of whether codex exists.
     expect(det.binPath === null || typeof det.binPath === 'string').toBe(true);
     expect(det.version === null || typeof det.version === 'string').toBe(true);
-    // When the CLI is absent the contract is a fully-null result.
     if (!det.installed) {
       expect(det.binPath).toBeNull();
       expect(det.version).toBeNull();

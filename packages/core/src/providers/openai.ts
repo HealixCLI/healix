@@ -10,10 +10,22 @@ import type {
   ProviderAdapter,
 } from './types.js';
 
+const PING = 'Reply with exactly this token and nothing else: HEALIX_OK';
+
+/** Shape of a `codex exec --json` JSONL event (only the fields we read). */
+interface CodexEvent {
+  type?: string;
+  message?: string;
+  text?: string;
+  delta?: string;
+  item?: { text?: string; type?: string };
+  error?: { message?: string };
+}
+
 /**
- * Codex CLI adapter (OpenAI subscription path). M0 stub: real detection is wired,
- * but the live health round-trip and plan() are implemented in a later milestone.
- * Note: OpenAI has no keyless SDK, so Codex CLI is its only subscription path.
+ * Real adapter for the OpenAI Codex CLI (subscription auth via ChatGPT — no API keys).
+ * Codex is OpenAI's only keyless subscription path, so there is no SDK fallback.
+ * Non-interactive work goes through `codex exec`; auth state via `codex login status`.
  */
 export class OpenAIProvider implements ProviderAdapter {
   readonly id = 'openai' as const;
@@ -25,12 +37,13 @@ export class OpenAIProvider implements ProviderAdapter {
     const binPath = await which(this.bin);
     if (!binPath) return { installed: false, binPath: null, version: null };
     const r = await runCli(this.bin, ['--version'], { timeoutMs: 8_000 });
-    const version = r.code === 0 ? r.stdout.trim().split(/\s+/).pop() ?? null : null;
+    // `codex --version` -> "codex-cli 0.142.4"
+    const version = r.code === 0 ? (r.stdout.trim().split(/\s+/).pop() ?? null) : null;
     return { installed: true, binPath, version };
   }
 
   async health(opts: HealthOptions = {}): Promise<HealthResult> {
-    void opts;
+    const probe = opts.probe ?? true;
     const det = await this.detect();
     const base: HealthResult = {
       provider: this.id,
@@ -43,35 +56,125 @@ export class OpenAIProvider implements ProviderAdapter {
       latencyMs: null,
       detail: '',
     };
+
     if (!det.installed) {
-      return { ...base, detail: 'codex CLI not found on PATH. Install the OpenAI Codex CLI to enable this provider.' };
+      return { ...base, detail: 'codex CLI not found on PATH. Install the OpenAI Codex CLI (npm i -g @openai/codex) to enable this provider.' };
+    }
+
+    // Cheap, local auth check first (no network / no token spend).
+    const login = await runCli(this.bin, ['login', 'status'], { timeoutMs: 10_000 });
+    const loggedIn = /logged in/i.test(login.stdout) && !/not logged in/i.test(login.stdout);
+    if (!loggedIn) {
+      return { ...base, status: 'not-authenticated', detail: 'Not authenticated. Run `codex login` to sign in with your ChatGPT subscription.' };
+    }
+
+    if (!probe) {
+      return { ...base, status: 'ready', authenticated: true, detail: 'Codex CLI detected and logged in (auth not probed).' };
+    }
+
+    // Live round-trip: confirms the session token actually refreshes/works
+    // (login status can read "logged in" while the refresh token is stale).
+    const start = Date.now();
+    const r = await runCli(this.bin, ['exec', '--skip-git-repo-check', '-s', 'read-only', '--json', PING], {
+      timeoutMs: opts.timeoutMs ?? 60_000,
+    });
+    const latencyMs = Date.now() - start;
+    const parsed = parseCodexExec(r.stdout, r.stderr);
+
+    if (r.timedOut) {
+      return { ...base, status: 'error', authenticated: true, detail: `Auth probe timed out after ${opts.timeoutMs ?? 60_000}ms.` };
+    }
+    if (parsed.authError) {
+      return { ...base, status: 'not-authenticated', detail: `Codex session expired — run \`codex login\` again. (${parsed.error ?? 'token refresh failed'})` };
+    }
+    if (parsed.ok) {
+      return {
+        ...base,
+        status: 'ready',
+        authenticated: true,
+        latencyMs,
+        detail: `Authenticated. Model replied "${parsed.text.slice(0, 32)}".`,
+      };
+    }
+    return { ...base, status: 'error', authenticated: true, detail: parsed.error ? `Probe error: ${parsed.error.slice(0, 160)}` : 'Probe returned no usable response.' };
+  }
+
+  async complete(prompt: string, opts: CompleteOptions = {}): Promise<CompletionResult> {
+    const args = ['exec', '--skip-git-repo-check', '-s', 'read-only', '--json'];
+    if (opts.cwd) args.push('-C', opts.cwd);
+    args.push(prompt);
+    const r = await runCli(this.bin, args, { timeoutMs: opts.timeoutMs ?? 180_000, cwd: opts.cwd });
+    if (r.timedOut) {
+      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion timed out.' };
+    }
+    const parsed = parseCodexExec(r.stdout, r.stderr);
+    if (parsed.authError) {
+      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Codex session expired — run `codex login`.' };
     }
     return {
-      ...base,
-      status: 'ready',
-      detail: 'Codex CLI detected. Live auth probe is not yet implemented (M0 stub).',
+      provider: this.id,
+      ok: parsed.ok,
+      text: parsed.text,
+      raw: r,
+      detail: parsed.ok ? 'ok' : (parsed.error ?? 'no response'),
     };
   }
 
-  async plan(): Promise<PlanResult> {
+  async plan(task: string, opts: { timeoutMs?: number } = {}): Promise<PlanResult> {
+    // Codex has no dedicated plan mode; the read-only sandbox in complete()
+    // already prevents any file/system changes, so a plan request is safe.
+    const res = await this.complete(`Produce a plan only — do not modify anything.\n\n${task}`, {
+      mode: 'plan',
+      timeoutMs: opts.timeoutMs ?? 120_000,
+    });
     return {
       provider: this.id,
-      ok: false,
-      plan: '',
-      raw: null,
-      detail: 'OpenAI/Codex plan() is not implemented yet (M0 stub).',
+      ok: res.ok,
+      plan: res.text,
+      raw: res.raw,
+      detail: res.ok ? 'Plan generated (read-only).' : res.detail,
     };
+  }
+}
+
+/** Parse `codex exec --json` JSONL output into a final-text / error / auth verdict. */
+export function parseCodexExec(stdout: string, stderr = ''): { ok: boolean; text: string; error: string | null; authError: boolean } {
+  let text = '';
+  let error: string | null = null;
+  let authError = false;
+
+  const consider = (msg: string | undefined) => {
+    if (!msg) return;
+    error = msg;
+    if (/refresh|log ?out|sign in again|not authenticated|unauthor/i.test(msg)) authError = true;
+  };
+
+  for (const line of stdout.split('\n')) {
+    const t = line.trim();
+    if (!t.startsWith('{')) continue;
+    let evt: CodexEvent;
+    try {
+      evt = JSON.parse(t) as CodexEvent;
+    } catch {
+      continue;
+    }
+    const type = evt.type ?? '';
+    if (type === 'error' || type === 'turn.failed') {
+      consider(evt.error?.message ?? evt.message);
+    }
+    // Accumulate assistant/agent message text across the various event shapes
+    // Codex has used (agent_message / item.completed / message deltas).
+    if (/message/.test(type) || type === 'item.completed') {
+      const piece = evt.item?.text ?? evt.text ?? evt.delta ?? evt.message;
+      if (piece && typeof piece === 'string') text += piece;
+    }
   }
 
-  async complete(_prompt: string, _opts: CompleteOptions = {}): Promise<CompletionResult> {
-    void _prompt;
-    void _opts;
-    return {
-      provider: this.id,
-      ok: false,
-      text: '',
-      raw: null,
-      detail: 'OpenAI/Codex complete() is not implemented yet (M0 stub).',
-    };
+  if (!text && stderr && /refresh|sign in again|not authenticated|unauthor/i.test(stderr)) {
+    authError = true;
+    error = stderr.split('\n').find((l) => l.trim()) ?? error;
   }
+
+  const ok = !authError && text.trim().length > 0;
+  return { ok, text: text.trim(), error, authError };
 }

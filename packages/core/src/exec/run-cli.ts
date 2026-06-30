@@ -47,10 +47,11 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       resolve({ code, stdout, stderr, timedOut, durationMs: Date.now() - start });
     });
 
-    if (opts.input !== undefined) {
-      child.stdin.write(opts.input);
-      child.stdin.end();
-    }
+    // Always close stdin. Some CLIs (e.g. `codex exec`) block reading stdin to
+    // EOF when none is provided; writing the optional input first preserves the
+    // stdin-piping path for tools that consume it.
+    if (opts.input !== undefined) child.stdin.write(opts.input);
+    child.stdin.end();
   });
 }
 

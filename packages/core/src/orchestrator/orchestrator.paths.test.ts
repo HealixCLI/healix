@@ -612,4 +612,64 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(done?.level).toBe('error');
     expect(done?.message).toMatch(/no tests passed|verified nothing/i);
   });
+
+  it('TRIAGE AI ESCALATION: a failed spec drives an AI-escalated triage call with a per-call abort signal', async () => {
+    // Regression coverage for the orphaned-triage-process bug: the orchestrator
+    // must give each AI-escalated triage call its own AbortController (so a
+    // slow call can be killed instead of abandoned to keep running in the
+    // background after the run reports complete). This asserts the provider's
+    // complete() call made during triage actually receives a live signal.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Triage Escalation Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const oneFailedOutcome: ExecOutcome = {
+      passed: 1,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: 'Home loads', status: 'passed', durationMs: 12 },
+        { title: 'Login works', status: 'failed', durationMs: 34, error: 'expect(locator).toBeVisible() failed' },
+      ],
+    };
+
+    const triageCompleteOpts: CompleteOptions[] = [];
+    const triageAwareProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
+        }
+        // Codegen and triage both land here (neither sets mode:'plan'), but only
+        // triage.analyze() calls provider.complete() without readOnly:true (see
+        // triage/index.ts vs. generate.ts's readOnly:true codegen calls) — use
+        // that to isolate triage's escalation call specifically.
+        if (opts && !opts.readOnly) triageCompleteOpts.push(opts);
+        return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: triageAwareProvider,
+      getMode: () => makeFakeMode(oneFailedOutcome),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
+
+    expect(['passed', 'failed']).toContain(summary.status);
+    expect(triageCompleteOpts.length).toBeGreaterThanOrEqual(1);
+    // Every triage-escalation call must carry its own live (not-yet-aborted)
+    // AbortSignal, proving the orchestrator's per-call AbortController wiring
+    // (withTimeoutAbort) reaches all the way down to provider.complete().
+    for (const opts of triageCompleteOpts) {
+      expect(opts.signal).toBeInstanceOf(AbortSignal);
+      expect(opts.signal?.aborted).toBe(false);
+    }
+  });
 });

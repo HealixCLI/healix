@@ -552,9 +552,35 @@ async function runPipeline(
       emit('export', 'warn', `Export failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
     }
 
-    const finalStatus: RunStatus = outcome.failed > 0 ? 'failed' : 'passed';
+    // A run only "passes" when at least one test actually passed and none
+    // failed. A run that produced no runnable specs, or where every test was
+    // blocked (e.g. missing Tier-B auth), has verified nothing — reporting it
+    // 'passed' would be a false green (CI would go green having tested nothing),
+    // so it settles as 'error' with an explanatory event.
+    let finalStatus: RunStatus;
+    if (outcome.failed > 0) {
+      finalStatus = 'failed';
+    } else if (outcome.passed > 0) {
+      finalStatus = 'passed';
+    } else {
+      finalStatus = 'error';
+    }
     setStatus(finalStatus, { finishedAt: nowIso() });
-    emit('done', 'info', `Run ${finalStatus}.`, { runId, status: finalStatus });
+    if (finalStatus === 'error') {
+      const reason =
+        outcome.results.length === 0
+          ? 'no runnable specs were produced'
+          : `no tests passed (${outcome.blocked} blocked)`;
+      emit('done', 'error', `Run verified nothing: ${reason}.`, {
+        runId,
+        status: finalStatus,
+        passed: outcome.passed,
+        failed: outcome.failed,
+        blocked: outcome.blocked,
+      });
+    } else {
+      emit('done', 'info', `Run ${finalStatus}.`, { runId, status: finalStatus });
+    }
 
     return { runId, status: finalStatus, reportPath, suite, outcome };
   } catch (err) {

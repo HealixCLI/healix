@@ -5,9 +5,25 @@ import { Activity, Cpu, Database, FolderOpen, LogIn, RefreshCw } from 'lucide-re
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
-import { cn } from '../lib/utils';
+import { cn, formatRelativeTime } from '../lib/utils';
 
 type Provider = HealthResult;
+
+interface Override {
+  health: HealthResult;
+  /** When this was actually confirmed via a real (probe:true) round-trip. */
+  checkedAt: number;
+}
+
+/**
+ * Module-level (outside the component) so a real, user-triggered check survives
+ * ProvidersView unmounting when the user navigates away and back — App.tsx renders
+ * views behind a plain conditional, so every visit to Settings is a fresh mount.
+ * Without this, the passive mount-time cheap check would appear to "log the user
+ * out" on every revisit even though the CLI session never changed. Reset only by
+ * closing/reloading the app.
+ */
+let cachedOverrides: Partial<Record<ProviderId, Override>> = {};
 
 function statusTone(p: Provider): BadgeTone {
   if (p.status === 'ready' && p.authenticated) return 'ok';
@@ -47,30 +63,64 @@ interface ConnectState {
 export function ProvidersView() {
   const [report, setReport] = useState<DoctorReport | null>(null);
   const [loading, setLoading] = useState(false);
-  // Per-provider live health overrides (from providerHealth re-checks).
-  const [overrides, setOverrides] = useState<Partial<Record<ProviderId, HealthResult>>>({});
+  // Per-provider live health overrides (from providerHealth re-checks / "Run health
+  // check"), seeded from the module-level cache so a real check survives remounts.
+  const [overrides, setOverrides] = useState<Partial<Record<ProviderId, Override>>>(() => cachedOverrides);
   const [connect, setConnect] = useState<Partial<Record<ProviderId, ConnectState>>>({});
   const [busy, setBusy] = useState<Partial<Record<ProviderId, 'login' | 'recheck'>>>({});
   const [error, setError] = useState<string | null>(null);
 
-  const run = useCallback(async (probe: boolean) => {
-    setLoading(true);
-    setError(null);
-    try {
-      const next = await window.healix.doctor({ probe });
-      setReport(next);
-      setOverrides({});
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setLoading(false);
-    }
-  }, []);
+  const updateOverrides = useCallback(
+    (updater: (prev: Partial<Record<ProviderId, Override>>) => Partial<Record<ProviderId, Override>>) => {
+      setOverrides((prev) => {
+        const next = updater(prev);
+        cachedOverrides = next;
+        return next;
+      });
+    },
+    [],
+  );
 
-  // Fast, no-cost detection on launch; the live auth probe is user-triggered.
+  const run = useCallback(
+    async (probe: boolean) => {
+      setLoading(true);
+      setError(null);
+      try {
+        const next = await window.healix.doctor({ probe });
+        setReport(next);
+        // A real (probe:true) run supersedes any prior overrides with a fresh,
+        // authoritative snapshot. The passive probe:false mount check must never
+        // touch overrides — it can't reflect auth state, so clearing here would
+        // discard the last real result and look like the user got logged out.
+        if (probe) {
+          const checkedAt = Date.now();
+          updateOverrides(() =>
+            Object.fromEntries(next.providers.map((p) => [p.provider, { health: p, checkedAt }])),
+          );
+        }
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setLoading(false);
+      }
+    },
+    [updateOverrides],
+  );
+
+  // Fast, no-cost detection on launch/remount; the live auth probe is user-triggered
+  // (via "Run health check" or a per-provider "Re-check") and its result persists
+  // across remounts — see cachedOverrides above.
   useEffect(() => {
     void run(false);
   }, [run]);
+
+  // Ticks once every 30s purely to re-render so "checked Xm ago" labels stay current
+  // between real checks — no network/CLI activity, just a local re-render trigger.
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const id = setInterval(() => setNow(Date.now()), 30_000);
+    return () => clearInterval(id);
+  }, []);
 
   const login = useCallback(async (id: ProviderId) => {
     setBusy((b) => ({ ...b, [id]: 'login' }));
@@ -93,17 +143,27 @@ export function ProvidersView() {
     setError(null);
     try {
       const health = await window.healix.providerHealth(id, true);
-      setOverrides((o) => ({ ...o, [id]: health }));
+      updateOverrides((o) => ({ ...o, [id]: { health, checkedAt: Date.now() } }));
     } catch (err) {
       setError(err instanceof Error ? err.message : String(err));
     } finally {
       setBusy((b) => ({ ...b, [id]: undefined }));
     }
-  }, []);
+  }, [updateOverrides]);
 
   // Merge any live override on top of the doctor snapshot.
-  const providers: HealthResult[] = (report?.providers ?? []).map((p) => overrides[p.provider] ?? p);
+  const providers: HealthResult[] = (report?.providers ?? []).map((p) => overrides[p.provider]?.health ?? p);
   const anyReady = providers.some((p) => p.status === 'ready' && p.authenticated);
+  const checkedAts = providers.map((p) => overrides[p.provider]?.checkedAt).filter((t): t is number => t != null);
+  const lastCheckedAt = checkedAts.length > 0 ? Math.min(...checkedAts) : null;
+  // Whether we've ever actually confirmed (not merely detected) that no provider is
+  // authenticated — distinct from simply not having probed yet this session.
+  const anyConfirmedNotReady = checkedAts.length > 0 && !anyReady;
+  const statusSub = anyReady
+    ? `authenticated${lastCheckedAt ? ` · checked ${formatRelativeTime(lastCheckedAt, now)}` : ''}`
+    : anyConfirmedNotReady
+      ? `login required · checked ${formatRelativeTime(lastCheckedAt!, now)}`
+      : 'not checked yet';
 
   return (
     <div className="mx-auto max-w-4xl px-8 pb-16 pt-8">
@@ -142,8 +202,8 @@ export function ProvidersView() {
           icon={<Activity className="h-4 w-4" />}
           label="Status"
           value={report ? (anyReady ? 'Provider ready' : 'No provider ready') : '—'}
-          sub={anyReady ? 'authenticated' : 'login required'}
-          tone={report ? (anyReady ? 'ok' : 'warn') : 'muted'}
+          sub={report ? statusSub : ''}
+          tone={report ? (anyReady ? 'ok' : anyConfirmedNotReady ? 'warn' : 'muted') : 'muted'}
         />
       </section>
 
@@ -160,6 +220,7 @@ export function ProvidersView() {
             const conn = connect[p.provider];
             const isBusy = busy[p.provider];
             const ready = p.status === 'ready' && p.authenticated;
+            const checkedAt = overrides[p.provider]?.checkedAt;
             return (
               <Card key={p.provider}>
                 <CardHeader>
@@ -174,6 +235,9 @@ export function ProvidersView() {
                 </CardHeader>
                 <CardContent>
                   <p className="text-xs leading-relaxed text-muted">{p.detail}</p>
+                  <p className="mt-1 text-[11px] text-muted">
+                    {checkedAt ? `Checked ${formatRelativeTime(checkedAt, now)}` : 'Not checked this session'}
+                  </p>
                   {(p.model || p.latencyMs) && (
                     <div className="mt-2 flex gap-3 text-xs text-muted">
                       {p.model && <span className="font-mono">{p.model}</span>}

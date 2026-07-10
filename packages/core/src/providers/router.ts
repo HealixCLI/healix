@@ -61,6 +61,15 @@ export class ProviderRouter {
     const hit = healthCache.get(key);
     if (hit && Date.now() - hit.at < HEALTH_TTL_MS) return hit.result;
     const result = await provider.health(opts);
+    // Do NOT cache transient probe failures (status 'error': a timed-out or
+    // aborted probe, a CLI hiccup). Caching a blip would make the provider look
+    // unusable for the whole TTL and block runs even after it recovers. Stable
+    // states (ready / not-authenticated / cli-missing) stay cached to collapse
+    // a burst of routing decisions into one probe per provider.
+    if (result.status === 'error') {
+      healthCache.delete(key);
+      return result;
+    }
     healthCache.set(key, { at: Date.now(), result });
     return result;
   }

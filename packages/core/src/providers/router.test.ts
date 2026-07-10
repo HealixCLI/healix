@@ -285,6 +285,53 @@ describe('ProviderRouter health cache (probes are paid AI round-trips)', () => {
     await router.select('codegen');
     expect(claude.healthCalls).toBe(2);
   });
+
+  it('does NOT cache a transient probe error — recovers on the very next routing call', async () => {
+    // First probe fails (timeout / CLI hiccup → status 'error'); the provider is
+    // healthy thereafter. A cached error would block routing for the whole TTL,
+    // so the error must not stick: the next call re-probes and recovers.
+    let calls = 0;
+    const flaky: ProviderAdapter = {
+      id: 'claude',
+      label: 'Flaky Claude',
+      capabilities: CLAUDE_CAPS,
+      async detect(): Promise<DetectResult> {
+        return { installed: true, binPath: '/fake/claude', version: '1.0.0' };
+      },
+      async health(): Promise<HealthResult> {
+        calls += 1;
+        const ok = calls > 1;
+        return {
+          provider: 'claude',
+          status: ok ? 'ready' : 'error',
+          installed: true,
+          binPath: '/fake/claude',
+          version: '1.0.0',
+          authenticated: ok,
+          model: ok ? 'fake-model' : null,
+          latencyMs: ok ? 1 : null,
+          detail: ok ? 'OK' : 'probe timed out',
+        };
+      },
+      async plan(): Promise<PlanResult> {
+        return { provider: 'claude', ok: false, plan: '', raw: null, detail: 'x' };
+      },
+      async complete(): Promise<CompletionResult> {
+        return { provider: 'claude', ok: false, text: '', raw: null, detail: 'x' };
+      },
+    };
+    const router = new ProviderRouter([flaky]);
+
+    // Transient error → nothing selected, but the error is NOT cached...
+    expect(await router.select('plan')).toBeNull();
+    // ...so the next routing call re-probes and finds the recovered provider.
+    expect((await router.select('plan'))?.provider.id).toBe('claude');
+    expect(calls).toBe(2);
+
+    // The recovered 'ready' result IS cached like any healthy probe (no re-probe).
+    await router.select('plan');
+    expect(calls).toBe(2);
+  });
 });
 
 describe('ProviderRouter default construction (no live calls)', () => {

@@ -3,7 +3,7 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Load node:sqlite via createRequire so this also works under bundled test runtimes
 // (vite-node) that don't recognise node:sqlite as a builtin via dynamic import.
@@ -216,5 +216,32 @@ describe('deleteRun cascade', () => {
     expect(await countRows('tests')).toBe(N);
     expect(await countRows('results')).toBe(N);
     expect(await countRows('agent_events')).toBe(N);
+  });
+});
+
+describe('agent event ordering', () => {
+  it('returns same-millisecond events in insertion order (stable rowid tiebreaker)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'event-order' });
+    const run = s.createRun(project.id);
+
+    // Freeze the clock so every event shares an identical created_at; only the
+    // rowid tiebreaker can then keep listEvents() in insertion order.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-10T12:00:00.000Z'));
+    try {
+      const N = 25;
+      for (let i = 0; i < N; i++) {
+        s.appendEvent(run.id, 'executing', `event ${i}`);
+      }
+      const events = s.listEvents(run.id);
+      expect(events).toHaveLength(N);
+      // All share one timestamp...
+      expect(new Set(events.map((e) => e.createdAt)).size).toBe(1);
+      // ...yet come back in the exact order they were appended.
+      expect(events.map((e) => e.message)).toEqual(Array.from({ length: N }, (_, i) => `event ${i}`));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

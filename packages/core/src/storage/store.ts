@@ -265,7 +265,10 @@ export class HealixStore {
   listEvents(runId: string): AgentEvent[] {
     return (
       this.db
-        .prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC')
+        // rowid is a monotonic insertion counter; it breaks ties when several
+        // events share the same millisecond created_at, so the log never
+        // reorders within a burst (created_at alone has no stable tiebreaker).
+        .prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC, rowid ASC')
         .all(runId) as Array<Record<string, unknown>>
     ).map(rowToEvent);
   }

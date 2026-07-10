@@ -190,7 +190,13 @@ export class ClaudeProvider implements ProviderAdapter {
   }
 
   async complete(prompt: string, opts: CompleteOptions = {}): Promise<CompletionResult> {
-    const args = ['-p', prompt, '--output-format', 'json'];
+    // Prompt travels via stdin, never argv: on Windows, runCli spawns through
+    // cmd.exe (shell:true), which mangles/truncates multi-line strings and has
+    // an ~8KB command-line limit — a large plan/triage prompt embedded as an
+    // argv element can get corrupted before `claude` ever sees it, causing the
+    // CLI to fall back to its interactive first screen instead of running
+    // headless. See run-cli.ts's `input` option for the stdin-write path.
+    const args = ['-p', '--output-format', 'json'];
     // readOnly and plan mode both map to --permission-mode plan: Claude Code's
     // plan permission mode is its no-writes mode — the model can read the repo
     // but every file-modifying tool is blocked, which is exactly the readOnly
@@ -200,6 +206,7 @@ export class ClaudeProvider implements ProviderAdapter {
       timeoutMs: opts.timeoutMs ?? 180_000,
       cwd: opts.cwd,
       signal: opts.signal,
+      input: prompt,
     });
     // Kill reasons first — see health() for why.
     if (r.timedOut) {
@@ -230,9 +237,11 @@ export class ClaudeProvider implements ProviderAdapter {
 
   async plan(task: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<PlanResult> {
     const timeoutMs = opts.timeoutMs ?? 120_000;
-    const r = await runCli(this.bin, ['-p', task, '--permission-mode', 'plan', '--output-format', 'json'], {
+    // Same stdin-not-argv rationale as complete() above.
+    const r = await runCli(this.bin, ['-p', '--permission-mode', 'plan', '--output-format', 'json'], {
       timeoutMs,
       signal: opts.signal,
+      input: task,
     });
     // Kill reasons BEFORE parsing: a timed-out/aborted run leaves partial or
     // empty stdout, and reporting that as "could not parse" hides the real

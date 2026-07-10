@@ -41,7 +41,11 @@ describe('runCli abort (AbortSignal)', () => {
 
   it('a run that completes normally reports aborted:false', async () => {
     const ctrl = new AbortController();
-    const r = await runCli(process.execPath, ['-e', 'process.stdout.write("hi")'], {
+    // Avoids "..." and spaces: on Windows, shell:true concatenates cmd+args
+    // with NO escaping (Node's DEP0190-flagged behavior), so cmd.exe eats
+    // unquoted double-quotes and re-splits on whitespace before this even
+    // reaches node — writing "hi" via char codes sidesteps both.
+    const r = await runCli(process.execPath, ['-e', 'process.stdout.write(String.fromCharCode(104,105))'], {
       signal: ctrl.signal,
       timeoutMs: 15_000,
     });
@@ -70,11 +74,40 @@ describe('runCli stdin handling', () => {
   it('still pipes stdin to children that consume it', async () => {
     const r = await runCli(
       process.execPath,
-      ['-e', 'let d="";process.stdin.on("data",c=>d+=c).on("end",()=>process.stdout.write(d))'],
+      // Same escaping-avoidance rationale as above: no quotes, no arrow
+      // functions (their `>` reads as cmd.exe output redirection when
+      // unquoted), and no spaces at all — even the space after a `let`
+      // keyword is enough for cmd.exe to split this into two tokens, so `d`
+      // is an implicit global instead of a `let` declaration.
+      ['-e', "d='';process.stdin.on('data',function(c){d+=c}).on('end',function(){process.stdout.write(d)})"],
       { input: 'hello-stdin', timeoutMs: 15_000 },
     );
     expect(r.code).toBe(0);
     expect(r.stdout).toBe('hello-stdin');
+  });
+
+  it('round-trips a large multi-line prompt with quotes and Windows paths without truncation', async () => {
+    // Regression case for the Windows argv bug: a prompt this size/shape would
+    // be mangled or truncated if passed as a single cmd.exe argv element
+    // (~8KB command-line limit, plus newline/quote parsing issues). Piped via
+    // stdin instead, it must survive byte-for-byte regardless of size.
+    const prompt = [
+      'line one',
+      'line two with "double quotes" and a Windows path C:\\Users\\Test User\\repo',
+      'x'.repeat(9000),
+    ].join('\n');
+    const r = await runCli(
+      process.execPath,
+      // Same escaping-avoidance rationale as above: no quotes, no arrow
+      // functions (their `>` reads as cmd.exe output redirection when
+      // unquoted), and no spaces at all — even the space after a `let`
+      // keyword is enough for cmd.exe to split this into two tokens, so `d`
+      // is an implicit global instead of a `let` declaration.
+      ['-e', "d='';process.stdin.on('data',function(c){d+=c}).on('end',function(){process.stdout.write(d)})"],
+      { input: prompt, timeoutMs: 15_000 },
+    );
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe(prompt);
   });
 });
 

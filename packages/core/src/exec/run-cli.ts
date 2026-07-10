@@ -46,12 +46,24 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       return;
     }
 
-    const child = spawn(cmd, args, {
+    const win32 = process.platform === 'win32';
+    // On Windows, shell:true hands cmd+args to cmd.exe as ONE concatenated
+    // string with NO escaping (Node made this explicit/hardened behavior —
+    // see the DEP0190 deprecation notice — it used to quote args implicitly).
+    // A `cmd` containing a space (e.g. a Node install under the very common
+    // "C:\Program Files\nodejs\node.exe") gets split at the space by cmd.exe
+    // and fails with "'C:\Program' is not recognized...". Quoting `cmd` here
+    // fixes that specific, always-reproducible case; it does not attempt to
+    // fully escape `args` (out of scope — callers must avoid passing
+    // user-controlled multi-word/multi-line content via argv at all, e.g. by
+    // using `opts.input` instead, which is exactly what CLI prompts do).
+    const quotedCmd = win32 && /[\s"]/.test(cmd) ? `"${cmd}"` : cmd;
+    const child = spawn(quotedCmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
       // npm-global CLIs (claude, codex) are .cmd shims on Windows; without a
       // shell the spawn fails with ENOENT (same treatment as playwright/execute).
-      shell: process.platform === 'win32',
+      shell: win32,
       // POSIX: make the child its own process-group leader so timeout/abort can
       // kill the CLI *and* everything it spawned (helpers, node children) with
       // one group signal — killing only the direct child leaves grandchildren

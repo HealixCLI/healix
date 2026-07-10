@@ -34,10 +34,7 @@ export default tseslint.config(
     files: ['**/*.{js,mjs,cjs,ts,tsx}'],
     rules: {
       '@typescript-eslint/no-explicit-any': 'off',
-      '@typescript-eslint/no-unused-vars': [
-        'warn',
-        { argsIgnorePattern: '^_', varsIgnorePattern: '^_' },
-      ],
+      '@typescript-eslint/no-unused-vars': ['warn', { argsIgnorePattern: '^_', varsIgnorePattern: '^_' }],
       '@typescript-eslint/no-empty-object-type': 'off',
       '@typescript-eslint/no-non-null-assertion': 'off',
       // Matching control characters is intentional here (e.g. stripping ANSI escape codes).

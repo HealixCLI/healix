@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../storage/types.js';
-import { parsePlan, synthesizePlan } from './plan.js';
+import { buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
 
 /** Minimal black-box project fixture (baseUrl set so synthesize yields URL-flavoured items). */
 function makeProject(overrides: Partial<Project> = {}): Project {
@@ -11,6 +11,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     repoPath: null,
     baseUrl: 'https://example.test',
     createdAt: '2026-01-01T00:00:00.000Z',
+    archivedAt: null,
     ...overrides,
   };
 }
@@ -116,5 +117,49 @@ describe('synthesizePlan', () => {
     const plan = synthesizePlan(makeProject({ baseUrl: null }));
     expect(plan.items).toHaveLength(1);
     expect(plan.items[0]?.tier).toBe('tierA-public');
+  });
+});
+
+describe('buildPlanPrompt (repo context)', () => {
+  it('omits the repo-context section when no repoIndex is provided', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test' });
+    expect(prompt).not.toContain('Repository context');
+    // The core instructions are still present.
+    expect(prompt).toContain('fenced JSON code block');
+  });
+
+  it('appends the summary and file paths when a repoIndex is provided', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id },
+      {
+        summary: 'Framework: next. Key directories: app, components.',
+        files: ['app/page.tsx', 'app/login/page.tsx'],
+      },
+    );
+
+    expect(prompt).toContain('Repository context (indexed):');
+    expect(prompt).toContain('Framework: next. Key directories: app, components.');
+    expect(prompt).toContain('- app/page.tsx');
+    expect(prompt).toContain('- app/login/page.tsx');
+    // Nothing was truncated, so no "more file(s)" trailer appears.
+    expect(prompt).not.toContain('more file(s) not listed');
+  });
+
+  it('bounds the file list at 80 paths and notes how many were omitted', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const files = Array.from({ length: 100 }, (_, i) => `src/file-${String(i).padStart(3, '0')}.ts`);
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id },
+      { summary: '100 files indexed.', files },
+    );
+
+    // First 80 are present, the 81st is not, and the omission is called out.
+    expect(prompt).toContain('- src/file-000.ts');
+    expect(prompt).toContain('- src/file-079.ts');
+    expect(prompt).not.toContain('src/file-080.ts');
+    expect(prompt).toContain('... and 20 more file(s) not listed.');
   });
 });

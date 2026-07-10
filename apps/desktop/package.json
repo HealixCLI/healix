@@ -28,7 +28,9 @@
     ],
     "asarUnpack": [
       "node_modules/playwright/**",
-      "node_modules/playwright-core/**"
+      "node_modules/playwright-core/**",
+      "node_modules/chromium-bidi/**",
+      "node_modules/archiver/**"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",

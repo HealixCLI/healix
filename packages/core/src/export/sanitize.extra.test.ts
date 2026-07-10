@@ -29,13 +29,7 @@ describe('sanitizeContent — JSON / JS-object secret redaction', () => {
   });
 
   it('redacts secret pairs but preserves a benign pair in the same object', () => {
-    const blob = [
-      '{',
-      '  "name": "value",',
-      '  "apiKey": "abc123",',
-      '  "authToken":"xyz"',
-      '}',
-    ].join('\n');
+    const blob = ['{', '  "name": "value",', '  "apiKey": "abc123",', '  "authToken":"xyz"', '}'].join('\n');
 
     const out = sanitizeContent(blob, suiteDir);
     const lines = out.split('\n');
@@ -48,6 +42,34 @@ describe('sanitizeContent — JSON / JS-object secret redaction', () => {
     expect(out).not.toContain('xyz');
     // The benign value survives intact.
     expect(out).toContain('"value"');
+  });
+
+  it('spares the package.json "author"/"authors" fields (auth is not author)', () => {
+    const author = '"author": "Jane Doe <jane@example.com>"';
+    const authors = '"authors": "Jane, John"';
+    expect(sanitizeContent(author, suiteDir)).toBe(author);
+    expect(sanitizeContent(authors, suiteDir)).toBe(authors);
+  });
+
+  it('still redacts authorization-style keys', () => {
+    const out = sanitizeContent('"authorization": "Basic abc"', suiteDir);
+    expect(out).toBe(`"authorization": "${REDACTED}"`);
+  });
+});
+
+describe('sanitizeContent — dotenv token boundaries', () => {
+  const suiteDir = path.join(os.tmpdir(), 'healix-sanitize-env-anchor');
+
+  it('does not redact identifiers that merely end in KEY (MONKEY/TURKEY)', () => {
+    for (const line of ['MONKEY=banana', 'TURKEY=gobble']) {
+      expect(sanitizeContent(line, suiteDir)).toBe(line);
+    }
+  });
+
+  it('still redacts underscore-delimited and APIKEY compounds', () => {
+    expect(sanitizeContent('MY_API_KEY=s3cret', suiteDir)).toBe(`MY_API_KEY=${REDACTED}`);
+    expect(sanitizeContent('APIKEY=s3cret', suiteDir)).toBe(`APIKEY=${REDACTED}`);
+    expect(sanitizeContent('TOKEN=s3cret', suiteDir)).toBe(`TOKEN=${REDACTED}`);
   });
 });
 

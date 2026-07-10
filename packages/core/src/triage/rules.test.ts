@@ -22,31 +22,23 @@ function verdictFor(error: string, title = 'example test'): Verdict {
 describe('classifyByRules / engine.classify', () => {
   describe('environment failures', () => {
     it('classifies ECONNREFUSED as environment', () => {
-      expect(
-        verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000'),
-      ).toBe('environment');
+      expect(verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000')).toBe('environment');
     });
 
     it('classifies net::ERR_CONNECTION_REFUSED as environment', () => {
-      expect(
-        verdictFor(
-          'page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/',
-        ),
-      ).toBe('environment');
+      expect(verdictFor('page.goto: net::ERR_CONNECTION_REFUSED at http://localhost:3000/')).toBe(
+        'environment',
+      );
     });
 
     it('classifies a navigation (page.goto) timeout as environment', () => {
-      expect(
-        verdictFor(
-          'page.goto: Timeout 30000ms exceeded.\nNavigating to "http://localhost:3000/"',
-        ),
-      ).toBe('environment');
+      expect(verdictFor('page.goto: Timeout 30000ms exceeded.\nNavigating to "http://localhost:3000/"')).toBe(
+        'environment',
+      );
     });
 
     it('classifies DNS resolution failure (ENOTFOUND) as environment', () => {
-      expect(
-        verdictFor('Error: getaddrinfo ENOTFOUND api.example.test'),
-      ).toBe('environment');
+      expect(verdictFor('Error: getaddrinfo ENOTFOUND api.example.test')).toBe('environment');
     });
   });
 
@@ -60,45 +52,33 @@ describe('classifyByRules / engine.classify', () => {
     });
 
     it('classifies a detached element as flaky', () => {
-      expect(
-        verdictFor(
-          'locator.click: Error: element was detached from the DOM, retrying',
-        ),
-      ).toBe('flaky');
+      expect(verdictFor('locator.click: Error: element was detached from the DOM, retrying')).toBe('flaky');
     });
 
     it('classifies pointer-event interception as flaky', () => {
-      expect(
-        verdictFor(
-          'locator.click: Error: <div> intercepts pointer events at the click point',
-        ),
-      ).toBe('flaky');
+      expect(verdictFor('locator.click: Error: <div> intercepts pointer events at the click point')).toBe(
+        'flaky',
+      );
     });
   });
 
   describe('selector / locator failures → test_is_wrong', () => {
     it("classifies pure 'locator not found' as test_is_wrong", () => {
       expect(
-        verdictFor(
-          'locator.click: Error: locator not found for getByRole(\'button\', { name: \'Checkout\' })',
-        ),
+        verdictFor("locator.click: Error: locator not found for getByRole('button', { name: 'Checkout' })"),
       ).toBe('test_is_wrong');
     });
 
     it("classifies 'strict mode violation' as test_is_wrong", () => {
       expect(
-        verdictFor(
-          'locator.click: Error: strict mode violation: getByRole(\'link\') resolved to 4 elements',
-        ),
+        verdictFor("locator.click: Error: strict mode violation: getByRole('link') resolved to 4 elements"),
       ).toBe('test_is_wrong');
     });
 
     it("classifies 'resolved to 0 elements' as test_is_wrong", () => {
-      expect(
-        verdictFor(
-          "Error: locator.waitFor: getByText('Welcome back') resolved to 0 elements",
-        ),
-      ).toBe('test_is_wrong');
+      expect(verdictFor("Error: locator.waitFor: getByText('Welcome back') resolved to 0 elements")).toBe(
+        'test_is_wrong',
+      );
     });
   });
 
@@ -127,11 +107,7 @@ describe('classifyByRules / engine.classify', () => {
 
     it('classifies a non-content assertion (toHaveCount) as ambiguous', () => {
       const verdict = verdictFor(
-        [
-          'Error: expect(locator).toHaveCount(expected)',
-          'Expected: 3',
-          'Received: 2',
-        ].join('\n'),
+        ['Error: expect(locator).toHaveCount(expected)', 'Expected: 3', 'Received: 2'].join('\n'),
       );
       expect(verdict).toBe('ambiguous');
     });
@@ -149,9 +125,9 @@ describe('classifyByRules / engine.classify', () => {
       'Received string: "Order failed"',
       '',
       'Call log:',
-      "  - expect.toHaveText with timeout 5000ms",
+      '  - expect.toHaveText with timeout 5000ms',
       "  - waiting for locator('#status')",
-      "  - locator resolved to <div id=\"status\">Order failed</div>",
+      '  - locator resolved to <div id="status">Order failed</div>',
     ].join('\n');
 
     it('does NOT classify as test_is_wrong (selector rule must not win)', () => {

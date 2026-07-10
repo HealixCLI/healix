@@ -5,9 +5,11 @@
 - **Deciders:** Anurag
 
 ## Context
+
 Healix is an AI-led tool with plan-mode approval gates and streaming agent output. The UX should feel like a focused, developer-grade companion — the user asked to "follow a Codex-like design."
 
 ## Decision
+
 Adopt a **Codex-inspired** design language:
 
 - **Calm and minimal** — generous whitespace, few accents, content-first.
@@ -18,6 +20,7 @@ Adopt a **Codex-inspired** design language:
 - **Progressive disclosure** — simple by default; advanced controls (tiers, provider override, mode toggle) tucked behind affordances.
 
 ## Consequences
+
 - A small design-token set (color, type, spacing, motion) defined up front; shared across app surfaces.
 - Approval-gate and streaming patterns become reusable components.
 - CLI output mirrors the same calm, structured aesthetic (plain, well-spaced, color-restrained).

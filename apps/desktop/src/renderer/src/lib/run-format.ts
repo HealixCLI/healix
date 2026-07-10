@@ -83,3 +83,84 @@ export function artifactLeaf(rel: string): string {
   const parts = rel.split(/[\\/]/).filter(Boolean);
   return parts[parts.length - 1] ?? rel;
 }
+
+// ---- Artifact media handling (screenshots / videos / traces) ----------------
+
+export type ArtifactKind = 'image' | 'video' | 'trace' | 'other';
+
+const IMAGE_EXT = /\.(png|jpe?g|gif|webp)$/i;
+const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
+
+/** Classify an artifact file so the gallery knows how to render it. */
+export function artifactKind(path: string): ArtifactKind {
+  if (IMAGE_EXT.test(path)) return 'image';
+  if (VIDEO_EXT.test(path)) return 'video';
+  if (/trace\.zip$/i.test(path)) return 'trace';
+  return 'other';
+}
+
+/**
+ * Renderer-loadable URL for an absolute artifact path. Served by the main
+ * process's healix-artifact:// protocol (restricted to the projects dir).
+ */
+export function artifactUrl(abs: string): string {
+  return `healix-artifact://run/${encodeURIComponent(abs)}`;
+}
+
+export interface ArtifactGroup {
+  /** Test folder name under test-results ('' for loose files). */
+  folder: string;
+  images: string[];
+  videos: string[];
+  other: string[];
+}
+
+/** Slugify a test title the way Playwright names output folders: lowercase, non-alphanumerics → dashes. */
+function slugifyTitle(title: string): string {
+  return title
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+/**
+ * Best-effort match between a test title and a Playwright test-results folder.
+ * Playwright folders are slugified "<file>-<title>[-<project>]", truncated for
+ * long names with a short hash appended — so an exact comparison is hopeless.
+ * We slugify the title the same way and accept the folder when it starts with
+ * (or contains) a prefix of that slug. Heuristic by design; callers must cope
+ * with "no match" (e.g. by falling back to the top of the artifacts tab).
+ */
+export function slugMatches(title: string, folder: string): boolean {
+  const slug = slugifyTitle(title);
+  if (!slug || !folder) return false;
+  const f = folder.toLowerCase();
+  // Compare on a bounded prefix because Playwright truncates + appends hashes.
+  const probe = slug.slice(0, 32);
+  return f.startsWith(probe) || f.includes(probe);
+}
+
+/** Group relative artifact paths by their test folder, media first. */
+export function groupArtifacts(rels: string[]): ArtifactGroup[] {
+  const byFolder = new Map<string, ArtifactGroup>();
+  for (const rel of rels) {
+    const slash = rel.indexOf('/');
+    const folder = slash === -1 ? '' : rel.slice(0, slash);
+    let group = byFolder.get(folder);
+    if (!group) {
+      group = { folder, images: [], videos: [], other: [] };
+      byFolder.set(folder, group);
+    }
+    const kind = artifactKind(rel);
+    if (kind === 'image') group.images.push(rel);
+    else if (kind === 'video') group.videos.push(rel);
+    else group.other.push(rel);
+  }
+  // Groups with media come first; loose files sink to the bottom.
+  return [...byFolder.values()].sort((a, b) => {
+    const aMedia = a.images.length + a.videos.length > 0 ? 0 : 1;
+    const bMedia = b.images.length + b.videos.length > 0 ? 0 : 1;
+    if (aMedia !== bMedia) return aMedia - bMedia;
+    return a.folder.localeCompare(b.folder);
+  });
+}

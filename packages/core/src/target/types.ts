@@ -7,6 +7,13 @@ export interface DetectedProject {
   startCommand: string | null;
   port: number | null;
   baseUrl: string | null;
+  /**
+   * Human-readable detection notes for surfacing in UIs/logs — e.g. which
+   * monorepo workspace the detection came from, or a "docker compose up"
+   * project hint when no start command could be derived. Present only when
+   * there is something worth saying; never load-bearing for launch().
+   */
+  notes?: string[];
 }
 
 export interface RepoIndex {

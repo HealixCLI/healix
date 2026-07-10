@@ -60,6 +60,8 @@ export interface TestModeContext {
   browser: BrowserSurface;
   explorationMode?: ExplorationMode;
   emit?: (phase: string, message: string, data?: unknown) => void;
+  /** Cooperative cancellation for long mode phases (generate/execute). */
+  signal?: AbortSignal;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import net from 'node:net';
 import process from 'node:process';
 import { logger } from '../logger.js';
 import type { LaunchHandle, LaunchOptions } from './types.js';
@@ -26,6 +27,54 @@ function redactSecrets(text: string): string {
     )
     .replace(/\b[A-Za-z0-9+/_-]{32,}={0,2}\b/g, '***')
     .replace(/\b[0-9a-fA-F]{32,}\b/g, '***');
+}
+
+/**
+ * Bind a TCP server to `port` (0 = OS-assigned ephemeral) and immediately
+ * release it, resolving with the port that was actually bound, or null when
+ * the bind failed (EADDRINUSE, EACCES, ...). Never rejects. Binds on the
+ * default (all-interfaces) address so anything holding the port on either
+ * stack makes the check fail — the strictest availability signal we can get.
+ */
+function tryBind(port: number): Promise<number | null> {
+  return new Promise((resolve) => {
+    const server = net.createServer();
+    // The probe server must never keep the parent event loop alive.
+    server.unref();
+    server.once('error', () => resolve(null));
+    server.listen(port, () => {
+      const addr = server.address();
+      const bound = typeof addr === 'object' && addr !== null ? addr.port : null;
+      server.close(() => resolve(bound));
+    });
+  });
+}
+
+/**
+ * Find a free TCP port for a per-run dev-server launch: try `preferred` first
+ * and keep it when it binds; otherwise (busy, privileged, or no preference)
+ * fall back to an OS-assigned ephemeral port.
+ *
+ * TOCTOU caveat: the port is released again before the caller spawns anything,
+ * so another process CAN grab it in the window between this check and the dev
+ * server binding it. That race is inherent to "find a free port" helpers (the
+ * dev server must bind the port itself; we cannot hand it an open socket).
+ * In practice the window is milliseconds and the failure mode is the same
+ * launch-timeout error we already surface — this helper only removes the
+ * *deterministic* collision where two concurrent runs of the same project both
+ * launch on the framework default port and silently test each other's server.
+ */
+export async function findFreePort(preferred?: number): Promise<number> {
+  if (preferred !== undefined) {
+    const got = await tryBind(preferred);
+    if (got !== null) return got;
+  }
+  const ephemeral = await tryBind(0);
+  if (ephemeral !== null) return ephemeral;
+  // Both binds failed (no sockets left / sandboxed environment). Fall back to
+  // the preferred/default so the caller still has something to try; launch()
+  // will surface the real error if it too cannot bind.
+  return preferred ?? 3000;
 }
 
 function deriveBaseUrl(opts: LaunchOptions): string {
@@ -81,6 +130,9 @@ function killTree(child: ChildProcess): void {
   }, 4_000);
   // Don't let the kill timer keep the event loop alive.
   if (typeof killTimer.unref === 'function') killTimer.unref();
+  // A clean exit must cancel the escalation — the process-group id could
+  // otherwise be reused by the OS and the stray SIGKILL would hit a stranger.
+  child.once('exit', () => clearTimeout(killTimer));
 }
 
 /**
@@ -120,6 +172,13 @@ export async function launch(opts: LaunchOptions): Promise<LaunchHandle> {
     detached,
     stdio: ['ignore', 'pipe', 'pipe'],
   });
+  // The detached child must not keep the PARENT's event loop alive — the run
+  // finishes (and the CLI exits) once stop() has torn the tree down, not when
+  // the OS reaps the group. Documented limitation: if the parent is SIGKILLed
+  // (no chance to run stop()/killTree), the detached process group is orphaned
+  // and keeps running; that is the price of detaching for group-kill. A normal
+  // parent exit still tears the tree down via the LaunchHandle cleanup paths.
+  child.unref();
 
   const stderrTail: string[] = [];
   const pushLines = (chunk: Buffer): void => {
@@ -178,7 +237,9 @@ export async function launch(opts: LaunchOptions): Promise<LaunchHandle> {
   // whenever the `failure` promise wins a race against the readiness poll.
   const throwIfFailed = (): void => {
     if (spawnError) {
-      throw new Error(`[healix] failed to launch '${startCommand}': ${(spawnError as Error).message}\n${tail()}`);
+      throw new Error(
+        `[healix] failed to launch '${startCommand}': ${(spawnError as Error).message}\n${tail()}`,
+      );
     }
     if (exited) {
       const info = exitInfo as { code: number | null; signal: NodeJS.Signals | null } | null;

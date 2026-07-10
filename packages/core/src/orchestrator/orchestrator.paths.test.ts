@@ -34,12 +34,7 @@ import type {
   TargetAdapter,
   UrlProbe,
 } from '../target/types.js';
-import type {
-  BrowserSurface,
-  BrowserSurfaceOptions,
-  DomSnapshot,
-  Point,
-} from '../browser/types.js';
+import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '../browser/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared fakes — same pattern as orchestrator.integration.test.ts. Every
@@ -89,7 +84,13 @@ const fakeProvider: ProviderAdapter = {
     if (opts?.mode === 'plan') {
       return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
     }
-    return { provider: 'claude', ok: true, text: 'canned text (no actionable json)', raw: null, detail: 'OK' };
+    return {
+      provider: 'claude',
+      ok: true,
+      text: 'canned text (no actionable json)',
+      raw: null,
+      detail: 'OK',
+    };
   },
 };
 
@@ -446,14 +447,7 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(planWarns.some((e) => /fallback|no usable plan/i.test(e.message))).toBe(true);
 
     // The synthesized fallback plan was actually used (it has at least one item).
-    const reportPath = join(
-      projectsDir(),
-      project.id,
-      'runs',
-      summary.runId,
-      'reports',
-      'report.json',
-    );
+    const reportPath = join(projectsDir(), project.id, 'runs', summary.runId, 'reports', 'report.json');
     const report = JSON.parse(await readFile(reportPath, 'utf8')) as RunReport;
     expect(report.plan.items.length).toBeGreaterThan(0);
   });

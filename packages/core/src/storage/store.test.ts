@@ -10,13 +10,7 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: typeof DatabaseSyncType };
 
-import {
-  type HealixStore,
-  dbInfo,
-  dbPath,
-  getStore,
-  resetStoreForTests,
-} from '@healix/core';
+import { type HealixStore, dbInfo, dbPath, getStore, resetStoreForTests } from '@healix/core';
 
 /**
  * Hermetic store tests. Each test runs against a throwaway SQLite database under a
@@ -140,11 +134,23 @@ describe('deleteProject cascade', () => {
 
     const N = 2;
     for (let i = 0; i < N; i++) {
-      const tt = s.insertTest({ runId: targetRun.id, title: `t${i}`, reqTag: null, tier: null, status: 'pending' });
+      const tt = s.insertTest({
+        runId: targetRun.id,
+        title: `t${i}`,
+        reqTag: null,
+        tier: null,
+        status: 'pending',
+      });
       s.insertResult({ testId: tt.id, status: 'passed', durationMs: null, error: null, artifactsJson: null });
       s.appendEvent(targetRun.id, 'executing', `te${i}`);
 
-      const kt = s.insertTest({ runId: keepRun.id, title: `k${i}`, reqTag: null, tier: null, status: 'pending' });
+      const kt = s.insertTest({
+        runId: keepRun.id,
+        title: `k${i}`,
+        reqTag: null,
+        tier: null,
+        status: 'pending',
+      });
       s.insertResult({ testId: kt.id, status: 'failed', durationMs: 5, error: 'boom', artifactsJson: null });
       s.appendEvent(keepRun.id, 'executing', `ke${i}`);
     }
@@ -184,7 +190,13 @@ describe('deleteRun cascade', () => {
       s.insertResult({ testId: t.id, status: 'passed', durationMs: i, error: null, artifactsJson: null });
       s.appendEvent(run.id, 'executing', `e${i}`);
 
-      const ot = s.insertTest({ runId: otherRun.id, title: `o${i}`, reqTag: null, tier: null, status: 'pending' });
+      const ot = s.insertTest({
+        runId: otherRun.id,
+        title: `o${i}`,
+        reqTag: null,
+        tier: null,
+        status: 'pending',
+      });
       s.insertResult({ testId: ot.id, status: 'passed', durationMs: i, error: null, artifactsJson: null });
       s.appendEvent(otherRun.id, 'executing', `oe${i}`);
     }

@@ -14,10 +14,22 @@ body,
 
 body {
   margin: 0;
-  background: #0b0b0f;
+  background: #0a0a0e;
   color: #e7e7ea;
-  font-family: ui-sans-serif, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif;
+  font-family:
+    ui-sans-serif,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    Helvetica,
+    Arial,
+    sans-serif;
   -webkit-font-smoothing: antialiased;
+  overscroll-behavior: none;
+}
+
+::selection {
+  background: rgba(70, 200, 120, 0.28);
 }
 
 ::-webkit-scrollbar {
@@ -27,6 +39,16 @@ body {
 ::-webkit-scrollbar-thumb {
   background: #26262e;
   border-radius: 6px;
+  border: 2px solid transparent;
+  background-clip: padding-box;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: #33333d;
+  background-clip: padding-box;
+  border: 2px solid transparent;
+}
+::-webkit-scrollbar-corner {
+  background: transparent;
 }
 
 /* Electron frameless title-bar drag regions */

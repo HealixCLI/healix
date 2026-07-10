@@ -43,10 +43,7 @@ async function loadDriver(): Promise<typeof DatabaseSync | null> {
       const mod = require('node:sqlite') as { DatabaseSync: typeof DatabaseSync };
       return mod.DatabaseSync;
     } catch (e) {
-      logger.warn(
-        'node:sqlite unavailable in this runtime:',
-        (e as { code?: string }).code ?? String(e),
-      );
+      logger.warn('node:sqlite unavailable in this runtime:', (e as { code?: string }).code ?? String(e));
       return null;
     }
   }
@@ -81,9 +78,19 @@ function readUserVersion(db: DatabaseSync): number {
   return row?.user_version ?? 0;
 }
 
+/** Add a column if the table doesn't have it yet (CREATE IF NOT EXISTS can't retrofit). */
+function ensureColumn(db: DatabaseSync, table: string, column: string, ddlType: string): void {
+  const cols = db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name?: string }>;
+  if (cols.some((c) => c.name === column)) return;
+  db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${ddlType};`);
+}
+
 function migrate(db: DatabaseSync): void {
   if (readUserVersion(db) < SCHEMA_VERSION) {
     db.exec(SCHEMA_SQL);
+    // v3: soft-archive flag on projects (pre-v3 DBs already have the table,
+    // so the CREATE above won't add the column).
+    ensureColumn(db, 'projects', 'archived_at', 'TEXT');
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     logger.info(`Database migrated to schema v${SCHEMA_VERSION}`);
   }
@@ -101,7 +108,10 @@ export async function dbInfo(): Promise<DbInfo> {
   };
   const db = await openDb();
   if (!db) {
-    return { ...base, detail: 'node:sqlite unavailable (needs Node >=22.5 or a compatible Electron runtime).' };
+    return {
+      ...base,
+      detail: 'node:sqlite unavailable (needs Node >=22.5 or a compatible Electron runtime).',
+    };
   }
   const version = readUserVersion(db);
   const tables = (

@@ -1,7 +1,20 @@
 export type LogLevel = 'debug' | 'info' | 'warn' | 'error';
 
 const order: Record<LogLevel, number> = { debug: 0, info: 1, warn: 2, error: 3 };
-let current: LogLevel = (process.env.HEALIX_LOG as LogLevel) || 'info';
+const DEFAULT_LEVEL: LogLevel = 'info';
+
+/**
+ * Validate HEALIX_LOG against the known levels. The previous bare
+ * `as LogLevel` cast let any value (e.g. HEALIX_LOG=verbose) through, making
+ * `order[current]` undefined — and since every `<` comparison with undefined
+ * is false, the filter silently disabled itself and EVERYTHING logged.
+ * Unknown values now fall back to the default level instead.
+ */
+function parseLevel(raw: string | undefined): LogLevel {
+  return raw && raw in order ? (raw as LogLevel) : DEFAULT_LEVEL;
+}
+
+let current: LogLevel = parseLevel(process.env.HEALIX_LOG);
 
 export function setLogLevel(level: LogLevel): void {
   current = level;

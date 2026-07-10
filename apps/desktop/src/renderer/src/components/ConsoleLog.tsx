@@ -18,7 +18,7 @@ export function ConsoleLog({ lines, emptyHint }: { lines: ConsoleLine[]; emptyHi
   }, [lines]);
 
   return (
-    <div className="h-full overflow-auto rounded-lg border border-border bg-[#0d0d12] p-3 font-mono text-xs leading-relaxed">
+    <div className="h-full overflow-auto rounded-lg border border-border bg-well p-3 font-mono text-xs leading-relaxed">
       {lines.length === 0 ? (
         <p className="text-muted">{emptyHint ?? 'Console output will appear here.'}</p>
       ) : (
@@ -26,7 +26,9 @@ export function ConsoleLog({ lines, emptyHint }: { lines: ConsoleLine[]; emptyHi
           <div key={line.id} className="flex gap-2">
             <span className="shrink-0 text-muted/70">{line.ts}</span>
             <span className="w-20 shrink-0 truncate text-accent/80">{line.phase}</span>
-            <span className={cn('whitespace-pre-wrap break-words', LEVEL_COLOR[line.level])}>{line.message}</span>
+            <span className={cn('whitespace-pre-wrap break-words', LEVEL_COLOR[line.level])}>
+              {line.message}
+            </span>
           </div>
         ))
       )}

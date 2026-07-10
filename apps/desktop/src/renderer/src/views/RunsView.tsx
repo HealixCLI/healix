@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExplorationMode, Project } from '@healix/core';
-import { Loader2, Play, RotateCcw } from 'lucide-react';
+import { Loader2, Play, RotateCcw, Square } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -24,6 +24,7 @@ const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   running: 'default',
   'awaiting-approval': 'warn',
   done: 'ok',
+  cancelled: 'muted',
   error: 'err',
 };
 
@@ -33,8 +34,12 @@ const PHASE_LABEL: Record<RunPhase, string> = {
   running: 'running',
   'awaiting-approval': 'awaiting approval',
   done: 'done',
+  cancelled: 'cancelled',
   error: 'error',
 };
+
+/** Engine phases in which the run has settled and a new one can be started. */
+const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
 
 export function RunsView({ initialProjectId }: { initialProjectId?: string | null }) {
   const { projects, loading: projectsLoading } = useProjects();
@@ -46,35 +51,43 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [mode, setMode] = useState<ExplorationMode>('codegen');
   const [prd, setPrd] = useState('');
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  // True from the moment the user clicks Cancel until run:done settles the run.
+  const [cancelling, setCancelling] = useState(false);
 
   const { detail, loading: detailLoading } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
 
+  // History rows may reference archived projects, so the lookup keeps ALL of
+  // them; only the "start a run" selector is restricted to active projects.
   const projectsById = useMemo(() => {
     const m = new Map<string, Project>();
     for (const p of projects) m.set(p.id, p);
     return m;
   }, [projects]);
+  const runnable = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
 
   // Default the selection to the deep-linked project, else the first project.
   useEffect(() => {
     if (projectId) return;
-    if (initialProjectId && projects.some((p) => p.id === initialProjectId)) {
+    if (initialProjectId && runnable.some((p) => p.id === initialProjectId)) {
       setProjectId(initialProjectId);
-    } else if (projects.length > 0) {
-      setProjectId(projects[0].id);
+    } else if (runnable.length > 0) {
+      setProjectId(runnable[0].id);
     }
-  }, [initialProjectId, projects, projectId]);
+  }, [initialProjectId, runnable, projectId]);
 
   const isActive =
-    engine.phase === 'starting' ||
-    engine.phase === 'running' ||
-    engine.phase === 'awaiting-approval';
+    engine.phase === 'starting' || engine.phase === 'running' || engine.phase === 'awaiting-approval';
+
+  // Clear the "Cancelling…" state once the run settles (run:done) or resets.
+  useEffect(() => {
+    if (!isActive) setCancelling(false);
+  }, [isActive]);
 
   // When a run finishes, refresh history and select the freshly-completed run.
   const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
-    if ((engine.phase === 'done' || engine.phase === 'error') && engine.runId) {
+    if (SETTLED_PHASES.includes(engine.phase) && engine.runId) {
       if (lastSettledRef.current === engine.runId) return;
       lastSettledRef.current = engine.runId;
       const settledId = engine.runId;
@@ -99,6 +112,14 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
       mode,
       prd: prd.trim() || undefined,
     });
+  };
+
+  const cancel = (): void => {
+    if (cancelling || !engine.runId) return;
+    setCancelling(true);
+    // The engine phase stays as-is until the authoritative run:done arrives
+    // with status 'cancelled' (SETTLED_PHASES then refreshes the history).
+    void engine.cancel();
   };
 
   const newRun = (): void => {
@@ -150,10 +171,10 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 <Select
                   value={projectId}
                   onChange={(e) => setProjectId(e.target.value)}
-                  disabled={isActive || projectsLoading || projects.length === 0}
+                  disabled={isActive || projectsLoading || runnable.length === 0}
                 >
-                  {projects.length === 0 && <option value="">No projects — create one first</option>}
-                  {projects.map((p) => (
+                  {runnable.length === 0 && <option value="">No active projects — create one first</option>}
+                  {runnable.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}
                     </option>
@@ -199,10 +220,22 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 )}
               </div>
               <div className="flex items-center gap-2">
-                {(engine.phase === 'done' || engine.phase === 'error') && (
+                {SETTLED_PHASES.includes(engine.phase) && (
                   <Button variant="ghost" onClick={newRun}>
                     <RotateCcw className="h-4 w-4" />
                     New run
+                  </Button>
+                )}
+                {isActive && (
+                  <Button
+                    variant="outline"
+                    className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
+                    onClick={cancel}
+                    // No runId yet means there is nothing to abort (still 'starting').
+                    disabled={cancelling || !engine.runId}
+                  >
+                    <Square className="h-4 w-4" />
+                    {cancelling ? 'Cancelling…' : 'Cancel'}
                   </Button>
                 )}
                 <Button onClick={start} disabled={!projectId || isActive}>

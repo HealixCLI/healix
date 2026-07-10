@@ -1,4 +1,4 @@
-import { runCli, which } from '../exec/run-cli.js';
+import { extractSemver, runCli, which } from '../exec/run-cli.js';
 import type {
   Capability,
   CompleteOptions,
@@ -37,8 +37,10 @@ export class OpenAIProvider implements ProviderAdapter {
     const binPath = await which(this.bin);
     if (!binPath) return { installed: false, binPath: null, version: null };
     const r = await runCli(this.bin, ['--version'], { timeoutMs: 8_000 });
-    // `codex --version` -> "codex-cli 0.142.4"
-    const version = r.code === 0 ? (r.stdout.trim().split(/\s+/).pop() ?? null) : null;
+    // Regex-extract the semver: `codex --version` prints "codex-cli 0.142.4",
+    // but update notices can append extra tokens, so the last whitespace token
+    // is not reliably the version.
+    const version = r.code === 0 ? extractSemver(r.stdout) : null;
     return { installed: true, binPath, version };
   }
 
@@ -58,18 +60,40 @@ export class OpenAIProvider implements ProviderAdapter {
     };
 
     if (!det.installed) {
-      return { ...base, detail: 'codex CLI not found on PATH. Install the OpenAI Codex CLI (npm i -g @openai/codex) to enable this provider.' };
+      return {
+        ...base,
+        detail:
+          'codex CLI not found on PATH. Install the OpenAI Codex CLI (npm i -g @openai/codex) to enable this provider.',
+      };
     }
 
     // Cheap, local auth check first (no network / no token spend).
-    const login = await runCli(this.bin, ['login', 'status'], { timeoutMs: 10_000 });
+    const login = await runCli(this.bin, ['login', 'status'], { timeoutMs: 10_000, signal: opts.signal });
+    // A timed-out (or aborted) status check produced NO verdict — reporting it
+    // as "not authenticated" would send the user off to re-login for what is
+    // actually a hung/slow CLI. Surface it as an error instead.
+    if (login.timedOut) {
+      return { ...base, status: 'error', detail: 'codex login status timed out — auth state unknown.' };
+    }
+    if (login.aborted) {
+      return { ...base, status: 'error', detail: 'Auth check aborted.' };
+    }
     const loggedIn = /logged in/i.test(login.stdout) && !/not logged in/i.test(login.stdout);
     if (!loggedIn) {
-      return { ...base, status: 'not-authenticated', detail: 'Not authenticated. Run `codex login` to sign in with your ChatGPT subscription.' };
+      return {
+        ...base,
+        status: 'not-authenticated',
+        detail: 'Not authenticated. Run `codex login` to sign in with your ChatGPT subscription.',
+      };
     }
 
     if (!probe) {
-      return { ...base, status: 'ready', authenticated: true, detail: 'Codex CLI detected and logged in (auth not probed).' };
+      return {
+        ...base,
+        status: 'ready',
+        authenticated: true,
+        detail: 'Codex CLI detected and logged in (auth not probed).',
+      };
     }
 
     // Live round-trip: confirms the session token actually refreshes/works
@@ -77,15 +101,28 @@ export class OpenAIProvider implements ProviderAdapter {
     const start = Date.now();
     const r = await runCli(this.bin, ['exec', '--skip-git-repo-check', '-s', 'read-only', '--json', PING], {
       timeoutMs: opts.timeoutMs ?? 60_000,
+      signal: opts.signal,
     });
     const latencyMs = Date.now() - start;
     const parsed = parseCodexExec(r.stdout, r.stderr);
 
     if (r.timedOut) {
-      return { ...base, status: 'error', authenticated: true, detail: `Auth probe timed out after ${opts.timeoutMs ?? 60_000}ms.` };
+      return {
+        ...base,
+        status: 'error',
+        authenticated: true,
+        detail: `Auth probe timed out after ${opts.timeoutMs ?? 60_000}ms.`,
+      };
+    }
+    if (r.aborted) {
+      return { ...base, status: 'error', authenticated: true, detail: 'Auth probe aborted.' };
     }
     if (parsed.authError) {
-      return { ...base, status: 'not-authenticated', detail: `Codex session expired — run \`codex login\` again. (${parsed.error ?? 'token refresh failed'})` };
+      return {
+        ...base,
+        status: 'not-authenticated',
+        detail: `Codex session expired — run \`codex login\` again. (${parsed.error ?? 'token refresh failed'})`,
+      };
     }
     if (parsed.ok) {
       return {
@@ -96,20 +133,40 @@ export class OpenAIProvider implements ProviderAdapter {
         detail: `Authenticated. Model replied "${parsed.text.slice(0, 32)}".`,
       };
     }
-    return { ...base, status: 'error', authenticated: true, detail: parsed.error ? `Probe error: ${parsed.error.slice(0, 160)}` : 'Probe returned no usable response.' };
+    return {
+      ...base,
+      status: 'error',
+      authenticated: true,
+      detail: parsed.error
+        ? `Probe error: ${parsed.error.slice(0, 160)}`
+        : 'Probe returned no usable response.',
+    };
   }
 
   async complete(prompt: string, opts: CompleteOptions = {}): Promise<CompletionResult> {
     const args = ['exec', '--skip-git-repo-check', '-s', 'read-only', '--json'];
     if (opts.cwd) args.push('-C', opts.cwd);
     args.push(prompt);
-    const r = await runCli(this.bin, args, { timeoutMs: opts.timeoutMs ?? 180_000, cwd: opts.cwd });
+    const r = await runCli(this.bin, args, {
+      timeoutMs: opts.timeoutMs ?? 180_000,
+      cwd: opts.cwd,
+      signal: opts.signal,
+    });
     if (r.timedOut) {
       return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion timed out.' };
     }
+    if (r.aborted) {
+      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion aborted.' };
+    }
     const parsed = parseCodexExec(r.stdout, r.stderr);
     if (parsed.authError) {
-      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Codex session expired — run `codex login`.' };
+      return {
+        provider: this.id,
+        ok: false,
+        text: '',
+        raw: r,
+        detail: 'Codex session expired — run `codex login`.',
+      };
     }
     return {
       provider: this.id,
@@ -120,12 +177,13 @@ export class OpenAIProvider implements ProviderAdapter {
     };
   }
 
-  async plan(task: string, opts: { timeoutMs?: number } = {}): Promise<PlanResult> {
+  async plan(task: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<PlanResult> {
     // Codex has no dedicated plan mode; the read-only sandbox in complete()
     // already prevents any file/system changes, so a plan request is safe.
     const res = await this.complete(`Produce a plan only — do not modify anything.\n\n${task}`, {
       mode: 'plan',
       timeoutMs: opts.timeoutMs ?? 120_000,
+      signal: opts.signal,
     });
     return {
       provider: this.id,
@@ -138,8 +196,18 @@ export class OpenAIProvider implements ProviderAdapter {
 }
 
 /** Parse `codex exec --json` JSONL output into a final-text / error / auth verdict. */
-export function parseCodexExec(stdout: string, stderr = ''): { ok: boolean; text: string; error: string | null; authError: boolean } {
-  let text = '';
+export function parseCodexExec(
+  stdout: string,
+  stderr = '',
+): { ok: boolean; text: string; error: string | null; authError: boolean } {
+  // Streamed deltas and completed items are tracked SEPARATELY: an
+  // `item.completed` event carries the FULL final message, and the deltas that
+  // streamed before it are partial copies of the same text — appending both
+  // (the old behaviour) double-counted the reply ("HEALIX_OKHEALIX_OK").
+  // Completed items win; deltas are only the fallback when no completed
+  // message event ever arrives (e.g. truncated output).
+  let deltaText = '';
+  const completedTexts: string[] = [];
   let error: string | null = null;
   let authError = false;
 
@@ -162,13 +230,23 @@ export function parseCodexExec(stdout: string, stderr = ''): { ok: boolean; text
     if (type === 'error' || type === 'turn.failed') {
       consider(evt.error?.message ?? evt.message);
     }
-    // Accumulate assistant/agent message text across the various event shapes
-    // Codex has used (agent_message / item.completed / message deltas).
-    if (/message/.test(type) || type === 'item.completed') {
-      const piece = evt.item?.text ?? evt.text ?? evt.delta ?? evt.message;
-      if (piece && typeof piece === 'string') text += piece;
+    if (type === 'item.completed') {
+      // Only message-ish items count as reply text — reasoning/command items
+      // also carry `text` and must not pollute the answer. An absent item.type
+      // (older CLI shapes) is accepted for backward compatibility.
+      const itemType = evt.item?.type;
+      if (itemType === undefined || /message/.test(itemType)) {
+        const piece = evt.item?.text ?? evt.text;
+        if (piece && typeof piece === 'string') completedTexts.push(piece);
+      }
+    } else if (/message/.test(type)) {
+      // Streaming shapes (agent_message / message deltas) accumulate.
+      const piece = evt.text ?? evt.delta ?? evt.message;
+      if (piece && typeof piece === 'string') deltaText += piece;
     }
   }
+
+  const text = completedTexts.length > 0 ? completedTexts.join('') : deltaText;
 
   if (!text && stderr && /refresh|sign in again|not authenticated|unauthor/i.test(stderr)) {
     authError = true;

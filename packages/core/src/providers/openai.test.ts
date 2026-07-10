@@ -49,6 +49,45 @@ describe('parseCodexExec (codex exec --json output)', () => {
     expect(parseCodexExec('not json at all\n').ok).toBe(false);
   });
 
+  it('prefers item.completed text over accumulated deltas (no double-counting)', () => {
+    // The deltas stream partial copies of the SAME text the completed item
+    // carries in full — appending both used to yield "HEALIX_OKHEALIX_OK".
+    const out = [
+      '{"type":"turn.started"}',
+      '{"type":"agent_message.delta","delta":"HEALIX"}',
+      '{"type":"agent_message.delta","delta":"_OK"}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"HEALIX_OK"}}',
+      '{"type":"turn.completed"}',
+    ].join('\n');
+    const r = parseCodexExec(out);
+    expect(r.ok).toBe(true);
+    expect(r.text).toBe('HEALIX_OK');
+  });
+
+  it('falls back to accumulated deltas when no item.completed carries text', () => {
+    // Truncated / older-CLI streams may never emit item.completed — the
+    // stitched deltas are then the best available answer.
+    const out = [
+      '{"type":"agent_message.delta","delta":"HEALIX"}',
+      '{"type":"agent_message.delta","delta":"_OK"}',
+    ].join('\n');
+    const r = parseCodexExec(out);
+    expect(r.ok).toBe(true);
+    expect(r.text).toBe('HEALIX_OK');
+  });
+
+  it('ignores non-message item.completed payloads (e.g. reasoning items)', () => {
+    // Reasoning/command items also carry `text`; only message items are the
+    // assistant's reply.
+    const out = [
+      '{"type":"item.completed","item":{"type":"reasoning","text":"thinking about it..."}}',
+      '{"type":"item.completed","item":{"type":"agent_message","text":"HEALIX_OK"}}',
+    ].join('\n');
+    const r = parseCodexExec(out);
+    expect(r.ok).toBe(true);
+    expect(r.text).toBe('HEALIX_OK');
+  });
+
   it('detects an auth failure surfaced only on stderr', () => {
     const r = parseCodexExec('', 'error: please sign in again');
     expect(r.authError).toBe(true);

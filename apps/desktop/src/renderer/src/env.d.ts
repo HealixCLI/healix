@@ -23,10 +23,12 @@ export interface HealixBridge {
 
   listProjects: () => Promise<Project[]>;
   createProject: (input: NewProject) => Promise<Project>;
-  deleteProject: (id: string) => Promise<{ ok: true }>;
+  deleteProject: (id: string) => Promise<{ ok: true; assetsRemoved: boolean }>;
+  archiveProject: (id: string, archived: boolean) => Promise<{ ok: true }>;
 
   startRun: (args: StartRunArgs) => Promise<RunSummary>;
   approveRun: (runId: string, ok: boolean) => Promise<{ settled: boolean }>;
+  cancelRun: (runId: string) => Promise<{ cancelled: boolean }>;
 
   exportSuite: (args: {
     suiteDir: string;
@@ -35,6 +37,7 @@ export interface HealixBridge {
     zip?: boolean;
   }) => Promise<SuiteBundle>;
   revealPath: (target: string) => Promise<{ ok: boolean }>;
+  showItemInFolder: (target: string) => Promise<{ ok: boolean }>;
 
   // ---- provider connect / live health ----
   providerLogin: (id: ProviderId) => Promise<ProviderLoginResult>;

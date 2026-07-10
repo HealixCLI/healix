@@ -1,5 +1,4 @@
 import { existsSync } from 'node:fs';
-import { join } from 'node:path';
 import type { Command } from 'commander';
 import pc from 'picocolors';
 import {
@@ -11,15 +10,24 @@ import {
   type TestCase,
   type TestStatus,
 } from '@healix/core';
+import { isTerminalRunStatus, reportPathFor, shapeRunShow } from '../lib/helpers.js';
 
 /** Print a friendly hint when the local SQLite store is unavailable. */
 function storeUnavailable(): void {
   console.log('');
   console.log(pc.yellow('  ⚠ Local storage is unavailable on this runtime.'));
   console.log(
-    pc.dim('    Healix needs node:sqlite (Node 22.5+ with --experimental-sqlite, or Node 23.4+). Run `healix doctor`.'),
+    pc.dim(
+      '    Healix needs node:sqlite (Node 22.5+ with --experimental-sqlite, or Node 23.4+). Run `healix doctor`.',
+    ),
   );
   console.log('');
+}
+
+/** JSON-mode variant: keep stdout valid JSON — report the problem on stderr, exit 1. */
+function storeUnavailableJson(): void {
+  console.error('Local storage is unavailable on this runtime (node:sqlite missing). Run `healix doctor`.');
+  process.exitCode = 1;
 }
 
 function fmtCell(value: string, width: number): string {
@@ -94,10 +102,6 @@ function printRunRow(run: Run): void {
   );
 }
 
-function reportPathFor(projectId: string, runId: string): string {
-  return join(projectsDir(), projectId, 'runs', runId, 'reports', 'report.json');
-}
-
 export function registerRuns(program: Command): void {
   const cmd = program.command('runs').description('Inspect Healix run history');
 
@@ -105,11 +109,16 @@ export function registerRuns(program: Command): void {
     .command('list')
     .description('List runs (optionally filtered by project)')
     .option('--project <id>', 'only show runs for this project id')
-    .action(async (opts: { project?: string }) => {
+    .option('--json', 'output the runs as a JSON array')
+    .action(async (opts: { project?: string; json?: boolean }) => {
       const store = await getStore();
-      if (!store) return storeUnavailable();
+      if (!store) return opts.json ? storeUnavailableJson() : storeUnavailable();
 
       const runs = store.listRuns(opts.project);
+      if (opts.json) {
+        console.log(JSON.stringify(runs, null, 2));
+        return;
+      }
       console.log('');
       if (runs.length === 0) {
         const where = opts.project ? ` for project ${pc.bold(opts.project)}` : '';
@@ -129,16 +138,28 @@ export function registerRuns(program: Command): void {
   cmd
     .command('show <runId>')
     .description('Show a run: status, per-test results, phase events, and report path')
-    .action(async (runId: string) => {
+    .option('--json', 'output the run, its tests, and its results as JSON')
+    .action(async (runId: string, opts: { json?: boolean }) => {
       const store = await getStore();
-      if (!store) return storeUnavailable();
+      if (!store) return opts.json ? storeUnavailableJson() : storeUnavailable();
 
       const run = store.getRun(runId);
       if (!run) {
-        console.log('');
-        console.log(pc.red(`  ✖ No run found with id ${pc.bold(runId)}.`));
-        console.log('');
+        if (opts.json) {
+          console.error(`No run found with id ${runId}.`);
+        } else {
+          console.log('');
+          console.log(pc.red(`  ✖ No run found with id ${pc.bold(runId)}.`));
+          console.log('');
+        }
         process.exitCode = 1;
+        return;
+      }
+
+      if (opts.json) {
+        console.log(
+          JSON.stringify(shapeRunShow(run, store.listTests(runId), store.listResults(runId)), null, 2),
+        );
         return;
       }
 
@@ -184,7 +205,9 @@ export function registerRuns(program: Command): void {
           if (r.error) console.log(`      ${pc.red(firstLine(r.error))}`);
         }
         console.log('');
-        const summaryParts = Object.entries(counts).map(([k, v]) => testStatusColor(k as TestStatus)(`${v} ${k}`));
+        const summaryParts = Object.entries(counts).map(([k, v]) =>
+          testStatusColor(k as TestStatus)(`${v} ${k}`),
+        );
         console.log(`    ${pc.dim('totals:')} ${summaryParts.join(pc.dim(' · '))}`);
       }
 
@@ -199,13 +222,85 @@ export function registerRuns(program: Command): void {
       }
 
       // ---- report path ----
-      const reportPath = reportPathFor(run.projectId, run.id);
+      const reportPath = reportPathFor(projectsDir(), run.projectId, run.id);
       console.log('');
       if (existsSync(reportPath)) {
         console.log(`  ${pc.dim('report')}  ${reportPath}`);
       } else {
         console.log(pc.dim(`  report   (not written yet — expected at ${reportPath})`));
       }
+      console.log('');
+    });
+
+  /**
+   * Mark an abandoned run as cancelled.
+   *
+   * This is a bookkeeping operation for runs whose driving process is gone
+   * (crashed terminal, killed desktop app, …): it flips the stored status to
+   * 'cancelled' and stamps finishedAt. It CANNOT signal a live orchestrator
+   * process (yet) — a run that is actively executing will keep going.
+   */
+  cmd
+    .command('cancel <runId>')
+    .description('Mark an abandoned (non-terminal) run as cancelled — does not stop a live process')
+    .action(async (runId: string) => {
+      const store = await getStore();
+      if (!store) {
+        storeUnavailable();
+        process.exitCode = 1;
+        return;
+      }
+
+      const run = store.getRun(runId);
+      if (!run) {
+        console.log('');
+        console.log(pc.red(`  ✖ No run found with id ${pc.bold(runId)}.`));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+
+      if (isTerminalRunStatus(run.status)) {
+        console.log('');
+        console.log(pc.yellow(`  ⚠ Run ${pc.bold(runId)} is already ${run.status} — nothing to cancel.`));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+
+      store.updateRunStatus(runId, 'cancelled', { finishedAt: new Date().toISOString() });
+      console.log('');
+      console.log(pc.green(`  ✔ Run ${pc.bold(runId)} marked as cancelled (was ${run.status}).`));
+      console.log(pc.dim('    Note: this updates the stored status only; it cannot stop a live process.'));
+      console.log('');
+    });
+
+  cmd
+    .command('rm <runId>')
+    .description('Delete a run and its recorded tests/results/events from the local store')
+    .action(async (runId: string) => {
+      const store = await getStore();
+      if (!store) {
+        storeUnavailable();
+        process.exitCode = 1;
+        return;
+      }
+
+      const run = store.getRun(runId);
+      if (!run) {
+        console.log('');
+        console.log(pc.red(`  ✖ No run found with id ${pc.bold(runId)}.`));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+
+      store.deleteRun(runId);
+      console.log('');
+      console.log(
+        pc.green(`  ✔ Deleted run ${pc.bold(runId)} (project ${run.projectId}) from the local store.`),
+      );
+      console.log(pc.dim('    On-disk artifacts under the project folder are kept.'));
       console.log('');
     });
 }

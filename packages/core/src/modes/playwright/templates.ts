@@ -52,9 +52,11 @@ export interface ConfigOptions {
 
 /**
  * playwright.config.ts wiring the three Healix tiers as Playwright projects,
- * a JSON + HTML reporter, and the on-failure artifact policy. Tier B depends on
- * an auth storageState produced by fixtures/auth.setup.ts; when no credentials
- * are wired the setup is a no-op and Tier B specs simply run unauthenticated.
+ * a JSON + HTML reporter, and the artifact policy: every test records a
+ * screenshot + video (so the run detail can always show what happened), while
+ * traces are kept only for failures. Tier B depends on an auth storageState
+ * produced by fixtures/auth.setup.ts; when no credentials are wired the setup
+ * is a no-op and Tier B specs simply run unauthenticated.
  */
 export function playwrightConfigContents(opts: ConfigOptions = {}): string {
   const baseUrl = (opts.baseUrl ?? '').trim();
@@ -84,8 +86,8 @@ export default defineConfig({
   ],
   use: {
     baseURL: ${baseUrlLiteral},
-    screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    screenshot: 'on',
+    video: 'on',
     trace: 'retain-on-failure',
   },
   projects: [

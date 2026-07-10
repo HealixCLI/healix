@@ -1,14 +1,24 @@
 import type { Command } from 'commander';
 import pc from 'picocolors';
 import { doctor } from '@healix/core';
+import { doctorExitCode } from '../lib/helpers.js';
 
 export function registerDoctor(program: Command): void {
   program
     .command('doctor')
     .description('Check environment, local storage, and AI provider health')
     .option('--no-probe', 'skip the live provider auth round-trip (detection only)')
-    .action(async (opts: { probe?: boolean }) => {
+    .option('--json', 'output the doctor report as JSON')
+    .action(async (opts: { probe?: boolean; json?: boolean }) => {
       const probe = opts.probe !== false;
+
+      if (opts.json) {
+        const rep = await doctor({ probe });
+        console.log(JSON.stringify(rep, null, 2));
+        process.exitCode = doctorExitCode(rep, { probe });
+        return;
+      }
+
       console.log(pc.bold('\n  Healix doctor\n'));
 
       const rep = await doctor({ probe });
@@ -47,5 +57,7 @@ export function registerDoctor(program: Command): void {
           : pc.yellow('  ⚠ No authenticated provider yet — log in to Claude (or install/login Codex).'),
       );
       console.log('');
+
+      process.exitCode = doctorExitCode(rep, { probe });
     });
 }

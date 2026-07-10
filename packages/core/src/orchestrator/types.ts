@@ -24,6 +24,12 @@ export interface RunOptions {
   autoApprove?: boolean;
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
+  /**
+   * Cooperative cancellation. When aborted, the run stops at the next phase
+   * boundary (and in-flight provider/suite work is killed), the run row is
+   * marked 'cancelled', and run() resolves with that summary — it never rejects.
+   */
+  signal?: AbortSignal;
 }
 
 export interface OrchestratorEvent {
@@ -57,7 +63,11 @@ export interface RunSummary {
   outcome?: ExecOutcome;
 }
 
-/** Drives the resumable run lifecycle: plan → approve → explore → generate → execute → triage → report → export. */
+/**
+ * Drives the run lifecycle: plan → approve → explore → generate → execute →
+ * triage → report → export. Every phase is checkpointed to SQLite; resuming an
+ * interrupted run is not implemented (a new run must be started).
+ */
 export interface Orchestrator {
   run(opts: RunOptions, hooks?: OrchestratorHooks): Promise<RunSummary>;
 }

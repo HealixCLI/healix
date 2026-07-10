@@ -15,49 +15,89 @@ export interface ExportOptions {
   zip?: boolean;
 }
 
+/** Bundle info returned by {@link exportSuite}: a {@link SuiteBundle} plus
+ * the list of entries skipped for safety (backward-compatible extension). */
+export interface ExportedSuiteBundle extends SuiteBundle {
+  /**
+   * Suite-relative POSIX paths of entries that were deliberately NOT copied
+   * for safety reasons (currently: symlinks whose real target escapes the
+   * suite root). Empty when nothing was skipped.
+   */
+  skipped: string[];
+}
+
 /** Directory names excluded from the export at any depth. */
 const EXCLUDED_DIRS = new Set<string>([
   'node_modules',
   'test-results',
   'playwright-report',
   '.git',
+  // `.auth` holds live browser storageState (real cookies / auth tokens)
+  // written by the auth fixture — exporting it leaks working credentials.
+  '.auth',
 ]);
+
+/**
+ * File names excluded only when they sit at the suite root. Playwright's JSON
+ * report (`results.json`) and run bookkeeping (`.last-run.json`) can embed
+ * response bodies/headers captured from the app under test, so they must not
+ * ship in a shareable bundle. Same-named files nested deeper (e.g. user
+ * fixtures) are left alone.
+ */
+const ROOT_EXCLUDED_FILES = new Set<string>(['results.json', '.last-run.json']);
 
 /**
  * Decide whether a directory entry should be excluded from the export.
  * Mirrors the exclusion rules in the module spec (build artefacts, VCS,
- * captured auth state, dotenv files, and logs).
+ * captured auth state, runner reports, dotenv files, OS metadata, and logs).
  */
-function isExcluded(name: string, isDirectory: boolean): boolean {
+function isExcluded(name: string, isDirectory: boolean, atRoot: boolean): boolean {
   if (isDirectory) {
     return EXCLUDED_DIRS.has(name);
   }
+  // Playwright report / bookkeeping files at the suite root.
+  if (atRoot && ROOT_EXCLUDED_FILES.has(name)) return true;
   // auth-state-*.json (captured login/session state).
   if (/^auth-state-.*\.json$/i.test(name)) return true;
   // .env, .env.local, .env.production, etc.
   if (/^\.env(\..+)?$/i.test(name)) return true;
   // *.log
   if (/\.log$/i.test(name)) return true;
+  // macOS Finder metadata — never useful in a shared bundle.
+  if (name === '.DS_Store') return true;
   return false;
+}
+
+/** Shared state threaded through the recursive copy. */
+interface CopyContext {
+  /** Original suite root (resolved); sanitization anchor + root-file rules. */
+  rootSrcDir: string;
+  /** Resolved output root, so the export never recurses into itself. */
+  rootDestDir: string;
+  /** `realpath` of the suite root — the containment boundary for symlinks. */
+  realRootDir: string;
+  /** Strip secrets / local absolute paths from text files. */
+  sanitize: boolean;
+  /** Canonical directories already entered (symlink-cycle guard). */
+  visited: Set<string>;
+  /** Suite-relative paths skipped for safety (outward symlinks). */
+  skipped: string[];
 }
 
 /**
  * Recursively copy `srcDir` into `destDir`, honouring the exclusion rules.
- * Text files are sanitized in place when `sanitize` is true. Symlinks are
- * dereferenced (copied as their target's contents) to keep the bundle
- * self-contained; broken/circular links are skipped defensively.
+ * Text files are sanitized in place when `ctx.sanitize` is true. Symlinks
+ * whose real target stays inside the suite root are dereferenced (copied as
+ * their target's contents) to keep the bundle self-contained; broken/circular
+ * links are skipped defensively.
  *
- * `rootSrcDir` is the original suite root, used as the sanitization anchor so
- * the same absolute prefix is stripped consistently at every depth.
+ * Symlink containment: a symlink whose real target resolves OUTSIDE the suite
+ * root is skipped and recorded in `ctx.skipped`. Dereferencing an outward
+ * link is an exfiltration primitive — e.g. `ln -s ~/.ssh/id_rsa key.txt`
+ * inside the suite would otherwise silently copy the private key into a
+ * bundle that is meant to be shared.
  */
-async function copyTree(
-  srcDir: string,
-  destDir: string,
-  rootSrcDir: string,
-  rootDestDir: string,
-  sanitize: boolean,
-  visited: Set<string>,
-): Promise<void> {
+async function copyTree(srcDir: string, destDir: string, ctx: CopyContext): Promise<void> {
   // Cycle guard: resolve to the canonical path and skip directories we have
   // already entered, so a self/ancestor directory symlink cannot loop forever.
   let canonical: string;
@@ -67,8 +107,8 @@ async function copyTree(
     // Missing/dangling — nothing to copy.
     return;
   }
-  if (visited.has(canonical)) return;
-  visited.add(canonical);
+  if (ctx.visited.has(canonical)) return;
+  ctx.visited.add(canonical);
 
   let entries;
   try {
@@ -80,6 +120,8 @@ async function copyTree(
 
   await fs.mkdir(destDir, { recursive: true });
 
+  const atRoot = srcDir === ctx.rootSrcDir;
+
   for (const entry of entries) {
     const name = entry.name;
     const srcPath = path.join(srcDir, name);
@@ -87,12 +129,28 @@ async function copyTree(
 
     // Guard against the output directory living inside the source tree, which
     // would otherwise cause the export to recursively copy itself.
-    if (path.resolve(srcPath) === rootDestDir) continue;
+    if (path.resolve(srcPath) === ctx.rootDestDir) continue;
 
     // Resolve symlinks to a real entry type before applying rules.
     let isDirectory = entry.isDirectory();
     let isFile = entry.isFile();
     if (entry.isSymbolicLink()) {
+      // Containment check: refuse to dereference links that escape the suite
+      // root (see the function doc-comment — outward links are an
+      // exfiltration primitive). Record the skip so callers can surface it.
+      let realTarget: string;
+      try {
+        realTarget = await fs.realpath(srcPath);
+      } catch {
+        // Dangling symlink — skip silently, as before.
+        continue;
+      }
+      const rel = path.relative(ctx.realRootDir, realTarget);
+      const escapes = rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel);
+      if (escapes) {
+        ctx.skipped.push(toPosix(path.relative(ctx.rootSrcDir, srcPath)));
+        continue;
+      }
       try {
         const st = await fs.stat(srcPath);
         isDirectory = st.isDirectory();
@@ -103,10 +161,10 @@ async function copyTree(
       }
     }
 
-    if (isExcluded(name, isDirectory)) continue;
+    if (isExcluded(name, isDirectory, atRoot)) continue;
 
     if (isDirectory) {
-      await copyTree(srcPath, destPath, rootSrcDir, rootDestDir, sanitize, visited);
+      await copyTree(srcPath, destPath, ctx);
       continue;
     }
 
@@ -115,7 +173,7 @@ async function copyTree(
       continue;
     }
 
-    await copyFile(srcPath, destPath, rootSrcDir, sanitize);
+    await copyFile(srcPath, destPath, ctx.rootSrcDir, ctx.sanitize);
   }
 }
 
@@ -184,13 +242,14 @@ async function listFiles(dir: string): Promise<string[]> {
  * Export a generated, runnable suite into a standalone, shareable bundle.
  *
  * Produces `outDir` (a sanitized copy of `suiteDir` minus build artefacts,
- * VCS data, captured auth state, dotenv files, and logs) and, by default, a
- * sibling `<outDir>.zip`. Returns a {@link SuiteBundle} describing the result.
+ * VCS data, captured auth state, runner reports, dotenv files, and logs) and,
+ * by default, a sibling `<outDir>.zip`. Returns an {@link ExportedSuiteBundle}
+ * describing the result, including any entries skipped for safety.
  *
  * Defensive: creates `outDir` if absent, never throws on a missing optional
  * source directory, and never leaves a partial process resource open.
  */
-export async function exportSuite(opts: ExportOptions): Promise<SuiteBundle> {
+export async function exportSuite(opts: ExportOptions): Promise<ExportedSuiteBundle> {
   const sanitize = opts.sanitize ?? true;
   const makeZip = opts.zip ?? true;
 
@@ -200,14 +259,31 @@ export async function exportSuite(opts: ExportOptions): Promise<SuiteBundle> {
   // Always materialise the destination, even for an empty/missing source.
   await fs.mkdir(outDir, { recursive: true });
 
+  // Canonical suite root: the containment boundary for symlink targets.
+  // (Falls back to the resolved path when the source does not exist yet.)
+  let realRootDir: string;
+  try {
+    realRootDir = await fs.realpath(suiteDir);
+  } catch {
+    realRootDir = suiteDir;
+  }
+
   // Copy the tree. The file manifest is rebuilt authoritatively via listFiles
   // afterwards to guarantee it reflects exactly what landed on disk. A shared
   // visited-set provides a cycle guard against directory symlink loops.
-  await copyTree(suiteDir, outDir, suiteDir, outDir, sanitize, new Set<string>());
+  const skipped: string[] = [];
+  await copyTree(suiteDir, outDir, {
+    rootSrcDir: suiteDir,
+    rootDestDir: outDir,
+    realRootDir,
+    sanitize,
+    visited: new Set<string>(),
+    skipped,
+  });
 
   const files = await listFiles(outDir);
 
-  const bundle: SuiteBundle = { dir: outDir, files };
+  const bundle: ExportedSuiteBundle = { dir: outDir, files, skipped };
 
   if (makeZip) {
     const zipPath = `${outDir}.zip`;

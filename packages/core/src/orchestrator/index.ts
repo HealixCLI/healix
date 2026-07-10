@@ -15,11 +15,12 @@ import type {
   TestPlan,
 } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
+import { findFreePort } from '../target/launcher.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
-import { buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
+import { buildPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
@@ -41,7 +42,11 @@ const TRIAGE_AI_LIMIT = 3;
 const STORE_FAILURE_WARN_THRESHOLD = 3;
 
 /**
- * Real resumable run state machine for the Healix orchestrator.
+ * Run state machine for the Healix orchestrator. Every phase transition is
+ * checkpointed to SQLite (run status + events), so an interrupted run is fully
+ * inspectable after the fact — but runs are NOT resumable: an interrupted run
+ * stays in its last recorded state and a new run must be started. (Startup
+ * reconciliation of orphaned rows lives in HealixStore.failOrphanedRuns().)
  *
  * `overrides` is a dependency-injection seam for testability: each dependency is
  * resolved as `override ?? current-default`, so `createOrchestrator()` with no
@@ -157,7 +162,22 @@ async function runPipeline(
     }
   };
 
-  const ctxEmit = (phase: string, message: string, data?: unknown): void => emit(phase, 'info', message, data);
+  const ctxEmit = (phase: string, message: string, data?: unknown): void =>
+    emit(phase, 'info', message, data);
+
+  // Cooperative cancellation. checkCancelled() is polled at every phase
+  // boundary; in-flight provider/suite work additionally receives the signal
+  // directly (ctx.signal, CompleteOptions.signal) so long-running phases can
+  // be interrupted from within. A cancelled run RESOLVES with a 'cancelled'
+  // summary — cancellation is a normal outcome, never a rejection — and the
+  // shared `finally` still tears down any white-box launch.
+  const signal = opts.signal;
+  const checkCancelled = (): boolean => signal?.aborted === true;
+  const cancelRun = (phase: OrchestratorPhase | string, message = 'Run cancelled by caller.'): RunSummary => {
+    emit(phase, 'info', message);
+    setStatus('cancelled', { finishedAt: nowIso() });
+    return { runId, status: 'cancelled' };
+  };
 
   try {
     await mkdir(join(runDir, 'plan'), { recursive: true });
@@ -188,6 +208,7 @@ async function runPipeline(
 
   try {
     // ---- 3. PLAN ----
+    if (checkCancelled()) return cancelRun('plan');
     setStatus('planning');
     emit('plan', 'info', 'Selecting planning provider.');
     // An injected provider override bypasses the router entirely (used in tests).
@@ -203,17 +224,45 @@ async function runPipeline(
     }
     emit('plan', 'info', `Planning with provider "${provider.id}".`);
 
-    plan = await runPlanPhase(provider, project, opts, emit, overrides);
+    // The target adapter is built before planning (it is a cheap bag of
+    // functions) so the plan phase can reuse its repo indexer for grounding.
+    const target = makeTarget();
+
+    // Best-effort repo grounding: a white-box plan is dramatically better when
+    // the model can see the repo's real structure (routes/pages/dirs), but
+    // indexing must never block or break planning — any failure simply means
+    // "plan without repo context".
+    let repoIndex: PlanRepoContext | undefined;
+    if (project.repoPath) {
+      try {
+        const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
+        repoIndex = { summary: idx.summary, files: idx.files };
+        emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
+      } catch (err) {
+        emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+      }
+    }
+
+    plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
     await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
     setStatus('awaiting-approval');
 
     // ---- 4. APPROVE ----
+    if (checkCancelled()) return cancelRun('approve');
     if (!opts.autoApprove && hooks?.onPlan) {
       emit('approve', 'info', 'Awaiting plan approval.');
       let approved = false;
       try {
-        approved = await hooks.onPlan(plan);
+        // Race the (potentially indefinite) human approval gate against abort:
+        // a run cancelled while parked at the gate must resolve 'cancelled',
+        // not hang forever awaiting an approval that will never come. The
+        // gate's eventual result is simply discarded after an abort.
+        const gate = await raceAbort(hooks.onPlan(plan), signal);
+        if (gate === ABORTED) {
+          return cancelRun('approve', 'Run cancelled while awaiting approval.');
+        }
+        approved = gate;
       } catch (err) {
         emit('approve', 'warn', `Approval gate threw: ${errMsg(err)}`, { stack: errStack(err) });
         approved = false;
@@ -229,24 +278,41 @@ async function runPipeline(
     }
 
     // ---- 5. ctx ----
-    const target = makeTarget();
     const browser = makeBrowser();
 
     // ---- 5b. LAUNCH (white-box) ----
     // A white-box project (repoPath set, no baseUrl) has no live URL yet, so detect + launch
     // the app and target the resulting URL. Best-effort: on failure, fall back to the detected
     // baseUrl rather than aborting. The handle is always stopped in the run's cleanup.
+    if (checkCancelled()) return cancelRun('launch');
     if (!project.baseUrl && project.repoPath) {
       const repoPath = project.repoPath;
       try {
         emit('launch', 'info', `[launch] Detecting app in ${repoPath}.`);
         const det = await target.detect(repoPath);
+        // Per-run port allocation: two concurrent runs of the same project
+        // previously both launched on the framework-default port — the second
+        // launch's readiness poll then hit the FIRST run's server and the two
+        // runs silently tested each other. Resolve a known-free port up front
+        // (preferring the detected one) and hand exactly that to launch().
+        const port = await findFreePort(det.port ?? undefined);
+        if (det.port !== null && port !== det.port) {
+          emit(
+            'launch',
+            'info',
+            `[launch] Detected port ${det.port} is in use; launching on free port ${port} instead.`,
+            { detectedPort: det.port, port },
+          );
+        }
         emit('launch', 'info', `[launch] Launching app (${det.startCommand ?? 'auto'}).`);
         const handle = await target.launch({
           repoPath,
           startCommand: det.startCommand ?? undefined,
-          baseUrl: det.baseUrl ?? undefined,
-          port: det.port ?? undefined,
+          // det.baseUrl embeds the DETECTED port; when the allocated port
+          // differs, omit it so launch() derives the URL from `port` and the
+          // readiness poll targets the server this run actually started.
+          baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
+          port,
           readyTimeoutMs: 120000,
         });
         launchHandle = handle;
@@ -268,10 +334,15 @@ async function runPipeline(
       browser,
       explorationMode: opts.explorationMode ?? 'codegen',
       emit: ctxEmit,
+      // Long mode phases (generate/execute) receive the run's abort signal so
+      // in-flight provider/suite work is killed on cancellation, not just
+      // skipped at the next phase boundary.
+      signal,
     };
     const mode = getMode(project.mode);
 
     // ---- 6. EXPLORE (best-effort) ----
+    if (checkCancelled()) return cancelRun('explore');
     if (effectiveBaseUrl && ctx.explorationMode === 'computer-use') {
       setStatus('exploring');
       emit('explore', 'info', `Exploring ${effectiveBaseUrl} (computer-use).`);
@@ -312,6 +383,7 @@ async function runPipeline(
     }
 
     // ---- 7. GENERATE ----
+    if (checkCancelled()) return cancelRun('generate');
     setStatus('generating');
     emit('generate', 'info', 'Scaffolding suite.');
     try {
@@ -333,12 +405,22 @@ async function runPipeline(
       emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
       const summary = await finalizeReport(
-        runDir, run, project, currentStatus, plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+        runDir,
+        run,
+        project,
+        currentStatus,
+        plan,
+        outcome,
+        triageEntries,
+        artifactFiles,
+        noteStoreOk,
+        noteStoreFailure,
       );
       return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
 
     // ---- 8. EXECUTE ----
+    if (checkCancelled()) return cancelRun('execute');
     setStatus('executing');
     emit('execute', 'info', `Executing ${specs.length} spec(s).`);
     try {
@@ -354,7 +436,16 @@ async function runPipeline(
       emit('execute', 'error', `Execution failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
       const summary = await finalizeReport(
-        runDir, run, project, currentStatus, plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+        runDir,
+        run,
+        project,
+        currentStatus,
+        plan,
+        outcome,
+        triageEntries,
+        artifactFiles,
+        noteStoreOk,
+        noteStoreFailure,
       );
       return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
@@ -367,7 +458,9 @@ async function runPipeline(
       artifactFiles = collected.files;
       emit('execute', 'info', `Collected ${artifactFiles.length} artifact file(s).`, { dir: collected.dir });
     } catch (err) {
-      emit('execute', 'warn', `Artifact collection failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+      emit('execute', 'warn', `Artifact collection failed (continuing): ${errMsg(err)}`, {
+        stack: errStack(err),
+      });
     }
 
     // ---- 9. TRIAGE (best-effort) ----
@@ -375,6 +468,7 @@ async function runPipeline(
     // few failures we additionally try AI analyze() with a short per-call timeout
     // and merge its verdict/confidence in; analyze() already falls back to
     // classify() internally, so the baseline is never lost. Triage never aborts.
+    if (checkCancelled()) return cancelRun('triage');
     setStatus('triaging');
     try {
       const failed = outcome.results.filter((r) => r.status === 'failed');
@@ -385,9 +479,7 @@ async function runPipeline(
         for (const r of failed) {
           // Recover the originating spec (by normalized title) to ground the triage
           // input with its requirement tag and source.
-          const spec = specs.find(
-            (s) => stableKey(undefined, s.title) === stableKey(undefined, r.title),
-          );
+          const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
           const input: TriageInput = {
             title: r.title,
             error: r.error ?? '',
@@ -406,10 +498,7 @@ async function runPipeline(
           if (aiBudget > 0) {
             aiBudget -= 1;
             try {
-              const enriched = await withTimeout(
-                engine.analyze(input, provider),
-                TRIAGE_ANALYZE_TIMEOUT_MS,
-              );
+              const enriched = await withTimeout(engine.analyze(input, provider), TRIAGE_ANALYZE_TIMEOUT_MS);
               if (enriched) triage = enriched;
             } catch (err) {
               // Timeout / analyze() threw — keep the deterministic baseline.
@@ -427,23 +516,37 @@ async function runPipeline(
     }
 
     // ---- 10. REPORT ----
+    if (checkCancelled()) return cancelRun('report');
     setStatus('reporting');
     emit('report', 'info', 'Writing report.');
     const reportPath = (
       await finalizeReport(
-        runDir, run, project, currentStatus, plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+        runDir,
+        run,
+        project,
+        currentStatus,
+        plan,
+        outcome,
+        triageEntries,
+        artifactFiles,
+        noteStoreOk,
+        noteStoreFailure,
       )
     ).reportPath;
 
     // ---- 11. EXPORT (best-effort) ----
     // Prefer the mode's own export() for the suite bundle; fall back to the
     // standalone exportSuite() if it throws. Either way, never abort the run.
+    if (checkCancelled()) return cancelRun('export');
     let suite: RunSummary['suite'];
     try {
       emit('export', 'info', 'Exporting suite bundle.');
       suite = await exportViaMode(mode, ctx, runDir, emit);
       if (suite) {
-        emit('export', 'info', `Exported ${suite.files.length} file(s).`, { dir: suite.dir, zipPath: suite.zipPath });
+        emit('export', 'info', `Exported ${suite.files.length} file(s).`, {
+          dir: suite.dir,
+          zipPath: suite.zipPath,
+        });
       }
     } catch (err) {
       emit('export', 'warn', `Export failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
@@ -461,7 +564,16 @@ async function runPipeline(
     try {
       reportPath = (
         await finalizeReport(
-          runDir, run, project, 'error', plan, outcome, triageEntries, artifactFiles, noteStoreOk, noteStoreFailure,
+          runDir,
+          run,
+          project,
+          'error',
+          plan,
+          outcome,
+          triageEntries,
+          artifactFiles,
+          noteStoreOk,
+          noteStoreFailure,
         )
       ).reportPath;
     } catch {
@@ -544,8 +656,9 @@ async function runPlanPhase(
   opts: RunOptions,
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
   overrides?: OrchestratorOverrides,
+  repoIndex?: PlanRepoContext,
 ): Promise<TestPlan> {
-  const prompt = buildPlanPrompt(project, opts);
+  const prompt = buildPlanPrompt(project, opts, repoIndex);
   // Attempt a single completion with one provider; classifies the outcome so the
   // caller can decide whether to retry with a fallback.
   const attempt = async (
@@ -555,6 +668,10 @@ async function runPlanPhase(
       const completion = await p.complete(prompt, {
         mode: 'plan',
         cwd: project.repoPath ?? undefined,
+        // Cancellation kills the in-flight provider CLI instead of letting a
+        // cancelled run keep burning tokens; the adapter resolves ok:false,
+        // and the pipeline's next boundary check turns that into 'cancelled'.
+        signal: opts.signal,
       });
       if (completion.ok && completion.text) {
         const parsed = parsePlan(completion.text);
@@ -610,17 +727,24 @@ function persistResults(
   noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
   for (const r of outcome.results) {
-    // Recover the spec by normalized title, then key on the SAME stable key used in GENERATE
-    // (reqTag preferred) so we reuse the row inserted there instead of duplicating it.
-    const matched = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
-    const key = stableKey(matched?.reqTag, matched?.title ?? r.title);
+    // The generated test titles are the model's own words, but they are guaranteed
+    // to carry the "[REQ:<tag>]" marker (ensureReqTag). Recover the tag from the
+    // result title first — it keys directly onto the row inserted in GENERATE —
+    // and only fall back to normalized-title matching when no tag survived.
+    const tagFromTitle = extractReqTag(r.title);
+    const matched = specs.find(
+      (s) =>
+        (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
+        stableKey(undefined, s.title) === stableKey(undefined, r.title),
+    );
+    const key = stableKey(tagFromTitle ?? matched?.reqTag, matched?.title ?? r.title);
     let testId = testIdByKey.get(key);
     if (!testId) {
       // No spec matched this result — insert a single fallback test row to anchor it.
       const fallback = store.insertTest({
         runId,
         title: r.title,
-        reqTag: matched?.reqTag ?? null,
+        reqTag: matched?.reqTag ?? tagFromTitle,
         tier: (matched?.tier ?? null) as Tier | null,
         status: r.status as TestStatus,
       });
@@ -635,12 +759,22 @@ function persistResults(
         error: r.error ?? null,
         artifactsJson: r.artifacts && r.artifacts.length > 0 ? JSON.stringify(r.artifacts) : null,
       });
+      // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
+      // report command) would otherwise see every test as eternally 'pending'.
+      store.updateTestStatus(testId, r.status as TestStatus);
       noteStoreOk();
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
     }
   }
+}
+
+/** Pull the "[REQ:<tag>]" marker out of an executed test's title, if present. */
+function extractReqTag(title: string): string | null {
+  const m = title.match(/\[REQ:([^\]]+)\]/i);
+  const tag = m?.[1]?.trim();
+  return tag && tag.length > 0 ? tag : null;
 }
 
 /** Stable identity for matching a result back to its spec: reqTag when present, else normalized title. */
@@ -701,6 +835,35 @@ async function exportViaMode(
     emit('export', 'debug', `mode.export() failed; falling back to exportSuite(): ${errMsg(err)}`);
     return exportSuite({ suiteDir: ctx.projectDir, outDir: join(runDir, 'export') });
   }
+}
+
+/** Sentinel resolved by raceAbort() when the signal wins the race. */
+const ABORTED = Symbol('healix.run.aborted');
+
+/**
+ * Race a promise against an AbortSignal. Resolves with the promise's value, or
+ * with the ABORTED sentinel the moment the signal fires — the underlying
+ * promise is left to settle in the background and its result is discarded.
+ * A sentinel (rather than a rejection) keeps cancellation on the normal
+ * control-flow path: run() must resolve 'cancelled', never reject.
+ */
+function raceAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T | typeof ABORTED> {
+  if (!signal) return p;
+  if (signal.aborted) return Promise.resolve(ABORTED);
+  return new Promise<T | typeof ABORTED>((resolve, reject) => {
+    const onAbort = (): void => resolve(ABORTED);
+    signal.addEventListener('abort', onAbort, { once: true });
+    p.then(
+      (v) => {
+        signal.removeEventListener('abort', onAbort);
+        resolve(v);
+      },
+      (err: unknown) => {
+        signal.removeEventListener('abort', onAbort);
+        reject(err instanceof Error ? err : new Error(String(err)));
+      },
+    );
+  });
 }
 
 /** Reject after `ms` if `p` has not settled, so a single provider call cannot stall triage. */

@@ -12,6 +12,8 @@ export interface Project {
   repoPath: string | null;
   baseUrl: string | null;
   createdAt: string;
+  /** Soft-archive timestamp; null = active. Archived projects keep all data. */
+  archivedAt: string | null;
 }
 
 export type RunStatus =

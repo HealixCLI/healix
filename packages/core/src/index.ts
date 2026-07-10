@@ -42,7 +42,7 @@ export { createTriageEngine } from './triage/index.js';
 export * from './triage/types.js';
 
 // Env + utilities
-export { appDataDir, ensureAppDataDir, dbPath, projectsDir } from './env/app-data.js';
+export { appDataDir, ensureAppDataDir, dbPath, projectsDir, deleteProjectAssets } from './env/app-data.js';
 export { logger, setLogLevel, type LogLevel } from './logger.js';
 export { runCli, which, type RunResult } from './exec/run-cli.js';
 export { notImplemented } from './util/not-implemented.js';

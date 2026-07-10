@@ -29,21 +29,35 @@ export class HealixStore {
       repoPath: input.repoPath ?? null,
       baseUrl: input.baseUrl ?? null,
       createdAt: new Date().toISOString(),
+      archivedAt: null,
     };
     this.db
-      .prepare('INSERT INTO projects (id, name, mode, repo_path, base_url, created_at) VALUES (?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+      )
       .run(project.id, project.name, project.mode, project.repoPath, project.baseUrl, project.createdAt);
     return project;
   }
 
+  /** Soft-archive (or restore) a project. Archived projects keep all runs and assets. */
+  setProjectArchived(id: string, archived: boolean): void {
+    this.db
+      .prepare('UPDATE projects SET archived_at = ? WHERE id = ?')
+      .run(archived ? new Date().toISOString() : null, id);
+  }
+
   listProjects(): Project[] {
-    return (this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as Array<Record<string, unknown>>).map(
-      rowToProject,
-    );
+    return (
+      this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToProject);
   }
 
   getProject(id: string): Project | null {
-    const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? rowToProject(row) : null;
   }
 
@@ -57,7 +71,9 @@ export class HealixStore {
         )
         .run(id);
       // 2. agent_events of runs of this project
-      this.db.prepare('DELETE FROM agent_events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
+      this.db
+        .prepare('DELETE FROM agent_events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)')
+        .run(id);
       // 3. tests of runs of this project
       this.db.prepare('DELETE FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
       // 4. runs of this project
@@ -91,11 +107,44 @@ export class HealixStore {
       .prepare(
         'INSERT INTO runs (id, project_id, status, provider, mode, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(run.id, run.projectId, run.status, run.provider, run.mode, run.startedAt, run.finishedAt, run.createdAt);
+      .run(
+        run.id,
+        run.projectId,
+        run.status,
+        run.provider,
+        run.mode,
+        run.startedAt,
+        run.finishedAt,
+        run.createdAt,
+      );
     return run;
   }
 
-  updateRunStatus(id: string, status: RunStatus, patch: { startedAt?: string; finishedAt?: string } = {}): void {
+  /**
+   * Janitor for runs orphaned by a crash/quit mid-pipeline: any run still in a
+   * non-terminal status whose row is older than `olderThanMs` (default 6h) is
+   * marked 'error' with a finishedAt stamp. The age threshold exists because a
+   * run may legitimately be in flight in ANOTHER process (CLI vs desktop) — we
+   * only reap runs old enough that no real pipeline could still be driving them.
+   * Returns the number of runs reaped.
+   */
+  failOrphanedRuns(opts: { olderThanMs?: number } = {}): number {
+    const olderThanMs = opts.olderThanMs ?? 6 * 60 * 60 * 1000;
+    const cutoff = new Date(Date.now() - olderThanMs).toISOString();
+    const result = this.db
+      .prepare(
+        `UPDATE runs SET status = 'error', finished_at = ?
+         WHERE status NOT IN ('passed', 'failed', 'error', 'cancelled') AND created_at < ?`,
+      )
+      .run(new Date().toISOString(), cutoff);
+    return Number(result.changes ?? 0);
+  }
+
+  updateRunStatus(
+    id: string,
+    status: RunStatus,
+    patch: { startedAt?: string; finishedAt?: string } = {},
+  ): void {
     const fields: string[] = ['status = ?'];
     const values: unknown[] = [status];
     if (patch.startedAt !== undefined) {
@@ -111,16 +160,20 @@ export class HealixStore {
   }
 
   getRun(id: string): Run | null {
-    const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as Record<string, unknown> | undefined;
+    const row = this.db.prepare('SELECT * FROM runs WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
     return row ? rowToRun(row) : null;
   }
 
   listRuns(projectId?: string): Run[] {
     const rows = projectId
-      ? (this.db.prepare('SELECT * FROM runs WHERE project_id = ? ORDER BY created_at DESC').all(projectId) as Array<
+      ? (this.db
+          .prepare('SELECT * FROM runs WHERE project_id = ? ORDER BY created_at DESC')
+          .all(projectId) as Array<Record<string, unknown>>)
+      : (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Array<
           Record<string, unknown>
-        >)
-      : (this.db.prepare('SELECT * FROM runs ORDER BY created_at DESC').all() as Array<Record<string, unknown>>);
+        >);
     return rows.map(rowToRun);
   }
 
@@ -155,18 +208,25 @@ export class HealixStore {
     return full;
   }
 
+  /** Reflect an execution outcome back onto the test row (inserted as 'pending' in GENERATE). */
+  updateTestStatus(id: string, status: TestStatus): void {
+    this.db.prepare('UPDATE tests SET status = ? WHERE id = ?').run(status, id);
+  }
+
   insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
     const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
     this.db
-      .prepare('INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)',
+      )
       .run(full.id, full.testId, full.status, full.durationMs, full.error, full.artifactsJson);
     return full;
   }
 
   listTests(runId: string): TestCase[] {
-    return (this.db.prepare('SELECT * FROM tests WHERE run_id = ?').all(runId) as Array<Record<string, unknown>>).map(
-      rowToTest,
-    );
+    return (
+      this.db.prepare('SELECT * FROM tests WHERE run_id = ?').all(runId) as Array<Record<string, unknown>>
+    ).map(rowToTest);
   }
 
   /** All result rows for a run, joined through tests (results have no run_id of their own). */
@@ -179,7 +239,12 @@ export class HealixStore {
   }
 
   // ---- orchestrator events (resumable checkpoints) ----
-  appendEvent(runId: string, phase: string, message: string, opts: { level?: EventLevel; data?: unknown } = {}): AgentEvent {
+  appendEvent(
+    runId: string,
+    phase: string,
+    message: string,
+    opts: { level?: EventLevel; data?: unknown } = {},
+  ): AgentEvent {
     const evt: AgentEvent = {
       id: `evt_${nanoid(10)}`,
       runId,
@@ -190,16 +255,18 @@ export class HealixStore {
       createdAt: new Date().toISOString(),
     };
     this.db
-      .prepare('INSERT INTO agent_events (id, run_id, phase, level, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)')
+      .prepare(
+        'INSERT INTO agent_events (id, run_id, phase, level, message, data_json, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
       .run(evt.id, evt.runId, evt.phase, evt.level, evt.message, evt.dataJson, evt.createdAt);
     return evt;
   }
 
   listEvents(runId: string): AgentEvent[] {
     return (
-      this.db.prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC').all(runId) as Array<
-        Record<string, unknown>
-      >
+      this.db
+        .prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC')
+        .all(runId) as Array<Record<string, unknown>>
     ).map(rowToEvent);
   }
 }
@@ -240,6 +307,7 @@ function rowToProject(r: Record<string, unknown>): Project {
     repoPath: s(r.repo_path),
     baseUrl: s(r.base_url),
     createdAt: String(r.created_at),
+    archivedAt: s(r.archived_at),
   };
 }
 

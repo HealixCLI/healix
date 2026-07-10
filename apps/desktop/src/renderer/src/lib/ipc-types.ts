@@ -44,6 +44,8 @@ export interface RunDetail {
   report: unknown | null;
   suiteDir: string | null;
   artifacts: string[];
+  /** Absolute path to the run's rendered HTML report, when present on disk. */
+  reportHtmlPath: string | null;
 }
 
 /**
@@ -92,4 +94,5 @@ export type RunChannelMessage =
   | { channel: 'run:event'; payload: { runId: string; event: OrchestratorEvent } }
   | { channel: 'run:plan'; payload: { runId: string; plan: TestPlan } }
   | { channel: 'run:done'; payload: { runId: string; summary: RunSummary } }
-  | { channel: 'run:frame'; payload: { runId: string; pngBase64: string } };
+  // Live browser mirror frame (JPEG, base64) for computer-use runs.
+  | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } };

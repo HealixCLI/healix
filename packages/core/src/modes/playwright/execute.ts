@@ -19,20 +19,101 @@ function stripAnsi(text: string): string {
   return (text ?? '').replace(ANSI_RE, '');
 }
 
+/**
+ * Env var names the suite subprocesses (npx/npm/playwright) are allowed to see.
+ * Matching is case-insensitive because Windows env names are case-insensitive
+ * (`Path` vs `PATH`). Everything NOT listed here — API keys, cloud creds,
+ * tokens, database URLs — is dropped.
+ */
+const SUITE_ENV_ALLOWLIST = new Set(
+  [
+    // Process basics — node/npm/npx cannot resolve or run without these.
+    'PATH',
+    'HOME',
+    'USERPROFILE',
+    'TMPDIR',
+    'TEMP',
+    'TMP',
+    'SHELL',
+    'LANG',
+    'LC_ALL',
+    'TERM',
+    'CI',
+    'NODE_ENV',
+    // npm / Playwright caches so installs and browser lookups keep working.
+    'npm_config_cache',
+    'PLAYWRIGHT_BROWSERS_PATH',
+    // Corporate proxies (npm install / browser download go through them).
+    'HTTP_PROXY',
+    'HTTPS_PROXY',
+    'NO_PROXY',
+    'http_proxy',
+    'https_proxy',
+    'no_proxy',
+    // Windows needs these for cmd.exe, .cmd shims, and npm/node to function.
+    'SystemRoot',
+    'ComSpec',
+    'PATHEXT',
+    'APPDATA',
+    'LOCALAPPDATA',
+    'ProgramFiles',
+  ].map((k) => k.toLowerCase()),
+);
+
+/**
+ * Build the environment for suite subprocesses from an explicit allowlist.
+ *
+ * WHY: the specs we execute are UNTRUSTED MODEL OUTPUT. The previous
+ * `{ ...process.env }` spread handed every host secret (API keys, cloud
+ * credentials, tokens) to whatever code the model generated — one
+ * `process.env` read plus one fetch() inside a spec exfiltrates them all.
+ * Only what node/npm/Playwright genuinely need to run is passed through,
+ * plus every HEALIX_* var (our own config, by definition non-secret) and the
+ * HEALIX_BASE_URL injection the scaffolded playwright.config reads.
+ */
+export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [key, value] of Object.entries(process.env)) {
+    if (SUITE_ENV_ALLOWLIST.has(key.toLowerCase()) || key.startsWith('HEALIX_')) {
+      env[key] = value;
+    }
+  }
+  if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
+  return env;
+}
+
 interface RawCommand {
   code: number | null;
   signal: NodeJS.Signals | null;
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /** True when ctx.signal cancelled the run (before spawn or mid-flight). */
+  aborted: boolean;
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
 function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
-    const args = ['playwright', 'test', '--reporter=json'];
-    const env: NodeJS.ProcessEnv = { ...process.env };
-    if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
+    // Cancelled before we even spawned — return immediately; nothing to kill.
+    if (ctx.signal?.aborted) {
+      resolve({
+        code: null,
+        signal: null,
+        stdout: '',
+        stderr: '[aborted before start]',
+        timedOut: false,
+        aborted: true,
+      });
+      return;
+    }
+
+    // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
+    // list, which is what writes results.json (json) and playwright-report/
+    // (html). The config's reporters are the artifact source of truth.
+    const args = ['playwright', 'test'];
+    // Allowlisted env only — generated specs are untrusted; see suiteEnv().
+    const env = suiteEnv(ctx);
 
     let child: ChildProcess;
     try {
@@ -45,15 +126,29 @@ function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
     } catch (err) {
       // A synchronous spawn failure (e.g. ENOENT) is NOT a timeout; reserve
       // timedOut:true for the real setTimeout path so it isn't mislabeled.
-      resolve({ code: null, signal: null, stdout: '', stderr: String(err), timedOut: false });
+      resolve({
+        code: null,
+        signal: null,
+        stdout: '',
+        stderr: String(err),
+        timedOut: false,
+        aborted: false,
+      });
       return;
     }
 
-    let stdout = '';
-    let stderr = '';
+    // Accumulate raw chunks and decode ONCE on settle — per-chunk toString()
+    // can split a multi-byte UTF-8 sequence and corrupt the JSON report.
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let timedOut = false;
+    let aborted = false;
+    const decoded = (): { stdout: string; stderr: string } => ({
+      stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+      stderr: Buffer.concat(stderrChunks).toString('utf8'),
+    });
 
     const kill = (signal: NodeJS.Signals): void => {
       if (!child.pid) return;
@@ -81,24 +176,52 @@ function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
       if (timedOut) kill('SIGKILL');
     }, EXEC_TIMEOUT_MS + 5_000);
 
+    // Cooperative cancellation: abort takes the SAME kill path as the timeout
+    // (SIGTERM the process group, then SIGKILL if it lingers). We do not
+    // resolve here — the child's 'close' event settles the promise so partial
+    // output is still decoded and no double-resolve is possible.
+    let abortHardKill: NodeJS.Timeout | undefined;
+    const onAbort = (): void => {
+      aborted = true;
+      emit(ctx, 'Execution aborted by caller; terminating', { pid: child.pid });
+      kill('SIGTERM');
+      abortHardKill = setTimeout(() => kill('SIGKILL'), 5_000);
+    };
+    ctx.signal?.addEventListener('abort', onAbort, { once: true });
+
+    const cleanup = (): void => {
+      clearTimeout(timer);
+      clearTimeout(hardKill);
+      if (abortHardKill) clearTimeout(abortHardKill);
+      // Remove the listener on settle so a long-lived AbortSignal (reused
+      // across phases) does not accumulate dead listeners / leak the closure.
+      ctx.signal?.removeEventListener('abort', onAbort);
+    };
+
     child.stdout?.on('data', (d: Buffer) => {
       stdoutBytes += d.length;
-      if (stdoutBytes <= MAX_BUFFER) stdout += d.toString();
+      if (stdoutBytes <= MAX_BUFFER) stdoutChunks.push(d);
     });
     child.stderr?.on('data', (d: Buffer) => {
       stderrBytes += d.length;
-      if (stderrBytes <= MAX_BUFFER) stderr += d.toString();
+      if (stderrBytes <= MAX_BUFFER) stderrChunks.push(d);
     });
 
     child.on('error', (err) => {
-      clearTimeout(timer);
-      clearTimeout(hardKill);
-      resolve({ code: null, signal: null, stdout, stderr: `${stderr}${String(err)}`, timedOut });
+      cleanup();
+      const { stdout, stderr } = decoded();
+      resolve({
+        code: null,
+        signal: null,
+        stdout,
+        stderr: `${stderr}${String(err)}`,
+        timedOut,
+        aborted,
+      });
     });
     child.on('close', (code, signal) => {
-      clearTimeout(timer);
-      clearTimeout(hardKill);
-      resolve({ code, signal: signal as NodeJS.Signals | null, stdout, stderr, timedOut });
+      cleanup();
+      resolve({ code, signal: signal as NodeJS.Signals | null, ...decoded(), timedOut, aborted });
     });
   });
 }
@@ -107,6 +230,8 @@ interface CmdResult {
   code: number | null;
   stdout: string;
   stderr: string;
+  /** True when ctx.signal cancelled the command (before spawn or mid-flight). */
+  aborted: boolean;
 }
 
 /** Run a one-off command (npm install / browser install) in the suite dir. */
@@ -117,28 +242,43 @@ function runCommand(
   timeoutMs: number,
 ): Promise<CmdResult> {
   return new Promise<CmdResult>((resolve) => {
+    // Cancelled before we even spawned — return immediately; nothing to kill.
+    if (ctx.signal?.aborted) {
+      resolve({ code: null, stdout: '', stderr: '[aborted before start]', aborted: true });
+      return;
+    }
+
     let child: ChildProcess;
     try {
       child = spawn(command, args, {
         cwd: ctx.projectDir,
-        env: { ...process.env },
+        // Allowlisted env only — same rationale as runPlaywright: install
+        // scripts run arbitrary code and must not inherit host secrets.
+        env: suiteEnv(ctx),
         shell: process.platform === 'win32', // npm/npx resolve to .cmd on Windows
       });
     } catch (err) {
-      resolve({ code: null, stdout: '', stderr: String(err) });
+      resolve({ code: null, stdout: '', stderr: String(err), aborted: false });
       return;
     }
 
-    let stdout = '';
-    let stderr = '';
+    const stdoutChunks: Buffer[] = [];
+    const stderrChunks: Buffer[] = [];
     let stdoutBytes = 0;
     let stderrBytes = 0;
     let settled = false;
+    const decoded = (): { stdout: string; stderr: string } => ({
+      stdout: Buffer.concat(stdoutChunks).toString('utf8'),
+      stderr: Buffer.concat(stderrChunks).toString('utf8'),
+    });
 
     const finish = (res: CmdResult): void => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
+      // Remove the abort listener on settle so a reused AbortSignal does not
+      // accumulate dead listeners across commands.
+      ctx.signal?.removeEventListener('abort', onAbort);
       resolve(res);
     };
 
@@ -148,20 +288,41 @@ function runCommand(
       } catch {
         /* already exited */
       }
-      finish({ code: null, stdout, stderr: `${stderr}\n[timed out after ${timeoutMs}ms]` });
+      const { stdout, stderr } = decoded();
+      finish({
+        code: null,
+        stdout,
+        stderr: `${stderr}\n[timed out after ${timeoutMs}ms]`,
+        aborted: false,
+      });
     }, timeoutMs);
+
+    // Cooperative cancellation: same kill-and-finish path as the timeout above.
+    const onAbort = (): void => {
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already exited */
+      }
+      const { stdout, stderr } = decoded();
+      finish({ code: null, stdout, stderr: `${stderr}\n[aborted]`, aborted: true });
+    };
+    ctx.signal?.addEventListener('abort', onAbort, { once: true });
 
     child.stdout?.on('data', (d: Buffer) => {
       stdoutBytes += d.length;
-      if (stdoutBytes <= MAX_BUFFER) stdout += d.toString();
+      if (stdoutBytes <= MAX_BUFFER) stdoutChunks.push(d);
     });
     child.stderr?.on('data', (d: Buffer) => {
       stderrBytes += d.length;
-      if (stderrBytes <= MAX_BUFFER) stderr += d.toString();
+      if (stderrBytes <= MAX_BUFFER) stderrChunks.push(d);
     });
 
-    child.on('error', (err) => finish({ code: null, stdout, stderr: `${stderr}${String(err)}` }));
-    child.on('close', (code) => finish({ code, stdout, stderr }));
+    child.on('error', (err) => {
+      const { stdout, stderr } = decoded();
+      finish({ code: null, stdout, stderr: `${stderr}${String(err)}`, aborted: false });
+    });
+    child.on('close', (code) => finish({ code, ...decoded(), aborted: false }));
   });
 }
 
@@ -180,7 +341,12 @@ async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
   }
 
   emit(ctx, '[execute] installing suite deps…');
-  const res = await runCommand(ctx, 'npm', ['install', '--no-audit', '--no-fund', '--silent'], INSTALL_TIMEOUT_MS);
+  const res = await runCommand(
+    ctx,
+    'npm',
+    ['install', '--no-audit', '--no-fund', '--silent'],
+    INSTALL_TIMEOUT_MS,
+  );
   if (res.code === 0) {
     emit(ctx, '[execute] suite deps installed');
   } else {
@@ -276,13 +442,16 @@ function looksLikeAuthBlock(errorText: string): boolean {
 function errorText(result: PwResult | undefined): string {
   if (!result) return '';
   const parts: string[] = [];
-  if (result.error) parts.push(result.error.message ?? '', result.error.stack ?? '', result.error.value ?? '');
+  if (result.error)
+    parts.push(result.error.message ?? '', result.error.stack ?? '', result.error.value ?? '');
   for (const e of result.errors ?? []) parts.push(e.message ?? '', e.stack ?? '', e.value ?? '');
   return stripAnsi(parts.filter(Boolean).join('\n')).trim();
 }
 
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
-  return (attachments ?? []).map((a) => a.path).filter((p): p is string => typeof p === 'string' && p.length > 0);
+  return (attachments ?? [])
+    .map((a) => a.path)
+    .filter((p): p is string => typeof p === 'string' && p.length > 0);
 }
 
 interface ParsedReport {
@@ -371,7 +540,7 @@ function parseReport(report: PwReport): ParsedReport {
   };
 
   const walk = (suite: PwSuite, parentTitle: string): void => {
-    const suiteTitle = parentTitle ? `${parentTitle} > ${suite.title ?? ''}` : suite.title ?? '';
+    const suiteTitle = parentTitle ? `${parentTitle} > ${suite.title ?? ''}` : (suite.title ?? '');
     for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle);
     for (const child of suite.suites ?? []) walk(child, suiteTitle);
   };
@@ -431,10 +600,18 @@ function parseSummaryText(combined: string): ParsedReport {
   return { results: [], passed, failed, blocked: 0, flaky };
 }
 
+/** Outcome returned when the caller cancelled the run — never a throw. */
+function abortedOutcome(exitCode: number | null = null): ExecOutcome {
+  return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [], raw: { aborted: true, exitCode } };
+}
+
 /**
  * Run the scaffolded suite and parse results into an ExecOutcome. Tier B login
  * failures become `blocked`. Never throws on test failure — only the outcome
  * object is returned; infrastructure errors are surfaced via raw + a warning.
+ * Cancellation (ctx.signal) also never throws: the run is killed and an
+ * aborted outcome (raw.aborted) is returned so callers can distinguish
+ * "cancelled" from "ran and everything failed".
  */
 export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
   emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
@@ -444,20 +621,45 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
   }
 
+  // Already cancelled? Return before ANY subprocess (npm install / npx) spawns.
+  if (ctx.signal?.aborted) {
+    emit(ctx, 'Execution aborted before start; returning aborted outcome', { aborted: true });
+    return abortedOutcome();
+  }
+
   await ensureSuiteDeps(ctx);
 
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
   let cmd = await runPlaywright(ctx);
 
+  // Cancelled during (or right before) the run: partial results are
+  // meaningless and would mislabel interrupted tests as failures — discard
+  // them and surface the abort via a warning event + raw.aborted instead.
+  if (cmd.aborted || ctx.signal?.aborted) {
+    emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
+    return abortedOutcome(cmd.code);
+  }
+
   // The browser binaries normally come from the shared global cache; if a run
   // fails because one is missing, install chromium into the cache and retry once.
   if (cmd.code !== 0 && looksLikeMissingBrowser(cmd)) {
     emit(ctx, '[execute] missing browser binary; running npx playwright install chromium…');
-    const browserInstall = await runCommand(ctx, 'npx', ['playwright', 'install', 'chromium'], INSTALL_TIMEOUT_MS);
+    const browserInstall = await runCommand(
+      ctx,
+      'npx',
+      ['playwright', 'install', 'chromium'],
+      INSTALL_TIMEOUT_MS,
+    );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
     cmd = await runPlaywright(ctx);
+
+    // The retry run can be cancelled too (as can the install before it).
+    if (cmd.aborted || ctx.signal?.aborted) {
+      emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
+      return abortedOutcome(cmd.code);
+    }
   }
   emit(ctx, '[execute] Playwright run finished', { exitCode: cmd.code, timedOut: cmd.timedOut });
 

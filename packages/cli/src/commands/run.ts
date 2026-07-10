@@ -1,5 +1,5 @@
 import { createInterface } from 'node:readline';
-import type { Command } from 'commander';
+import { Option, type Command } from 'commander';
 import pc from 'picocolors';
 import {
   createOrchestrator,
@@ -10,6 +10,7 @@ import {
   type RunSummary,
   type TestPlan,
 } from '@healix/core';
+import { runExitCode } from '../lib/helpers.js';
 
 const PHASE_COLOR: Record<string, (s: string) => string> = {
   plan: pc.magenta,
@@ -80,7 +81,8 @@ function printSummary(summary: RunSummary): void {
   console.log('');
   console.log(pc.bold('  Run summary'));
   console.log(`    ${pc.dim('runId')}    ${summary.runId}`);
-  const statusColor = summary.status === 'passed' ? pc.green : summary.status === 'failed' ? pc.red : pc.yellow;
+  const statusColor =
+    summary.status === 'passed' ? pc.green : summary.status === 'failed' ? pc.red : pc.yellow;
   console.log(`    ${pc.dim('status')}   ${statusColor(summary.status)}`);
 
   const o = summary.outcome;
@@ -96,7 +98,9 @@ function printSummary(summary: RunSummary): void {
   if (summary.reportPath) console.log(`    ${pc.dim('report')}   ${summary.reportPath}`);
   if (summary.suite?.dir) console.log(`    ${pc.dim('suite')}    ${summary.suite.dir}`);
   console.log('');
-  console.log(pc.dim(`  See full history with \`healix runs show ${summary.runId}\` (or \`healix runs list\`).`));
+  console.log(
+    pc.dim(`  See full history with \`healix runs show ${summary.runId}\` (or \`healix runs list\`).`),
+  );
   console.log('');
 }
 
@@ -105,8 +109,8 @@ export function registerRun(program: Command): void {
     .command('run')
     .description('Plan, generate, execute, and report a test run for a project')
     .requiredOption('--project <id>', 'project id to run against')
-    .option('--provider <provider>', 'AI provider: claude | openai')
-    .option('--mode <mode>', 'exploration mode: codegen | computer-use')
+    .addOption(new Option('--provider <provider>', 'AI provider').choices(['claude', 'openai']))
+    .addOption(new Option('--mode <mode>', 'exploration mode').choices(['codegen', 'computer-use']))
     .option('--yes', 'auto-approve the plan (skip the approval gate)', false)
     .option('--prd <text>', 'PRD / acceptance-criteria text to ground generation')
     .action(
@@ -130,7 +134,9 @@ export function registerRun(program: Command): void {
             onPlan: opts.yes ? undefined : promptApproval,
           });
           printSummary(summary);
-          if (summary.status === 'failed' || summary.status === 'error') process.exitCode = 1;
+          // Only a fully passed run exits 0 — a cancelled run (declined or
+          // non-interactive approval gate) must not look like success in CI.
+          process.exitCode = runExitCode(summary.status);
         } catch (err) {
           console.log('');
           console.log(pc.red(`  ✖ Run failed: ${err instanceof Error ? err.message : String(err)}`));

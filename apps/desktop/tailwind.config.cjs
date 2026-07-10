@@ -5,12 +5,17 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        bg: '#0b0b0f',
-        panel: '#141419',
+        bg: '#0a0a0e',
+        panel: '#131318',
+        well: '#0d0d12',
         border: '#26262e',
         muted: '#8a8a96',
         fg: '#e7e7ea',
-        accent: '#7c5cff',
+        // Brand green — matches the Healix leaf gradient.
+        accent: '#46c878',
+        // Cool blue for in-progress / informational states, so green stays
+        // reserved for brand + success.
+        info: '#6ca5f2',
         ok: '#3fb950',
         warn: '#d29922',
         err: '#f85149',

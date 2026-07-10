@@ -618,12 +618,22 @@ function waitForApproval(runId: string, sender: WebContents): Promise<boolean> {
   return new Promise<boolean>((resolve) => {
     // If a stale gate somehow exists for this id, reject it first.
     settleApproval(runId, false);
-    pendingApprovals.set(runId, { resolve });
 
     // If the window is torn down while we wait, fail closed.
     const onDestroyed = (): void => {
       settleApproval(runId, false);
     };
+
+    // Wrap resolve so settling the gate (approve, reject, or destroy) also
+    // detaches the 'destroyed' listener. Without this, a normally-approved run
+    // leaves a dead listener on the long-lived window every time — after enough
+    // runs Node emits MaxListenersExceededWarning and each closure leaks.
+    const settle = (ok: boolean): void => {
+      sender.removeListener('destroyed', onDestroyed);
+      resolve(ok);
+    };
+
+    pendingApprovals.set(runId, { resolve: settle });
     sender.once('destroyed', onDestroyed);
   });
 }

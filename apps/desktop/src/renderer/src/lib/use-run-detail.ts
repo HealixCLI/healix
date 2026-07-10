@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import type { RunDetail } from './ipc-types';
 
 export interface RunDetailState {
@@ -17,8 +17,13 @@ export function useRunDetail(runId: string | null): RunDetailState {
   const [detail, setDetail] = useState<RunDetail | null>(null);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Monotonic request token: a slow response for a previous runId must not
+  // overwrite state for the current one (e.g. click run A then B; A resolves
+  // last and would otherwise show A's detail while B is selected).
+  const reqId = useRef(0);
 
   const load = useCallback(async (): Promise<void> => {
+    const myId = ++reqId.current;
     if (!runId) {
       setDetail(null);
       setError(null);
@@ -28,12 +33,15 @@ export function useRunDetail(runId: string | null): RunDetailState {
     setLoading(true);
     setError(null);
     try {
-      setDetail(await window.healix.runDetail(runId));
+      const next = await window.healix.runDetail(runId);
+      if (myId === reqId.current) setDetail(next);
     } catch (err) {
-      setError(toMessage(err));
-      setDetail(null);
+      if (myId === reqId.current) {
+        setError(toMessage(err));
+        setDetail(null);
+      }
     } finally {
-      setLoading(false);
+      if (myId === reqId.current) setLoading(false);
     }
   }, [runId]);
 

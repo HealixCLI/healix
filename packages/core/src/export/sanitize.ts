@@ -32,14 +32,15 @@ interface SecretPattern {
 
 const SECRET_PATTERNS: readonly SecretPattern[] = [
   // KEY=value style (dotenv / shell). Redacts the value, keeps the key and the
-  // original separator/whitespace. The identifier must be UPPERCASE and contain
-  // a secret token (KEY/TOKEN/SECRET/PASSWORD/...) as a full underscore-delimited
-  // segment (APIKEY allowed as a common unseparated compound), so MY_API_KEY and
-  // DB_PASSWORD match while MONKEY/TURKEY and token-free words ('RAPID') do not.
-  // A non-empty value is required.
+  // original separator/whitespace. The identifier must contain a secret token
+  // (KEY/TOKEN/SECRET/PASSWORD/...) as a full underscore-delimited segment
+  // (APIKEY allowed as a common unseparated compound). Case-insensitive, so both
+  // MY_API_KEY and api_key match; the ^ anchor plus the required delimiter keep
+  // MONKEY/TURKEY and token-free words ('RAPID', 'normal') from matching. A
+  // non-empty value is required.
   {
     regex:
-      /^([ \t]*(?:export[ \t]+)?(?:[A-Z0-9_]*_)?(?:APIKEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)(?:_[A-Z0-9_]*)?[ \t]*=[ \t]*)\S.*$/gm,
+      /^([ \t]*(?:export[ \t]+)?(?:[A-Za-z0-9_]*_)?(?:APIKEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)(?:_[A-Za-z0-9_]*)?[ \t]*=[ \t]*)\S.*$/gim,
     replace: (_m, prefix) => `${String(prefix)}<REDACTED>`,
   },
   // "key": "value" style (JSON / JS objects). Redacts the value, keeps the key.
@@ -48,6 +49,15 @@ const SECRET_PATTERNS: readonly SecretPattern[] = [
   {
     regex:
       /("(?:[a-z0-9_-]*(?:key|token|secret|password|passwd|apikey|api_key|auth(?!ors?\b)|credential)[a-z0-9_-]*)"[ \t]*:[ \t]*)"(?:[^"\\]|\\.)*"/gi,
+    replace: (_m, prefix) => `${String(prefix)}"<REDACTED>"`,
+  },
+  // "key": 12345 style — an UNQUOTED (numeric) secret value. The quoted variant
+  // above handles string values; this catches numeric secrets (PINs, numeric
+  // keys) that would otherwise ship in the clear. Rewritten to a quoted
+  // placeholder so the surrounding JSON stays valid.
+  {
+    regex:
+      /("(?:[a-z0-9_-]*(?:key|token|secret|password|passwd|apikey|api_key|auth(?!ors?\b)|credential)[a-z0-9_-]*)"[ \t]*:[ \t]*)(-?\d[\w.+-]*)/gi,
     replace: (_m, prefix) => `${String(prefix)}"<REDACTED>"`,
   },
   // Bearer tokens embedded anywhere.

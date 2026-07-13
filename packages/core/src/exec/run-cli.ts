@@ -46,18 +46,23 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       return;
     }
 
+    const isWindows = process.platform === 'win32';
     const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
-      // npm-global CLIs (claude, codex) are .cmd shims on Windows; without a
-      // shell the spawn fails with ENOENT (same treatment as playwright/execute).
-      shell: process.platform === 'win32',
+      // Windows: npm-global CLIs (claude, codex) are .cmd/.bat shims that can
+      // only be spawned through a shell (Node refuses to exec .cmd directly).
+      // But real executables (node.exe, where, …) must NOT go through cmd.exe —
+      // it mangles quoted/paren args, so e.g. `node -e 'foo("hi")'` becomes a
+      // syntax error and the child exits 1. So only shell out on Windows when
+      // the target isn't already a directly-spawnable .exe/.com.
+      shell: isWindows && !/\.(exe|com)$/i.test(cmd),
       // POSIX: make the child its own process-group leader so timeout/abort can
       // kill the CLI *and* everything it spawned (helpers, node children) with
       // one group signal — killing only the direct child leaves grandchildren
       // running and holding our stdio pipes open (same treatment as
       // playwright/execute).
-      detached: process.platform !== 'win32',
+      detached: !isWindows,
     });
     let stdout = '';
     let stderr = '';

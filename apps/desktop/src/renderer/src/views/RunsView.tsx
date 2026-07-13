@@ -209,17 +209,20 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
               </div>
             </div>
 
-            <div className="mt-4 flex items-center justify-between">
-              <div className="text-xs text-muted">
+            <div className="mt-4 flex min-w-0 items-center justify-between">
+              <div className="min-w-0 text-xs text-muted">
                 {selectedProject ? (
-                  <span className="font-mono">
+                  <span
+                    className="block truncate font-mono"
+                    title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+                  >
                     {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
                   </span>
                 ) : (
                   'Select a project to begin.'
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 {SETTLED_PHASES.includes(engine.phase) && (
                   <Button variant="ghost" onClick={newRun}>
                     <RotateCcw className="h-4 w-4" />

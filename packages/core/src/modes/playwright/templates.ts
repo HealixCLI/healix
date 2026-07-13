@@ -75,7 +75,10 @@ export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // Retries drive Healix's flaky detection (a test must fail then pass on retry
+  // to register as flaky). Default to 1 locally too — gating on CI meant flaky
+  // was never detectable on a local \`healix run\`. Override with HEALIX_RETRIES.
+  retries: process.env.HEALIX_RETRIES ? Number(process.env.HEALIX_RETRIES) : process.env.CI ? 2 : 1,
   workers: process.env.CI ? 1 : undefined,
   timeout: 60_000,
   expect: { timeout: 10_000 },

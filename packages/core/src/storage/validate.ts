@@ -63,6 +63,18 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
       error: 'A project needs a repo path or a base URL — set at least one.',
     };
   }
+  // Repo path is a LOCAL filesystem path to an already-cloned checkout — it is
+  // later used as a child process's cwd, never fetched or cloned. A remote git
+  // URL (https://github.com/..., git@..., etc.) pasted in here looks plausible
+  // but silently breaks every run: rejecting it up front, with a pointer to the
+  // field that DOES want a URL, is far cheaper than a confusing failure deep in
+  // plan/codegen once the project is already saved.
+  if (repoPath && /^(https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(repoPath)) {
+    return {
+      ok: false,
+      error: `Repo path must be a local folder path, not a URL (received "${repoPath}"). Clone the repo locally and point Repo path at that folder, or use Base URL for the running app instead.`,
+    };
+  }
   if (baseUrl && !isValidBaseUrl(baseUrl)) {
     return {
       ok: false,

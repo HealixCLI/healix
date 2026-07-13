@@ -71,6 +71,19 @@ describe('validateNewProject', () => {
     });
   });
 
+  it('rejects a remote git URL in repoPath (the "pasted a GitHub link" mistake)', () => {
+    const r = validateNewProject({ name: 'Acme', repoPath: 'https://github.com/acme/web-app' });
+    expect(r.ok).toBe(false);
+    expect(r.ok === false && r.error).toMatch(/local folder path, not a URL/i);
+  });
+
+  it('rejects ssh/git-protocol remote URLs in repoPath too', () => {
+    expect(validateNewProject({ name: 'Acme', repoPath: 'git@github.com:acme/web-app.git' }).ok).toBe(false);
+    expect(validateNewProject({ name: 'Acme', repoPath: 'ssh://git@github.com/acme/web-app.git' }).ok).toBe(
+      false,
+    );
+  });
+
   it('rejects a malformed base URL even when a repo is also given', () => {
     const r = validateNewProject({ name: 'Acme', repoPath: '/code/acme', baseUrl: 'not-a-url' });
     expect(r.ok).toBe(false);

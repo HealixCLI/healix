@@ -79,6 +79,20 @@ export async function zipDirectory(sourceDir: string, zipPath: string): Promise<
   // Enumerate up front (sorted) so entry order is stable across filesystems.
   const relFiles = await listFilesSorted(absSource);
 
+  // Read each entry's bytes up front, in sorted order. archiver's stream-based
+  // archive.file() reads files concurrently and can emit them OUT of call order
+  // (a later, faster read finishes first), which makes the archive bytes
+  // non-deterministic despite the sorted enumeration — two exports of identical
+  // content then differ ~occasionally. Appending in-memory buffers pins the
+  // entry order, restoring the reproducibility guarantee documented above.
+  const entries: Array<{ name: string; content: Buffer }> = [];
+  for (const rel of relFiles) {
+    entries.push({
+      name: `${rootName}/${rel}`,
+      content: await fs.readFile(path.join(absSource, ...rel.split('/'))),
+    });
+  }
+
   return await new Promise<ZipResult>((resolve, reject) => {
     const output = createWriteStream(absZip);
     const archive = archiver('zip', { zlib: { level: 9 } });
@@ -109,11 +123,8 @@ export async function zipDirectory(sourceDir: string, zipPath: string): Promise<
     archive.on('error', fail);
 
     archive.pipe(output);
-    for (const rel of relFiles) {
-      archive.file(path.join(absSource, ...rel.split('/')), {
-        name: `${rootName}/${rel}`,
-        date: FIXED_ENTRY_DATE,
-      });
+    for (const entry of entries) {
+      archive.append(entry.content, { name: entry.name, date: FIXED_ENTRY_DATE });
     }
     void archive.finalize().catch(fail);
   });

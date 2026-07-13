@@ -148,7 +148,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
       </div>
 
       {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col px-8 pb-6 pt-8">
+      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8">
         <header className="flex items-end justify-between border-b border-border pb-5">
           <div>
             <h1 className="font-mono text-xl font-semibold tracking-tight">Runs</h1>

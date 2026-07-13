@@ -46,7 +46,11 @@ export function createTriageEngine(): TriageEngine {
       return classifyByRules(input);
     },
 
-    async analyze(input: TriageInput, provider: ProviderAdapter): Promise<TriageResult> {
+    async analyze(
+      input: TriageInput,
+      provider: ProviderAdapter,
+      signal?: AbortSignal,
+    ): Promise<TriageResult> {
       // Deterministic baseline is always computed: it is the fallback and also
       // seeds a suggestedPatch the AI may omit.
       const baseline = classifyByRules(input);
@@ -60,7 +64,7 @@ export function createTriageEngine(): TriageEngine {
 
       let reply: Awaited<ReturnType<ProviderAdapter['complete']>>;
       try {
-        reply = await provider.complete(prompt, { timeoutMs: ANALYZE_TIMEOUT_MS });
+        reply = await provider.complete(prompt, { timeoutMs: ANALYZE_TIMEOUT_MS, signal });
       } catch {
         // Provider threw (process error, etc.) — never leak; fall back.
         return baseline;

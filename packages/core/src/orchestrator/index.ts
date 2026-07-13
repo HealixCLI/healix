@@ -501,8 +501,13 @@ async function runPipeline(
           // Best-effort AI enrichment for the first N failures, bounded per call.
           if (aiBudget > 0) {
             aiBudget -= 1;
+            const controller = new AbortController();
             try {
-              const enriched = await withTimeout(engine.analyze(input, provider), TRIAGE_ANALYZE_TIMEOUT_MS);
+              const enriched = await withTimeoutAbort(
+                engine.analyze(input, provider, controller.signal),
+                TRIAGE_ANALYZE_TIMEOUT_MS,
+                controller,
+              );
               if (enriched) triage = enriched;
             } catch (err) {
               // Timeout / analyze() threw — keep the deterministic baseline.
@@ -896,10 +901,19 @@ function raceAbort<T>(p: Promise<T>, signal: AbortSignal | undefined): Promise<T
   });
 }
 
-/** Reject after `ms` if `p` has not settled, so a single provider call cannot stall triage. */
-function withTimeout<T>(p: Promise<T>, ms: number): Promise<T> {
+/**
+ * Reject after `ms` if `p` has not settled, AND abort `controller` — so the
+ * underlying CLI child process is actually killed instead of left running,
+ * untracked, in the background after this call is abandoned (a single slow
+ * provider call must not stall triage, but it also must not outlive it).
+ * Exported for tests.
+ */
+export function withTimeoutAbort<T>(p: Promise<T>, ms: number, controller: AbortController): Promise<T> {
   return new Promise<T>((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error(`timed out after ${ms}ms`)), ms);
+    const timer = setTimeout(() => {
+      controller.abort();
+      reject(new Error(`timed out after ${ms}ms`));
+    }, ms);
     p.then(
       (v) => {
         clearTimeout(timer);

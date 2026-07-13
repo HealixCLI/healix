@@ -20,5 +20,10 @@ export interface TriageResult {
 /** Deterministic classifier first, AI hypothesis second (ported from TestBot failure-triage). */
 export interface TriageEngine {
   classify(input: TriageInput): TriageResult;
-  analyze(input: TriageInput, provider: ProviderAdapter): Promise<TriageResult>;
+  /**
+   * `signal` lets the caller cancel the underlying provider call (and kill its
+   * CLI child process) when its own patience runs out, instead of abandoning
+   * it to keep running in the background untracked.
+   */
+  analyze(input: TriageInput, provider: ProviderAdapter, signal?: AbortSignal): Promise<TriageResult>;
 }

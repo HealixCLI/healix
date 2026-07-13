@@ -12,8 +12,32 @@
  *     if present) which is fast and harmless, and the assertions hold whether
  *     or not the CLI is installed on the host.
  */
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../exec/run-cli.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../exec/run-cli.js')>();
+  return { ...actual, runCli: vi.fn() };
+});
+
+import { runCli } from '../exec/run-cli.js';
 import { ClaudeProvider, parseClaudeJson } from './claude.js';
+
+// Module-wide mock: give it a harmless default so unrelated calls (e.g. the
+// existing detect() test's `--version` probe) don't blow up, and clear call
+// history before every test so call-count assertions in the new prompt-
+// delivery tests below aren't polluted by calls other tests made.
+const runCliMock = vi.mocked(runCli);
+runCliMock.mockResolvedValue({
+  code: 0,
+  stdout: '',
+  stderr: '',
+  timedOut: false,
+  aborted: false,
+  durationMs: 0,
+});
+beforeEach(() => {
+  runCliMock.mockClear();
+});
 
 describe('parseClaudeJson (tolerant --output-format json parsing)', () => {
   /** Canned successful result object, as the CLI prints it. */
@@ -100,5 +124,90 @@ describe('ClaudeProvider.detect (shape only — no live probe)', () => {
       expect(det.binPath).toBeNull();
       expect(det.version).toBeNull();
     }
+  });
+});
+
+describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', () => {
+  const provider = new ClaudeProvider();
+  const okStdout = JSON.stringify({ is_error: false, result: 'ok' });
+
+  it('complete() sends the prompt via stdin, never in argv', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    const prompt = 'plain prompt';
+    await provider.complete(prompt);
+
+    expect(runCliMock).toHaveBeenCalledTimes(1);
+    const [, args, callOpts] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(['-p', '--output-format', 'json']);
+    expect(args).not.toContain(prompt);
+    expect(callOpts?.input).toBe(prompt);
+  });
+
+  it('complete() in plan/readOnly mode still sends the prompt via stdin', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    const prompt = 'plan-mode prompt';
+    await provider.complete(prompt, { mode: 'plan' });
+
+    const [, args, callOpts] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(['-p', '--output-format', 'json', '--permission-mode', 'plan']);
+    expect(args).not.toContain(prompt);
+    expect(callOpts?.input).toBe(prompt);
+  });
+
+  it('plan() sends the task via stdin, never in argv', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    const task = 'plan this task';
+    await provider.plan(task);
+
+    const [, args, callOpts] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(['-p', '--permission-mode', 'plan', '--output-format', 'json']);
+    expect(args).not.toContain(task);
+    expect(callOpts?.input).toBe(task);
+  });
+
+  it('regression: a multi-line prompt with quotes and a Windows path never touches argv', async () => {
+    // This is the exact shape that broke on Windows: embedded newlines/quotes/
+    // backslash-paths mangled by cmd.exe when passed as a single argv element.
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    const prompt = [
+      'Repository path (white-box): C:\\Users\\Test User\\repo',
+      'PRD / acceptance criteria to ground the plan:',
+      '"""',
+      'The app must handle "quoted" input & special chars like | and ^.',
+      '"""',
+    ].join('\n');
+    await provider.complete(prompt, { mode: 'plan' });
+
+    const [, args, callOpts] = runCliMock.mock.calls[0]!;
+    for (const a of args) expect(a).not.toContain(prompt);
+    expect(callOpts?.input).toBe(prompt);
   });
 });

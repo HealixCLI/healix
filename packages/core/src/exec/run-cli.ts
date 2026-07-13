@@ -47,16 +47,27 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     }
 
     const isWindows = process.platform === 'win32';
-    const child = spawn(cmd, args, {
+    // Windows: npm-global CLIs (claude, codex) are .cmd/.bat shims that can
+    // only be spawned through a shell (Node refuses to exec .cmd directly).
+    // But real executables (node.exe, where, …) must NOT go through cmd.exe —
+    // it mangles quoted/paren args, so e.g. `node -e 'foo("hi")'` becomes a
+    // syntax error and the child exits 1. So only shell out on Windows when
+    // the target isn't already a directly-spawnable .exe/.com.
+    const useShell = isWindows && !/\.(exe|com)$/i.test(cmd);
+    // When shell:true, cmd+args are handed to cmd.exe as ONE concatenated
+    // string with NO escaping (Node's hardened shell:true behavior — see the
+    // DEP0190 deprecation notice — it used to quote args implicitly). A `cmd`
+    // containing a space or quote (e.g. a .cmd shim path under "Program
+    // Files") gets split/mis-parsed by cmd.exe, so quote it in that case. This
+    // does not attempt to fully escape `args` (out of scope — callers must
+    // avoid passing user-controlled multi-word/multi-line content via argv at
+    // all, e.g. by using `opts.input` instead, which is exactly what CLI
+    // prompts do).
+    const quotedCmd = useShell && /[\s"]/.test(cmd) ? `"${cmd}"` : cmd;
+    const child = spawn(quotedCmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
-      // Windows: npm-global CLIs (claude, codex) are .cmd/.bat shims that can
-      // only be spawned through a shell (Node refuses to exec .cmd directly).
-      // But real executables (node.exe, where, …) must NOT go through cmd.exe —
-      // it mangles quoted/paren args, so e.g. `node -e 'foo("hi")'` becomes a
-      // syntax error and the child exits 1. So only shell out on Windows when
-      // the target isn't already a directly-spawnable .exe/.com.
-      shell: isWindows && !/\.(exe|com)$/i.test(cmd),
+      shell: useShell,
       // POSIX: make the child its own process-group leader so timeout/abort can
       // kill the CLI *and* everything it spawned (helpers, node children) with
       // one group signal — killing only the direct child leaves grandchildren

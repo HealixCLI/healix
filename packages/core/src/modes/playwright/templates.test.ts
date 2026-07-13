@@ -24,4 +24,12 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     );
     expect(playwrightConfigContents()).toContain("process.env.HEALIX_BASE_URL || 'http://localhost:3000'");
   });
+
+  it('enables retries locally so flaky detection can trigger (overridable via HEALIX_RETRIES)', () => {
+    const cfg = playwrightConfigContents();
+    // Local default must be non-zero (1) or a fail-then-pass can never register
+    // as flaky; CI gets 2; HEALIX_RETRIES overrides both.
+    expect(cfg).toContain('process.env.HEALIX_RETRIES');
+    expect(cfg).toContain('process.env.CI ? 2 : 1');
+  });
 });

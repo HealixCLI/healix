@@ -138,23 +138,28 @@ export function ProvidersView() {
     }
   }, []);
 
-  const recheck = useCallback(async (id: ProviderId) => {
-    setBusy((b) => ({ ...b, [id]: 'recheck' }));
-    setError(null);
-    try {
-      const health = await window.healix.providerHealth(id, true);
-      updateOverrides((o) => ({ ...o, [id]: { health, checkedAt: Date.now() } }));
-    } catch (err) {
-      setError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setBusy((b) => ({ ...b, [id]: undefined }));
-    }
-  }, [updateOverrides]);
+  const recheck = useCallback(
+    async (id: ProviderId) => {
+      setBusy((b) => ({ ...b, [id]: 'recheck' }));
+      setError(null);
+      try {
+        const health = await window.healix.providerHealth(id, true);
+        updateOverrides((o) => ({ ...o, [id]: { health, checkedAt: Date.now() } }));
+      } catch (err) {
+        setError(err instanceof Error ? err.message : String(err));
+      } finally {
+        setBusy((b) => ({ ...b, [id]: undefined }));
+      }
+    },
+    [updateOverrides],
+  );
 
   // Merge any live override on top of the doctor snapshot.
   const providers: HealthResult[] = (report?.providers ?? []).map((p) => overrides[p.provider]?.health ?? p);
   const anyReady = providers.some((p) => p.status === 'ready' && p.authenticated);
-  const checkedAts = providers.map((p) => overrides[p.provider]?.checkedAt).filter((t): t is number => t != null);
+  const checkedAts = providers
+    .map((p) => overrides[p.provider]?.checkedAt)
+    .filter((t): t is number => t != null);
   const lastCheckedAt = checkedAts.length > 0 ? Math.min(...checkedAts) : null;
   // Whether we've ever actually confirmed (not merely detected) that no provider is
   // authenticated — distinct from simply not having probed yet this session.

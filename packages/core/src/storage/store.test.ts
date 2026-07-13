@@ -76,7 +76,7 @@ describe('deleteProject cascade', () => {
   it('removes all descendant rows without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();
 
-    const project = s.createProject({ name: 'cascade-project' });
+    const project = s.createProject({ name: 'cascade-project', baseUrl: 'https://cascade.test' });
     const run = s.createRun(project.id, { provider: null, mode: 'playwright' });
 
     const N = 3;
@@ -126,8 +126,8 @@ describe('deleteProject cascade', () => {
   it('leaves a second unrelated project and its children untouched', async () => {
     const s = await store();
 
-    const target = s.createProject({ name: 'to-delete' });
-    const keep = s.createProject({ name: 'to-keep' });
+    const target = s.createProject({ name: 'to-delete', baseUrl: 'https://to-delete.test' });
+    const keep = s.createProject({ name: 'to-keep', baseUrl: 'https://to-keep.test' });
 
     const targetRun = s.createRun(target.id);
     const keepRun = s.createRun(keep.id);
@@ -180,7 +180,7 @@ describe('deleteRun cascade', () => {
   it('removes the run and its descendants without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();
 
-    const project = s.createProject({ name: 'run-cascade' });
+    const project = s.createProject({ name: 'run-cascade', baseUrl: 'https://run-cascade.test' });
     const run = s.createRun(project.id);
     const otherRun = s.createRun(project.id);
 
@@ -222,7 +222,7 @@ describe('deleteRun cascade', () => {
 describe('agent event ordering', () => {
   it('returns same-millisecond events in insertion order (stable rowid tiebreaker)', async () => {
     const s = await store();
-    const project = s.createProject({ name: 'event-order' });
+    const project = s.createProject({ name: 'event-order', baseUrl: 'https://event-order.test' });
     const run = s.createRun(project.id);
 
     // Freeze the clock so every event shares an identical created_at; only the

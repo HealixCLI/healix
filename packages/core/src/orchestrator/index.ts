@@ -361,6 +361,10 @@ async function runPipeline(
           }
         }
         const snap = await browser.snapshot();
+        // Ground GENERATE in what we actually observed: the interactive-element
+        // inventory is fed into the generation prompt so computer-use specs
+        // target real selectors instead of guessing (was captured, then dropped).
+        ctx.snapshot = snap;
         emit('explore', 'info', `Explored "${snap.title}".`, {
           url: snap.url,
           interactiveElements: snap.interactiveElements.length,

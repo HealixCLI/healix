@@ -1,7 +1,8 @@
 {
   "name": "@healix/desktop",
-  "version": "0.0.0",
+  "version": "0.1.2",
   "description": "Healix desktop app (Electron + React)",
+  "author": "Healix",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
@@ -36,13 +37,19 @@
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        "dir"
+        "dmg",
+        "zip"
       ]
     },
     "win": {
       "target": [
         "nsis"
       ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
     },
     "linux": {
       "target": [

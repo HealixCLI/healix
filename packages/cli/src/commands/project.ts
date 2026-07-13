@@ -58,7 +58,19 @@ export function registerProject(program: Command): void {
         repoPath: opts.repo ?? null,
         baseUrl: opts.url ?? null,
       };
-      const project = store.createProject(input);
+      let project: Project;
+      try {
+        // createProject validates: a project needs a repo or a valid http(s)
+        // base URL. Surface that as a clean message, not a stack trace.
+        project = store.createProject(input);
+      } catch (err) {
+        console.log('');
+        console.log(pc.red(`  ✖ ${err instanceof Error ? err.message : String(err)}`));
+        console.log(pc.dim('    Pass --repo <path> and/or --url <baseUrl>.'));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
       console.log('');
       console.log(`  ${pc.green('✔')} Created project ${pc.bold(project.name)} ${pc.dim(`(${project.id})`)}`);
       printProjectDetail(project);

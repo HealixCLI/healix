@@ -46,7 +46,11 @@ export function createTriageEngine(): TriageEngine {
       return classifyByRules(input);
     },
 
-    async analyze(input: TriageInput, provider: ProviderAdapter, signal?: AbortSignal): Promise<TriageResult> {
+    async analyze(
+      input: TriageInput,
+      provider: ProviderAdapter,
+      signal?: AbortSignal,
+    ): Promise<TriageResult> {
       // Deterministic baseline is always computed: it is the fallback and also
       // seeds a suggestedPatch the AI may omit.
       const baseline = classifyByRules(input);

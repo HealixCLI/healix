@@ -93,6 +93,31 @@ describe('sanitizeContent — Anthropic key shape', () => {
   });
 });
 
+describe('sanitizeContent — broadened redaction (lowercase + unquoted)', () => {
+  const suiteDir = path.join(os.tmpdir(), 'healix-sanitize-broaden-anchor');
+
+  it('redacts a lowercase / mixed-case dotenv key=value', () => {
+    expect(sanitizeContent('api_key=hunter2secret', suiteDir)).toBe(`api_key=${REDACTED}`);
+    expect(sanitizeContent('export db_password=p@ss', suiteDir)).toBe(`export db_password=${REDACTED}`);
+    expect(sanitizeContent('Api_Key=abc', suiteDir)).toBe(`Api_Key=${REDACTED}`);
+  });
+
+  it('still leaves token-free lowercase assignments alone', () => {
+    for (const line of ['normal=hello', 'monkey=banana', 'count=5']) {
+      expect(sanitizeContent(line, suiteDir)).toBe(line);
+    }
+  });
+
+  it('redacts an unquoted numeric secret value in JSON', () => {
+    expect(sanitizeContent('"apiKey": 12345', suiteDir)).toBe(`"apiKey": "${REDACTED}"`);
+    expect(sanitizeContent('"authToken":42', suiteDir)).toBe(`"authToken":"${REDACTED}"`);
+  });
+
+  it('leaves a non-secret unquoted numeric value alone', () => {
+    expect(sanitizeContent('"timeout": 5000', suiteDir)).toBe('"timeout": 5000');
+  });
+});
+
 describe('isTextFile', () => {
   it('returns true for known text extensions', () => {
     for (const file of ['a.ts', 'config.json', 'README.md', 'script.js']) {

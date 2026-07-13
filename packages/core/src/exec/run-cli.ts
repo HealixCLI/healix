@@ -46,30 +46,34 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       return;
     }
 
-    const win32 = process.platform === 'win32';
-    // On Windows, shell:true hands cmd+args to cmd.exe as ONE concatenated
-    // string with NO escaping (Node made this explicit/hardened behavior —
-    // see the DEP0190 deprecation notice — it used to quote args implicitly).
-    // A `cmd` containing a space (e.g. a Node install under the very common
-    // "C:\Program Files\nodejs\node.exe") gets split at the space by cmd.exe
-    // and fails with "'C:\Program' is not recognized...". Quoting `cmd` here
-    // fixes that specific, always-reproducible case; it does not attempt to
-    // fully escape `args` (out of scope — callers must avoid passing
-    // user-controlled multi-word/multi-line content via argv at all, e.g. by
-    // using `opts.input` instead, which is exactly what CLI prompts do).
-    const quotedCmd = win32 && /[\s"]/.test(cmd) ? `"${cmd}"` : cmd;
+    const isWindows = process.platform === 'win32';
+    // Windows: npm-global CLIs (claude, codex) are .cmd/.bat shims that can
+    // only be spawned through a shell (Node refuses to exec .cmd directly).
+    // But real executables (node.exe, where, …) must NOT go through cmd.exe —
+    // it mangles quoted/paren args, so e.g. `node -e 'foo("hi")'` becomes a
+    // syntax error and the child exits 1. So only shell out on Windows when
+    // the target isn't already a directly-spawnable .exe/.com.
+    const useShell = isWindows && !/\.(exe|com)$/i.test(cmd);
+    // When shell:true, cmd+args are handed to cmd.exe as ONE concatenated
+    // string with NO escaping (Node's hardened shell:true behavior — see the
+    // DEP0190 deprecation notice — it used to quote args implicitly). A `cmd`
+    // containing a space or quote (e.g. a .cmd shim path under "Program
+    // Files") gets split/mis-parsed by cmd.exe, so quote it in that case. This
+    // does not attempt to fully escape `args` (out of scope — callers must
+    // avoid passing user-controlled multi-word/multi-line content via argv at
+    // all, e.g. by using `opts.input` instead, which is exactly what CLI
+    // prompts do).
+    const quotedCmd = useShell && /[\s"]/.test(cmd) ? `"${cmd}"` : cmd;
     const child = spawn(quotedCmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
-      // npm-global CLIs (claude, codex) are .cmd shims on Windows; without a
-      // shell the spawn fails with ENOENT (same treatment as playwright/execute).
-      shell: win32,
+      shell: useShell,
       // POSIX: make the child its own process-group leader so timeout/abort can
       // kill the CLI *and* everything it spawned (helpers, node children) with
       // one group signal — killing only the direct child leaves grandchildren
       // running and holding our stdio pipes open (same treatment as
       // playwright/execute).
-      detached: process.platform !== 'win32',
+      detached: !isWindows,
     });
     let stdout = '';
     let stderr = '';

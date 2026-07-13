@@ -1,0 +1,114 @@
+name: Release
+
+# Builds distributable desktop artifacts on native runners:
+#   - macOS (Apple Silicon / arm64): .dmg + .zip
+#   - Windows (x64): NSIS installer .exe
+# Windows is built on a real windows-latest runner rather than cross-compiled
+# from macOS (electron-builder's wine path is slow and flaky); GitHub gives us
+# native runners for both, so we use them.
+#
+# Triggers:
+#   - push a tag matching v*  -> package + draft a GitHub Release with the assets
+#   - manual (workflow_dispatch) -> package + upload artifacts only (no release)
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  package:
+    name: Package · ${{ matrix.name }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            name: macOS (Apple Silicon)
+            artifact: healix-macos-arm64
+            builder_args: --mac --arm64
+          - os: windows-latest
+            name: Windows (x64)
+            artifact: healix-windows-x64
+            builder_args: --win --x64
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Enable Corepack
+        run: corepack enable
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          cache: pnpm
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      # Builds @healix/core, @healix/cli, and the desktop renderer/main bundles
+      # (electron-vite -> apps/desktop/out) that electron-builder then packages.
+      - name: Build workspace
+        run: pnpm build
+
+      - name: Package desktop app
+        working-directory: apps/desktop
+        env:
+          # No Apple Developer credentials in CI: build UNSIGNED. Setting this to
+          # false stops electron-builder from trying to auto-discover a signing
+          # identity on macOS and failing the run. (Users will see a Gatekeeper
+          # prompt on first launch until signing/notarization is wired up.)
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: pnpm exec electron-builder ${{ matrix.builder_args }} --publish never
+
+      - name: Upload packaged artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: |
+            apps/desktop/release/*.dmg
+            apps/desktop/release/*.zip
+            apps/desktop/release/*.exe
+            apps/desktop/release/*.blockmap
+            apps/desktop/release/latest*.yml
+          if-no-files-found: error
+          retention-days: 14
+
+  release:
+    name: Draft GitHub Release
+    needs: package
+    # Only when a tag was pushed — manual dispatch just uploads artifacts.
+    if: startsWith(github.ref, 'refs/tags/')
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all packaged artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Create draft release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          # NUL-delimited + array so asset names containing spaces (e.g.
+          # "Healix Setup 0.1.0.exe" from electron-builder/NSIS) are NOT
+          # word-split by the shell — that split broke the first v0.1.0 release.
+          mapfile -d '' files < <(find dist -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) -print0)
+          printf 'Attaching: %s\n' "${files[@]}"
+          # Draft (not published) so a human reviews assets before it goes public.
+          gh release create "${GITHUB_REF_NAME}" "${files[@]}" \
+            --repo "${GITHUB_REPOSITORY}" \
+            --title "${GITHUB_REF_NAME}" \
+            --draft \
+            --generate-notes

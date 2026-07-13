@@ -633,7 +633,12 @@ describe('orchestrator paths (offline DI seam)', () => {
       flaky: 0,
       results: [
         { title: 'Home loads', status: 'passed', durationMs: 12 },
-        { title: 'Login works', status: 'failed', durationMs: 34, error: 'expect(locator).toBeVisible() failed' },
+        {
+          title: 'Login works',
+          status: 'failed',
+          durationMs: 34,
+          error: 'expect(locator).toBeVisible() failed',
+        },
       ],
     };
 

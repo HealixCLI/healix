@@ -101,10 +101,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          files=$(find dist -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \))
-          echo "Attaching:"; echo "$files"
+          # NUL-delimited + array so asset names containing spaces (e.g.
+          # "Healix Setup 0.1.0.exe" from electron-builder/NSIS) are NOT
+          # word-split by the shell — that split broke the first v0.1.0 release.
+          mapfile -d '' files < <(find dist -type f \( -name '*.dmg' -o -name '*.zip' -o -name '*.exe' \) -print0)
+          printf 'Attaching: %s\n' "${files[@]}"
           # Draft (not published) so a human reviews assets before it goes public.
-          gh release create "${GITHUB_REF_NAME}" $files \
+          gh release create "${GITHUB_REF_NAME}" "${files[@]}" \
             --repo "${GITHUB_REPOSITORY}" \
             --title "${GITHUB_REF_NAME}" \
             --draft \

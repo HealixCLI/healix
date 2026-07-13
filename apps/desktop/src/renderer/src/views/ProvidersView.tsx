@@ -154,8 +154,12 @@ export function ProvidersView() {
     [updateOverrides],
   );
 
-  // Merge any live override on top of the doctor snapshot.
-  const providers: HealthResult[] = (report?.providers ?? []).map((p) => overrides[p.provider]?.health ?? p);
+  // Merge any live override on top of the doctor snapshot. Only Claude is
+  // surfaced in this UI — the doctor report still detects/probes every
+  // provider the core package knows about, but this app targets Claude only.
+  const providers: HealthResult[] = (report?.providers ?? [])
+    .map((p) => overrides[p.provider]?.health ?? p)
+    .filter((p) => p.provider === 'claude');
   const anyReady = providers.some((p) => p.status === 'ready' && p.authenticated);
   const checkedAts = providers
     .map((p) => overrides[p.provider]?.checkedAt)
@@ -219,7 +223,7 @@ export function ProvidersView() {
 
       <section className="mt-8">
         <h2 className="mb-3 text-sm font-semibold text-muted">AI Providers</h2>
-        <div className="grid grid-cols-1 gap-3 sm:grid-cols-2">
+        <div className="grid max-w-md grid-cols-1 gap-3">
           {providers.map((p) => {
             const tone = statusTone(p);
             const conn = connect[p.provider];

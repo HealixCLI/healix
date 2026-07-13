@@ -57,6 +57,29 @@ describe('runCli abort (AbortSignal)', () => {
   });
 });
 
+describe('runCli cwd validation', () => {
+  it('resolves with a clear error instead of spawning when cwd does not exist', async () => {
+    const r = await runCli(process.execPath, ['-e', 'process.stdout.write("should not run")'], {
+      cwd: 'C:\\this\\path\\does\\not\\exist\\healix-test',
+      timeoutMs: 15_000,
+    });
+    expect(r.code).toBeNull();
+    expect(r.timedOut).toBe(false);
+    expect(r.aborted).toBe(false);
+    expect(r.stdout).toBe('');
+    expect(r.stderr).toContain('working directory does not exist');
+  });
+
+  it('spawns normally when cwd exists', async () => {
+    const r = await runCli(process.execPath, ['-e', 'process.stdout.write(String.fromCharCode(104,105))'], {
+      cwd: process.cwd(),
+      timeoutMs: 15_000,
+    });
+    expect(r.code).toBe(0);
+    expect(r.stdout).toBe('hi');
+  });
+});
+
 describe('runCli stdin handling', () => {
   it('does not crash on EPIPE when the child exits before reading stdin', async () => {
     // A child that exits instantly closes its stdin pipe while we are still

@@ -1,0 +1,64 @@
+name: Version bump
+
+# Auto-increments the desktop app's PATCH version on every push/merge to main
+# and commits the bump back to main.
+#
+# No infinite loop: the bump is pushed with the repo's GITHUB_TOKEN, and GitHub
+# does NOT re-trigger workflows for GITHUB_TOKEN pushes. The `[skip ci]` tag and
+# the commit-message guard below are belt-and-braces (they also cover the case
+# where someone later swaps in a PAT).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+
+# Serialize bumps so two quick merges can't race on the same file/push.
+concurrency:
+  group: version-bump-main
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    # Don't act on our own bump commit, or anything explicitly marked [skip ci].
+    if: >-
+      ${{ !contains(github.event.head_commit.message, '[skip ci]')
+          && !startsWith(github.event.head_commit.message, 'chore(release): bump version') }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Bump desktop patch version
+        id: bump
+        run: |
+          set -euo pipefail
+          # Bump only the version field; preserve key order + 2-space + trailing
+          # newline so the file stays prettier-clean.
+          new=$(node -e '
+            const fs = require("fs");
+            const p = "apps/desktop/package.json";
+            const j = JSON.parse(fs.readFileSync(p, "utf8"));
+            const [maj, min, pat] = j.version.split(".").map(Number);
+            j.version = [maj, min, pat + 1].join(".");
+            fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
+            console.log(j.version);
+          ')
+          echo "version=${new}" >> "$GITHUB_OUTPUT"
+          echo "Bumped desktop version to ${new}"
+
+      - name: Commit and push
+        run: |
+          set -euo pipefail
+          git config user.name  'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add apps/desktop/package.json
+          git commit -m "chore(release): bump version to ${{ steps.bump.outputs.version }} [skip ci]"
+          # Reconcile with anything that landed on main while we were bumping.
+          git pull --rebase origin main
+          git push origin HEAD:main

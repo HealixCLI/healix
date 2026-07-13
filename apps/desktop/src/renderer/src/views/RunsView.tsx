@@ -98,6 +98,23 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     }
   }, [engine.phase, engine.runId, refreshRuns]);
 
+  // Refresh as soon as the run gets an id, and again on every phase change
+  // while active, so a brand-new run appears and phase transitions (e.g.
+  // awaiting-approval) show up in the history rail without a manual refresh.
+  useEffect(() => {
+    if (!engine.runId || !isActive) return;
+    void refreshRuns();
+  }, [engine.runId, engine.phase, isActive, refreshRuns]);
+
+  // The orchestrator advances through several statuses (exploring/generating/
+  // executing/...) without changing engine.phase (it stays 'running'), so
+  // poll the same refresh while active to keep the status badge current.
+  useEffect(() => {
+    if (!isActive) return;
+    const id = setInterval(() => void refreshRuns(), 3000);
+    return () => clearInterval(id);
+  }, [isActive, refreshRuns]);
+
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === projectId) ?? null,
     [projects, projectId],

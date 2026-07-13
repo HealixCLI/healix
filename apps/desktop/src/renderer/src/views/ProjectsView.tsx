@@ -1,21 +1,29 @@
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
-import type { Project } from '@healix/core';
-import { Archive, ArchiveRestore, FolderGit2, Globe, Plus, Trash2 } from 'lucide-react';
+import type { NewProject, Project } from '@healix/core';
+import { Archive, ArchiveRestore, FolderGit2, Globe, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
+import { ConfirmDialog } from '../components/ui/confirm-dialog';
 import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Select } from '../components/ui/select';
 import { useProjects } from '../lib/use-projects';
 
+/** Which form (if any) is currently shown: closed, creating a new project, or editing an existing one. */
+type FormState = { kind: 'closed' } | { kind: 'create' } | { kind: 'edit'; project: Project };
+
 export function ProjectsView({ onRunProject }: { onRunProject?: (project: Project) => void }) {
-  const { projects, loading, error, create, remove, archive } = useProjects();
-  const [showForm, setShowForm] = useState(false);
+  const { projects, loading, error, create, update, remove, archive } = useProjects();
+  const [formState, setFormState] = useState<FormState>({ kind: 'closed' });
 
   const active = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
   const archived = useMemo(() => projects.filter((p) => p.archivedAt), [projects]);
+
+  const closeForm = () => setFormState({ kind: 'closed' });
+  const toggleCreate = () =>
+    setFormState((s) => (s.kind === 'create' ? { kind: 'closed' } : { kind: 'create' }));
 
   return (
     <div className="mx-auto max-w-4xl px-8 pb-16 pt-8">
@@ -26,9 +34,9 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
             Targets healix can plan, generate, and run suites against.
           </p>
         </div>
-        <Button variant={showForm ? 'outline' : 'default'} onClick={() => setShowForm((v) => !v)}>
+        <Button variant={formState.kind === 'create' ? 'outline' : 'default'} onClick={toggleCreate}>
           <Plus className="h-4 w-4" />
-          {showForm ? 'Close' : 'New project'}
+          {formState.kind === 'create' ? 'Close' : 'New project'}
         </Button>
       </header>
 
@@ -36,7 +44,14 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
         <p className="mt-4 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">{error}</p>
       )}
 
-      {showForm && <NewProjectForm onCreate={create} onDone={() => setShowForm(false)} />}
+      {formState.kind === 'create' && <ProjectForm onSubmit={create} onDone={closeForm} />}
+      {formState.kind === 'edit' && (
+        <ProjectForm
+          project={formState.project}
+          onSubmit={(input) => update(formState.project.id, input)}
+          onDone={closeForm}
+        />
+      )}
 
       <section className="mt-6 flex flex-col gap-2">
         {loading && <p className="text-sm text-muted">Loading projects…</p>}
@@ -51,6 +66,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
           <ProjectRow
             key={p.id}
             project={p}
+            onEdit={() => setFormState({ kind: 'edit', project: p })}
             onDelete={() => void remove(p.id)}
             onArchive={() => void archive(p.id, true)}
             onRun={onRunProject ? () => onRunProject(p) : undefined}
@@ -70,6 +86,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
               <ProjectRow
                 key={p.id}
                 project={p}
+                onEdit={() => setFormState({ kind: 'edit', project: p })}
                 onDelete={() => void remove(p.id)}
                 onUnarchive={() => void archive(p.id, false)}
               />
@@ -93,12 +110,14 @@ function shortenPath(p: string, segments = 2): string {
 
 function ProjectRow({
   project,
+  onEdit,
   onDelete,
   onArchive,
   onUnarchive,
   onRun,
 }: {
   project: Project;
+  onEdit: () => void;
   onDelete: () => void;
   onArchive?: () => void;
   onUnarchive?: () => void;
@@ -137,6 +156,9 @@ function ProjectRow({
               Run
             </Button>
           )}
+          <Button size="icon" variant="ghost" onClick={onEdit} aria-label="Edit project" title="Edit project">
+            <Pencil className="h-4 w-4" />
+          </Button>
           {onArchive && (
             <Button
               size="icon"
@@ -154,7 +176,7 @@ function ProjectRow({
               Restore
             </Button>
           )}
-          <DeleteButton onDelete={onDelete} />
+          <DeleteButton projectName={project.name} onDelete={onDelete} />
         </div>
       </CardContent>
     </Card>
@@ -162,43 +184,37 @@ function ProjectRow({
 }
 
 /**
- * Two-step destructive delete: the first click arms the button (auto-disarms
- * after a few seconds), the second click permanently removes the project, its
- * runs, and every on-disk asset (suites, screenshots, recordings).
+ * Delete requires an explicit confirmation in a modal dialog before anything
+ * is removed — the click that opens the dialog never itself deletes.
  */
-function DeleteButton({ onDelete }: { onDelete: () => void }) {
-  const [armed, setArmed] = useState(false);
+function DeleteButton({ projectName, onDelete }: { projectName: string; onDelete: () => void }) {
+  const [confirming, setConfirming] = useState(false);
 
-  useEffect(() => {
-    if (!armed) return;
-    const t = setTimeout(() => setArmed(false), 5000);
-    return () => clearTimeout(t);
-  }, [armed]);
-
-  if (!armed) {
-    return (
+  return (
+    <>
       <Button
         size="icon"
         variant="ghost"
-        onClick={() => setArmed(true)}
+        onClick={() => setConfirming(true)}
         aria-label="Delete project"
-        title="Delete project (asks to confirm)"
+        title="Delete project"
       >
         <Trash2 className="h-4 w-4" />
       </Button>
-    );
-  }
-  return (
-    <Button
-      size="sm"
-      variant="outline"
-      className="border-err/50 text-err hover:border-err hover:bg-err/10"
-      onClick={onDelete}
-      title="Permanently removes the project, all runs, and all media"
-    >
-      <Trash2 className="h-3.5 w-3.5" />
-      Delete runs & media?
-    </Button>
+      {confirming && (
+        <ConfirmDialog
+          title={`Delete "${projectName}"?`}
+          description="This permanently removes the project along with all of its runs, generated suites, screenshots, and recordings. This cannot be undone."
+          confirmLabel="Delete"
+          destructive
+          onConfirm={() => {
+            setConfirming(false);
+            onDelete();
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </>
   );
 }
 
@@ -219,17 +235,27 @@ function isValidBaseUrl(raw: string): boolean {
   }
 }
 
-function NewProjectForm({
-  onCreate,
+/**
+ * Shared create/edit form. In create mode `project` is omitted and fields start
+ * blank; in edit mode `project` seeds every field with its current value, all
+ * still freely editable, and submitting calls the same onSubmit with the full
+ * (possibly unchanged) NewProject shape — the caller decides whether that means
+ * create() or update(project.id, ...).
+ */
+function ProjectForm({
+  project,
+  onSubmit,
   onDone,
 }: {
-  onCreate: ReturnType<typeof useProjects>['create'];
+  project?: Project;
+  onSubmit: (input: NewProject) => Promise<Project | null>;
   onDone: () => void;
 }) {
-  const [name, setName] = useState('');
-  const [repoPath, setRepoPath] = useState('');
-  const [baseUrl, setBaseUrl] = useState('');
-  const [mode, setMode] = useState<'playwright'>('playwright');
+  const isEdit = project !== undefined;
+  const [name, setName] = useState(project?.name ?? '');
+  const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
+  const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
+  const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
   const [submitting, setSubmitting] = useState(false);
 
   // Same rules as core validateNewProject: a project needs a name, at least one
@@ -243,17 +269,19 @@ function NewProjectForm({
     e.preventDefault();
     if (!canSubmit) return;
     setSubmitting(true);
-    const created = await onCreate({
+    const saved = await onSubmit({
       name: trimmedName,
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
     });
     setSubmitting(false);
-    if (created) {
-      setName('');
-      setRepoPath('');
-      setBaseUrl('');
+    if (saved) {
+      if (!isEdit) {
+        setName('');
+        setRepoPath('');
+        setBaseUrl('');
+      }
       onDone();
     }
   };
@@ -261,7 +289,7 @@ function NewProjectForm({
   return (
     <Card className="mt-5">
       <CardHeader>
-        <CardTitle>New project</CardTitle>
+        <CardTitle>{isEdit ? `Edit "${project.name}"` : 'New project'}</CardTitle>
       </CardHeader>
       <CardContent>
         <form className="grid grid-cols-1 gap-4 sm:grid-cols-2" onSubmit={submit}>
@@ -308,7 +336,7 @@ function NewProjectForm({
                 Cancel
               </Button>
               <Button type="submit" disabled={!canSubmit}>
-                {submitting ? 'Creating…' : 'Create project'}
+                {submitting ? 'Saving…' : isEdit ? 'Save changes' : 'Create project'}
               </Button>
             </div>
           </div>

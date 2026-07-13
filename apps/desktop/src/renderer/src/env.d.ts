@@ -23,6 +23,7 @@ export interface HealixBridge {
 
   listProjects: () => Promise<Project[]>;
   createProject: (input: NewProject) => Promise<Project>;
+  updateProject: (id: string, input: NewProject) => Promise<Project>;
   deleteProject: (id: string) => Promise<{ ok: true; assetsRemoved: boolean }>;
   archiveProject: (id: string, archived: boolean) => Promise<{ ok: true }>;
 

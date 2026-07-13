@@ -46,6 +46,24 @@ export class HealixStore {
     return project;
   }
 
+  /**
+   * Update a project's editable fields (name, mode, repoPath, baseUrl). Runs the
+   * same validation as createProject — it is edited via the identical form, so
+   * the identical invariant (name required, at least one of repo/URL, a valid
+   * base URL) must hold. Throws if the project does not exist.
+   */
+  updateProject(id: string, input: NewProject): Project {
+    const existing = this.getProject(id);
+    if (!existing) throw new Error(`Project not found: ${id}`);
+    const validation = validateNewProject(input);
+    if (!validation.ok) throw new Error(validation.error);
+    const { name, mode, repoPath, baseUrl } = validation.value;
+    this.db
+      .prepare('UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ? WHERE id = ?')
+      .run(name, mode, repoPath, baseUrl, id);
+    return { ...existing, name, mode, repoPath, baseUrl };
+  }
+
   /** Soft-archive (or restore) a project. Archived projects keep all runs and assets. */
   setProjectArchived(id: string, archived: boolean): void {
     this.db

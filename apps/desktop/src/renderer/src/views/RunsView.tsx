@@ -16,6 +16,7 @@ import { useProjects } from '../lib/use-projects';
 import { useRuns } from '../lib/use-runs';
 import { useRunDetail } from '../lib/use-run-detail';
 import { useLiveFrame } from '../lib/use-live-frame';
+import { cn } from '../lib/utils';
 import { EXPLORATION_MODES, useRunEngine, type RunPhase } from '../lib/run-engine';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
@@ -53,6 +54,8 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // True from the moment the user clicks Cancel until run:done settles the run.
   const [cancelling, setCancelling] = useState(false);
+  // Session-only: resets to expanded on next launch.
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
 
   const { detail, loading: detailLoading } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
@@ -150,7 +153,12 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   return (
     <div className="flex h-full min-h-0">
       {/* History rail */}
-      <div className="flex w-64 shrink-0 flex-col border-r border-border px-4 pb-6 pt-8">
+      <div
+        className={cn(
+          'flex shrink-0 flex-col border-r border-border pb-6 pt-8',
+          historyCollapsed ? 'w-12 items-center px-1' : 'w-64 px-4',
+        )}
+      >
         <RunHistory
           runs={runs}
           loading={runsLoading}
@@ -161,6 +169,8 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           }}
           onRefresh={() => void refreshRuns()}
           projectsById={projectsById}
+          collapsed={historyCollapsed}
+          onToggleCollapse={() => setHistoryCollapsed((v) => !v)}
         />
       </div>
 

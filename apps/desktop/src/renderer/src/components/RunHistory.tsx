@@ -1,5 +1,5 @@
 import type { Project, Run } from '@healix/core';
-import { RefreshCw } from 'lucide-react';
+import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { cn } from '../lib/utils';
@@ -14,6 +14,8 @@ export function RunHistory({
   onSelect,
   onRefresh,
   projectsById,
+  collapsed,
+  onToggleCollapse,
 }: {
   runs: Run[];
   loading: boolean;
@@ -22,20 +24,35 @@ export function RunHistory({
   onSelect: (runId: string) => void;
   onRefresh: () => void;
   projectsById: Map<string, Project>;
+  collapsed: boolean;
+  onToggleCollapse: () => void;
 }) {
+  if (collapsed) {
+    return (
+      <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Expand history">
+        <ChevronRight className="h-3.5 w-3.5" />
+      </Button>
+    );
+  }
+
   return (
     <div className="flex h-full min-h-0 flex-col">
       <div className="mb-1.5 flex items-center justify-between">
         <span className="text-xs font-medium text-muted">History</span>
-        <Button
-          size="icon"
-          variant="ghost"
-          onClick={onRefresh}
-          aria-label="Refresh history"
-          disabled={loading}
-        >
-          <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
-        </Button>
+        <div className="flex items-center gap-1">
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onRefresh}
+            aria-label="Refresh history"
+            disabled={loading}
+          >
+            <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+          </Button>
+          <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Collapse history">
+            <ChevronLeft className="h-3.5 w-3.5" />
+          </Button>
+        </div>
       </div>
 
       {error && (

@@ -1,0 +1,18 @@
+# Force LF line endings for all text files in the working tree on every OS.
+# Without this, Windows CI runners (core.autocrlf=true) check files out with
+# CRLF and `prettier --check` — which expects LF — flags every file, failing
+# the Windows leg of the CI matrix while Linux/macOS pass.
+* text=auto eol=lf
+
+# Binary assets git must never touch (no EOL conversion, no diff).
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.gif  binary
+*.ico  binary
+*.icns binary
+*.woff  binary
+*.woff2 binary
+*.zip  binary
+*.dmg  binary
+*.exe  binary

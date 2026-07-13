@@ -1,6 +1,6 @@
 {
   "name": "@healix/desktop",
-  "version": "0.1.3",
+  "version": "0.1.4",
   "description": "Healix desktop app (Electron + React)",
   "author": "Healix",
   "main": "./out/main/index.js",

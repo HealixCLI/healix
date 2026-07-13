@@ -38,7 +38,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
 
       {showForm && <NewProjectForm onCreate={create} onDone={() => setShowForm(false)} />}
 
-      <section className="mt-6 flex flex-col gap-3">
+      <section className="mt-6 flex flex-col gap-2">
         {loading && <p className="text-sm text-muted">Loading projects…</p>}
         {!loading && projects.length === 0 && (
           <Card>
@@ -65,7 +65,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
             Archived
             <span className="font-normal">· {archived.length}</span>
           </h2>
-          <div className="flex flex-col gap-3">
+          <div className="flex flex-col gap-2">
             {archived.map((p) => (
               <ProjectRow
                 key={p.id}
@@ -79,6 +79,16 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
       )}
     </div>
   );
+}
+
+/** Shorten a long absolute path to its trailing segments (…/a/b) for compact display. */
+function shortenPath(p: string, segments = 2): string {
+  const parts = p
+    .replace(/[/\\]+$/, '')
+    .split(/[/\\]/)
+    .filter(Boolean);
+  if (parts.length <= segments) return p;
+  return `…/${parts.slice(-segments).join('/')}`;
 }
 
 function ProjectRow({
@@ -97,30 +107,31 @@ function ProjectRow({
   const isArchived = Boolean(project.archivedAt);
   return (
     <Card className={isArchived ? 'opacity-70' : undefined}>
-      <CardContent className="flex items-center justify-between gap-4 py-4">
+      <CardContent className="flex items-center justify-between gap-3 px-4 py-2.5">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
-            <span className="truncate font-medium text-fg">{project.name}</span>
+            <span className="truncate text-sm font-medium text-fg">{project.name}</span>
             <Badge tone="muted">{project.mode}</Badge>
             {isArchived && <Badge tone="muted">archived</Badge>}
           </div>
-          <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
+          {/* One-line target: trailing path segments (full path on hover) keep the row sleek. */}
+          <div className="mt-0.5 flex min-w-0 items-center gap-3 text-xs text-muted">
             {project.repoPath && (
-              <span className="flex items-center gap-1 font-mono">
-                <FolderGit2 className="h-3 w-3" />
-                {project.repoPath}
+              <span className="flex min-w-0 items-center gap-1 font-mono" title={project.repoPath}>
+                <FolderGit2 className="h-3 w-3 shrink-0" />
+                <span className="truncate">{shortenPath(project.repoPath)}</span>
               </span>
             )}
             {project.baseUrl && (
-              <span className="flex items-center gap-1 font-mono">
-                <Globe className="h-3 w-3" />
-                {project.baseUrl}
+              <span className="flex min-w-0 items-center gap-1 font-mono" title={project.baseUrl}>
+                <Globe className="h-3 w-3 shrink-0" />
+                <span className="truncate">{project.baseUrl}</span>
               </span>
             )}
             {!project.repoPath && !project.baseUrl && <span>No repo or URL set</span>}
           </div>
         </div>
-        <div className="flex shrink-0 items-center gap-2">
+        <div className="flex shrink-0 items-center gap-1">
           {onRun && (
             <Button size="sm" variant="outline" onClick={onRun}>
               Run

@@ -34,12 +34,7 @@ import type {
   TargetAdapter,
   UrlProbe,
 } from '../target/types.js';
-import type {
-  BrowserSurface,
-  BrowserSurfaceOptions,
-  DomSnapshot,
-  Point,
-} from '../browser/types.js';
+import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '../browser/types.js';
 
 // ---------------------------------------------------------------------------
 // Shared fakes — same pattern as orchestrator.integration.test.ts. Every
@@ -89,7 +84,13 @@ const fakeProvider: ProviderAdapter = {
     if (opts?.mode === 'plan') {
       return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
     }
-    return { provider: 'claude', ok: true, text: 'canned text (no actionable json)', raw: null, detail: 'OK' };
+    return {
+      provider: 'claude',
+      ok: true,
+      text: 'canned text (no actionable json)',
+      raw: null,
+      detail: 'OK',
+    };
   },
 };
 
@@ -446,14 +447,7 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(planWarns.some((e) => /fallback|no usable plan/i.test(e.message))).toBe(true);
 
     // The synthesized fallback plan was actually used (it has at least one item).
-    const reportPath = join(
-      projectsDir(),
-      project.id,
-      'runs',
-      summary.runId,
-      'reports',
-      'report.json',
-    );
+    const reportPath = join(projectsDir(), project.id, 'runs', summary.runId, 'reports', 'report.json');
     const report = JSON.parse(await readFile(reportPath, 'utf8')) as RunReport;
     expect(report.plan.items.length).toBeGreaterThan(0);
   });
@@ -532,5 +526,90 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(subscribedAfterStartAndGoto).toBe(true);
     expect(unsubscribeCalled).toBe(true);
     expect(stopCalled).toBe(true);
+  });
+
+  it('FALSE-GREEN GUARD: a run that generates zero specs settles as error, not passed', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Zero Spec Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // generate() yields nothing and execute() returns an empty outcome — the
+    // pipeline verified nothing, so the run must NOT be reported 'passed'.
+    const emptyOutcome: ExecOutcome = { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+    const mode: TestMode = {
+      ...makeFakeMode(emptyOutcome),
+      async generate(): Promise<GeneratedSpec[]> {
+        return [];
+      },
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    expect(summary.status).toBe('error');
+    expect(summary.outcome?.passed).toBe(0);
+    expect(store.getRun(summary.runId)?.status).toBe('error');
+
+    // The 'done' event explains WHY nothing was verified — not a bare "passed".
+    const done = events.find((e) => e.phase === 'done');
+    expect(done?.level).toBe('error');
+    expect(done?.message).toMatch(/no runnable specs|verified nothing/i);
+  });
+
+  it('FALSE-GREEN GUARD: an all-blocked outcome settles as error, not passed', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'All Blocked Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // Specs generate fine, but every test is blocked (e.g. missing Tier-B auth):
+    // nothing actually passed, so the run must be 'error', never a false green.
+    const allBlocked: ExecOutcome = {
+      passed: 0,
+      failed: 0,
+      blocked: 2,
+      flaky: 0,
+      results: [
+        { title: 'Home loads', status: 'blocked', durationMs: 5 },
+        { title: 'Login works', status: 'blocked', durationMs: 6 },
+      ],
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(allBlocked),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    expect(summary.status).toBe('error');
+    expect(summary.outcome?.blocked).toBe(2);
+    expect(summary.outcome?.passed).toBe(0);
+    expect(store.getRun(summary.runId)?.status).toBe('error');
+
+    const done = events.find((e) => e.phase === 'done');
+    expect(done?.level).toBe('error');
+    expect(done?.message).toMatch(/no tests passed|verified nothing/i);
   });
 });

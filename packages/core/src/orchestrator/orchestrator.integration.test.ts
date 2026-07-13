@@ -33,12 +33,7 @@ import type {
   TargetAdapter,
   UrlProbe,
 } from '../target/types.js';
-import type {
-  BrowserSurface,
-  BrowserSurfaceOptions,
-  DomSnapshot,
-  Point,
-} from '../browser/types.js';
+import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '../browser/types.js';
 
 /** Canned plan body the fake provider emits as a fenced JSON object. */
 const CANNED_PLAN = {
@@ -84,7 +79,13 @@ const fakeProvider: ProviderAdapter = {
     if (opts?.mode === 'plan') {
       return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
     }
-    return { provider: 'claude', ok: true, text: 'canned text (no actionable json)', raw: null, detail: 'OK' };
+    return {
+      provider: 'claude',
+      ok: true,
+      text: 'canned text (no actionable json)',
+      raw: null,
+      detail: 'OK',
+    };
   },
 };
 

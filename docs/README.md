@@ -4,18 +4,18 @@
 
 ## Start here
 
-| Doc | What it covers |
-|---|---|
-| [`feature-plan.md`](./feature-plan.md) | Vision, confirmed decisions, components, milestones, risks |
-| [`architecture/high-level-architecture.md`](./architecture/high-level-architecture.md) | System diagrams, run lifecycle, provider routing, browser surface |
+| Doc                                                                                            | What it covers                                                             |
+| ---------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------- |
+| [`feature-plan.md`](./feature-plan.md)                                                         | Vision, confirmed decisions, components, milestones, risks                 |
+| [`architecture/high-level-architecture.md`](./architecture/high-level-architecture.md)         | System diagrams, run lifecycle, provider routing, browser surface          |
 | [`architecture/healix-architecture.excalidraw`](./architecture/healix-architecture.excalidraw) | Editable high-level diagram (open in Excalidraw / VS Code Excalidraw ext.) |
-| [`adr/`](./adr/README.md) | Architecture Decision Records — decided + placeholder stubs |
+| [`adr/`](./adr/README.md)                                                                      | Architecture Decision Records — decided + placeholder stubs                |
 
 ## Confirmed at a glance
 
-- **Orchestration:** Claude Code CLI + Codex CLI in *plan mode* (primary), SDK fallback.
+- **Orchestration:** Claude Code CLI + Codex CLI in _plan mode_ (primary), SDK fallback.
 - **Auth:** subscription only — never API keys; in-app login health-check.
-- **UI testing:** computer-use *and* codegen, selectable per run.
+- **UI testing:** computer-use _and_ codegen, selectable per run.
 - **Routing:** best-for-task with automatic fallback.
 - **Storage:** local-first — SQLite + filesystem.
 - **Browser:** one embedded Playwright/CDP Chromium for computer-use + browser-use.
@@ -25,7 +25,7 @@
 - **UX:** Codex-inspired (calm, monochrome/dark, keyboard-first, approval gates).
 - **Target:** white-box (repo) and/or black-box (URL), per project.
 
-## Repository layout (planned)
+## Repository layout
 
 ```
 healix/

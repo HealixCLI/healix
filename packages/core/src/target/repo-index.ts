@@ -30,7 +30,22 @@ const SKIP_DIRS = new Set<string>([
 ]);
 
 /** Top-level dirs we call out in the summary when present. */
-const KEY_DIRS = ['src', 'app', 'pages', 'components', 'lib', 'server', 'api', 'routes', 'public', 'tests', 'test', 'e2e', 'apps', 'packages'];
+const KEY_DIRS = [
+  'src',
+  'app',
+  'pages',
+  'components',
+  'lib',
+  'server',
+  'api',
+  'routes',
+  'public',
+  'tests',
+  'test',
+  'e2e',
+  'apps',
+  'packages',
+];
 
 /** Map common extensions to a coarse language bucket for the language mix. */
 const EXT_LANG: Record<string, string> = {
@@ -151,9 +166,7 @@ function describeLanguageMix(langCounts: Map<string, number>): string {
   const total = [...langCounts.values()].reduce((a, b) => a + b, 0);
   if (total === 0) return 'no recognized source files';
   const ranked = [...langCounts.entries()].sort((a, b) => b[1] - a[1]);
-  const parts = ranked
-    .slice(0, 4)
-    .map(([lang, count]) => `${lang} ${Math.round((count / total) * 100)}%`);
+  const parts = ranked.slice(0, 4).map(([lang, count]) => `${lang} ${Math.round((count / total) * 100)}%`);
   return parts.join(', ');
 }
 

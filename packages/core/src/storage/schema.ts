@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 2;
+export const SCHEMA_VERSION = 3;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -8,7 +8,8 @@ CREATE TABLE IF NOT EXISTS projects (
   mode        TEXT NOT NULL DEFAULT 'playwright',
   repo_path   TEXT,
   base_url    TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
+  archived_at TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (

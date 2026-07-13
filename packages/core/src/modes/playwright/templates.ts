@@ -52,9 +52,11 @@ export interface ConfigOptions {
 
 /**
  * playwright.config.ts wiring the three Healix tiers as Playwright projects,
- * a JSON + HTML reporter, and the on-failure artifact policy. Tier B depends on
- * an auth storageState produced by fixtures/auth.setup.ts; when no credentials
- * are wired the setup is a no-op and Tier B specs simply run unauthenticated.
+ * a JSON + HTML reporter, and the artifact policy: every test records a
+ * screenshot + video (so the run detail can always show what happened), while
+ * traces are kept only for failures. Tier B depends on an auth storageState
+ * produced by fixtures/auth.setup.ts; when no credentials are wired the setup
+ * is a no-op and Tier B specs simply run unauthenticated.
  */
 export function playwrightConfigContents(opts: ConfigOptions = {}): string {
   const baseUrl = (opts.baseUrl ?? '').trim();
@@ -73,7 +75,10 @@ export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
   forbidOnly: !!process.env.CI,
-  retries: process.env.CI ? 1 : 0,
+  // Retries drive Healix's flaky detection (a test must fail then pass on retry
+  // to register as flaky). Default to 1 locally too — gating on CI meant flaky
+  // was never detectable on a local \`healix run\`. Override with HEALIX_RETRIES.
+  retries: process.env.HEALIX_RETRIES ? Number(process.env.HEALIX_RETRIES) : process.env.CI ? 2 : 1,
   workers: process.env.CI ? 1 : undefined,
   timeout: 60_000,
   expect: { timeout: 10_000 },
@@ -84,8 +89,8 @@ export default defineConfig({
   ],
   use: {
     baseURL: ${baseUrlLiteral},
-    screenshot: 'only-on-failure',
-    video: 'retain-on-failure',
+    screenshot: 'on',
+    video: 'on',
     trace: 'retain-on-failure',
   },
   projects: [

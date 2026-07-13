@@ -9,6 +9,9 @@ interface PackageJson {
   scripts?: Record<string, string>;
   dependencies?: Record<string, string>;
   devDependencies?: Record<string, string>;
+  /** npm/yarn/bun workspace globs — presence alone marks a monorepo root. */
+  workspaces?: unknown;
+  packageManager?: string;
 }
 
 const RUN_PREFIX: Record<PackageManager, string> = {
@@ -55,7 +58,7 @@ function detectPackageManager(repoPath: string, pkg: PackageJson | null): Packag
   }
   // No lockfile: infer from packageManager field if present, else default to
   // npm when a package.json exists at all.
-  const field = (pkg as { packageManager?: string } | null)?.packageManager;
+  const field = pkg?.packageManager;
   if (typeof field === 'string') {
     if (field.startsWith('pnpm')) return 'pnpm';
     if (field.startsWith('yarn')) return 'yarn';
@@ -119,7 +122,13 @@ export function inferFramework(repoPath: string, pkg: PackageJson | null): strin
   if (fileExists(repoPath, 'Gemfile')) return 'rails';
 
   // Generic Node entry point.
-  if (pkg && (deps.dotenv || pkg.scripts?.start || fileExists(repoPath, 'server.js') || fileExists(repoPath, 'index.js'))) {
+  if (
+    pkg &&
+    (deps.dotenv ||
+      pkg.scripts?.start ||
+      fileExists(repoPath, 'server.js') ||
+      fileExists(repoPath, 'index.js'))
+  ) {
     return 'node';
   }
 
@@ -136,8 +145,21 @@ function frameworkToKind(framework: string | null, deps: Record<string, string>)
   if (fullstack.has(framework)) return 'fullstack';
 
   // A repo that pairs a frontend dep with a server dep is fullstack.
-  const hasFrontendDep = !!(deps.react || deps['react-dom'] || deps.vue || deps.svelte || deps['@angular/core'] || deps.vite);
-  const hasBackendDep = !!(deps.express || deps.fastify || deps.koa || deps['@nestjs/core'] || deps['@nestjs/common']);
+  const hasFrontendDep = !!(
+    deps.react ||
+    deps['react-dom'] ||
+    deps.vue ||
+    deps.svelte ||
+    deps['@angular/core'] ||
+    deps.vite
+  );
+  const hasBackendDep = !!(
+    deps.express ||
+    deps.fastify ||
+    deps.koa ||
+    deps['@nestjs/core'] ||
+    deps['@nestjs/common']
+  );
   if (hasFrontendDep && hasBackendDep) return 'fullstack';
 
   if (frontend.has(framework)) return 'frontend';
@@ -186,7 +208,7 @@ function defaultPort(framework: string | null): number {
 }
 
 /** Dev binaries whose bare `-p` flag unambiguously means "port". */
-const DEV_PORT_BINARIES = /\b(?:vite|webpack-dev-server)\b/;
+const DEV_PORT_BINARIES = /\b(?:vite|webpack-dev-server|next)\b/;
 
 function toPort(raw: string | undefined): number | null {
   if (!raw) return null;
@@ -217,19 +239,28 @@ function parsePortFromScript(script: string): number | null {
   return null;
 }
 
+/**
+ * Env files consulted for PORT/APP_PORT, in precedence order (first hit wins).
+ * Mirrors the dotenv/Next.js convention where local overrides win over the
+ * shared file: `.env.local` > `.env.development` > `.env`. A dev server that
+ * loads these files will bind the same port we detect here.
+ */
+const ENV_FILES = ['.env.local', '.env.development', '.env'];
+
 function readEnvPort(repoPath: string): number | null {
-  const envPath = path.join(repoPath, '.env');
-  let content: string;
-  try {
-    content = fs.readFileSync(envPath, 'utf-8');
-  } catch {
-    return null;
-  }
-  for (const line of content.split('\n')) {
-    const m = line.match(/^\s*(?:PORT|APP_PORT)\s*=\s*['"]?(\d{2,5})['"]?\s*$/);
-    if (m && m[1]) {
-      const n = Number.parseInt(m[1], 10);
-      if (Number.isInteger(n) && n > 0 && n <= 65535) return n;
+  for (const file of ENV_FILES) {
+    let content: string;
+    try {
+      content = fs.readFileSync(path.join(repoPath, file), 'utf-8');
+    } catch {
+      continue;
+    }
+    for (const line of content.split('\n')) {
+      const m = line.match(/^\s*(?:PORT|APP_PORT)\s*=\s*['"]?(\d{2,5})['"]?\s*$/);
+      if (m && m[1]) {
+        const n = Number.parseInt(m[1], 10);
+        if (Number.isInteger(n) && n > 0 && n <= 65535) return n;
+      }
     }
   }
   return null;
@@ -275,26 +306,170 @@ function detectPort(
 }
 
 /**
+ * First-level container dirs scanned for monorepo workspace apps, in priority
+ * order — `apps/*` typically holds the runnable applications, `packages/*` the
+ * libraries, so apps are scanned first.
+ */
+const WORKSPACE_CONTAINERS = ['apps', 'packages'];
+/**
+ * Upper bound on how many first-level workspace dirs we inspect in total. The
+ * scan is a best-effort convenience, not an exhaustive search: a pathological
+ * repo with hundreds of packages must not turn detect() into a crawl.
+ */
+const MAX_WORKSPACE_DIRS = 24;
+
+/** A launchable app found under apps/* or packages/*. */
+interface WorkspaceDetection {
+  /** Relative dir from the repo root, POSIX-style (e.g. "apps/web"). */
+  relDir: string;
+  pkg: PackageJson;
+  framework: string;
+  scriptName: string;
+  port: number;
+}
+
+/** True when the root declares a JS workspace layout (npm/yarn/bun field or pnpm-workspace.yaml). */
+function hasWorkspaces(repoPath: string, rootPkg: PackageJson | null): boolean {
+  if (rootPkg?.workspaces) return true;
+  return fileExists(repoPath, 'pnpm-workspace.yaml');
+}
+
+/**
+ * Scan first-level `apps/*` / `packages/*` dirs (bounded, sorted for
+ * determinism) for the FIRST child package.json that has both a detectable
+ * framework and a dev/start script. Returns null when nothing launchable is
+ * found — the caller then falls back to the root-level detection as before.
+ */
+function scanWorkspaces(repoPath: string): WorkspaceDetection | null {
+  let inspected = 0;
+  for (const container of WORKSPACE_CONTAINERS) {
+    const containerAbs = path.join(repoPath, container);
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(containerAbs, { withFileTypes: true });
+    } catch {
+      continue; // container missing/unreadable — try the next one
+    }
+    // Stable order so two runs over the same repo always pick the same app.
+    entries.sort((a, b) => a.name.localeCompare(b.name));
+    for (const entry of entries) {
+      if (!entry.isDirectory()) continue;
+      if (inspected >= MAX_WORKSPACE_DIRS) return null;
+      inspected += 1;
+
+      const childDir = path.join(containerAbs, entry.name);
+      const childPkg = readPackageJson(childDir);
+      if (!childPkg) continue;
+      const framework = inferFramework(childDir, childPkg);
+      if (!framework) continue;
+      const scriptName =
+        START_SCRIPTS.find((n) => typeof childPkg.scripts?.[n] === 'string' && childPkg.scripts[n]) ?? null;
+      if (!scriptName) continue;
+
+      // Port detection runs against the CHILD dir so its own script body /
+      // .env files win, exactly as they would for a standalone checkout.
+      const port = detectPort(childDir, childPkg, framework, scriptName);
+      return { relDir: `${container}/${entry.name}`, pkg: childPkg, framework, scriptName, port };
+    }
+  }
+  return null;
+}
+
+/**
+ * Build the start command for a workspace app. When the root declares a
+ * workspace layout AND has a known package manager AND the child package is
+ * addressable by name, prefer the PM's native workspace invocation (it runs
+ * from the repo root, which is where launch() spawns). Anything less falls
+ * back to a plain `cd <dir> && <pm> <script>` that works regardless of
+ * workspace wiring. bun deliberately uses the cd fallback too — its workspace
+ * filtering flags vary across versions.
+ */
+function workspaceStartCommand(
+  repoPath: string,
+  rootPkg: PackageJson | null,
+  rootPm: PackageManager | null,
+  ws: WorkspaceDetection,
+): string {
+  const name = typeof ws.pkg.name === 'string' && ws.pkg.name.trim().length > 0 ? ws.pkg.name.trim() : null;
+  if (name && rootPm && hasWorkspaces(repoPath, rootPkg)) {
+    switch (rootPm) {
+      case 'pnpm':
+        return `pnpm --filter ${name} ${ws.scriptName}`;
+      case 'yarn':
+        return `yarn workspace ${name} ${ws.scriptName}`;
+      case 'npm':
+        return `npm run ${ws.scriptName} --workspace ${name}`;
+      case 'bun':
+        break; // fall through to the cd form
+    }
+  }
+  const childPm = detectPackageManager(path.join(repoPath, ws.relDir), ws.pkg) ?? rootPm ?? 'npm';
+  return `cd ${ws.relDir} && ${RUN_PREFIX[childPm]} ${ws.scriptName}`;
+}
+
+/** Compose files that mark a docker-first project (any one is enough). */
+const COMPOSE_FILES = ['docker-compose.yml', 'docker-compose.yaml', 'compose.yml', 'compose.yaml'];
+
+/**
  * Detect framework / package manager / start command / port for a repo.
  * Fully defensive: a missing package.json yields kind 'unknown' but we still
  * attempt marker-file framework inference (e.g. python/go/java backends).
+ *
+ * Monorepo fallback: when the ROOT package.json yields neither a framework nor
+ * a start command, the first launchable app under `apps/*` / `packages/*` is
+ * used instead (its framework/port, with a workspace-aware start command), and
+ * the chosen subdir is recorded in `notes`.
  */
 export async function detect(repoPath: string): Promise<DetectedProject> {
   const pkg = readPackageJson(repoPath);
   const pm = detectPackageManager(repoPath, pkg);
-  const framework = inferFramework(repoPath, pkg);
-  const deps = mergedDeps(pkg);
-  const kind = frameworkToKind(framework, deps);
+  let framework = inferFramework(repoPath, pkg);
+  let kind = frameworkToKind(framework, mergedDeps(pkg));
+  const notes: string[] = [];
 
-  const { command: startCommand, scriptName } = detectStartCommand(pkg, pm);
+  let { command: startCommand, scriptName } = detectStartCommand(pkg, pm);
 
   // Only assign a port/baseUrl when we have something runnable or a recognized
   // framework; an entirely unknown repo with no package.json gets nulls.
   let port: number | null = null;
   let baseUrl: string | null = null;
-  if (framework !== null || startCommand !== null || pkg !== null) {
+
+  if (framework === null && startCommand === null) {
+    // Root told us nothing launchable — try the monorepo workspace scan.
+    const ws = scanWorkspaces(repoPath);
+    if (ws) {
+      framework = ws.framework;
+      kind = frameworkToKind(ws.framework, mergedDeps(ws.pkg));
+      scriptName = ws.scriptName;
+      startCommand = workspaceStartCommand(repoPath, pkg, pm, ws);
+      port = ws.port;
+      baseUrl = `http://localhost:${port}`;
+      notes.push(
+        `Monorepo: using workspace app "${ws.relDir}"${typeof ws.pkg.name === 'string' && ws.pkg.name ? ` (${ws.pkg.name})` : ''}.`,
+      );
+    }
+  }
+
+  if (port === null && (framework !== null || startCommand !== null || pkg !== null)) {
     port = detectPort(repoPath, pkg, framework, scriptName);
     baseUrl = `http://localhost:${port}`;
+  }
+
+  // A recognized framework with NO derivable start command (Go/Django/Rails/
+  // Spring/Rust, docker-only setups, ...): keep startCommand null, but say so
+  // explicitly instead of leaving callers to infer the gap from a bare null.
+  if (framework !== null && startCommand === null) {
+    notes.push(
+      `Framework "${framework}" detected but no start command could be derived — auto-launch is unavailable; start the app manually and set a base URL.`,
+    );
+  }
+
+  // Docker presence hint. We NEVER attempt a docker launch; the note explains
+  // why auto-launch is missing (or likely wrong) for container-first repos.
+  if (COMPOSE_FILES.some((f) => fileExists(repoPath, f))) {
+    notes.push('"docker compose up" project — auto-launch not supported yet.');
+  } else if (fileExists(repoPath, 'Dockerfile')) {
+    notes.push('Dockerfile present — containerized auto-launch not supported yet.');
   }
 
   return {
@@ -304,5 +479,6 @@ export async function detect(repoPath: string): Promise<DetectedProject> {
     startCommand,
     port,
     baseUrl,
+    ...(notes.length > 0 ? { notes } : {}),
   };
 }

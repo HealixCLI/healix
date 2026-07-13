@@ -37,7 +37,8 @@ const RE_ENVIRONMENT =
 const RE_TIMEOUT = /\bTimeout(?:Error)?\b|timed out/i;
 
 // Element became unstable: present but not interactable / removed mid-action.
-const RE_FLAKY = /(not visible|element is not visible|detached|not stable|intercepts pointer events|element is outside of the viewport|not attached)/i;
+const RE_FLAKY =
+  /(not visible|element is not visible|detached|not stable|intercepts pointer events|element is outside of the viewport|not attached)/i;
 
 // Assertion failures — Playwright's expect() output.
 const RE_ASSERTION =
@@ -115,7 +116,7 @@ const RULES: readonly Rule[] = [
       return mk(
         'test_is_wrong',
         0.7,
-        'The test\'s locator did not resolve to exactly one element (not found, zero matches, or strict-mode violation). This usually means the selector in the test no longer matches the live UI.',
+        "The test's locator did not resolve to exactly one element (not found, zero matches, or strict-mode violation). This usually means the selector in the test no longer matches the live UI.",
       );
     },
   },

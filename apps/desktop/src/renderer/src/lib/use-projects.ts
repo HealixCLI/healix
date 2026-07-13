@@ -7,7 +7,10 @@ export interface ProjectsState {
   error: string | null;
   refresh: () => Promise<void>;
   create: (input: NewProject) => Promise<Project | null>;
+  /** Permanently deletes the project, its runs, and all on-disk assets. */
   remove: (id: string) => Promise<void>;
+  /** Soft-archive (or restore) a project; all data is kept. */
+  archive: (id: string, archived: boolean) => Promise<void>;
 }
 
 function toMessage(err: unknown): string {
@@ -55,7 +58,10 @@ export function useProjects(): ProjectsState {
     async (id: string): Promise<void> => {
       setError(null);
       try {
-        await window.healix.deleteProject(id);
+        const res = await window.healix.deleteProject(id);
+        if (!res.assetsRemoved) {
+          setError('Project deleted, but some on-disk assets could not be removed.');
+        }
         await refresh();
       } catch (err) {
         setError(toMessage(err));
@@ -64,5 +70,18 @@ export function useProjects(): ProjectsState {
     [refresh],
   );
 
-  return { projects, loading, error, refresh, create, remove };
+  const archive = useCallback(
+    async (id: string, archived: boolean): Promise<void> => {
+      setError(null);
+      try {
+        await window.healix.archiveProject(id, archived);
+        await refresh();
+      } catch (err) {
+        setError(toMessage(err));
+      }
+    },
+    [refresh],
+  );
+
+  return { projects, loading, error, refresh, create, remove, archive };
 }

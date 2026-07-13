@@ -29,13 +29,7 @@ describe('sanitizeContent — JSON / JS-object secret redaction', () => {
   });
 
   it('redacts secret pairs but preserves a benign pair in the same object', () => {
-    const blob = [
-      '{',
-      '  "name": "value",',
-      '  "apiKey": "abc123",',
-      '  "authToken":"xyz"',
-      '}',
-    ].join('\n');
+    const blob = ['{', '  "name": "value",', '  "apiKey": "abc123",', '  "authToken":"xyz"', '}'].join('\n');
 
     const out = sanitizeContent(blob, suiteDir);
     const lines = out.split('\n');
@@ -48,6 +42,34 @@ describe('sanitizeContent — JSON / JS-object secret redaction', () => {
     expect(out).not.toContain('xyz');
     // The benign value survives intact.
     expect(out).toContain('"value"');
+  });
+
+  it('spares the package.json "author"/"authors" fields (auth is not author)', () => {
+    const author = '"author": "Jane Doe <jane@example.com>"';
+    const authors = '"authors": "Jane, John"';
+    expect(sanitizeContent(author, suiteDir)).toBe(author);
+    expect(sanitizeContent(authors, suiteDir)).toBe(authors);
+  });
+
+  it('still redacts authorization-style keys', () => {
+    const out = sanitizeContent('"authorization": "Basic abc"', suiteDir);
+    expect(out).toBe(`"authorization": "${REDACTED}"`);
+  });
+});
+
+describe('sanitizeContent — dotenv token boundaries', () => {
+  const suiteDir = path.join(os.tmpdir(), 'healix-sanitize-env-anchor');
+
+  it('does not redact identifiers that merely end in KEY (MONKEY/TURKEY)', () => {
+    for (const line of ['MONKEY=banana', 'TURKEY=gobble']) {
+      expect(sanitizeContent(line, suiteDir)).toBe(line);
+    }
+  });
+
+  it('still redacts underscore-delimited and APIKEY compounds', () => {
+    expect(sanitizeContent('MY_API_KEY=s3cret', suiteDir)).toBe(`MY_API_KEY=${REDACTED}`);
+    expect(sanitizeContent('APIKEY=s3cret', suiteDir)).toBe(`APIKEY=${REDACTED}`);
+    expect(sanitizeContent('TOKEN=s3cret', suiteDir)).toBe(`TOKEN=${REDACTED}`);
   });
 });
 
@@ -68,6 +90,31 @@ describe('sanitizeContent — Anthropic key shape', () => {
     const out = sanitizeContent(`ANTHROPIC=${key}`, suiteDir);
     expect(out).not.toContain(key);
     expect(out).toContain(REDACTED);
+  });
+});
+
+describe('sanitizeContent — broadened redaction (lowercase + unquoted)', () => {
+  const suiteDir = path.join(os.tmpdir(), 'healix-sanitize-broaden-anchor');
+
+  it('redacts a lowercase / mixed-case dotenv key=value', () => {
+    expect(sanitizeContent('api_key=hunter2secret', suiteDir)).toBe(`api_key=${REDACTED}`);
+    expect(sanitizeContent('export db_password=p@ss', suiteDir)).toBe(`export db_password=${REDACTED}`);
+    expect(sanitizeContent('Api_Key=abc', suiteDir)).toBe(`Api_Key=${REDACTED}`);
+  });
+
+  it('still leaves token-free lowercase assignments alone', () => {
+    for (const line of ['normal=hello', 'monkey=banana', 'count=5']) {
+      expect(sanitizeContent(line, suiteDir)).toBe(line);
+    }
+  });
+
+  it('redacts an unquoted numeric secret value in JSON', () => {
+    expect(sanitizeContent('"apiKey": 12345', suiteDir)).toBe(`"apiKey": "${REDACTED}"`);
+    expect(sanitizeContent('"authToken":42', suiteDir)).toBe(`"authToken":"${REDACTED}"`);
+  });
+
+  it('leaves a non-secret unquoted numeric value alone', () => {
+    expect(sanitizeContent('"timeout": 5000', suiteDir)).toBe('"timeout": 5000');
   });
 });
 

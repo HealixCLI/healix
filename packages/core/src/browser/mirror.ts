@@ -4,14 +4,23 @@ import type { Page } from 'playwright';
 const FRAME_INTERVAL_MS = 500;
 
 /**
- * Drives a live PNG screenshot stream off a single page at ~2fps.
+ * Live-mirror frames are JPEG (quality 70), not PNG: a full-page PNG of a real
+ * app is routinely several times larger than the equivalent JPEG, and at ~2fps
+ * every frame crosses the process boundary (base64 over IPC to the renderer).
+ * JPEG keeps the stream cheap; mild compression artifacts are fine for a
+ * preview. Durable evidence screenshots (browser/index.ts) stay PNG.
+ */
+const FRAME_SCREENSHOT_OPTIONS = { type: 'jpeg', quality: 70 } as const;
+
+/**
+ * Drives a live JPEG screenshot stream off a single page at ~2fps.
  *
  * Multiple subscribers share one capture loop; we only capture while there is
  * at least one subscriber, and we guard against overlapping captures so a slow
  * screenshot never queues up behind itself.
  */
 export class FrameMirror {
-  private readonly subscribers = new Set<(png: Buffer) => void>();
+  private readonly subscribers = new Set<(frame: Buffer) => void>();
   private timer: ReturnType<typeof setInterval> | undefined;
   private capturing = false;
   private readonly getPage: () => Page | undefined;
@@ -21,7 +30,7 @@ export class FrameMirror {
   }
 
   /** Subscribe to live frames; returns an unsubscribe fn. Non-blocking. */
-  subscribe(cb: (png: Buffer) => void): () => void {
+  subscribe(cb: (frame: Buffer) => void): () => void {
     this.subscribers.add(cb);
     this.ensureRunning();
     let active = true;
@@ -75,11 +84,11 @@ export class FrameMirror {
 
     this.capturing = true;
     try {
-      const png = (await page.screenshot({ type: 'png' })) as Buffer;
+      const frame = (await page.screenshot(FRAME_SCREENSHOT_OPTIONS)) as Buffer;
       // Snapshot subscribers so unsubscribing mid-iteration is safe.
       for (const cb of Array.from(this.subscribers)) {
         try {
-          cb(png);
+          cb(frame);
         } catch {
           // A misbehaving subscriber must not break the mirror loop.
         }

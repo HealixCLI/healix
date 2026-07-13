@@ -2,7 +2,18 @@ import os from 'node:os';
 import path from 'node:path';
 
 /** File extensions that are treated as sanitizable text. */
-const TEXT_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.mjs', '.cjs', '.json', '.md', '.txt', '.yml', '.yaml']);
+const TEXT_EXTENSIONS = new Set([
+  '.ts',
+  '.tsx',
+  '.js',
+  '.mjs',
+  '.cjs',
+  '.json',
+  '.md',
+  '.txt',
+  '.yml',
+  '.yaml',
+]);
 
 /** Placeholder substituted for the user's home directory. */
 const HOME_PLACEHOLDER = '<HOME>';
@@ -21,17 +32,32 @@ interface SecretPattern {
 
 const SECRET_PATTERNS: readonly SecretPattern[] = [
   // KEY=value style (dotenv / shell). Redacts the value, keeps the key and the
-  // original separator/whitespace. The identifier must be UPPERCASE and CONTAIN a
-  // secret token (KEY/TOKEN/SECRET/PASSWORD/...), so MY_API_KEY and DB_PASSWORD
-  // match while lowercase words ('capital') and token-free words ('RAPID') do not.
-  // A non-empty value is required.
+  // original separator/whitespace. The identifier must contain a secret token
+  // (KEY/TOKEN/SECRET/PASSWORD/...) as a full underscore-delimited segment
+  // (APIKEY allowed as a common unseparated compound). Case-insensitive, so both
+  // MY_API_KEY and api_key match; the ^ anchor plus the required delimiter keep
+  // MONKEY/TURKEY and token-free words ('RAPID', 'normal') from matching. A
+  // non-empty value is required.
   {
-    regex: /^([ \t]*(?:export[ \t]+)?[A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIAL)[A-Z0-9_]*[ \t]*=[ \t]*)\S.*$/gm,
+    regex:
+      /^([ \t]*(?:export[ \t]+)?(?:[A-Za-z0-9_]*_)?(?:APIKEY|KEY|TOKEN|SECRET|PASSWORD|PASSWD|CREDENTIALS?)(?:_[A-Za-z0-9_]*)?[ \t]*=[ \t]*)\S.*$/gim,
     replace: (_m, prefix) => `${String(prefix)}<REDACTED>`,
   },
   // "key": "value" style (JSON / JS objects). Redacts the value, keeps the key.
+  // `auth(?!ors?\b)` keeps authorization/authToken/oauth but spares the
+  // package.json "author"/"authors" fields.
   {
-    regex: /("(?:[a-z0-9_-]*(?:key|token|secret|password|passwd|apikey|api_key|auth|credential)[a-z0-9_-]*)"[ \t]*:[ \t]*)"(?:[^"\\]|\\.)*"/gi,
+    regex:
+      /("(?:[a-z0-9_-]*(?:key|token|secret|password|passwd|apikey|api_key|auth(?!ors?\b)|credential)[a-z0-9_-]*)"[ \t]*:[ \t]*)"(?:[^"\\]|\\.)*"/gi,
+    replace: (_m, prefix) => `${String(prefix)}"<REDACTED>"`,
+  },
+  // "key": 12345 style — an UNQUOTED (numeric) secret value. The quoted variant
+  // above handles string values; this catches numeric secrets (PINs, numeric
+  // keys) that would otherwise ship in the clear. Rewritten to a quoted
+  // placeholder so the surrounding JSON stays valid.
+  {
+    regex:
+      /("(?:[a-z0-9_-]*(?:key|token|secret|password|passwd|apikey|api_key|auth(?!ors?\b)|credential)[a-z0-9_-]*)"[ \t]*:[ \t]*)(-?\d[\w.+-]*)/gi,
     replace: (_m, prefix) => `${String(prefix)}"<REDACTED>"`,
   },
   // Bearer tokens embedded anywhere.

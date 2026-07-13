@@ -16,7 +16,7 @@ import { execute } from './execute.js';
 /** Directories whose presence is purely build/runtime noise — never traversed for export. */
 const EXPORT_IGNORE_DIRS = new Set(['node_modules', '.git', 'test-results', 'playwright-report']);
 
-/** Artifact roots written by Playwright's on-failure capture policy. */
+/** Artifact roots written by Playwright's capture policy (screenshots/videos/traces). */
 const ARTIFACT_DIRS = ['test-results', 'playwright-report'];
 
 /** Recursively list files under `dir`, returning paths relative to `dir`. */

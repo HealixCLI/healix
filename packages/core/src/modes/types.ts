@@ -1,6 +1,6 @@
 import type { ProviderAdapter } from '../providers/types.js';
 import type { TargetAdapter } from '../target/types.js';
-import type { BrowserSurface } from '../browser/types.js';
+import type { BrowserSurface, DomSnapshot } from '../browser/types.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
 
 export type ExplorationMode = 'computer-use' | 'codegen';
@@ -59,7 +59,11 @@ export interface TestModeContext {
   target: TargetAdapter;
   browser: BrowserSurface;
   explorationMode?: ExplorationMode;
+  /** DOM snapshot captured during computer-use exploration; grounds generation. */
+  snapshot?: DomSnapshot;
   emit?: (phase: string, message: string, data?: unknown) => void;
+  /** Cooperative cancellation for long mode phases (generate/execute). */
+  signal?: AbortSignal;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

@@ -2,6 +2,7 @@
   "name": "@healix/desktop",
   "version": "0.0.0",
   "description": "Healix desktop app (Electron + React)",
+  "author": "Healix",
   "main": "./out/main/index.js",
   "scripts": {
     "dev": "electron-vite dev",
@@ -28,18 +29,26 @@
     ],
     "asarUnpack": [
       "node_modules/playwright/**",
-      "node_modules/playwright-core/**"
+      "node_modules/playwright-core/**",
+      "node_modules/chromium-bidi/**",
+      "node_modules/archiver/**"
     ],
     "mac": {
       "category": "public.app-category.developer-tools",
       "target": [
-        "dir"
+        "dmg",
+        "zip"
       ]
     },
     "win": {
       "target": [
         "nsis"
       ]
+    },
+    "nsis": {
+      "oneClick": false,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": true
     },
     "linux": {
       "target": [

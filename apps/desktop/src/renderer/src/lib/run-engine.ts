@@ -1,19 +1,15 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type {
-  ExplorationMode,
-  OrchestratorEvent,
-  RunSummary,
-  TestPlan,
-} from '@healix/core';
+import type { ExplorationMode, OrchestratorEvent, RunSummary, TestPlan } from '@healix/core';
 import type { RunChannelMessage, StartRunArgs } from './ipc-types';
 
-export type RunPhase =
-  | 'idle'
-  | 'starting'
-  | 'running'
-  | 'awaiting-approval'
-  | 'done'
-  | 'error';
+export type RunPhase = 'idle' | 'starting' | 'running' | 'awaiting-approval' | 'done' | 'cancelled' | 'error';
+
+/** Map a final run summary status onto the engine phase. */
+function settledPhase(status: RunSummary['status']): RunPhase {
+  if (status === 'error') return 'error';
+  if (status === 'cancelled') return 'cancelled';
+  return 'done';
+}
 
 export interface ConsoleLine {
   id: number;
@@ -38,6 +34,8 @@ export interface RunEngineState {
 export interface RunEngine extends RunEngineState {
   start: (args: StartRunArgs) => Promise<void>;
   approve: (ok: boolean) => Promise<void>;
+  /** Request cancellation of the active run; run:done ('cancelled') confirms. */
+  cancel: () => Promise<void>;
   reset: () => void;
 }
 
@@ -66,16 +64,13 @@ export function useRunEngine(): RunEngine {
   // Track the active runId without re-subscribing on every change.
   const activeRunId = useRef<string | null>(null);
 
-  const pushLine = useCallback(
-    (level: OrchestratorEvent['level'], phase: string, message: string): void => {
-      const id = ++lineSeq.current;
-      setState((prev) => ({
-        ...prev,
-        lines: [...prev.lines, { id, level, phase, message, ts: nowLabel() }],
-      }));
-    },
-    [],
-  );
+  const pushLine = useCallback((level: OrchestratorEvent['level'], phase: string, message: string): void => {
+    const id = ++lineSeq.current;
+    setState((prev) => ({
+      ...prev,
+      lines: [...prev.lines, { id, level, phase, message, ts: nowLabel() }],
+    }));
+  }, []);
 
   useEffect(() => {
     const unsubscribe = window.healix.onRunEvent((msg: RunChannelMessage) => {
@@ -108,7 +103,7 @@ export function useRunEngine(): RunEngine {
           setState((prev) => ({
             ...prev,
             summary,
-            phase: summary.status === 'error' ? 'error' : 'done',
+            phase: settledPhase(summary.status),
           }));
           break;
         }
@@ -129,7 +124,7 @@ export function useRunEngine(): RunEngine {
         ...prev,
         summary,
         // run:done may have already set phase; keep error sticky.
-        phase: prev.phase === 'error' ? 'error' : summary.status === 'error' ? 'error' : 'done',
+        phase: prev.phase === 'error' ? 'error' : settledPhase(summary.status),
       }));
     } catch (err) {
       const message = err instanceof Error ? err.message : String(err);
@@ -140,15 +135,29 @@ export function useRunEngine(): RunEngine {
   const approve = useCallback(async (ok: boolean): Promise<void> => {
     const runId = activeRunId.current;
     if (!runId) return;
+    // A rejection is a cancellation, not an error — run:done confirms shortly.
     setState((prev) => ({
       ...prev,
       planDecided: true,
-      phase: ok ? 'running' : 'error',
+      phase: ok ? 'running' : prev.phase,
     }));
     try {
       await window.healix.approveRun(runId, ok);
     } catch {
       // The gate may have already settled (e.g. run torn down); safe to ignore.
+    }
+  }, []);
+
+  const cancel = useCallback(async (): Promise<void> => {
+    const runId = activeRunId.current;
+    if (!runId) return;
+    // Cancellation is asynchronous and cooperative: the main process aborts the
+    // orchestrator, which winds down at the next phase boundary. We do NOT flip
+    // the phase here — the authoritative 'cancelled' arrives via run:done.
+    try {
+      await window.healix.cancelRun(runId);
+    } catch {
+      // The run may have already settled; run:done tells the real story.
     }
   }, []);
 
@@ -158,7 +167,7 @@ export function useRunEngine(): RunEngine {
     setState(INITIAL);
   }, []);
 
-  return { ...state, start, approve, reset };
+  return { ...state, start, approve, cancel, reset };
 }
 
 export const EXPLORATION_MODES: ReadonlyArray<{ value: ExplorationMode; label: string; hint: string }> = [

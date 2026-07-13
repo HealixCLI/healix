@@ -21,13 +21,7 @@ export function Leaf({ className }: { className?: string }) {
           strokeWidth="22"
           strokeLinecap="round"
         />
-        <g
-          fill="none"
-          stroke="#0d3a22"
-          strokeOpacity="0.55"
-          strokeWidth="15"
-          strokeLinecap="round"
-        >
+        <g fill="none" stroke="#0d3a22" strokeOpacity="0.55" strokeWidth="15" strokeLinecap="round">
           <path d="M512 340 C 560 360, 600 392, 624 440" />
           <path d="M512 340 C 464 360, 424 392, 400 440" />
           <path d="M512 470 C 568 494, 612 532, 636 584" />

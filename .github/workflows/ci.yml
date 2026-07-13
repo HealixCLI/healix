@@ -6,8 +6,12 @@ on:
 
 jobs:
   quality:
-    name: Build, Typecheck, Lint, Test
-    runs-on: ubuntu-latest
+    name: Build, Typecheck, Lint, Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
 
     steps:
       - name: Checkout
@@ -25,6 +29,9 @@ jobs:
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
 
+      - name: Format check
+        run: pnpm format:check
+
       - name: Build
         run: pnpm build
 
@@ -36,3 +43,23 @@ jobs:
 
       - name: Test
         run: pnpm test
+
+      # Boot the built Electron app headlessly (Linux only — uses xvfb) and
+      # assert the HEALIX_SMOKE handshake so a broken main-process bundle
+      # (e.g. an unresolvable externalized dep) fails CI instead of shipping.
+      - name: Desktop boot smoke (xvfb)
+        if: matrix.os == 'ubuntu-latest'
+        timeout-minutes: 10
+        working-directory: apps/desktop
+        env:
+          HEALIX_SMOKE: '1'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb
+          set +e
+          output=$(timeout 300 xvfb-run --auto-servernum npx electron . --no-sandbox 2>&1)
+          status=$?
+          set -e
+          echo "$output"
+          echo "electron exited with $status"
+          echo "$output" | grep -q "HEALIX_SMOKE_OK"

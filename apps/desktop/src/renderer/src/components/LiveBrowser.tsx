@@ -2,7 +2,7 @@ import { Monitor } from 'lucide-react';
 import { Badge } from './ui/badge';
 
 /**
- * Live browser mirror for computer-use runs. Renders the latest PNG frame
+ * Live browser mirror for computer-use runs. Renders the latest JPEG frame
  * streamed over the run:frame channel; shows a calm placeholder otherwise.
  */
 export function LiveBrowser({
@@ -21,10 +21,10 @@ export function LiveBrowser({
         {active && mode === 'computer-use' && frame && <Badge tone="ok">streaming</Badge>}
         {active && mode === 'computer-use' && !frame && <Badge tone="default">waiting…</Badge>}
       </div>
-      <div className="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border bg-[#0d0d12]">
+      <div className="relative min-h-0 flex-1 overflow-hidden rounded-lg border border-border bg-well">
         {frame ? (
           <img
-            src={`data:image/png;base64,${frame}`}
+            src={`data:image/jpeg;base64,${frame}`}
             alt="Live browser frame"
             className="h-full w-full object-contain"
           />

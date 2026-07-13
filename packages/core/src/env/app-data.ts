@@ -1,6 +1,7 @@
 import { homedir, platform } from 'node:os';
-import { join, resolve } from 'node:path';
+import { join, resolve, sep } from 'node:path';
 import { mkdirSync } from 'node:fs';
+import { rm } from 'node:fs/promises';
 
 /** Resolve the OS-specific Healix application-data directory (no side effects). */
 export function appDataDir(): string {
@@ -34,4 +35,21 @@ export function projectsDir(): string {
 
 export function dbPath(): string {
   return join(appDataDir(), 'healix.db');
+}
+
+/**
+ * Irreversibly remove a project's on-disk assets (runs, suites, reports, media).
+ * The id must look like a Healix project id and resolve strictly inside the
+ * projects dir — a malformed id must never turn into an `rm -rf` elsewhere.
+ */
+export async function deleteProjectAssets(projectId: string): Promise<void> {
+  if (!/^prj_[A-Za-z0-9_-]+$/.test(projectId)) {
+    throw new Error(`Refusing to delete assets for suspicious project id: ${JSON.stringify(projectId)}`);
+  }
+  const root = resolve(projectsDir());
+  const target = resolve(join(root, projectId));
+  if (!target.startsWith(root + sep)) {
+    throw new Error(`Refusing to delete assets outside the projects dir: ${target}`);
+  }
+  await rm(target, { recursive: true, force: true });
 }

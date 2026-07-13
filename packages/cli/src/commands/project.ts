@@ -1,13 +1,15 @@
 import type { Command } from 'commander';
 import pc from 'picocolors';
-import { getStore, type ModeId, type NewProject, type Project } from '@healix/core';
+import { deleteProjectAssets, getStore, type ModeId, type NewProject, type Project } from '@healix/core';
 
 /** Print a friendly hint when the local SQLite store is unavailable. */
 function storeUnavailable(): void {
   console.log('');
   console.log(pc.yellow('  ⚠ Local storage is unavailable on this runtime.'));
   console.log(
-    pc.dim('    Healix needs node:sqlite (Node 22.5+ with --experimental-sqlite, or Node 23.4+). Run `healix doctor`.'),
+    pc.dim(
+      '    Healix needs node:sqlite (Node 22.5+ with --experimental-sqlite, or Node 23.4+). Run `healix doctor`.',
+    ),
   );
   console.log('');
 }
@@ -21,7 +23,8 @@ function printProjectRow(p: Project): void {
   const name = fmtCell(p.name, 24);
   const mode = fmtCell(p.mode, 12);
   const target = p.baseUrl ?? p.repoPath ?? pc.dim('—');
-  console.log(`  ${pc.bold(id)}  ${name}  ${pc.cyan(mode)}  ${pc.dim(target)}`);
+  const archived = p.archivedAt ? `  ${pc.yellow('[archived]')}` : '';
+  console.log(`  ${pc.bold(id)}  ${name}  ${pc.cyan(mode)}  ${pc.dim(target)}${archived}`);
 }
 
 function printProjectDetail(p: Project): void {
@@ -31,6 +34,7 @@ function printProjectDetail(p: Project): void {
   console.log(`    ${pc.dim('repo')}      ${p.repoPath ?? pc.dim('—')}`);
   console.log(`    ${pc.dim('baseUrl')}   ${p.baseUrl ?? pc.dim('—')}`);
   console.log(`    ${pc.dim('created')}   ${p.createdAt}`);
+  if (p.archivedAt) console.log(`    ${pc.dim('archived')}  ${pc.yellow(p.archivedAt)}`);
   console.log('');
 }
 
@@ -54,7 +58,19 @@ export function registerProject(program: Command): void {
         repoPath: opts.repo ?? null,
         baseUrl: opts.url ?? null,
       };
-      const project = store.createProject(input);
+      let project: Project;
+      try {
+        // createProject validates: a project needs a repo or a valid http(s)
+        // base URL. Surface that as a clean message, not a stack trace.
+        project = store.createProject(input);
+      } catch (err) {
+        console.log('');
+        console.log(pc.red(`  ✖ ${err instanceof Error ? err.message : String(err)}`));
+        console.log(pc.dim('    Pass --repo <path> and/or --url <baseUrl>.'));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
       console.log('');
       console.log(`  ${pc.green('✔')} Created project ${pc.bold(project.name)} ${pc.dim(`(${project.id})`)}`);
       printProjectDetail(project);
@@ -101,8 +117,9 @@ export function registerProject(program: Command): void {
 
   cmd
     .command('rm <id>')
-    .description('Remove a project')
-    .action(async (id: string) => {
+    .description('Permanently remove a project, its runs, and all on-disk assets')
+    .option('--keep-assets', 'delete only the database rows; keep run folders on disk')
+    .action(async (id: string, opts: { keepAssets?: boolean }) => {
       const store = await getStore();
       if (!store) return storeUnavailable();
 
@@ -115,8 +132,51 @@ export function registerProject(program: Command): void {
         return;
       }
       store.deleteProject(id);
+      let assetNote = pc.dim('(kept on-disk assets)');
+      if (!opts.keepAssets) {
+        try {
+          await deleteProjectAssets(id);
+          assetNote = pc.dim('(runs, suites, and media removed from disk)');
+        } catch (err) {
+          assetNote = pc.yellow(
+            `(could not remove on-disk assets: ${err instanceof Error ? err.message : String(err)})`,
+          );
+        }
+      }
       console.log('');
-      console.log(`  ${pc.green('✔')} Removed project ${pc.bold(project.name)} ${pc.dim(`(${id})`)}`);
+      console.log(
+        `  ${pc.green('✔')} Removed project ${pc.bold(project.name)} ${pc.dim(`(${id})`)} ${assetNote}`,
+      );
       console.log('');
     });
+
+  cmd
+    .command('archive <id>')
+    .description('Soft-archive a project (keeps all runs and assets; hidden from new runs)')
+    .action(async (id: string) => setArchived(id, true));
+
+  cmd
+    .command('unarchive <id>')
+    .description('Restore an archived project')
+    .action(async (id: string) => setArchived(id, false));
+}
+
+async function setArchived(id: string, archived: boolean): Promise<void> {
+  const store = await getStore();
+  if (!store) return storeUnavailable();
+
+  const project = store.getProject(id);
+  if (!project) {
+    console.log('');
+    console.log(pc.red(`  ✖ No project found with id ${pc.bold(id)}.`));
+    console.log('');
+    process.exitCode = 1;
+    return;
+  }
+  store.setProjectArchived(id, archived);
+  console.log('');
+  console.log(
+    `  ${pc.green('✔')} ${archived ? 'Archived' : 'Restored'} project ${pc.bold(project.name)} ${pc.dim(`(${id})`)}`,
+  );
+  console.log('');
 }

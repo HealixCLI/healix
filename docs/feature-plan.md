@@ -13,15 +13,15 @@
 
 ## 2. What changes vs. the old TestBot_MCP
 
-| Dimension | Old (TestBot_MCP / `@healix/mcp` v2) | New (Healix) |
-|---|---|---|
-| Form factor | MCP server inside an IDE + Next.js webapp on Vercel | **Electron app + `healix` CLI**, one shared core |
-| AI calls | Proxied server-side through the webapp (OpenAI, API-key billing) | **Local orchestrator** drives **Claude Code CLI + Codex CLI** (plan mode) with **SDK fallback**; subscription auth, **no API keys** |
-| Persistence | Supabase (Postgres) + Supabase Storage | **Local: SQLite + filesystem** |
-| Async pipeline | Inngest background jobs | **Local orchestrator state machine** (resumable runs) |
-| Test engines | Playwright only | **Pluggable modes** — Playwright → Selenium → XYZ |
-| Exploration | browser-use (Python subprocess) + Playwright fallback | **Single embedded Playwright/CDP browser** for both computer-use and browser-use, **selectable per run** |
-| Output | Dashboard run page (cloud) | **Local dashboard + downloadable standalone suites** |
+| Dimension      | Old (TestBot_MCP / `@healix/mcp` v2)                             | New (Healix)                                                                                                                        |
+| -------------- | ---------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------- |
+| Form factor    | MCP server inside an IDE + Next.js webapp on Vercel              | **Electron app + `healix` CLI**, one shared core                                                                                    |
+| AI calls       | Proxied server-side through the webapp (OpenAI, API-key billing) | **Local orchestrator** drives **Claude Code CLI + Codex CLI** (plan mode) with **SDK fallback**; subscription auth, **no API keys** |
+| Persistence    | Supabase (Postgres) + Supabase Storage                           | **Local: SQLite + filesystem**                                                                                                      |
+| Async pipeline | Inngest background jobs                                          | **Local orchestrator state machine** (checkpointed runs; resume planned)                                                            |
+| Test engines   | Playwright only                                                  | **Pluggable modes** — Playwright → Selenium → XYZ                                                                                   |
+| Exploration    | browser-use (Python subprocess) + Playwright fallback            | **Single embedded Playwright/CDP browser** for both computer-use and browser-use, **selectable per run**                            |
+| Output         | Dashboard run page (cloud)                                       | **Local dashboard + downloadable standalone suites**                                                                                |
 
 Concepts worth carrying over from the reference: **tiered execution** (public / per-role auth / backend), **requirement-tagged tests** (`[REQ:F#.S#.AC#]`), **credential injection via Playwright `storageState`**, and the **failure-triage classifier → AI** pipeline.
 
@@ -31,7 +31,7 @@ Concepts worth carrying over from the reference: **tiered execution** (public / 
 
 These are locked and recorded as ADRs in [`adr/`](./adr/README.md):
 
-1. **Orchestration** — CLI subprocess **primary** (Claude Code CLI + Codex CLI in *plan mode*), **SDK fallback** (Claude Agent SDK; OpenAI has no keyless SDK, so its fallback is effectively Codex CLI). → [ADR-0001](./adr/0001-cli-primary-sdk-fallback.md)
+1. **Orchestration** — CLI subprocess **primary** (Claude Code CLI + Codex CLI in _plan mode_), **SDK fallback** (Claude Agent SDK; OpenAI has no keyless SDK, so its fallback is effectively Codex CLI). → [ADR-0001](./adr/0001-cli-primary-sdk-fallback.md)
 2. **Auth** — **Subscription only, never API keys.** The app exposes a "Login / health-check" action that triggers the provider CLI login and verifies the session. → [ADR-0002](./adr/0002-subscription-auth-no-api-keys.md)
 3. **UI testing model** — **Both** computer-use (agentic) and codegen, **selectable per run**. → [ADR-0003](./adr/0003-dual-mode-ui-testing.md)
 4. **Provider routing** — **Best-for-task with automatic fallback** on error/rate-limit. → [ADR-0004](./adr/0004-best-for-task-routing.md)
@@ -52,6 +52,7 @@ These are locked and recorded as ADRs in [`adr/`](./adr/README.md):
 - **CI engineer** — "Run the exact same flow headless via `healix run` in a pipeline."
 
 Core stories:
+
 1. Connect a provider via subscription and see a green health-check.
 2. Create a project (attach repo and/or URL), pick mode = **Healix Playwright**.
 3. Run **plan mode** → review the AI's proposed test plan → approve.
@@ -81,7 +82,7 @@ Healix CLI  ───┘   (orchestrator)  Router └─ Codex CLI (plan mode)  
 
 ### 5.1 Components (`@healix/core`)
 
-- **Orchestrator** — resumable state machine: `plan → explore → generate → execute → triage → report`. Plan-mode first; a human approval gate precedes any file writes or execution.
+- **Orchestrator** — checkpointed state machine: `plan → explore → generate → execute → triage → report`. Every phase persists state to SQLite (resuming interrupted runs is planned, not yet implemented). Plan-mode first; a human approval gate precedes any file writes or execution.
 - **Provider Router** — capability-based routing (computer-use → Claude by default; codegen → either) + health checks + automatic fallback.
 - **Provider Adapters** — `ClaudeProvider` (Claude Code CLI + Agent SDK fallback), `OpenAIProvider` (Codex CLI).
 - **Auth / Session Manager** — triggers CLI login, parses/validates session state, surfaces status. Stores **no keys**.
@@ -90,12 +91,12 @@ Healix CLI  ───┘   (orchestrator)  Router └─ Codex CLI (plan mode)  
 - **Target Adapter** — white-box (repo indexer + start-command auto-detect/launcher, ported from `auto-detector.js`) and/or black-box (URL).
 - **Storage Layer** — SQLite (projects/runs/tests/results/triage) + filesystem (artifacts/reports/suites) under the OS app-data dir.
 - **Suite Exporter** — emits a self-contained Playwright project (zip).
-- **Failure Triage** — deterministic classifier → AI hypothesis (ported concept from `failure-triage/`). *(Post-MVP.)*
+- **Failure Triage** — deterministic classifier → AI hypothesis (ported concept from `failure-triage/`). _(Implemented.)_
 
 ### 5.2 Front-ends
 
 - **Electron app** (electron-vite + React/TS) — setup, provider health, project config, plan review/approval, **live browser view**, run console, local dashboard, artifact browser, suite download, mode switcher.
-- **`healix` CLI** — full parity for headless/CI: `healix login`, `healix doctor`, `healix scan`, `healix plan`, `healix generate`, `healix run`, `healix report`, `healix export`.
+- **`healix` CLI** — full parity for headless/CI: `healix doctor`, `healix providers`, `healix project`, `healix scan`, `healix run`, `healix runs`, `healix report`, `healix export`.
 
 ---
 
@@ -113,6 +114,7 @@ Healix CLI  ───┘   (orchestrator)  Router └─ Codex CLI (plan mode)  
         ├── reports/              # html + json report
         └── auth/                 # storageState per role (sanitized on export)
 ```
+
 `<app-data>` = `~/Library/Application Support` (macOS), `%APPDATA%` (Windows), `$XDG_DATA_HOME` (Linux).
 
 ---
@@ -120,13 +122,16 @@ Healix CLI  ───┘   (orchestrator)  Router └─ Codex CLI (plan mode)  
 ## 7. Milestones
 
 ### M0 — Foundations (scaffold)
+
 - Monorepo: `apps/desktop` (electron-vite + React/TS), `packages/core` (`@healix/core`), `packages/cli` (`healix`).
 - SQLite schema + filesystem layout; app-data resolver.
 - electron-builder packaging; CI lint/typecheck/test.
 
 ### M1 — MVP (the confirmed first milestone)
+
 **Healix Playwright, single provider, full loop:**
-- Provider connect + **CLI login health-check** (one provider: Claude *or* OpenAI/Codex).
+
+- Provider connect + **CLI login health-check** (one provider: Claude _or_ OpenAI/Codex).
 - Project create — **white-box (repo) or black-box (URL)**.
 - **Plan mode** → human approval gate.
 - **Both execution models** (computer-use explore / codegen) selectable per run.
@@ -137,15 +142,19 @@ Healix CLI  ───┘   (orchestrator)  Router └─ Codex CLI (plan mode)  
 - **Codex-inspired UI** shell with live browser view + streaming console.
 
 ### M2 — Dual provider + routing
+
 - Second provider; **best-for-task routing + automatic fallback**; per-run provider override.
 
 ### M3 — Failure triage
+
 - Port deterministic classifier → AI hypothesis (test-wrong / app-wrong / env / flaky); evidence bundle (trace + source + AC); verdict chips in dashboard.
 
 ### M4 — More modes
+
 - **Healix Selenium** behind the same `TestMode` interface; mode switch without re-authoring intent. Then "XYZ".
 
 ### M5 — Hardening & distribution
+
 - Auto-update, code signing, telemetry (local/opt-in), CI export recipes (GitHub Actions/GitLab).
 
 ---

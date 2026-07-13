@@ -118,7 +118,7 @@ flowchart TB
     SPECS --> RERUN["Re-run headless (deterministic, downloadable)"]
 ```
 
-Discovery uses computer-use **or** browser-use (per run); the *output* is always deterministic Playwright specs that re-run without the AI. See [ADR-0006](../adr/0006-embedded-browser-surface.md).
+Discovery uses computer-use **or** browser-use (per run); the _output_ is always deterministic Playwright specs that re-run without the AI. See [ADR-0006](../adr/0006-embedded-browser-surface.md).
 
 ---
 
@@ -126,27 +126,27 @@ Discovery uses computer-use **or** browser-use (per run); the *output* is always
 
 Concepts to port from `../TestBot_MCP/testbot-mcp/src`:
 
-| Healix module | Reference source | Note |
-|---|---|---|
-| Target Adapter (white-box launch) | `auto-detector.js`, `multi-service-starter.js`, `port-preflight.js` | Detect port/framework/start command |
-| Browser Surface | `browser-use-driver.js`, `playwright-explorer.js`, `playwright-mcp-client.js` | Collapse into one CDP surface |
-| Test-Mode (Playwright) | `playwright-integration.js`, `tier-isolation.js`, `results-merger.js` | Tiered execution + blocked status |
-| Credential injection | `credentials-injector.js`, `auth-flow-utils.js` | `storageState` per role |
-| Generation | `webapp .../test-generation`, `prd-chunked.js`, `qa-contracts.js` | Now local, provider-driven |
-| Failure triage | `failure-triage/` (`classifier.js`, `agent-response.js`, `trace-parser.js`) | Classifier → AI hypothesis |
-| Report | `report-generator.js` | Local HTML/JSON instead of ingest |
+| Healix module                     | Reference source                                                              | Note                                |
+| --------------------------------- | ----------------------------------------------------------------------------- | ----------------------------------- |
+| Target Adapter (white-box launch) | `auto-detector.js`, `multi-service-starter.js`, `port-preflight.js`           | Detect port/framework/start command |
+| Browser Surface                   | `browser-use-driver.js`, `playwright-explorer.js`, `playwright-mcp-client.js` | Collapse into one CDP surface       |
+| Test-Mode (Playwright)            | `playwright-integration.js`, `tier-isolation.js`, `results-merger.js`         | Tiered execution + blocked status   |
+| Credential injection              | `credentials-injector.js`, `auth-flow-utils.js`                               | `storageState` per role             |
+| Generation                        | `webapp .../test-generation`, `prd-chunked.js`, `qa-contracts.js`             | Now local, provider-driven          |
+| Failure triage                    | `failure-triage/` (`classifier.js`, `agent-response.js`, `trace-parser.js`)   | Classifier → AI hypothesis          |
+| Report                            | `report-generator.js`                                                         | Local HTML/JSON instead of ingest   |
 
 ---
 
 ## 6. Tech stack
 
-| Layer | Choice |
-|---|---|
-| Desktop shell | Electron + electron-vite, electron-builder |
-| Renderer | React + TypeScript |
-| Shared core | `@healix/core` (TypeScript, framework-agnostic) |
-| CLI | Node/TS (`healix`), same core |
-| Storage | SQLite (`better-sqlite3`) + filesystem |
-| Browser automation | Playwright (CDP) |
-| AI | Claude Code CLI + Codex CLI (plan mode) · Claude Agent SDK (fallback) |
-| Secrets | OS keychain (`keytar`/`safeStorage`) — no keys, only session metadata |
+| Layer              | Choice                                                                |
+| ------------------ | --------------------------------------------------------------------- |
+| Desktop shell      | Electron + electron-vite, electron-builder                            |
+| Renderer           | React + TypeScript                                                    |
+| Shared core        | `@healix/core` (TypeScript, framework-agnostic)                       |
+| CLI                | Node/TS (`healix`), same core                                         |
+| Storage            | SQLite (`better-sqlite3`) + filesystem                                |
+| Browser automation | Playwright (CDP)                                                      |
+| AI                 | Claude Code CLI + Codex CLI (plan mode) · Claude Agent SDK (fallback) |
+| Secrets            | OS keychain (`keytar`/`safeStorage`) — no keys, only session metadata |

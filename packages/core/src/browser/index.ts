@@ -1,12 +1,7 @@
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
 import { collectInteractiveElements } from './selectors.js';
 import { FrameMirror } from './mirror.js';
-import type {
-  BrowserSurface,
-  BrowserSurfaceOptions,
-  DomSnapshot,
-  Point,
-} from './types.js';
+import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from './types.js';
 
 export * from './types.js';
 
@@ -15,9 +10,7 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
 /** Throw a uniform error when the surface is used before {@link start}. */
 function requireStarted<T>(value: T | undefined, what: string): T {
   if (value === undefined || value === null) {
-    throw new Error(
-      `[healix] BrowserSurface.${what} called before start(); call start() first.`,
-    );
+    throw new Error(`[healix] BrowserSurface.${what} called before start(); call start() first.`);
   }
   return value;
 }
@@ -137,10 +130,7 @@ export function createBrowserSurface(): BrowserSurface {
       } catch {
         axTree = undefined;
       }
-      const [title, interactiveElements] = await Promise.all([
-        p.title(),
-        collectInteractiveElements(p),
-      ]);
+      const [title, interactiveElements] = await Promise.all([p.title(), collectInteractiveElements(p)]);
       return {
         url: p.url(),
         title,

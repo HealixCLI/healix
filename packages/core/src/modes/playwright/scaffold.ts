@@ -19,7 +19,10 @@ function emit(ctx: TestModeContext, message: string, data?: unknown): void {
 /** Best-effort: derive a friendly package name from the project dir basename. */
 function suiteName(projectDir: string): string {
   const base = projectDir.split(/[\\/]/).filter(Boolean).pop() ?? 'healix-suite';
-  const slug = base.toLowerCase().replace(/[^a-z0-9._-]+/g, '-').replace(/^[-.]+|[-.]+$/g, '');
+  const slug = base
+    .toLowerCase()
+    .replace(/[^a-z0-9._-]+/g, '-')
+    .replace(/^[-.]+|[-.]+$/g, '');
   return slug || 'healix-suite';
 }
 

@@ -10,7 +10,8 @@ export type RunChannelMessage =
   | { channel: 'run:event'; payload: { runId: string; event: unknown } }
   | { channel: 'run:plan'; payload: { runId: string; plan: unknown } }
   | { channel: 'run:done'; payload: { runId: string; summary: unknown } }
-  | { channel: 'run:frame'; payload: { runId: string; pngBase64: string } };
+  // Live browser mirror frame (JPEG, base64) for computer-use runs.
+  | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } };
 
 const RUN_CHANNELS = ['run:started', 'run:event', 'run:plan', 'run:done', 'run:frame'] as const;
 
@@ -20,8 +21,7 @@ const api = {
   providers: () => ipcRenderer.invoke('healix:providers'),
 
   // provider auth
-  providerLogin: (id: 'claude' | 'openai') =>
-    ipcRenderer.invoke('provider:login', { id }),
+  providerLogin: (id: 'claude' | 'openai') => ipcRenderer.invoke('provider:login', { id }),
   providerHealth: (id: 'claude' | 'openai', probe?: boolean) =>
     ipcRenderer.invoke('provider:health', { id, probe }),
 
@@ -34,6 +34,7 @@ const api = {
     baseUrl?: string | null;
   }) => ipcRenderer.invoke('projects:create', input),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),
+  archiveProject: (id: string, archived: boolean) => ipcRenderer.invoke('projects:archive', { id, archived }),
 
   // runs
   startRun: (args: {
@@ -43,8 +44,8 @@ const api = {
     autoApprove?: boolean;
     prd?: string;
   }) => ipcRenderer.invoke('run:start', args),
-  approveRun: (runId: string, ok: boolean) =>
-    ipcRenderer.invoke('run:approve', { runId, ok }),
+  approveRun: (runId: string, ok: boolean) => ipcRenderer.invoke('run:approve', { runId, ok }),
+  cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
 
@@ -52,6 +53,7 @@ const api = {
   exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>
     ipcRenderer.invoke('export:suite', args),
   revealPath: (target: string) => ipcRenderer.invoke('shell:reveal', target),
+  showItemInFolder: (target: string) => ipcRenderer.invoke('shell:showItem', target),
 
   /**
    * Subscribe to the full run lifecycle. The callback receives a discriminated

@@ -1,7 +1,7 @@
-import { useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { Project } from '@healix/core';
-import { FolderGit2, Globe, Plus, Trash2 } from 'lucide-react';
+import { Archive, ArchiveRestore, FolderGit2, Globe, Plus, Trash2 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
@@ -11,15 +11,20 @@ import { Select } from '../components/ui/select';
 import { useProjects } from '../lib/use-projects';
 
 export function ProjectsView({ onRunProject }: { onRunProject?: (project: Project) => void }) {
-  const { projects, loading, error, create, remove } = useProjects();
+  const { projects, loading, error, create, remove, archive } = useProjects();
   const [showForm, setShowForm] = useState(false);
+
+  const active = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
+  const archived = useMemo(() => projects.filter((p) => p.archivedAt), [projects]);
 
   return (
     <div className="mx-auto max-w-4xl px-8 pb-16 pt-8">
       <header className="flex items-end justify-between border-b border-border pb-5">
         <div>
           <h1 className="font-mono text-xl font-semibold tracking-tight">Projects</h1>
-          <p className="mt-1 text-sm text-muted">Targets healix can plan, generate, and run suites against.</p>
+          <p className="mt-1 text-sm text-muted">
+            Targets healix can plan, generate, and run suites against.
+          </p>
         </div>
         <Button variant={showForm ? 'outline' : 'default'} onClick={() => setShowForm((v) => !v)}>
           <Plus className="h-4 w-4" />
@@ -42,15 +47,36 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
             </CardContent>
           </Card>
         )}
-        {projects.map((p) => (
+        {active.map((p) => (
           <ProjectRow
             key={p.id}
             project={p}
             onDelete={() => void remove(p.id)}
+            onArchive={() => void archive(p.id, true)}
             onRun={onRunProject ? () => onRunProject(p) : undefined}
           />
         ))}
       </section>
+
+      {archived.length > 0 && (
+        <section className="mt-8">
+          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted">
+            <Archive className="h-3.5 w-3.5" />
+            Archived
+            <span className="font-normal">· {archived.length}</span>
+          </h2>
+          <div className="flex flex-col gap-3">
+            {archived.map((p) => (
+              <ProjectRow
+                key={p.id}
+                project={p}
+                onDelete={() => void remove(p.id)}
+                onUnarchive={() => void archive(p.id, false)}
+              />
+            ))}
+          </div>
+        </section>
+      )}
     </div>
   );
 }
@@ -58,19 +84,25 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
 function ProjectRow({
   project,
   onDelete,
+  onArchive,
+  onUnarchive,
   onRun,
 }: {
   project: Project;
   onDelete: () => void;
+  onArchive?: () => void;
+  onUnarchive?: () => void;
   onRun?: () => void;
 }) {
+  const isArchived = Boolean(project.archivedAt);
   return (
-    <Card>
+    <Card className={isArchived ? 'opacity-70' : undefined}>
       <CardContent className="flex items-center justify-between gap-4 py-4">
         <div className="min-w-0">
           <div className="flex items-center gap-2">
             <span className="truncate font-medium text-fg">{project.name}</span>
             <Badge tone="muted">{project.mode}</Badge>
+            {isArchived && <Badge tone="muted">archived</Badge>}
           </div>
           <div className="mt-1 flex flex-wrap gap-x-4 gap-y-1 text-xs text-muted">
             {project.repoPath && (
@@ -94,13 +126,86 @@ function ProjectRow({
               Run
             </Button>
           )}
-          <Button size="icon" variant="ghost" onClick={onDelete} aria-label="Delete project">
-            <Trash2 className="h-4 w-4" />
-          </Button>
+          {onArchive && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={onArchive}
+              aria-label="Archive project"
+              title="Archive (keeps all runs and media)"
+            >
+              <Archive className="h-4 w-4" />
+            </Button>
+          )}
+          {onUnarchive && (
+            <Button size="sm" variant="ghost" onClick={onUnarchive}>
+              <ArchiveRestore className="h-4 w-4" />
+              Restore
+            </Button>
+          )}
+          <DeleteButton onDelete={onDelete} />
         </div>
       </CardContent>
     </Card>
   );
+}
+
+/**
+ * Two-step destructive delete: the first click arms the button (auto-disarms
+ * after a few seconds), the second click permanently removes the project, its
+ * runs, and every on-disk asset (suites, screenshots, recordings).
+ */
+function DeleteButton({ onDelete }: { onDelete: () => void }) {
+  const [armed, setArmed] = useState(false);
+
+  useEffect(() => {
+    if (!armed) return;
+    const t = setTimeout(() => setArmed(false), 5000);
+    return () => clearTimeout(t);
+  }, [armed]);
+
+  if (!armed) {
+    return (
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={() => setArmed(true)}
+        aria-label="Delete project"
+        title="Delete project (asks to confirm)"
+      >
+        <Trash2 className="h-4 w-4" />
+      </Button>
+    );
+  }
+  return (
+    <Button
+      size="sm"
+      variant="outline"
+      className="border-err/50 text-err hover:border-err hover:bg-err/10"
+      onClick={onDelete}
+      title="Permanently removes the project, all runs, and all media"
+    >
+      <Trash2 className="h-3.5 w-3.5" />
+      Delete runs & media?
+    </Button>
+  );
+}
+
+/**
+ * Mirror of core `isValidBaseUrl` (packages/core/src/storage/validate.ts).
+ * Duplicated because the renderer runs in a browser context and cannot import
+ * @healix/core (its barrel pulls in node:sqlite). Core remains the hard guard;
+ * this is purely for inline feedback. Keep the two in sync.
+ */
+function isValidBaseUrl(raw: string): boolean {
+  const value = raw.trim();
+  if (!value || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname.length > 0;
+  } catch {
+    return false;
+  }
 }
 
 function NewProjectForm({
@@ -116,12 +221,19 @@ function NewProjectForm({
   const [mode, setMode] = useState<'playwright'>('playwright');
   const [submitting, setSubmitting] = useState(false);
 
+  // Same rules as core validateNewProject: a project needs a name, at least one
+  // of repo/URL, and a well-formed http(s) URL when a base URL is provided.
+  const trimmedName = name.trim();
+  const hasTarget = repoPath.trim().length > 0 || baseUrl.trim().length > 0;
+  const baseUrlInvalid = baseUrl.trim().length > 0 && !isValidBaseUrl(baseUrl);
+  const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !submitting;
+
   const submit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
-    if (!name.trim() || submitting) return;
+    if (!canSubmit) return;
     setSubmitting(true);
     const created = await onCreate({
-      name: name.trim(),
+      name: trimmedName,
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
@@ -165,20 +277,29 @@ function NewProjectForm({
               onChange={(e) => setBaseUrl(e.target.value)}
               placeholder="https://app.acme.test"
               className="font-mono"
+              aria-invalid={baseUrlInvalid}
             />
+            {baseUrlInvalid && (
+              <p className="mt-1 text-xs text-err">Enter a valid http(s) URL, e.g. https://app.acme.test</p>
+            )}
           </Field>
           <Field label="Mode">
             <Select value={mode} onChange={(e) => setMode(e.target.value as 'playwright')}>
               <option value="playwright">playwright</option>
             </Select>
           </Field>
-          <div className="flex items-end justify-end gap-2 sm:col-span-2">
-            <Button type="button" variant="ghost" onClick={onDone}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!name.trim() || submitting}>
-              {submitting ? 'Creating…' : 'Create project'}
-            </Button>
+          <div className="flex flex-wrap items-center justify-between gap-2 sm:col-span-2">
+            <p className={`text-xs ${hasTarget ? 'text-muted' : 'text-err'}`}>
+              A project needs a repo path or a base URL — set at least one.
+            </p>
+            <div className="flex items-end justify-end gap-2">
+              <Button type="button" variant="ghost" onClick={onDone}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!canSubmit}>
+                {submitting ? 'Creating…' : 'Create project'}
+              </Button>
+            </div>
           </div>
         </form>
       </CardContent>
@@ -186,15 +307,7 @@ function NewProjectForm({
   );
 }
 
-function Field({
-  label,
-  className,
-  children,
-}: {
-  label: string;
-  className?: string;
-  children: ReactNode;
-}) {
+function Field({ label, className, children }: { label: string; className?: string; children: ReactNode }) {
   return (
     <div className={className}>
       <Label className="mb-1.5 block">{label}</Label>

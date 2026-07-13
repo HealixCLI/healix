@@ -19,11 +19,7 @@ describe('zipDirectory', () => {
     const sourceDir = path.join(workDir, 'suite');
     await fs.mkdir(path.join(sourceDir, 'tests'), { recursive: true });
     await fs.writeFile(path.join(sourceDir, 'README.md'), '# hello\n', 'utf8');
-    await fs.writeFile(
-      path.join(sourceDir, 'tests', 'login.spec.ts'),
-      'export const x = 1;\n',
-      'utf8',
-    );
+    await fs.writeFile(path.join(sourceDir, 'tests', 'login.spec.ts'), 'export const x = 1;\n', 'utf8');
 
     const zipPath = path.join(workDir, 'suite.zip');
     const result = await zipDirectory(sourceDir, zipPath);
@@ -47,6 +43,33 @@ describe('zipDirectory', () => {
     } finally {
       await fd.close();
     }
+  });
+
+  it('produces byte-identical archives for identical content (reproducible)', async () => {
+    // Two separate trees with identical content but different mtimes; both
+    // are named `suite` so the archive-root folder name matches too.
+    const make = async (parent: string): Promise<string> => {
+      const dir = path.join(workDir, parent, 'suite');
+      await fs.mkdir(path.join(dir, 'tests'), { recursive: true });
+      await fs.writeFile(path.join(dir, 'README.md'), '# same content\n', 'utf8');
+      await fs.writeFile(path.join(dir, 'tests', 'a.spec.ts'), 'export const a = 1;\n', 'utf8');
+      return dir;
+    };
+    const dirA = await make('a');
+    const dirB = await make('b');
+
+    // Force clearly different on-disk mtimes for tree B.
+    const past = new Date('2020-05-05T05:05:05Z');
+    for (const rel of ['README.md', path.join('tests', 'a.spec.ts')]) {
+      await fs.utimes(path.join(dirB, rel), past, past);
+    }
+
+    const zipA = await zipDirectory(dirA, path.join(workDir, 'a.zip'));
+    const zipB = await zipDirectory(dirB, path.join(workDir, 'b.zip'));
+
+    const [bufA, bufB] = await Promise.all([fs.readFile(zipA.zipPath), fs.readFile(zipB.zipPath)]);
+    expect(bufA.length).toBeGreaterThan(0);
+    expect(bufA.equals(bufB)).toBe(true);
   });
 
   it('rejects when the source directory does not exist (no silent empty zip)', async () => {

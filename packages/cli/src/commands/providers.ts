@@ -1,6 +1,7 @@
 import type { Command } from 'commander';
 import pc from 'picocolors';
 import { ProviderRouter } from '@healix/core';
+import { providersHealthExitCode } from '../lib/helpers.js';
 
 export function registerProviders(program: Command): void {
   const cmd = program.command('providers').description('Inspect AI providers');
@@ -26,6 +27,8 @@ export function registerProviders(program: Command): void {
     .action(async (opts: { probe?: boolean; json?: boolean }) => {
       const router = new ProviderRouter();
       const results = await router.healthAll({ probe: opts.probe !== false });
+      // CI-safe: non-zero when no provider is ready + authenticated.
+      process.exitCode = providersHealthExitCode(results);
       if (opts.json) {
         console.log(JSON.stringify(results, null, 2));
         return;

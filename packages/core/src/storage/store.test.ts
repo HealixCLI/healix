@@ -3,20 +3,14 @@ import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { DatabaseSync as DatabaseSyncType } from 'node:sqlite';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 // Load node:sqlite via createRequire so this also works under bundled test runtimes
 // (vite-node) that don't recognise node:sqlite as a builtin via dynamic import.
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: typeof DatabaseSyncType };
 
-import {
-  type HealixStore,
-  dbInfo,
-  dbPath,
-  getStore,
-  resetStoreForTests,
-} from '@healix/core';
+import { type HealixStore, dbInfo, dbPath, getStore, resetStoreForTests } from '@healix/core';
 
 /**
  * Hermetic store tests. Each test runs against a throwaway SQLite database under a
@@ -82,7 +76,7 @@ describe('deleteProject cascade', () => {
   it('removes all descendant rows without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();
 
-    const project = s.createProject({ name: 'cascade-project' });
+    const project = s.createProject({ name: 'cascade-project', baseUrl: 'https://cascade.test' });
     const run = s.createRun(project.id, { provider: null, mode: 'playwright' });
 
     const N = 3;
@@ -132,19 +126,31 @@ describe('deleteProject cascade', () => {
   it('leaves a second unrelated project and its children untouched', async () => {
     const s = await store();
 
-    const target = s.createProject({ name: 'to-delete' });
-    const keep = s.createProject({ name: 'to-keep' });
+    const target = s.createProject({ name: 'to-delete', baseUrl: 'https://to-delete.test' });
+    const keep = s.createProject({ name: 'to-keep', baseUrl: 'https://to-keep.test' });
 
     const targetRun = s.createRun(target.id);
     const keepRun = s.createRun(keep.id);
 
     const N = 2;
     for (let i = 0; i < N; i++) {
-      const tt = s.insertTest({ runId: targetRun.id, title: `t${i}`, reqTag: null, tier: null, status: 'pending' });
+      const tt = s.insertTest({
+        runId: targetRun.id,
+        title: `t${i}`,
+        reqTag: null,
+        tier: null,
+        status: 'pending',
+      });
       s.insertResult({ testId: tt.id, status: 'passed', durationMs: null, error: null, artifactsJson: null });
       s.appendEvent(targetRun.id, 'executing', `te${i}`);
 
-      const kt = s.insertTest({ runId: keepRun.id, title: `k${i}`, reqTag: null, tier: null, status: 'pending' });
+      const kt = s.insertTest({
+        runId: keepRun.id,
+        title: `k${i}`,
+        reqTag: null,
+        tier: null,
+        status: 'pending',
+      });
       s.insertResult({ testId: kt.id, status: 'failed', durationMs: 5, error: 'boom', artifactsJson: null });
       s.appendEvent(keepRun.id, 'executing', `ke${i}`);
     }
@@ -174,7 +180,7 @@ describe('deleteRun cascade', () => {
   it('removes the run and its descendants without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();
 
-    const project = s.createProject({ name: 'run-cascade' });
+    const project = s.createProject({ name: 'run-cascade', baseUrl: 'https://run-cascade.test' });
     const run = s.createRun(project.id);
     const otherRun = s.createRun(project.id);
 
@@ -184,7 +190,13 @@ describe('deleteRun cascade', () => {
       s.insertResult({ testId: t.id, status: 'passed', durationMs: i, error: null, artifactsJson: null });
       s.appendEvent(run.id, 'executing', `e${i}`);
 
-      const ot = s.insertTest({ runId: otherRun.id, title: `o${i}`, reqTag: null, tier: null, status: 'pending' });
+      const ot = s.insertTest({
+        runId: otherRun.id,
+        title: `o${i}`,
+        reqTag: null,
+        tier: null,
+        status: 'pending',
+      });
       s.insertResult({ testId: ot.id, status: 'passed', durationMs: i, error: null, artifactsJson: null });
       s.appendEvent(otherRun.id, 'executing', `oe${i}`);
     }
@@ -204,5 +216,32 @@ describe('deleteRun cascade', () => {
     expect(await countRows('tests')).toBe(N);
     expect(await countRows('results')).toBe(N);
     expect(await countRows('agent_events')).toBe(N);
+  });
+});
+
+describe('agent event ordering', () => {
+  it('returns same-millisecond events in insertion order (stable rowid tiebreaker)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'event-order', baseUrl: 'https://event-order.test' });
+    const run = s.createRun(project.id);
+
+    // Freeze the clock so every event shares an identical created_at; only the
+    // rowid tiebreaker can then keep listEvents() in insertion order.
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-10T12:00:00.000Z'));
+    try {
+      const N = 25;
+      for (let i = 0; i < N; i++) {
+        s.appendEvent(run.id, 'executing', `event ${i}`);
+      }
+      const events = s.listEvents(run.id);
+      expect(events).toHaveLength(N);
+      // All share one timestamp...
+      expect(new Set(events.map((e) => e.createdAt)).size).toBe(1);
+      // ...yet come back in the exact order they were appended.
+      expect(events.map((e) => e.message)).toEqual(Array.from({ length: N }, (_, i) => `event ${i}`));
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

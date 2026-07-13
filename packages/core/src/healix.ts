@@ -16,10 +16,7 @@ export interface DoctorReport {
 /** Environment + storage + provider health snapshot (powers `healix doctor` and the desktop UI). */
 export async function doctor(opts: { probe?: boolean } = {}): Promise<DoctorReport> {
   const router = new ProviderRouter();
-  const [db, providers] = await Promise.all([
-    dbInfo(),
-    router.healthAll({ probe: opts.probe ?? true }),
-  ]);
+  const [db, providers] = await Promise.all([dbInfo(), router.healthAll({ probe: opts.probe ?? true })]);
   const ready = providers.some((p) => p.status === 'ready' && p.authenticated);
   return {
     node: process.version,

@@ -26,7 +26,15 @@ function statusLabel(p: Provider): string {
 
 function Dot({ tone }: { tone: BadgeTone }) {
   const color =
-    tone === 'ok' ? 'bg-ok' : tone === 'warn' ? 'bg-warn' : tone === 'err' ? 'bg-err' : tone === 'muted' ? 'bg-muted' : 'bg-accent';
+    tone === 'ok'
+      ? 'bg-ok'
+      : tone === 'warn'
+        ? 'bg-warn'
+        : tone === 'err'
+          ? 'bg-err'
+          : tone === 'muted'
+            ? 'bg-muted'
+            : 'bg-accent';
   return <span className={cn('inline-block h-2 w-2 rounded-full', color)} />;
 }
 
@@ -208,7 +216,7 @@ export function ProvidersView() {
                     >
                       {conn.launched
                         ? 'Complete login in the opened terminal, then Re-check.'
-                        : conn.detail ?? 'Could not launch the login flow.'}
+                        : (conn.detail ?? 'Could not launch the login flow.')}
                     </p>
                   )}
                 </CardContent>
@@ -220,7 +228,8 @@ export function ProvidersView() {
       </section>
 
       <footer className="mt-10 border-t border-border pt-4 text-xs text-muted">
-        “Run health check” performs a live round-trip to verify your subscription login. Everything stays on this machine.
+        “Run health check” performs a live round-trip to verify your subscription login. Everything stays on
+        this machine.
       </footer>
     </div>
   );

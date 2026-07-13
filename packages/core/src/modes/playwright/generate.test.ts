@@ -216,3 +216,81 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(specs[0].contents).not.toContain('writeFileSync');
   });
 });
+
+// ---- snapshot grounding: ctx.snapshot feeds real selectors into the prompt --
+
+function makeSnapshot(count: number): NonNullable<TestModeContext['snapshot']> {
+  return {
+    url: 'https://app.acme.test/login',
+    title: 'Login',
+    interactiveElements: Array.from({ length: count }, (_, i) => ({
+      role: 'button',
+      name: `Action ${i}`,
+      selector: `[data-testid="act-${i}"]`,
+    })),
+  };
+}
+
+describe('generate — grounds the prompt in the observed DOM snapshot', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-snap-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWith(snapshot: TestModeContext['snapshot']): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      snapshot,
+    };
+  }
+
+  it('injects the observed interactive elements (real selectors) into the prompt', async () => {
+    await generate(ctxWith(makeSnapshot(3)), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('Interactive elements observed');
+    expect(prompt).toContain('https://app.acme.test/login');
+    expect(prompt).toContain('button "Action 0"');
+    expect(prompt).toContain('[data-testid="act-0"]');
+  });
+
+  it('adds no inventory when there is no snapshot (codegen path is unchanged)', async () => {
+    await generate(ctxWith(undefined), PLAN);
+    expect(calls[0].prompt).not.toContain('Interactive elements observed');
+  });
+
+  it('omits the inventory for API-tier specs (they must not drive a browser page)', async () => {
+    const apiPlan: TestPlan = {
+      summary: 'api',
+      items: [
+        {
+          id: 'REQ-9',
+          title: 'Health endpoint',
+          reqTag: 'REQ-9',
+          tier: 'tierC-api',
+          intent: 'GET /health returns 200',
+        },
+      ],
+    };
+    await generate(ctxWith(makeSnapshot(3)), apiPlan);
+    expect(calls[0].prompt).not.toContain('Interactive elements observed');
+  });
+
+  it('caps the inventory and reports how many were omitted', async () => {
+    await generate(ctxWith(makeSnapshot(50)), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('[data-testid="act-39"]'); // 40th (0-indexed) is shown
+    expect(prompt).not.toContain('[data-testid="act-40"]'); // 41st is omitted
+    expect(prompt).toContain('(+10 more not shown)');
+  });
+});

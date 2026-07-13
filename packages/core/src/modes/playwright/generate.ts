@@ -149,10 +149,46 @@ function retryNoteForbidden(violations: string[]): string {
   return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '@playwright/test'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
 }
 
+/** Cap on interactive elements injected into a prompt (keeps it bounded). */
+const MAX_SNAPSHOT_ELEMENTS = 40;
+/** Truncate an accessible name so one pathological element can't bloat the prompt. */
+const MAX_ELEMENT_NAME_LEN = 80;
+
+/**
+ * Render the interactive-element inventory captured during computer-use
+ * exploration (ctx.snapshot) as a compact list, so generation targets REAL
+ * selectors instead of guessing. Returns '' when there is nothing to add:
+ *   - no snapshot (codegen path never sets one) or no elements observed;
+ *   - an API tier (tierC-api), which must not drive a browser page at all.
+ * The list is capped at MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so
+ * a huge page can't blow up the prompt (and the omission isn't silent).
+ */
+function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
+  if (tier === 'tierC-api') return '';
+  const elements = ctx.snapshot?.interactiveElements ?? [];
+  if (elements.length === 0) return '';
+
+  const shown = elements.slice(0, MAX_SNAPSHOT_ELEMENTS);
+  const lines = shown.map((el) => {
+    const name =
+      el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
+    return `- ${el.role} "${name}" -> ${el.selector}`;
+  });
+  const omitted = elements.length - shown.length;
+  const more = omitted > 0 ? `\n(+${omitted} more not shown)` : '';
+  const where = ctx.snapshot?.url ? ` on ${ctx.snapshot.url}` : '';
+
+  return `
+
+Interactive elements observed${where} during exploration — PREFER these real selectors over guessing:
+${lines.join('\n')}${more}`;
+}
+
 function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
+  const inventory = formatSnapshotInventory(ctx, tier);
 
   const tierGuidance =
     tier === 'tierC-api'
@@ -171,7 +207,7 @@ Requirements:
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Include AT LEAST ONE concrete expect(...) assertion.
 - Be self-contained and runnable; do not import local helpers.
-- ${tierGuidance}${strictNote}
+- ${tierGuidance}${strictNote}${inventory}
 
 Test intent: ${item.intent}
 Test title hint: ${item.title}

@@ -29,7 +29,7 @@ afterEach(() => {
 describe('project soft-archive', () => {
   it('archives and restores a project without touching its rows', async () => {
     const store = (await getStore())!;
-    const p = store.createProject({ name: 'Archivable' });
+    const p = store.createProject({ name: 'Archivable', baseUrl: 'https://archivable.test' });
     expect(p.archivedAt).toBeNull();
 
     store.setProjectArchived(p.id, true);

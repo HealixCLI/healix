@@ -15,6 +15,12 @@ export { resetDbForTests } from './storage/db.js';
 export { SCHEMA_VERSION } from './storage/schema.js';
 export { HealixStore, getStore } from './storage/store.js';
 export { resetStoreForTests } from './storage/store.js';
+export {
+  validateNewProject,
+  isValidBaseUrl,
+  type NewProjectValidation,
+  type NormalizedNewProject,
+} from './storage/validate.js';
 export * from './storage/types.js';
 
 // Target adapter (white-box / black-box)

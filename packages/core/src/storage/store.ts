@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb, resetDbForTests } from './db.js';
+import { validateNewProject } from './validate.js';
 import type {
   AgentEvent,
   EventLevel,
@@ -22,12 +23,18 @@ export class HealixStore {
 
   // ---- projects ----
   createProject(input: NewProject): Project {
+    // Validate + normalize here so EVERY caller (desktop IPC, CLI) is guarded
+    // against creating an empty/unreachable project. validateNewProject is the
+    // single source of truth for the invariant; the UI mirrors it for feedback.
+    const validation = validateNewProject(input);
+    if (!validation.ok) throw new Error(validation.error);
+    const { name, mode, repoPath, baseUrl } = validation.value;
     const project: Project = {
       id: `prj_${nanoid(10)}`,
-      name: input.name,
-      mode: input.mode ?? 'playwright',
-      repoPath: input.repoPath ?? null,
-      baseUrl: input.baseUrl ?? null,
+      name,
+      mode,
+      repoPath,
+      baseUrl,
       createdAt: new Date().toISOString(),
       archivedAt: null,
     };
@@ -264,13 +271,15 @@ export class HealixStore {
 
   listEvents(runId: string): AgentEvent[] {
     return (
-      this.db
-        // rowid is a monotonic insertion counter; it breaks ties when several
-        // events share the same millisecond created_at, so the log never
-        // reorders within a burst (created_at alone has no stable tiebreaker).
-        .prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC, rowid ASC')
-        .all(runId) as Array<Record<string, unknown>>
-    ).map(rowToEvent);
+      (
+        this.db
+          // rowid is a monotonic insertion counter; it breaks ties when several
+          // events share the same millisecond created_at, so the log never
+          // reorders within a burst (created_at alone has no stable tiebreaker).
+          .prepare('SELECT * FROM agent_events WHERE run_id = ? ORDER BY created_at ASC, rowid ASC')
+          .all(runId) as Array<Record<string, unknown>>
+      ).map(rowToEvent)
+    );
   }
 }
 

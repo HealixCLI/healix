@@ -191,6 +191,23 @@ function DeleteButton({ onDelete }: { onDelete: () => void }) {
   );
 }
 
+/**
+ * Mirror of core `isValidBaseUrl` (packages/core/src/storage/validate.ts).
+ * Duplicated because the renderer runs in a browser context and cannot import
+ * @healix/core (its barrel pulls in node:sqlite). Core remains the hard guard;
+ * this is purely for inline feedback. Keep the two in sync.
+ */
+function isValidBaseUrl(raw: string): boolean {
+  const value = raw.trim();
+  if (!value || value.length > 2048) return false;
+  try {
+    const url = new URL(value);
+    return (url.protocol === 'http:' || url.protocol === 'https:') && url.hostname.length > 0;
+  } catch {
+    return false;
+  }
+}
+
 function NewProjectForm({
   onCreate,
   onDone,
@@ -204,12 +221,19 @@ function NewProjectForm({
   const [mode, setMode] = useState<'playwright'>('playwright');
   const [submitting, setSubmitting] = useState(false);
 
+  // Same rules as core validateNewProject: a project needs a name, at least one
+  // of repo/URL, and a well-formed http(s) URL when a base URL is provided.
+  const trimmedName = name.trim();
+  const hasTarget = repoPath.trim().length > 0 || baseUrl.trim().length > 0;
+  const baseUrlInvalid = baseUrl.trim().length > 0 && !isValidBaseUrl(baseUrl);
+  const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !submitting;
+
   const submit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
-    if (!name.trim() || submitting) return;
+    if (!canSubmit) return;
     setSubmitting(true);
     const created = await onCreate({
-      name: name.trim(),
+      name: trimmedName,
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
@@ -253,20 +277,29 @@ function NewProjectForm({
               onChange={(e) => setBaseUrl(e.target.value)}
               placeholder="https://app.acme.test"
               className="font-mono"
+              aria-invalid={baseUrlInvalid}
             />
+            {baseUrlInvalid && (
+              <p className="mt-1 text-xs text-err">Enter a valid http(s) URL, e.g. https://app.acme.test</p>
+            )}
           </Field>
           <Field label="Mode">
             <Select value={mode} onChange={(e) => setMode(e.target.value as 'playwright')}>
               <option value="playwright">playwright</option>
             </Select>
           </Field>
-          <div className="flex items-end justify-end gap-2 sm:col-span-2">
-            <Button type="button" variant="ghost" onClick={onDone}>
-              Cancel
-            </Button>
-            <Button type="submit" disabled={!name.trim() || submitting}>
-              {submitting ? 'Creating…' : 'Create project'}
-            </Button>
+          <div className="flex flex-wrap items-center justify-between gap-2 sm:col-span-2">
+            <p className={`text-xs ${hasTarget ? 'text-muted' : 'text-err'}`}>
+              A project needs a repo path or a base URL — set at least one.
+            </p>
+            <div className="flex items-end justify-end gap-2">
+              <Button type="button" variant="ghost" onClick={onDone}>
+                Cancel
+              </Button>
+              <Button type="submit" disabled={!canSubmit}>
+                {submitting ? 'Creating…' : 'Create project'}
+              </Button>
+            </div>
           </div>
         </form>
       </CardContent>

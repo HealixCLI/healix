@@ -1,4 +1,5 @@
 import { spawn } from 'node:child_process';
+import { statSync } from 'node:fs';
 
 export interface RunResult {
   code: number | null;
@@ -44,6 +45,31 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     if (opts.signal?.aborted) {
       resolve({ code: null, stdout: '', stderr: '[aborted]', timedOut: false, aborted: true, durationMs: 0 });
       return;
+    }
+
+    // A missing/invalid cwd (e.g. a project's repoPath was moved or deleted)
+    // makes CreateProcess/posix_spawn fail on ANY child, including the shell
+    // itself on Windows — libuv then reports a confusing "spawn <shell> ENOENT"
+    // that has nothing to do with the real target binary. Check up front and
+    // fail with a message that names the actual problem.
+    if (opts.cwd !== undefined) {
+      let cwdIsDir = false;
+      try {
+        cwdIsDir = statSync(opts.cwd).isDirectory();
+      } catch {
+        cwdIsDir = false;
+      }
+      if (!cwdIsDir) {
+        resolve({
+          code: null,
+          stdout: '',
+          stderr: `working directory does not exist: ${opts.cwd}`,
+          timedOut: false,
+          aborted: false,
+          durationMs: Date.now() - start,
+        });
+        return;
+      }
     }
 
     const isWindows = process.platform === 'win32';

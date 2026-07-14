@@ -16,6 +16,7 @@ import { useProjects } from '../lib/use-projects';
 import { useRuns } from '../lib/use-runs';
 import { useRunDetail } from '../lib/use-run-detail';
 import { useLiveFrame } from '../lib/use-live-frame';
+import { cn } from '../lib/utils';
 import { EXPLORATION_MODES, useRunEngine, type RunPhase } from '../lib/run-engine';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
@@ -53,6 +54,8 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // True from the moment the user clicks Cancel until run:done settles the run.
   const [cancelling, setCancelling] = useState(false);
+  // Session-only: resets to expanded on next launch.
+  const [historyCollapsed, setHistoryCollapsed] = useState(false);
 
   const { detail, loading: detailLoading } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
@@ -98,6 +101,23 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     }
   }, [engine.phase, engine.runId, refreshRuns]);
 
+  // Refresh as soon as the run gets an id, and again on every phase change
+  // while active, so a brand-new run appears and phase transitions (e.g.
+  // awaiting-approval) show up in the history rail without a manual refresh.
+  useEffect(() => {
+    if (!engine.runId || !isActive) return;
+    void refreshRuns();
+  }, [engine.runId, engine.phase, isActive, refreshRuns]);
+
+  // The orchestrator advances through several statuses (exploring/generating/
+  // executing/...) without changing engine.phase (it stays 'running'), so
+  // poll the same refresh while active to keep the status badge current.
+  useEffect(() => {
+    if (!isActive) return;
+    const id = setInterval(() => void refreshRuns(), 3000);
+    return () => clearInterval(id);
+  }, [isActive, refreshRuns]);
+
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === projectId) ?? null,
     [projects, projectId],
@@ -133,7 +153,12 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   return (
     <div className="flex h-full min-h-0">
       {/* History rail */}
-      <div className="flex w-64 shrink-0 flex-col border-r border-border px-4 pb-6 pt-8">
+      <div
+        className={cn(
+          'flex shrink-0 flex-col border-r border-border pb-6 pt-8',
+          historyCollapsed ? 'w-12 items-center px-1' : 'w-64 px-4',
+        )}
+      >
         <RunHistory
           runs={runs}
           loading={runsLoading}
@@ -144,11 +169,13 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           }}
           onRefresh={() => void refreshRuns()}
           projectsById={projectsById}
+          collapsed={historyCollapsed}
+          onToggleCollapse={() => setHistoryCollapsed((v) => !v)}
         />
       </div>
 
       {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col px-8 pb-6 pt-8">
+      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8">
         <header className="flex items-end justify-between border-b border-border pb-5">
           <div>
             <h1 className="font-mono text-xl font-semibold tracking-tight">Runs</h1>
@@ -209,17 +236,20 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
               </div>
             </div>
 
-            <div className="mt-4 flex items-center justify-between">
-              <div className="text-xs text-muted">
+            <div className="mt-4 flex min-w-0 items-center justify-between">
+              <div className="min-w-0 text-xs text-muted">
                 {selectedProject ? (
-                  <span className="font-mono">
+                  <span
+                    className="block truncate font-mono"
+                    title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+                  >
                     {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
                   </span>
                 ) : (
                   'Select a project to begin.'
                 )}
               </div>
-              <div className="flex items-center gap-2">
+              <div className="flex shrink-0 items-center gap-2">
                 {SETTLED_PHASES.includes(engine.phase) && (
                   <Button variant="ghost" onClick={newRun}>
                     <RotateCcw className="h-4 w-4" />

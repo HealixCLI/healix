@@ -363,9 +363,7 @@ ipcMain.handle('shell:showItem', (_e, target: string): { ok: boolean } => {
 
 // ---- PRD file upload (native file picker + text extraction) ----
 
-const PRD_FILE_FILTERS = [
-  { name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] },
-];
+const PRD_FILE_FILTERS = [{ name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] }];
 
 export interface PickPrdFileResult {
   canceled: boolean;
@@ -386,7 +384,9 @@ async function extractPrdText(filePath: string): Promise<string> {
     case '.pdf':
       return (await pdfParse(await readFile(filePath))).text;
     case '.doc':
-      throw new Error('Legacy .doc files are not supported — please save as .docx, .txt, or .md and try again.');
+      throw new Error(
+        'Legacy .doc files are not supported — please save as .docx, .txt, or .md and try again.',
+      );
     default:
       throw new Error(`Unsupported file type: ${ext || '(unknown)'}`);
   }

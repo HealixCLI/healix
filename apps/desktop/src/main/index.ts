@@ -167,22 +167,19 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
   });
 });
 
-ipcMain.handle(
-  'projects:update',
-  async (_e, payload: { id: string } & NewProject): Promise<Project> => {
-    const store = await requireStore();
-    const { id, ...input } = payload ?? ({} as { id: string } & NewProject);
-    if (!id) throw new Error('Project id is required.');
-    const name = (input?.name ?? '').trim();
-    if (!name) throw new Error('Project name is required.');
-    return store.updateProject(id, {
-      name,
-      mode: input.mode ?? 'playwright',
-      repoPath: normalizeOptional(input.repoPath),
-      baseUrl: normalizeOptional(input.baseUrl),
-    });
-  },
-);
+ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProject): Promise<Project> => {
+  const store = await requireStore();
+  const { id, ...input } = payload ?? ({} as { id: string } & NewProject);
+  if (!id) throw new Error('Project id is required.');
+  const name = (input?.name ?? '').trim();
+  if (!name) throw new Error('Project name is required.');
+  return store.updateProject(id, {
+    name,
+    mode: input.mode ?? 'playwright',
+    repoPath: normalizeOptional(input.repoPath),
+    baseUrl: normalizeOptional(input.baseUrl),
+  });
+});
 
 ipcMain.handle('projects:delete', async (_e, id: string): Promise<{ ok: true; assetsRemoved: boolean }> => {
   const store = await requireStore();

@@ -359,7 +359,11 @@ function ProjectForm({
             )}
           </Field>
           <Field label="Mode">
-            <Select value={mode} onChange={(e) => setMode(e.target.value as 'playwright')} disabled={readOnly}>
+            <Select
+              value={mode}
+              onChange={(e) => setMode(e.target.value as 'playwright')}
+              disabled={readOnly}
+            >
               <option value="playwright">playwright</option>
             </Select>
           </Field>

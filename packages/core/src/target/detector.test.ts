@@ -49,6 +49,8 @@ describe('detect', () => {
     expect(result.kind).toBe('frontend');
     expect(result.packageManager).toBe('pnpm');
     expect(result.startCommand).toBe('pnpm dev');
+    expect(result.installCommand).toBe('pnpm install');
+    expect(result.installDir).toBe('.');
     expect(result.port).toBe(5173);
     expect(result.baseUrl).toBe('http://localhost:5173');
   });
@@ -72,6 +74,8 @@ describe('detect', () => {
     expect(result.kind).toBe('fullstack');
     expect(result.packageManager).toBe('npm');
     expect(result.startCommand).toBe('npm run dev');
+    expect(result.installCommand).toBe('npm install');
+    expect(result.installDir).toBe('.');
     expect(result.port).toBe(3000);
     expect(result.baseUrl).toBe('http://localhost:3000');
   });
@@ -95,6 +99,8 @@ describe('detect', () => {
     expect(result.kind).toBe('backend');
     expect(result.packageManager).toBe('yarn');
     expect(result.startCommand).toBe('yarn dev');
+    expect(result.installCommand).toBe('yarn install');
+    expect(result.installDir).toBe('.');
     expect(result.port).toBe(3000);
     expect(result.baseUrl).toBe('http://localhost:3000');
   });
@@ -107,6 +113,8 @@ describe('detect', () => {
 
     expect(result.kind).toBe('unknown');
     expect(result.framework).toBeNull();
+    expect(result.installCommand).toBeNull();
+    expect(result.installDir).toBeNull();
     expect(result.packageManager).toBeNull();
     expect(result.startCommand).toBeNull();
     expect(result.port).toBeNull();

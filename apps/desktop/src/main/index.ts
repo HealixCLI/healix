@@ -20,7 +20,10 @@ import {
   createOrchestrator,
   exportSuite,
   projectsDir,
+  reposDir,
   deleteProjectAssets,
+  isGitRemoteUrl,
+  cloneRepo,
   type NewProject,
   type Project,
   type ExplorationMode,
@@ -159,10 +162,22 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
   const store = await requireStore();
   const name = (input?.name ?? '').trim();
   if (!name) throw new Error('Project name is required.');
+
+  // "Repo path" accepts a local folder OR a git URL (GitHub/GitLab/etc.) — a
+  // URL is cloned here, up front, so the store only ever sees a local path.
+  let repoPath = normalizeOptional(input.repoPath);
+  if (repoPath && isGitRemoteUrl(repoPath)) {
+    try {
+      repoPath = (await cloneRepo(repoPath, reposDir())).path;
+    } catch (err) {
+      throw new Error(`Could not clone ${repoPath}: ${err instanceof Error ? err.message : String(err)}`);
+    }
+  }
+
   return store.createProject({
     name,
     mode: input.mode ?? 'playwright',
-    repoPath: normalizeOptional(input.repoPath),
+    repoPath,
     baseUrl: normalizeOptional(input.baseUrl),
   });
 });

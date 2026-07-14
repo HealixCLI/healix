@@ -153,6 +153,8 @@ const fakeTarget: TargetAdapter = {
       framework: null,
       packageManager: null,
       startCommand: null,
+      installCommand: null,
+      installDir: null,
       port: null,
       baseUrl: null,
     };

@@ -21,6 +21,14 @@ const RUN_PREFIX: Record<PackageManager, string> = {
   bun: 'bun run',
 };
 
+/** The install invocation for each package manager. */
+const PM_INSTALL: Record<PackageManager, string> = {
+  npm: 'npm install',
+  pnpm: 'pnpm install',
+  yarn: 'yarn install',
+  bun: 'bun install',
+};
+
 /** Lockfile -> package manager, checked in priority order. */
 const LOCKFILES: Array<{ file: string; pm: PackageManager }> = [
   { file: 'pnpm-lock.yaml', pm: 'pnpm' },
@@ -375,36 +383,55 @@ function scanWorkspaces(repoPath: string): WorkspaceDetection | null {
   return null;
 }
 
+/** Start + install commands derived for a workspace app, and the dir installDir gates on. */
+interface WorkspaceCommands {
+  startCommand: string;
+  installCommand: string;
+  installDir: string;
+}
+
 /**
- * Build the start command for a workspace app. When the root declares a
- * workspace layout AND has a known package manager AND the child package is
- * addressable by name, prefer the PM's native workspace invocation (it runs
- * from the repo root, which is where launch() spawns). Anything less falls
- * back to a plain `cd <dir> && <pm> <script>` that works regardless of
- * workspace wiring. bun deliberately uses the cd fallback too — its workspace
- * filtering flags vary across versions.
+ * Build the start + install commands for a workspace app. When the root
+ * declares a workspace layout AND has a known package manager AND the child
+ * package is addressable by name, prefer the PM's native workspace invocation
+ * (it runs from the repo root, which is where launch() spawns, and a root
+ * install covers every workspace package). Anything less falls back to a
+ * plain `cd <dir> && <pm> <script>` / `cd <dir> && <pm> install` pair that
+ * works regardless of workspace wiring — this is also what a repo with NO
+ * root package.json at all (each app manages its own deps independently)
+ * needs. bun deliberately uses the cd fallback too — its workspace filtering
+ * flags vary across versions.
  */
-function workspaceStartCommand(
+function workspaceCommands(
   repoPath: string,
   rootPkg: PackageJson | null,
   rootPm: PackageManager | null,
   ws: WorkspaceDetection,
-): string {
+): WorkspaceCommands {
   const name = typeof ws.pkg.name === 'string' && ws.pkg.name.trim().length > 0 ? ws.pkg.name.trim() : null;
   if (name && rootPm && hasWorkspaces(repoPath, rootPkg)) {
+    const installCommand = PM_INSTALL[rootPm];
     switch (rootPm) {
       case 'pnpm':
-        return `pnpm --filter ${name} ${ws.scriptName}`;
+        return { startCommand: `pnpm --filter ${name} ${ws.scriptName}`, installCommand, installDir: '.' };
       case 'yarn':
-        return `yarn workspace ${name} ${ws.scriptName}`;
+        return { startCommand: `yarn workspace ${name} ${ws.scriptName}`, installCommand, installDir: '.' };
       case 'npm':
-        return `npm run ${ws.scriptName} --workspace ${name}`;
+        return {
+          startCommand: `npm run ${ws.scriptName} --workspace ${name}`,
+          installCommand,
+          installDir: '.',
+        };
       case 'bun':
         break; // fall through to the cd form
     }
   }
   const childPm = detectPackageManager(path.join(repoPath, ws.relDir), ws.pkg) ?? rootPm ?? 'npm';
-  return `cd ${ws.relDir} && ${RUN_PREFIX[childPm]} ${ws.scriptName}`;
+  return {
+    startCommand: `cd ${ws.relDir} && ${RUN_PREFIX[childPm]} ${ws.scriptName}`,
+    installCommand: `cd ${ws.relDir} && ${PM_INSTALL[childPm]}`,
+    installDir: ws.relDir,
+  };
 }
 
 /** Compose files that mark a docker-first project (any one is enough). */
@@ -433,15 +460,25 @@ export async function detect(repoPath: string): Promise<DetectedProject> {
   // framework; an entirely unknown repo with no package.json gets nulls.
   let port: number | null = null;
   let baseUrl: string | null = null;
+  let installCommand: string | null = pm ? PM_INSTALL[pm] : null;
+  let installDir: string | null = pm ? '.' : null;
 
-  if (framework === null && startCommand === null) {
-    // Root told us nothing launchable — try the monorepo workspace scan.
+  // Try the monorepo workspace scan whenever the ROOT gave us nothing
+  // launchable — regardless of whether a marker-file framework guess (e.g.
+  // "rust" from a root Cargo.toml alongside a Tauri/desktop app) was made.
+  // A root-level marker file with no start command is strictly less useful
+  // than an actual runnable app under apps/*/packages/*, so it must not
+  // block the scan from ever running.
+  if (startCommand === null) {
     const ws = scanWorkspaces(repoPath);
     if (ws) {
       framework = ws.framework;
       kind = frameworkToKind(ws.framework, mergedDeps(ws.pkg));
       scriptName = ws.scriptName;
-      startCommand = workspaceStartCommand(repoPath, pkg, pm, ws);
+      const commands = workspaceCommands(repoPath, pkg, pm, ws);
+      startCommand = commands.startCommand;
+      installCommand = commands.installCommand;
+      installDir = commands.installDir;
       port = ws.port;
       baseUrl = `http://localhost:${port}`;
       notes.push(
@@ -477,6 +514,8 @@ export async function detect(repoPath: string): Promise<DetectedProject> {
     framework,
     packageManager: pm,
     startCommand,
+    installCommand,
+    installDir,
     port,
     baseUrl,
     ...(notes.length > 0 ? { notes } : {}),

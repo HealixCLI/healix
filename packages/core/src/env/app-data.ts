@@ -33,6 +33,11 @@ export function projectsDir(): string {
   return join(appDataDir(), 'projects');
 }
 
+/** Root for repos cloned from a git URL passed into a project's "Repo path" field. */
+export function reposDir(): string {
+  return join(appDataDir(), 'repos');
+}
+
 export function dbPath(): string {
   return join(appDataDir(), 'healix.db');
 }

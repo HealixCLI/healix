@@ -308,6 +308,8 @@ async function runPipeline(
         const handle = await target.launch({
           repoPath,
           startCommand: det.startCommand ?? undefined,
+          installCommand: det.installCommand ?? undefined,
+          installDir: det.installDir ?? undefined,
           // det.baseUrl embeds the DETECTED port; when the allocated port
           // differs, omit it so launch() derives the URL from `port` and the
           // readiness poll targets the server this run actually started.

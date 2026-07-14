@@ -1,6 +1,15 @@
 import type { Command } from 'commander';
 import pc from 'picocolors';
-import { deleteProjectAssets, getStore, type ModeId, type NewProject, type Project } from '@healix/core';
+import {
+  cloneRepo,
+  deleteProjectAssets,
+  getStore,
+  isGitRemoteUrl,
+  reposDir,
+  type ModeId,
+  type NewProject,
+  type Project,
+} from '@healix/core';
 
 /** Print a friendly hint when the local SQLite store is unavailable. */
 function storeUnavailable(): void {
@@ -45,17 +54,35 @@ export function registerProject(program: Command): void {
     .command('add')
     .description('Register a new project')
     .requiredOption('--name <name>', 'human-readable project name')
-    .option('--repo <path>', 'path to the project repository (white-box access)')
+    .option('--repo <path>', 'local path, or a git URL to clone (white-box access)')
     .option('--url <baseUrl>', 'base URL of the running app (black-box access)')
     .option('--mode <mode>', 'test engine mode (default: playwright)', 'playwright')
     .action(async (opts: { name: string; repo?: string; url?: string; mode?: string }) => {
       const store = await getStore();
       if (!store) return storeUnavailable();
 
+      // "Repo path" accepts a local folder OR a git URL — a URL is cloned here,
+      // up front, so createProject only ever sees a local path.
+      let repoPath = opts.repo ?? null;
+      if (repoPath && isGitRemoteUrl(repoPath)) {
+        console.log('');
+        console.log(pc.dim(`  Cloning ${repoPath}…`));
+        try {
+          repoPath = (await cloneRepo(repoPath, reposDir())).path;
+          console.log(pc.dim(`  Cloned into ${repoPath}`));
+        } catch (err) {
+          console.log('');
+          console.log(pc.red(`  ✖ ${err instanceof Error ? err.message : String(err)}`));
+          console.log('');
+          process.exitCode = 1;
+          return;
+        }
+      }
+
       const input: NewProject = {
         name: opts.name,
         mode: (opts.mode ?? 'playwright') as ModeId,
-        repoPath: opts.repo ?? null,
+        repoPath,
         baseUrl: opts.url ?? null,
       };
       let project: Project;

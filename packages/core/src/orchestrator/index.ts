@@ -16,6 +16,7 @@ import type {
 } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
+import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
@@ -282,14 +283,27 @@ async function runPipeline(
 
     // ---- 5b. LAUNCH (white-box) ----
     // A white-box project (repoPath set, no baseUrl) has no live URL yet, so detect + launch
-    // the app and target the resulting URL. Best-effort: on failure, fall back to the detected
-    // baseUrl rather than aborting. The handle is always stopped in the run's cleanup.
+    // the app and target the resulting URL. Recovery ladder on failure:
+    //   1. errors that look like missing dependencies → run the detected package
+    //      manager's install in the repo and retry the launch once;
+    //   2. still failing → the run STOPS as 'error'. There is no URL to fall
+    //      back to for a white-box project, so "continuing best-effort" meant
+    //      generating and executing an entire suite against a dead URL — every
+    //      result was junk and the provider tokens were wasted.
+    // The handle is always stopped in the run's cleanup.
     if (checkCancelled()) return cancelRun('launch');
     if (!project.baseUrl && project.repoPath) {
       const repoPath = project.repoPath;
+      emit('launch', 'info', `[launch] Detecting app in ${repoPath}.`);
+      let det: Awaited<ReturnType<typeof target.detect>> | null = null;
       try {
-        emit('launch', 'info', `[launch] Detecting app in ${repoPath}.`);
-        const det = await target.detect(repoPath);
+        det = await target.detect(repoPath);
+      } catch (err) {
+        emit('launch', 'error', `[launch] Detection failed: ${errMsg(err)}`, { stack: errStack(err) });
+      }
+
+      let launchError: unknown = null;
+      if (det) {
         // Per-run port allocation: two concurrent runs of the same project
         // previously both launched on the framework-default port — the second
         // launch's readiness poll then hit the FIRST run's server and the two
@@ -304,24 +318,80 @@ async function runPipeline(
             { detectedPort: det.port, port },
           );
         }
+        const doLaunch = async (): Promise<void> => {
+          const handle = await target.launch({
+            repoPath,
+            startCommand: det.startCommand ?? undefined,
+            // det.baseUrl embeds the DETECTED port; when the allocated port
+            // differs, omit it so launch() derives the URL from `port` and the
+            // readiness poll targets the server this run actually started.
+            baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
+            port,
+            readyTimeoutMs: 120000,
+          });
+          launchHandle = handle;
+          effectiveBaseUrl = handle.baseUrl;
+          emit('launch', 'info', `[launch] App ready at ${handle.baseUrl}.`);
+        };
+
         emit('launch', 'info', `[launch] Launching app (${det.startCommand ?? 'auto'}).`);
-        const handle = await target.launch({
-          repoPath,
-          startCommand: det.startCommand ?? undefined,
-          // det.baseUrl embeds the DETECTED port; when the allocated port
-          // differs, omit it so launch() derives the URL from `port` and the
-          // readiness poll targets the server this run actually started.
-          baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
-          port,
-          readyTimeoutMs: 120000,
-        });
-        launchHandle = handle;
-        effectiveBaseUrl = handle.baseUrl;
-        emit('launch', 'info', `[launch] App ready at ${handle.baseUrl}.`);
-      } catch (err) {
-        emit('launch', 'warn', `[launch] Launch failed (continuing best-effort): ${errMsg(err)}`, {
-          stack: errStack(err),
-        });
+        try {
+          await doLaunch();
+        } catch (err) {
+          launchError = err;
+          // Recovery rung 1: missing dependencies → install once, retry once.
+          if (looksLikeMissingDeps(errMsg(err)) && det.packageManager && !checkCancelled()) {
+            emit(
+              'launch',
+              'warn',
+              `[launch] Launch failed with missing-dependency symptoms; running ${det.packageManager} install and retrying.`,
+              { error: errMsg(err) },
+            );
+            const execCli = overrides?.execCli ?? runCli;
+            const install = await execCli(det.packageManager, ['install'], {
+              cwd: repoPath,
+              timeoutMs: 300_000,
+            });
+            if (install.code === 0) {
+              emit('launch', 'info', '[launch] Dependencies installed; retrying launch.');
+              try {
+                await doLaunch();
+                launchError = null;
+              } catch (retryErr) {
+                launchError = retryErr;
+              }
+            } else {
+              emit('launch', 'warn', `[launch] ${det.packageManager} install failed (exit ${install.code}).`, {
+                stderrTail: install.stderr.split(/\r?\n/).filter(Boolean).slice(-8),
+              });
+            }
+          }
+        }
+      }
+
+      // Recovery exhausted: stop honestly instead of testing a dead URL.
+      if (!launchHandle) {
+        emit(
+          'launch',
+          'error',
+          `[launch] Target app could not be started${launchError ? `: ${errMsg(launchError)}` : ''}. ` +
+            'Fix the start command (healix scan <repo>), start the app yourself and register the project with --url, or check the error above.',
+          { stack: errStack(launchError ?? undefined) },
+        );
+        setStatus('error', { finishedAt: nowIso() });
+        const summary = await finalizeReport(
+          runDir,
+          run,
+          project,
+          currentStatus,
+          plan,
+          outcome,
+          triageEntries,
+          artifactFiles,
+          noteStoreOk,
+          noteStoreFailure,
+        );
+        return { runId, status: 'error', reportPath: summary.reportPath };
       }
     }
 
@@ -948,6 +1018,16 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Launch stderr that suggests the repo's dependencies were never installed —
+ * the one launch failure Healix can recover from by itself (install + retry).
+ */
+export function looksLikeMissingDeps(message: string): boolean {
+  return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|command not found|not recognized as an internal|ENOENT|node_modules/i.test(
+    message,
+  );
 }
 
 function errMsg(err: unknown): string {

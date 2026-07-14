@@ -41,6 +41,7 @@ import {
   readManifest,
   seedRunSuite,
 } from '../suite/canonical.js';
+import { readProjectConfig, resolveTierBEnv } from '../suite/config.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
@@ -55,7 +56,7 @@ import type {
 export * from './types.js';
 
 /** Per-call budget for the best-effort AI triage enrichment. */
-const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
+const TRIAGE_ANALYZE_TIMEOUT_MS = 45_000;
 /** How many failures (at most) get escalated to AI triage analysis. */
 const TRIAGE_AI_LIMIT = 3;
 /** Consecutive best-effort store-write failures before we warn that persistence is down. */
@@ -483,6 +484,25 @@ async function runPipeline(
       }
     }
 
+    // Project config (.healix/config.json, committed + secret-free): resolves
+    // which env vars hold the Tier-B credentials and where the login page
+    // lives (relative login URLs resolve against the just-launched base URL).
+    // Explicit HEALIX_TIERB_* env vars always override the config.
+    let extraEnv: Record<string, string> = {};
+    if (project.repoPath) {
+      try {
+        const projectConfig = await readProjectConfig(project.repoPath);
+        extraEnv = resolveTierBEnv(projectConfig, effectiveBaseUrl);
+        if (Object.keys(extraEnv).length > 0) {
+          emit('generate', 'debug', 'Resolved Tier-B auth wiring from project config/env.', {
+            keys: Object.keys(extraEnv),
+          });
+        }
+      } catch (err) {
+        emit('generate', 'debug', `Project config read failed (continuing): ${errMsg(err)}`);
+      }
+    }
+
     const ctx: TestModeContext = {
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
@@ -496,6 +516,7 @@ async function runPipeline(
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
       signal,
+      extraEnv,
     };
     const mode = getMode(project.mode);
 
@@ -748,6 +769,58 @@ async function runPipeline(
       emit('triage', 'warn', `Triage phase error (continuing): ${errMsg(err)}`, { stack: errStack(err) });
     }
 
+    // ---- 9a. HEAL AUTH (best-effort root-cause repair) ----
+    // A failed auth setup dooms EVERY dependent authenticated test — one root
+    // cause, many blocked results. Instead of settling as 'blocked' (or
+    // repairing doomed tests one by one), regenerate the login flow from the
+    // live login page ONCE and re-run the authenticated tier. Only attempted
+    // when credentials are actually configured — without them a login cannot
+    // succeed, so a heal would be wasted work.
+    if (checkCancelled()) return cancelRun('heal');
+    if (outcome && mode.repairAuthSetup) {
+      const raw = outcome.raw as { authSetupFailed?: boolean; authSetupError?: string } | undefined;
+      const credsConfigured = Boolean(
+        (ctx.extraEnv?.HEALIX_TIERB_EMAIL ?? process.env.HEALIX_TIERB_EMAIL) &&
+        (ctx.extraEnv?.HEALIX_TIERB_PASSWORD ?? process.env.HEALIX_TIERB_PASSWORD),
+      );
+      if (raw?.authSetupFailed && credsConfigured) {
+        setStatus('triaging');
+        emit('heal', 'info', 'Auth setup failed with credentials configured; attempting login self-heal.');
+        try {
+          const healed = await mode.repairAuthSetup(ctx, raw.authSetupError ?? '');
+          if (healed) {
+            emit('heal', 'info', 'Re-running authenticated tier with the healed login.');
+            const retest = await mode.execute(ctx, allSpecs, { projects: ['tierB-auth'] });
+            const retestRaw = retest.raw as { authSetupFailed?: boolean } | undefined;
+            if (!retestRaw?.authSetupFailed) {
+              // Merge: replace the outcome entries the retest re-ran, then
+              // recount headline numbers from the merged results.
+              for (const rr of retest.results) {
+                const idx = outcome.results.findIndex(
+                  (r) => stableKey(undefined, r.title) === stableKey(undefined, rr.title),
+                );
+                if (idx >= 0) outcome.results[idx] = rr;
+                else outcome.results.push(rr);
+              }
+              recountOutcome(outcome);
+              persistResults(store, runId, allSpecs, retest, testIdByKey, noteStoreOk, noteStoreFailure);
+              emit(
+                'heal',
+                'info',
+                `Login self-heal verified: authenticated tier re-ran (${retest.passed} passed, ${retest.failed} failed).`,
+              );
+            } else {
+              emit('heal', 'warn', 'Healed login still failed on re-run; keeping blocked outcomes.');
+            }
+          } else {
+            emit('heal', 'info', 'No safe login repair produced; keeping blocked outcomes.');
+          }
+        } catch (err) {
+          emit('heal', 'warn', `Auth self-heal error (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+        }
+      }
+    }
+
     // ---- 9b. HEAL (best-effort self-repair of NEW specs) ----
     // Policy (the safety line every serious tool draws): repair ONLY failures
     // triaged as defects in the TEST itself — never app defects; "healing" an
@@ -859,11 +932,14 @@ async function runPipeline(
       try {
         const finalOutcome = outcome;
         const toBank = specs.filter((s) => {
-          const res = finalOutcome.results.find(
+          // ALL results attributable to this spec must be green. Taking the
+          // first match let a failing spec bank whenever some other passed
+          // result's title happened to appear in this spec's source text.
+          const matches = finalOutcome.results.filter(
             (r) =>
               stableKey(undefined, r.title) === stableKey(undefined, s.title) || s.contents.includes(r.title),
           );
-          return res !== undefined && (res.status === 'passed' || res.status === 'flaky');
+          return matches.length > 0 && matches.every((r) => r.status === 'passed' || r.status === 'flaky');
         });
         if (toBank.length > 0) {
           const head = await gitHead(project.repoPath, overrides?.execCli);
@@ -1158,6 +1234,41 @@ function extractReqTag(title: string): string | null {
   const m = title.match(/\[REQ:([^\]]+)\]/i);
   const tag = m?.[1]?.trim();
   return tag && tag.length > 0 ? tag : null;
+}
+
+/**
+ * Recompute an outcome's headline counters from its (mutated) results array.
+ * Mirrors parseReport's counting: flaky counts toward passed; skipped/pending
+ * move nothing.
+ */
+function recountOutcome(outcome: ExecOutcome): void {
+  let passed = 0;
+  let failed = 0;
+  let blocked = 0;
+  let flaky = 0;
+  for (const r of outcome.results) {
+    switch (r.status) {
+      case 'passed':
+        passed += 1;
+        break;
+      case 'flaky':
+        flaky += 1;
+        passed += 1;
+        break;
+      case 'blocked':
+        blocked += 1;
+        break;
+      case 'failed':
+        failed += 1;
+        break;
+      default:
+        break;
+    }
+  }
+  outcome.passed = passed;
+  outcome.failed = failed;
+  outcome.blocked = blocked;
+  outcome.flaky = flaky;
 }
 
 /**

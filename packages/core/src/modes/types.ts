@@ -66,12 +66,20 @@ export interface TestModeContext {
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
+  /**
+   * Extra HEALIX_* env vars for suite subprocesses (e.g. Tier-B credentials
+   * resolved from .healix/config.json). Non-HEALIX_ keys are ignored by the
+   * execute-phase allowlist.
+   */
+  extraEnv?: Record<string, string>;
 }
 
 /** Options for a (re-)execution pass. */
 export interface ExecuteOptions {
   /** Restrict the run to these spec paths (relative to projectDir). Empty/undefined = full suite. */
   only?: string[];
+  /** Restrict the run to these Playwright projects (their dependencies still run). */
+  projects?: string[];
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */
@@ -89,4 +97,12 @@ export interface TestMode {
    * failures triaged as test defects — never to mask an app defect.
    */
   repair?(ctx: TestModeContext, spec: GeneratedSpec, error: string): Promise<GeneratedSpec | null>;
+  /**
+   * Optional auth-setup self-heal: the login step failed (credentials ARE
+   * configured), dooming every dependent authenticated test. Regenerate the
+   * login flow from a fresh look at the live login page and rewrite the setup
+   * file. Returns true when a repaired setup was written (caller re-runs the
+   * authenticated project), false when no safe repair was produced.
+   */
+  repairAuthSetup?(ctx: TestModeContext, error: string): Promise<boolean>;
 }

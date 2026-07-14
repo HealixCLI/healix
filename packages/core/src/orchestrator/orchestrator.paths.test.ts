@@ -1061,4 +1061,194 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(summary.status).toBe('failed');
     expect(summary.outcome?.failed).toBe(1);
   });
+  it('HEAL AUTH: a failed auth setup with creds configured heals the login and re-runs Tier B', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Auth Heal Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    process.env.HEALIX_TIERB_EMAIL = 'qa@example.test';
+    process.env.HEALIX_TIERB_PASSWORD = 'secret';
+    try {
+      const tierBSpec: GeneratedSpec = {
+        path: '/virtual/tests/tierB-auth/dash.spec.ts',
+        title: '[REQ:REQ-002] Dashboard greeting',
+        reqTag: 'REQ-002',
+        tier: 'tierB-auth',
+        contents: "test('[REQ:REQ-002] Dashboard greeting', () => {});",
+      };
+
+      let authHealCalls = 0;
+      const executeCalls: Array<string[] | undefined> = [];
+      const mode: TestMode = {
+        ...makeFakeMode(ALL_PASS_OUTCOME),
+        async generate(): Promise<GeneratedSpec[]> {
+          return [{ ...tierBSpec }];
+        },
+        async execute(_ctx, _specs, opts): Promise<ExecOutcome> {
+          executeCalls.push(opts?.projects);
+          if (opts?.projects?.includes('tierB-auth')) {
+            // Post-heal targeted re-run: login works, the test passes.
+            return {
+              passed: 1,
+              failed: 0,
+              blocked: 0,
+              flaky: 0,
+              results: [{ title: tierBSpec.title, status: 'passed', durationMs: 5 }],
+              raw: { authSetupFailed: false },
+            };
+          }
+          // Initial full run: the setup failed, Tier B is blocked.
+          return {
+            passed: 0,
+            failed: 0,
+            blocked: 1,
+            flaky: 0,
+            results: [
+              { title: tierBSpec.title, status: 'blocked', durationMs: 0, error: 'Auth setup failed' },
+            ],
+            raw: { authSetupFailed: true, authSetupError: 'no email field found', performedLogin: false },
+          };
+        },
+        async repairAuthSetup(): Promise<boolean> {
+          authHealCalls += 1;
+          return true;
+        },
+      };
+
+      const events: OrchestratorEvent[] = [];
+      const orchestrator = createOrchestrator({
+        provider: fakeProvider,
+        getMode: () => mode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      });
+      const summary = await orchestrator.run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events.push(e) },
+      );
+
+      expect(authHealCalls).toBe(1);
+      // One full run, then exactly one tierB-only re-run.
+      expect(executeCalls.filter((p) => p?.includes('tierB-auth'))).toHaveLength(1);
+      // The healed login flipped the blocked outcome into an honest pass.
+      expect(summary.status).toBe('passed');
+      expect(summary.outcome?.blocked).toBe(0);
+      expect(summary.outcome?.passed).toBe(1);
+      expect(events.some((e) => e.phase === 'heal' && /Login self-heal verified/.test(e.message))).toBe(true);
+    } finally {
+      delete process.env.HEALIX_TIERB_EMAIL;
+      delete process.env.HEALIX_TIERB_PASSWORD;
+    }
+  });
+
+  it('HEAL AUTH: never attempted without credentials — the run settles blocked honestly', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No Creds Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+    delete process.env.HEALIX_TIERB_EMAIL;
+    delete process.env.HEALIX_TIERB_PASSWORD;
+
+    let authHealCalls = 0;
+    const mode: TestMode = {
+      ...makeFakeMode(ALL_PASS_OUTCOME),
+      async execute(): Promise<ExecOutcome> {
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 1,
+          flaky: 0,
+          results: [
+            { title: 'Home loads', status: 'passed', durationMs: 3 },
+            { title: 'Dashboard greeting', status: 'blocked', durationMs: 0, error: 'without credentials' },
+          ],
+          raw: { authSetupFailed: true, authSetupError: 'anonymous', performedLogin: false },
+        };
+      },
+      async repairAuthSetup(): Promise<boolean> {
+        authHealCalls += 1;
+        return true;
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    expect(authHealCalls).toBe(0);
+    expect(summary.status).toBe('blocked');
+  });
+  it('SUITE TOP-UP: a spec with ANY failing attributed result is never banked (regression: first-match banking)', async () => {
+    const { mkdir: mkdirP, writeFile: writeFileP } = await import('node:fs/promises');
+    const { execFileSync } = await import('node:child_process');
+    const { existsSync } = await import('node:fs');
+
+    const repo = mkdtempSync(join(tmpdir(), 'healix-nobank-repo-'));
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: repo, encoding: 'utf-8' });
+    git('init', '-q');
+    git('config', 'user.email', 'test@healix.dev');
+    git('config', 'user.name', 'Healix Test');
+    git('config', 'commit.gpgsign', 'false');
+    await writeFileP(join(repo, 'app.js'), 'x\n', 'utf-8');
+    git('add', '.');
+    git('commit', '-qm', 'init');
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({ name: 'NoBank Demo', mode: 'playwright', repoPath: repo });
+
+    // The failing spec's source CONTAINS the passing result's title ("Home loads")
+    // in a comment — the old first-match logic banked it because of that.
+    const mode: TestMode = {
+      ...makeFakeMode(ALL_PASS_OUTCOME),
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        const rel = join('tests', 'tierB-auth', 'badge.spec.ts');
+        const abs = join(ctx.projectDir, rel);
+        const contents =
+          "import { test, expect } from '@playwright/test';\n" +
+          '// unlike Home loads, this checks the badge count\n' +
+          "test.describe('[REQ:REQ-042] Badge', () => {\n" +
+          "  test('badge shows the open count', async ({ page }) => { await expect(page).toHaveTitle(/x/); });\n" +
+          '});\n';
+        await mkdirP(join(abs, '..'), { recursive: true });
+        await writeFileP(abs, contents, 'utf-8');
+        return [{ path: abs, title: '[REQ:REQ-042] Badge', reqTag: 'REQ-042', tier: 'tierB-auth', contents }];
+      },
+      async execute(): Promise<ExecOutcome> {
+        return {
+          passed: 1,
+          failed: 1,
+          blocked: 0,
+          flaky: 0,
+          results: [
+            { title: 'Home loads', status: 'passed', durationMs: 2 },
+            { title: 'badge shows the open count', status: 'failed', durationMs: 5, error: 'boom' },
+          ],
+        };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    expect(summary.status).toBe('failed');
+    // The failing spec must NOT have been banked or committed.
+    expect(existsSync(join(repo, '.healix', 'suite', 'tests', 'tierB-auth', 'badge.spec.ts'))).toBe(false);
+    expect(git('log', '-1', '--pretty=%s')).not.toMatch(/top up suite/);
+
+    rmSync(repo, { recursive: true, force: true });
+  });
 });

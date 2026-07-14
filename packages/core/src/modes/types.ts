@@ -17,6 +17,8 @@ export interface TestPlan {
   summary: string;
   items: TestPlanItem[];
   raw?: unknown;
+  /** Already-covered REQ tags the plan says are affected by recent code changes (stale candidates). */
+  impactedReqTags?: string[];
 }
 
 export interface GeneratedSpec {
@@ -66,12 +68,25 @@ export interface TestModeContext {
   signal?: AbortSignal;
 }
 
+/** Options for a (re-)execution pass. */
+export interface ExecuteOptions {
+  /** Restrict the run to these spec paths (relative to projectDir). Empty/undefined = full suite. */
+  only?: string[];
+}
+
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */
 export interface TestMode {
   readonly id: ModeId;
   scaffold(ctx: TestModeContext): Promise<void>;
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
-  execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
+  execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: ExecuteOptions): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;
+  /**
+   * Optional self-heal: rewrite ONE defective generated spec given its runtime
+   * error (validated through the same gates as generation). Returns the
+   * repaired spec, or null when no safe repair was produced. Only invoked for
+   * failures triaged as test defects — never to mask an app defect.
+   */
+  repair?(ctx: TestModeContext, spec: GeneratedSpec, error: string): Promise<GeneratedSpec | null>;
 }

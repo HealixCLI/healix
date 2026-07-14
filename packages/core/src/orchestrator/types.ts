@@ -25,6 +25,12 @@ export interface RunOptions {
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
   /**
+   * Bank newly validated specs into the repo's canonical suite (.healix/suite)
+   * and commit them (never pushed). Default true for white-box projects; set
+   * false (CLI --no-commit) to leave the repo untouched.
+   */
+  commitSuite?: boolean;
+  /**
    * Cooperative cancellation. When aborted, the run stops at the next phase
    * boundary (and in-flight provider/suite work is killed), the run row is
    * marked 'cancelled', and run() resolves with that summary — it never rejects.

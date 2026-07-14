@@ -14,6 +14,7 @@ interface RawPlanItem {
 interface RawPlan {
   summary?: unknown;
   items?: unknown;
+  impactedReqTags?: unknown;
 }
 
 const KNOWN_TIERS: ReadonlyArray<Tier> = ['tierA-public', 'tierB-auth', 'tierC-api'];
@@ -33,6 +34,17 @@ export interface PlanRepoContext {
 }
 
 /**
+ * Top-up context for incremental runs against an existing canonical suite:
+ * requirement tags the suite already covers, and a bounded git diffstat of the
+ * app since the suite was last banked. Steers the plan toward NEW coverage and
+ * asks it to name existing tags whose behavior the diff likely changed.
+ */
+export interface PlanTopUpContext {
+  coveredTags: string[];
+  diffStat: string | null;
+}
+
+/**
  * Build the planning prompt. Asks the model for a single fenced ```json block so
  * the response is machine-parseable, while still leaving room for prose.
  *
@@ -40,7 +52,12 @@ export interface PlanRepoContext {
  * (summary + up to MAX_PLAN_PROMPT_FILES file paths) is appended so the plan is
  * grounded in the actual repo instead of the model guessing generic flows.
  */
-export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: PlanRepoContext): string {
+export function buildPlanPrompt(
+  project: Project,
+  opts: RunOptions,
+  repoIndex?: PlanRepoContext,
+  topUp?: PlanTopUpContext,
+): string {
   const lines: string[] = [];
   lines.push('You are Healix, an autonomous QA engineer. Produce a concise end-to-end test plan');
   lines.push('for the application under test described below.');
@@ -68,6 +85,23 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
       if (remaining > 0) lines.push(`... and ${remaining} more file(s) not listed.`);
     }
   }
+  const topUpTags = topUp?.coveredTags ?? [];
+  if (topUpTags.length > 0) {
+    lines.push('');
+    lines.push('An existing test suite ALREADY COVERS these requirement tags:');
+    lines.push(topUpTags.join(', '));
+    lines.push('This is a TOP-UP run: plan NEW scenarios that extend coverage rather than');
+    lines.push('re-planning covered tags. Re-list a covered tag only when the code changes');
+    lines.push('below alter its behavior (it will be re-generated).');
+  }
+  if (topUp?.diffStat) {
+    lines.push('');
+    lines.push('Code changes in the app since the suite was last updated (git diffstat):');
+    lines.push('"""');
+    lines.push(topUp.diffStat);
+    lines.push('"""');
+    lines.push('Prioritize scenarios that exercise the changed behavior.');
+  }
   lines.push('');
   lines.push('Respond with exactly one fenced JSON code block of the shape:');
   lines.push('```json');
@@ -80,7 +114,10 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push(`      "tier": "${KNOWN_TIERS.join('" | "')}",`);
   lines.push('      "intent": "what this test verifies, in one or two sentences"');
   lines.push('    }');
-  lines.push('  ]');
+  lines.push('  ],');
+  lines.push(
+    '  "impactedReqTags": ["already-covered tags whose behavior the code changes above likely affected; [] when none"]',
+  );
   lines.push('}');
   lines.push('```');
   lines.push('');
@@ -120,7 +157,14 @@ export function parsePlan(text: string): TestPlan | null {
       ? raw.summary.trim()
       : 'Generated test plan.';
 
-  return { summary, items, raw };
+  // Impacted tags are advisory (used for stale flagging); keep only clean strings.
+  const impactedReqTags = Array.isArray(raw.impactedReqTags)
+    ? raw.impactedReqTags
+        .filter((t): t is string => typeof t === 'string' && t.trim().length > 0)
+        .map((t) => t.trim())
+    : [];
+
+  return { summary, items, raw, ...(impactedReqTags.length > 0 ? { impactedReqTags } : {}) };
 }
 
 /** Deterministic fallback plan when the model produced nothing usable. */

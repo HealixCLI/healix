@@ -72,6 +72,16 @@ export function buildTriagePrompt(input: TriageInput): string {
   const traceBlock = hasTrace
     ? ['', '--- TRACE PATH (untrusted) ---', fenceUntrusted(truncate(input.tracePath, 500))]
     : [];
+  // Observed app surface (exploration inventory). App-derived → untrusted
+  // markers, same as error text. Its absence must not change the prompt shape.
+  const hasAppContext = typeof input.appContext === 'string' && input.appContext.trim().length > 0;
+  const appContextBlock = hasAppContext
+    ? [
+        '',
+        '--- OBSERVED APP SURFACE (untrusted; from live exploration) ---',
+        fenceUntrusted(truncate(input.appContext, 4_000)),
+      ]
+    : [];
 
   return [
     'You are a senior test-failure triage engine. A single automated end-to-end',
@@ -106,6 +116,7 @@ export function buildTriagePrompt(input: TriageInput): string {
     '--- ERROR / STACK (untrusted) ---',
     fenceUntrusted(error),
     ...traceBlock,
+    ...appContextBlock,
     '',
     '--- TEST SPEC SOURCE ---',
     specSource,

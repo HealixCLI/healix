@@ -12,6 +12,7 @@ import type {
 } from '../types.js';
 import { scaffold } from './scaffold.js';
 import { generate, repairSpec } from './generate.js';
+import { repairAuthSetup } from './heal-auth.js';
 import { execute } from './execute.js';
 
 /** Directories whose presence is purely build/runtime noise — never traversed for export. */
@@ -80,6 +81,10 @@ export function createPlaywrightMode(): TestMode {
 
     repair(ctx: TestModeContext, spec: GeneratedSpec, error: string): Promise<GeneratedSpec | null> {
       return repairSpec(ctx, spec, error);
+    },
+
+    repairAuthSetup(ctx: TestModeContext, error: string): Promise<boolean> {
+      return repairAuthSetup(ctx, error);
     },
 
     async collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }> {

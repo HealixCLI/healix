@@ -78,6 +78,11 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
       env[key] = value;
     }
   }
+  // Config-resolved additions (e.g. Tier-B credentials from .healix/config.json).
+  // HEALIX_-prefixed only, so the allowlist's security posture is unchanged.
+  for (const [key, value] of Object.entries(ctx.extraEnv ?? {})) {
+    if (key.startsWith('HEALIX_')) env[key] = value;
+  }
   if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
   return env;
 }
@@ -93,7 +98,11 @@ interface RawCommand {
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
-function runPlaywright(ctx: TestModeContext, only: string[] = []): Promise<RawCommand> {
+function runPlaywright(
+  ctx: TestModeContext,
+  only: string[] = [],
+  projects: string[] = [],
+): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
     // Cancelled before we even spawned — return immediately; nothing to kill.
     if (ctx.signal?.aborted) {
@@ -112,8 +121,10 @@ function runPlaywright(ctx: TestModeContext, only: string[] = []): Promise<RawCo
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
     // A targeted pass (repair re-runs) appends spec paths as Playwright file
-    // filters; project dependencies (auth-setup) still run automatically.
+    // filters and/or --project selectors; project dependencies (auth-setup)
+    // still run automatically for selected projects.
     const args = ['playwright', 'test', ...only];
+    for (const p of projects) args.push('--project', p);
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -695,7 +706,7 @@ function abortedOutcome(exitCode: number | null = null): ExecOutcome {
 export async function execute(
   ctx: TestModeContext,
   specs: GeneratedSpec[],
-  opts: { only?: string[] } = {},
+  opts: { only?: string[]; projects?: string[] } = {},
 ): Promise<ExecOutcome> {
   emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
 
@@ -714,7 +725,7 @@ export async function execute(
 
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
-  let cmd = await runPlaywright(ctx, opts.only ?? []);
+  let cmd = await runPlaywright(ctx, opts.only ?? [], opts.projects ?? []);
 
   // Cancelled during (or right before) the run: partial results are
   // meaningless and would mislabel interrupted tests as failures — discard
@@ -736,7 +747,7 @@ export async function execute(
     );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
-    cmd = await runPlaywright(ctx, opts.only ?? []);
+    cmd = await runPlaywright(ctx, opts.only ?? [], opts.projects ?? []);
 
     // The retry run can be cancelled too (as can the install before it).
     if (cmd.aborted || ctx.signal?.aborted) {
@@ -750,10 +761,12 @@ export async function execute(
   if (!report) report = parseStdoutJson(cmd.stdout);
 
   let parsed: ParsedReport;
+  let authSignals: AuthSignals | null = null;
   if (report) {
     const setup = findAuthSetupOutcome(report);
     const performedLogin = await readSetupMeta(ctx.projectDir);
     const auth: AuthSignals = { setupFailed: setup.failed, setupError: setup.error, performedLogin };
+    authSignals = auth;
     if (setup.failed) {
       emit(ctx, '[execute] auth setup failed; Tier B outcomes classified as blocked', {
         setupError: setup.error.split('\n')[0] ?? '',
@@ -790,6 +803,11 @@ export async function execute(
       timedOut: cmd.timedOut,
       hadJsonReport: report !== null,
       stderrTail: stripAnsi(cmd.stderr).split(/\r?\n/).filter(Boolean).slice(-20),
+      // Structural auth signals for the orchestrator's HEAL phase: a failed
+      // setup with credentials configured is a healable root cause.
+      authSetupFailed: authSignals?.setupFailed ?? false,
+      authSetupError: authSignals?.setupError ?? '',
+      performedLogin: authSignals?.performedLogin ?? null,
     },
   };
 

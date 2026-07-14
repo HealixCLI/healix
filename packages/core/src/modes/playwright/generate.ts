@@ -194,7 +194,7 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
     tier === 'tierC-api'
       ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page.'
       : tier === 'tierB-auth'
-        ? 'This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.'
+        ? 'This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour. Other tests share the same live app state, so never hard-code absolute counts/totals that other tests may change: read the current value first, act, then assert the RELATIVE change (e.g. count increases by 1).'
         : 'This is a public flow requiring no authentication.';
 
   return `You are generating ONE Playwright test spec file in TypeScript.

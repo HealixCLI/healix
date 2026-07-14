@@ -59,6 +59,9 @@ const api = {
   revealPath: (target: string) => ipcRenderer.invoke('shell:reveal', target),
   showItemInFolder: (target: string) => ipcRenderer.invoke('shell:showItem', target),
 
+  // PRD file upload (native picker + text extraction, main-process side)
+  pickPrdFile: () => ipcRenderer.invoke('dialog:pickPrdFile'),
+
   /**
    * Subscribe to the full run lifecycle. The callback receives a discriminated
    * message ({ channel, payload }). Returns an unsubscribe function that detaches

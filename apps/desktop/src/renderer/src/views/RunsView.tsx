@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExplorationMode, Project } from '@healix/core';
-import { Loader2, Play, RotateCcw, Square, X } from 'lucide-react';
+import { Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -64,6 +64,11 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [projectId, setProjectId] = useState<string>('');
   const [mode, setMode] = useState<ExplorationMode>('codegen');
   const [prd, setPrd] = useState('');
+  // Set once a PRD file is successfully uploaded; cleared if the user edits the
+  // textarea by hand, since the displayed text no longer matches the file.
+  const [prdFileName, setPrdFileName] = useState<string | null>(null);
+  const [prdFileBusy, setPrdFileBusy] = useState(false);
+  const [prdFileError, setPrdFileError] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
   // True from the moment the user clicks Cancel until run:done settles the run.
   const [cancelling, setCancelling] = useState(false);
@@ -195,6 +200,25 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     setSelectedRunId(null);
   };
 
+  const uploadPrdFile = async (): Promise<void> => {
+    setPrdFileError(null);
+    setPrdFileBusy(true);
+    try {
+      const result = await window.healix.pickPrdFile();
+      if (result.canceled) return;
+      if (result.error) {
+        setPrdFileError(result.error);
+        return;
+      }
+      setPrd(result.text ?? '');
+      setPrdFileName(result.fileName ?? null);
+    } catch (err) {
+      setPrdFileError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPrdFileBusy(false);
+    }
+  };
+
   // The live run surface takes precedence over a selected history detail — EXCEPT
   // for a rehydrated (not-actually-live-this-session) pending approval, which is
   // just one browsable history row: it only takes over while its OWN row is the
@@ -283,12 +307,51 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
               </div>
               <div className="sm:col-span-2">
                 <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
-                <Textarea
-                  value={prd}
-                  onChange={(e) => setPrd(e.target.value)}
-                  placeholder="Paste requirements to ground test generation…"
-                  disabled={isActive}
-                />
+                <div className="relative">
+                  <Textarea
+                    value={prd}
+                    onChange={(e) => {
+                      setPrd(e.target.value);
+                      // The text no longer reflects the uploaded file verbatim.
+                      setPrdFileName(null);
+                    }}
+                    placeholder="Paste requirements to ground test generation…"
+                    disabled={isActive}
+                    className="pr-9"
+                  />
+                  <button
+                    type="button"
+                    onClick={() => void uploadPrdFile()}
+                    disabled={isActive || prdFileBusy}
+                    aria-label="Upload a PRD file"
+                    title="Upload a PRD file"
+                    className={cn(
+                      'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
+                      'text-muted transition-colors hover:bg-panel hover:text-fg',
+                      'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
+                      'disabled:pointer-events-none disabled:opacity-50',
+                    )}
+                  >
+                    {prdFileBusy ? (
+                      <Loader2 className="h-4 w-4 animate-spin" />
+                    ) : (
+                      <Plus className="h-4 w-4" />
+                    )}
+                  </button>
+                </div>
+                <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
+                  <span>
+                    {prdFileName ? (
+                      <>
+                        Selected file: <span className="font-mono text-fg">{prdFileName}</span>
+                      </>
+                    ) : (
+                      'No file selected — paste text above or upload a PRD.'
+                    )}
+                  </span>
+                  <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
+                </div>
+                {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
               </div>
             </div>
 

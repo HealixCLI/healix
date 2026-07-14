@@ -1,11 +1,17 @@
-import type { Project, Run } from '@healix/core';
+import { useMemo, useState } from 'react';
+import type { Project, Run, RunStatus } from '@healix/core';
 import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
+import { Select } from './ui/select';
 import { cn } from '../lib/utils';
-import { formatCreatedAt, runStatusTone } from '../lib/run-format';
+import { ALL_RUN_STATUSES, formatCreatedAt, formatRunStatus, runStatusTone } from '../lib/run-format';
 
-/** Selectable run-history list (newest first). */
+/** Sentinel option value meaning "no status filter applied". */
+const ALL_STATUSES = 'all';
+type StatusFilter = RunStatus | typeof ALL_STATUSES;
+
+/** Selectable run-history list (newest first), filterable by status. */
 export function RunHistory({
   runs,
   loading,
@@ -27,6 +33,15 @@ export function RunHistory({
   collapsed: boolean;
   onToggleCollapse: () => void;
 }) {
+  // Kept local (rather than lifted to RunsView) so the filter stays applied
+  // across refreshes/re-renders without the caller needing to know about it.
+  const [statusFilter, setStatusFilter] = useState<StatusFilter>(ALL_STATUSES);
+
+  const filteredRuns = useMemo(
+    () => (statusFilter === ALL_STATUSES ? runs : runs.filter((r) => r.status === statusFilter)),
+    [runs, statusFilter],
+  );
+
   if (collapsed) {
     return (
       <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Expand history">
@@ -55,6 +70,25 @@ export function RunHistory({
         </div>
       </div>
 
+      <div className="mb-2 flex items-center gap-1.5">
+        <label htmlFor="run-status-filter" className="shrink-0 text-[11px] text-muted">
+          Status:
+        </label>
+        <Select
+          id="run-status-filter"
+          value={statusFilter}
+          onChange={(e) => setStatusFilter(e.target.value as StatusFilter)}
+          className="h-7 text-xs"
+        >
+          <option value={ALL_STATUSES}>All Statuses</option>
+          {ALL_RUN_STATUSES.map((status) => (
+            <option key={status} value={status}>
+              {formatRunStatus(status)}
+            </option>
+          ))}
+        </Select>
+      </div>
+
       {error && (
         <p className="mb-2 rounded-md border border-err/40 bg-err/10 px-2 py-1.5 text-xs text-err">{error}</p>
       )}
@@ -64,8 +98,11 @@ export function RunHistory({
         {!loading && runs.length === 0 && !error && (
           <p className="px-3 py-4 text-xs text-muted">No runs yet. Start one above.</p>
         )}
+        {!loading && runs.length > 0 && filteredRuns.length === 0 && (
+          <p className="px-3 py-4 text-xs text-muted">No test runs found.</p>
+        )}
         <ul className="divide-y divide-border/50">
-          {runs.map((run) => {
+          {filteredRuns.map((run) => {
             const selected = run.id === selectedRunId;
             const project = projectsById.get(run.projectId);
             return (

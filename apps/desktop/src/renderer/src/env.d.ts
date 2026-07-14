@@ -10,6 +10,7 @@ import type {
   SuiteBundle,
 } from '@healix/core';
 import type {
+  PickPrdFileResult,
   ProviderLoginResult,
   ProviderSummary,
   RunDetail,
@@ -39,6 +40,9 @@ export interface HealixBridge {
   }) => Promise<SuiteBundle>;
   revealPath: (target: string) => Promise<{ ok: boolean }>;
   showItemInFolder: (target: string) => Promise<{ ok: boolean }>;
+
+  // ---- PRD file upload ----
+  pickPrdFile: () => Promise<PickPrdFileResult>;
 
   // ---- provider connect / live health ----
   providerLogin: (id: ProviderId) => Promise<ProviderLoginResult>;

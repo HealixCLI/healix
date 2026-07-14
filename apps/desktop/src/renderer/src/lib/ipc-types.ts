@@ -31,6 +31,14 @@ export interface ProviderLoginResult {
   detail: string;
 }
 
+/** Result of the native "upload a PRD" file picker (pdf/doc/docx/md/txt). */
+export interface PickPrdFileResult {
+  canceled: boolean;
+  fileName?: string;
+  text?: string;
+  error?: string;
+}
+
 /**
  * Detail bundle for a single historical run (store rows + parsed report.json).
  * `report` is the raw JSON from reports/report.json (unknown — narrow with

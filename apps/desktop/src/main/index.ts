@@ -1,11 +1,12 @@
 import { spawn } from 'node:child_process';
 import { readdir, readFile, stat } from 'node:fs/promises';
 import type { Dirent } from 'node:fs';
-import { join, relative, resolve, sep } from 'node:path';
+import { extname, join, relative, resolve, sep } from 'node:path';
 import { pathToFileURL } from 'node:url';
 import {
   app,
   BrowserWindow,
+  dialog,
   ipcMain,
   net,
   protocol,
@@ -13,6 +14,8 @@ import {
   type IpcMainInvokeEvent,
   type WebContents,
 } from 'electron';
+import mammoth from 'mammoth';
+import pdfParse from 'pdf-parse';
 import {
   doctor,
   ProviderRouter,
@@ -419,6 +422,54 @@ ipcMain.handle('shell:showItem', (_e, target: string): { ok: boolean } => {
   if (!target) return { ok: false };
   shell.showItemInFolder(target);
   return { ok: true };
+});
+
+// ---- PRD file upload (native file picker + text extraction) ----
+
+const PRD_FILE_FILTERS = [{ name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] }];
+
+export interface PickPrdFileResult {
+  canceled: boolean;
+  fileName?: string;
+  text?: string;
+  error?: string;
+}
+
+/** Extract plain text from an uploaded PRD file, used verbatim as acceptance criteria. */
+async function extractPrdText(filePath: string): Promise<string> {
+  const ext = extname(filePath).toLowerCase();
+  switch (ext) {
+    case '.txt':
+    case '.md':
+      return readFile(filePath, 'utf8');
+    case '.docx':
+      return (await mammoth.extractRawText({ path: filePath })).value;
+    case '.pdf':
+      return (await pdfParse(await readFile(filePath))).text;
+    case '.doc':
+      throw new Error(
+        'Legacy .doc files are not supported — please save as .docx, .txt, or .md and try again.',
+      );
+    default:
+      throw new Error(`Unsupported file type: ${ext || '(unknown)'}`);
+  }
+}
+
+ipcMain.handle('dialog:pickPrdFile', async (event: IpcMainInvokeEvent): Promise<PickPrdFileResult> => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const picked = win
+    ? await dialog.showOpenDialog(win, { properties: ['openFile'], filters: PRD_FILE_FILTERS })
+    : await dialog.showOpenDialog({ properties: ['openFile'], filters: PRD_FILE_FILTERS });
+  if (picked.canceled || picked.filePaths.length === 0) return { canceled: true };
+
+  const filePath = picked.filePaths[0];
+  const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
+  try {
+    const text = (await extractPrdText(filePath)).trim();
+    return { canceled: false, fileName, text };
+  } catch (err) {
+    return { canceled: false, fileName, error: errMsg(err) };
+  }
 });
 
 // ---- Provider login (open the CLI login flow) ----

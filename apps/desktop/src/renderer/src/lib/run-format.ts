@@ -21,6 +21,30 @@ export function runStatusTone(status: RunStatus): BadgeTone {
   return RUN_STATUS_TONE[status] ?? 'default';
 }
 
+/** Every run status, in pipeline order, for status-filter dropdowns. */
+export const ALL_RUN_STATUSES: RunStatus[] = [
+  'pending',
+  'planning',
+  'awaiting-approval',
+  'exploring',
+  'generating',
+  'executing',
+  'triaging',
+  'reporting',
+  'passed',
+  'failed',
+  'error',
+  'cancelled',
+];
+
+/** Human-readable label for a run status, e.g. 'awaiting-approval' -> 'Awaiting Approval'. */
+export function formatRunStatus(status: RunStatus): string {
+  return status
+    .split('-')
+    .map((word) => word[0].toUpperCase() + word.slice(1))
+    .join(' ');
+}
+
 /** A run is finished (terminal) when no further phase transitions are expected. */
 export function isTerminalRun(status: RunStatus): boolean {
   return (

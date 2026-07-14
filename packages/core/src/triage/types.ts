@@ -8,6 +8,13 @@ export interface TriageInput {
   specSource?: string;
   reqTag?: string;
   tracePath?: string;
+  /**
+   * What the app actually exposes (observed interactive-element inventory from
+   * exploration). Lets the analyzer distinguish "the app is missing X" from
+   * "the test looked for X on the wrong page" — without it, a wrong-route test
+   * failure reads exactly like a missing feature.
+   */
+  appContext?: string;
 }
 
 export interface TriageResult {

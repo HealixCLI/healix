@@ -734,6 +734,17 @@ async function runPipeline(
             error: r.error ?? '',
             ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
             ...(spec?.contents ? { specSource: spec.contents } : {}),
+            // Observed app surface: without it, a wrong-route test failure
+            // ("element not found on /") reads exactly like a missing feature
+            // and gets misjudged app_is_wrong (seen in the field).
+            ...(ctx.snapshot
+              ? {
+                  appContext: `Page "${ctx.snapshot.title}" at ${ctx.snapshot.url} exposes:\n${ctx.snapshot.interactiveElements
+                    .slice(0, 30)
+                    .map((el) => `- ${el.role} "${el.name.slice(0, 60)}" -> ${el.selector}`)
+                    .join('\n')}`,
+                }
+              : {}),
           };
           // Deterministic baseline always wins as the starting point and the fallback.
           let triage: ReportTriageEntry['triage'];

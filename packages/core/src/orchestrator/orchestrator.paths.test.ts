@@ -725,4 +725,112 @@ describe('orchestrator paths (offline DI seam)', () => {
       expect(opts.signal?.aborted).toBe(false);
     }
   });
+  it('LAUNCH RECOVERY: missing-deps failure installs dependencies and retries the launch once', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'WhiteBox Recovery',
+      mode: 'playwright',
+      repoPath: join(tmpdir(), 'healix-fake-repo'),
+    });
+
+    let launches = 0;
+    const target: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        return {
+          kind: 'backend',
+          framework: 'express',
+          packageManager: 'npm',
+          startCommand: 'npm run start',
+          port: null,
+          baseUrl: null,
+        };
+      },
+      async launch(): Promise<LaunchHandle> {
+        launches += 1;
+        if (launches === 1) throw new Error("Cannot find module 'express'");
+        return { baseUrl: 'http://127.0.0.1:4199', pid: null, async stop(): Promise<void> {} };
+      },
+    };
+
+    const installs: string[][] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => target,
+      makeBrowser: () => fakeBrowser,
+      execCli: async (cmd, args) => {
+        installs.push([cmd, ...args]);
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    // Rung 1 fired exactly once and the retried launch carried the run to green.
+    expect(installs).toEqual([['npm', 'install']]);
+    expect(launches).toBe(2);
+    expect(summary.status).toBe('passed');
+  });
+
+  it('LAUNCH RECOVERY: an unrecoverable launch failure stops the run as error BEFORE generation', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'WhiteBox Dead Server',
+      mode: 'playwright',
+      repoPath: join(tmpdir(), 'healix-fake-repo'),
+    });
+
+    let generateCalls = 0;
+    const mode: TestMode = {
+      ...makeFakeMode(ALL_PASS_OUTCOME),
+      async generate(): Promise<GeneratedSpec[]> {
+        generateCalls += 1;
+        return [];
+      },
+    };
+    const target: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        return {
+          kind: 'backend',
+          framework: 'express',
+          packageManager: 'npm',
+          startCommand: 'npm run start',
+          port: null,
+          baseUrl: null,
+        };
+      },
+      async launch(): Promise<LaunchHandle> {
+        // Not a missing-deps signature: the install rung must NOT fire.
+        throw new Error('server exited early with exit code 1');
+      },
+    };
+
+    const installs: string[][] = [];
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => target,
+      makeBrowser: () => fakeBrowser,
+      execCli: async (cmd, args) => {
+        installs.push([cmd, ...args]);
+        return { code: 0, stdout: '', stderr: '' };
+      },
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    // No pointless install, no doomed generation, an honest error with guidance.
+    expect(installs).toEqual([]);
+    expect(generateCalls).toBe(0);
+    expect(summary.status).toBe('error');
+    expect(store.getRun(summary.runId)?.status).toBe('error');
+    const launchError = events.find((e) => e.phase === 'launch' && e.level === 'error');
+    expect(launchError?.message).toMatch(/could not be started/i);
+  });
 });

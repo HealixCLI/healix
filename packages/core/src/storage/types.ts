@@ -27,6 +27,8 @@ export type RunStatus =
   | 'reporting'
   | 'passed'
   | 'failed'
+  /** Terminal: nothing failed, but ≥1 test was blocked (prerequisite such as Tier-B auth not met) — NOT a green run. */
+  | 'blocked'
   | 'error'
   | 'cancelled';
 

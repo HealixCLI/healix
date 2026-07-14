@@ -33,6 +33,10 @@ const api = {
     repoPath?: string | null;
     baseUrl?: string | null;
   }) => ipcRenderer.invoke('projects:create', input),
+  updateProject: (
+    id: string,
+    input: { name: string; mode?: string; repoPath?: string | null; baseUrl?: string | null },
+  ) => ipcRenderer.invoke('projects:update', { id, ...input }),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),
   archiveProject: (id: string, archived: boolean) => ipcRenderer.invoke('projects:archive', { id, archived }),
 

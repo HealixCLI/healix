@@ -12,6 +12,7 @@ const RUN_STATUS_TONE: Partial<Record<RunStatus, BadgeTone>> = {
   reporting: 'default',
   passed: 'ok',
   failed: 'err',
+  blocked: 'warn',
   error: 'err',
   cancelled: 'muted',
 };
@@ -46,7 +47,13 @@ export function formatRunStatus(status: RunStatus): string {
 
 /** A run is finished (terminal) when no further phase transitions are expected. */
 export function isTerminalRun(status: RunStatus): boolean {
-  return status === 'passed' || status === 'failed' || status === 'error' || status === 'cancelled';
+  return (
+    status === 'passed' ||
+    status === 'failed' ||
+    status === 'blocked' ||
+    status === 'error' ||
+    status === 'cancelled'
+  );
 }
 
 const TEST_STATUS_TONE: Record<TestStatus, BadgeTone> = {

@@ -16,6 +16,7 @@ import type {
 } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
+import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
@@ -282,14 +283,27 @@ async function runPipeline(
 
     // ---- 5b. LAUNCH (white-box) ----
     // A white-box project (repoPath set, no baseUrl) has no live URL yet, so detect + launch
-    // the app and target the resulting URL. Best-effort: on failure, fall back to the detected
-    // baseUrl rather than aborting. The handle is always stopped in the run's cleanup.
+    // the app and target the resulting URL. Recovery ladder on failure:
+    //   1. errors that look like missing dependencies → run the detected package
+    //      manager's install in the repo and retry the launch once;
+    //   2. still failing → the run STOPS as 'error'. There is no URL to fall
+    //      back to for a white-box project, so "continuing best-effort" meant
+    //      generating and executing an entire suite against a dead URL — every
+    //      result was junk and the provider tokens were wasted.
+    // The handle is always stopped in the run's cleanup.
     if (checkCancelled()) return cancelRun('launch');
     if (!project.baseUrl && project.repoPath) {
       const repoPath = project.repoPath;
+      emit('launch', 'info', `[launch] Detecting app in ${repoPath}.`);
+      let det: Awaited<ReturnType<typeof target.detect>> | null = null;
       try {
-        emit('launch', 'info', `[launch] Detecting app in ${repoPath}.`);
-        const det = await target.detect(repoPath);
+        det = await target.detect(repoPath);
+      } catch (err) {
+        emit('launch', 'error', `[launch] Detection failed: ${errMsg(err)}`, { stack: errStack(err) });
+      }
+
+      let launchError: unknown = null;
+      if (det) {
         // Per-run port allocation: two concurrent runs of the same project
         // previously both launched on the framework-default port — the second
         // launch's readiness poll then hit the FIRST run's server and the two
@@ -304,24 +318,85 @@ async function runPipeline(
             { detectedPort: det.port, port },
           );
         }
+        const doLaunch = async (): Promise<void> => {
+          const handle = await target.launch({
+            repoPath,
+            startCommand: det.startCommand ?? undefined,
+            // det.baseUrl embeds the DETECTED port; when the allocated port
+            // differs, omit it so launch() derives the URL from `port` and the
+            // readiness poll targets the server this run actually started.
+            baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
+            port,
+            readyTimeoutMs: 120000,
+          });
+          launchHandle = handle;
+          effectiveBaseUrl = handle.baseUrl;
+          emit('launch', 'info', `[launch] App ready at ${handle.baseUrl}.`);
+        };
+
         emit('launch', 'info', `[launch] Launching app (${det.startCommand ?? 'auto'}).`);
-        const handle = await target.launch({
-          repoPath,
-          startCommand: det.startCommand ?? undefined,
-          // det.baseUrl embeds the DETECTED port; when the allocated port
-          // differs, omit it so launch() derives the URL from `port` and the
-          // readiness poll targets the server this run actually started.
-          baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
-          port,
-          readyTimeoutMs: 120000,
-        });
-        launchHandle = handle;
-        effectiveBaseUrl = handle.baseUrl;
-        emit('launch', 'info', `[launch] App ready at ${handle.baseUrl}.`);
-      } catch (err) {
-        emit('launch', 'warn', `[launch] Launch failed (continuing best-effort): ${errMsg(err)}`, {
-          stack: errStack(err),
-        });
+        try {
+          await doLaunch();
+        } catch (err) {
+          launchError = err;
+          // Recovery rung 1: missing dependencies → install once, retry once.
+          if (looksLikeMissingDeps(errMsg(err)) && det.packageManager && !checkCancelled()) {
+            emit(
+              'launch',
+              'warn',
+              `[launch] Launch failed with missing-dependency symptoms; running ${det.packageManager} install and retrying.`,
+              { error: errMsg(err) },
+            );
+            const execCli = overrides?.execCli ?? runCli;
+            const install = await execCli(det.packageManager, ['install'], {
+              cwd: repoPath,
+              timeoutMs: 300_000,
+            });
+            if (install.code === 0) {
+              emit('launch', 'info', '[launch] Dependencies installed; retrying launch.');
+              try {
+                await doLaunch();
+                launchError = null;
+              } catch (retryErr) {
+                launchError = retryErr;
+              }
+            } else {
+              emit(
+                'launch',
+                'warn',
+                `[launch] ${det.packageManager} install failed (exit ${install.code}).`,
+                {
+                  stderrTail: install.stderr.split(/\r?\n/).filter(Boolean).slice(-8),
+                },
+              );
+            }
+          }
+        }
+      }
+
+      // Recovery exhausted: stop honestly instead of testing a dead URL.
+      if (!launchHandle) {
+        emit(
+          'launch',
+          'error',
+          `[launch] Target app could not be started${launchError ? `: ${errMsg(launchError)}` : ''}. ` +
+            'Fix the start command (healix scan <repo>), start the app yourself and register the project with --url, or check the error above.',
+          { stack: errStack(launchError ?? undefined) },
+        );
+        setStatus('error', { finishedAt: nowIso() });
+        const summary = await finalizeReport(
+          runDir,
+          run,
+          project,
+          currentStatus,
+          plan,
+          outcome,
+          triageEntries,
+          artifactFiles,
+          noteStoreOk,
+          noteStoreFailure,
+        );
+        return { runId, status: 'error', reportPath: summary.reportPath };
       }
     }
 
@@ -342,10 +417,15 @@ async function runPipeline(
     const mode = getMode(project.mode);
 
     // ---- 6. EXPLORE (best-effort) ----
+    // Runs in BOTH exploration modes whenever a live URL exists: the DOM
+    // snapshot grounds GENERATE in real selectors either way. Codegen mode
+    // used to skip this entirely, so its specs guessed routes/locators blind —
+    // the dominant source of test_is_wrong failures. Frame mirroring (the live
+    // browser view in the desktop app) stays a computer-use-only feature.
     if (checkCancelled()) return cancelRun('explore');
-    if (effectiveBaseUrl && ctx.explorationMode === 'computer-use') {
+    if (effectiveBaseUrl) {
       setStatus('exploring');
-      emit('explore', 'info', `Exploring ${effectiveBaseUrl} (computer-use).`);
+      emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
       // Live frame mirroring is best-effort and must never abort the run; the
       // subscription + browser teardown both happen in this phase's finally.
       let unsubFrames: (() => void) | null = null;
@@ -353,7 +433,7 @@ async function runPipeline(
         await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
         await browser.goto(effectiveBaseUrl);
         // Subscribe AFTER start/goto so the UI only mirrors the live page.
-        if (hooks?.onFrame) {
+        if (hooks?.onFrame && ctx.explorationMode === 'computer-use') {
           try {
             unsubFrames = browser.onFrame(hooks.onFrame);
           } catch (err) {
@@ -362,8 +442,8 @@ async function runPipeline(
         }
         const snap = await browser.snapshot();
         // Ground GENERATE in what we actually observed: the interactive-element
-        // inventory is fed into the generation prompt so computer-use specs
-        // target real selectors instead of guessing (was captured, then dropped).
+        // inventory is fed into the generation prompt so specs target real
+        // selectors instead of guessing (was captured, then dropped).
         ctx.snapshot = snap;
         emit('explore', 'info', `Explored "${snap.title}".`, {
           url: snap.url,
@@ -472,12 +552,15 @@ async function runPipeline(
     // few failures we additionally try AI analyze() with a short per-call timeout
     // and merge its verdict/confidence in; analyze() already falls back to
     // classify() internally, so the baseline is never lost. Triage never aborts.
+    // Blocked outcomes are triaged too: a blocked test is precisely where
+    // classification is least certain (was it really a prerequisite failure,
+    // or a mislabeled defect?), so skipping them hid defects from the report.
     if (checkCancelled()) return cancelRun('triage');
     setStatus('triaging');
     try {
-      const failed = outcome.results.filter((r) => r.status === 'failed');
+      const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
-        emit('triage', 'info', `Triaging ${failed.length} failure(s).`);
+        emit('triage', 'info', `Triaging ${failed.length} failure(s)/blocked outcome(s).`);
         const engine = createTriageEngine();
         let aiBudget = TRIAGE_AI_LIMIT;
         for (const r of failed) {
@@ -561,14 +644,18 @@ async function runPipeline(
       emit('export', 'warn', `Export failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
     }
 
-    // A run only "passes" when at least one test actually passed and none
-    // failed. A run that produced no runnable specs, or where every test was
-    // blocked (e.g. missing Tier-B auth), has verified nothing — reporting it
-    // 'passed' would be a false green (CI would go green having tested nothing),
-    // so it settles as 'error' with an explanatory event.
+    // Honest final status:
+    //  - any failure → 'failed';
+    //  - no failures but ≥1 blocked test → 'blocked' (a prerequisite such as
+    //    Tier-B auth was not met, so part of the plan was NOT verified —
+    //    headlining it 'passed' hid real defects behind blocked entries);
+    //  - all green with ≥1 pass → 'passed';
+    //  - nothing ran at all → 'error' ("verified nothing").
     let finalStatus: RunStatus;
     if (outcome.failed > 0) {
       finalStatus = 'failed';
+    } else if (outcome.blocked > 0) {
+      finalStatus = 'blocked';
     } else if (outcome.passed > 0) {
       finalStatus = 'passed';
     } else {
@@ -576,17 +663,20 @@ async function runPipeline(
     }
     setStatus(finalStatus, { finishedAt: nowIso() });
     if (finalStatus === 'error') {
-      const reason =
-        outcome.results.length === 0
-          ? 'no runnable specs were produced'
-          : `no tests passed (${outcome.blocked} blocked)`;
-      emit('done', 'error', `Run verified nothing: ${reason}.`, {
+      emit('done', 'error', 'Run verified nothing: no runnable specs were produced.', {
         runId,
         status: finalStatus,
         passed: outcome.passed,
         failed: outcome.failed,
         blocked: outcome.blocked,
       });
+    } else if (finalStatus === 'blocked') {
+      emit(
+        'done',
+        'warn',
+        `Run blocked: ${outcome.blocked} test(s) could not be verified (prerequisite failed); ${outcome.passed} passed.`,
+        { runId, status: finalStatus, passed: outcome.passed, blocked: outcome.blocked },
+      );
     } else {
       emit('done', 'info', `Run ${finalStatus}.`, { runId, status: finalStatus });
     }
@@ -933,6 +1023,16 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/**
+ * Launch stderr that suggests the repo's dependencies were never installed —
+ * the one launch failure Healix can recover from by itself (install + retry).
+ */
+export function looksLikeMissingDeps(message: string): boolean {
+  return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|command not found|not recognized as an internal|ENOENT|node_modules/i.test(
+    message,
+  );
 }
 
 function errMsg(err: unknown): string {

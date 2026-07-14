@@ -88,4 +88,13 @@ export interface OrchestratorOverrides {
   makeBrowser?: () => BrowserSurface;
   /** Persistence store. Default: await getStore(). */
   store?: HealixStore;
+  /**
+   * Run an external CLI (used by launch recovery to install dependencies).
+   * Default: runCli. Injectable so tests can observe/stub the install rung.
+   */
+  execCli?: (
+    cmd: string,
+    args: string[],
+    opts?: { timeoutMs?: number; cwd?: string },
+  ) => Promise<{ code: number | null; stdout: string; stderr: string }>;
 }

@@ -428,15 +428,75 @@ function projectIsTierB(projectName: string | undefined): boolean {
   return /tierb/i.test(String(projectName ?? ''));
 }
 
-/**
- * A Tier B failure whose error indicates the login/storageState step never
- * established a session is a `blocked` outcome (prerequisite failed), not a
- * genuine assertion failure.
- */
-function looksLikeAuthBlock(errorText: string): boolean {
-  return /storageState|auth\.setup|authenticate|sign[ -]?in|log[ -]?in|unauthorized|401|403|not authenticated|session/i.test(
-    errorText,
+/** The auth-setup project/spec that produces the Tier B storageState. */
+function isAuthSetup(projectName: string | undefined, file: string | undefined): boolean {
+  return (
+    /auth[-._ ]?setup/i.test(String(projectName ?? '')) ||
+    /auth\.setup\.[cm]?[jt]sx?$/i.test(String(file ?? ''))
   );
+}
+
+/**
+ * Structural signals for classifying Tier B outcomes. Derived from the run
+ * itself (the auth-setup project's result + the setup's sidecar meta file),
+ * NEVER from matching error text: Playwright errors embed the failing source
+ * snippet, so a spec merely *mentioning* auth words in a comment used to be
+ * enough to downgrade a genuine failure to `blocked` (defect-leakage bug).
+ */
+export interface AuthSignals {
+  /** The auth-setup project itself failed (Tier B dependants were skipped). */
+  setupFailed: boolean;
+  /** Error text from the failed auth-setup, attached to blocked Tier B rows. */
+  setupError: string;
+  /**
+   * Whether the setup performed a REAL login (from setup-meta.json).
+   * null = unknown (older suite template without the sidecar): in that case
+   * Tier B failures are NEVER downgraded — honest failure beats false block.
+   */
+  performedLogin: boolean | null;
+}
+
+const NO_AUTH_SIGNALS: AuthSignals = { setupFailed: false, setupError: '', performedLogin: null };
+
+/** Pre-pass: find the auth-setup spec's outcome in the raw Playwright report. */
+export function findAuthSetupOutcome(report: PwReport): { failed: boolean; error: string } {
+  let failed = false;
+  let error = '';
+  const visitSpec = (spec: PwSpec, suiteFile: string | undefined): void => {
+    for (const test of spec.tests ?? []) {
+      if (!isAuthSetup(test.projectName, spec.file ?? suiteFile)) continue;
+      const last = (test.results ?? [])[(test.results ?? []).length - 1];
+      const status = normalizeStatus(last?.status ?? test.status);
+      if (status === 'failed') {
+        failed = true;
+        if (!error) error = errorText(last);
+      }
+    }
+  };
+  const walk = (suite: PwSuite): void => {
+    for (const spec of suite.specs ?? []) visitSpec(spec, suite.file);
+    for (const child of suite.suites ?? []) walk(child);
+  };
+  for (const suite of report.suites ?? []) walk(suite);
+  return { failed, error };
+}
+
+/** Read the auth setup's sidecar meta (best-effort; null when absent/invalid). */
+async function readSetupMeta(projectDir: string): Promise<boolean | null> {
+  try {
+    const raw = await readFile(join(projectDir, 'fixtures', '.auth', 'setup-meta.json'), 'utf-8');
+    const meta: unknown = JSON.parse(raw);
+    if (
+      meta &&
+      typeof meta === 'object' &&
+      typeof (meta as { performedLogin?: unknown }).performedLogin === 'boolean'
+    ) {
+      return (meta as { performedLogin: boolean }).performedLogin;
+    }
+  } catch {
+    /* absent or unreadable — signal unknown */
+  }
+  return null;
 }
 
 function errorText(result: PwResult | undefined): string {
@@ -462,7 +522,7 @@ interface ParsedReport {
   flaky: number;
 }
 
-function parseReport(report: PwReport): ParsedReport {
+export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNALS): ParsedReport {
   const results: ExecResultItem[] = [];
   let passed = 0;
   let failed = 0;
@@ -492,10 +552,27 @@ function parseReport(report: PwReport): ParsedReport {
       if (testLevelFlaky || (hadPass && hadFail)) isFlaky = true;
 
       let status = normalizeStatus(last?.status ?? test.status);
-      const errText = errorText(last);
+      let errText = errorText(last);
 
-      if (status === 'failed' && projectIsTierB(test.projectName) && looksLikeAuthBlock(errText)) {
-        status = 'blocked';
+      // Structural Tier B classification (see AuthSignals). Three cases:
+      //  1. Auth setup FAILED → Playwright skipped its dependants; those skips
+      //     (and any failures from a partial run) are `blocked` prerequisites,
+      //     carrying the setup's own error so the cause is visible.
+      //  2. Setup passed WITHOUT a real login (performedLogin === false: no
+      //     credentials configured) → Tier B ran anonymous; its failures were
+      //     doomed in advance and are `blocked`, not app defects.
+      //  3. Setup performed a real login (or is unknown) → every failure is
+      //     honest. NEVER downgraded — this was the defect-leakage bug.
+      if (projectIsTierB(test.projectName)) {
+        if (auth.setupFailed && (status === 'failed' || status === 'skipped')) {
+          status = 'blocked';
+          errText =
+            errText ||
+            `Auth setup failed — Tier B prerequisite not met.${auth.setupError ? `\n${auth.setupError}` : ''}`;
+        } else if (status === 'failed' && auth.performedLogin === false) {
+          status = 'blocked';
+          errText = `Tier B ran without credentials (no HEALIX_TIERB_* configured; anonymous session).\n${errText}`;
+        }
       }
 
       if ((STATUS_PRIORITY[status] ?? 0) >= (STATUS_PRIORITY[worst] ?? 0)) {
@@ -668,7 +745,17 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   let parsed: ParsedReport;
   if (report) {
-    parsed = parseReport(report);
+    const setup = findAuthSetupOutcome(report);
+    const performedLogin = await readSetupMeta(ctx.projectDir);
+    const auth: AuthSignals = { setupFailed: setup.failed, setupError: setup.error, performedLogin };
+    if (setup.failed) {
+      emit(ctx, '[execute] auth setup failed; Tier B outcomes classified as blocked', {
+        setupError: setup.error.split('\n')[0] ?? '',
+      });
+    } else if (performedLogin === false) {
+      emit(ctx, '[execute] auth setup ran without credentials; Tier B failures classified as blocked');
+    }
+    parsed = parseReport(report, auth);
   } else {
     parsed = parseSummaryText(`${cmd.stdout}\n${cmd.stderr}`);
     if (parsed.results.length === 0 && parsed.passed === 0 && parsed.failed === 0) {

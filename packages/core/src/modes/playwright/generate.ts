@@ -158,7 +158,7 @@ const MAX_ELEMENT_NAME_LEN = 80;
  * Render the interactive-element inventory captured during computer-use
  * exploration (ctx.snapshot) as a compact list, so generation targets REAL
  * selectors instead of guessing. Returns '' when there is nothing to add:
- *   - no snapshot (codegen path never sets one) or no elements observed;
+ *   - no snapshot (no live URL to explore, or exploration failed) or no elements observed;
  *   - an API tier (tierC-api), which must not drive a browser page at all.
  * The list is capped at MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so
  * a huge page can't blow up the prompt (and the omission isn't silent).

@@ -137,6 +137,18 @@ import { mkdir, writeFile, access } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const authFile = 'fixtures/.auth/user.json';
+// Sidecar read by Healix after the run: records whether a REAL login was
+// performed, so Tier B failures can be classified structurally (blocked vs
+// genuine) instead of by matching error text.
+const metaFile = 'fixtures/.auth/setup-meta.json';
+
+async function writeMeta(performedLogin) {
+  await writeFile(
+    metaFile,
+    JSON.stringify({ performedLogin, at: new Date().toISOString() }),
+    'utf-8',
+  );
+}
 
 /**
  * Establishes the Tier B authenticated storageState. By default this produces an
@@ -151,15 +163,20 @@ setup('authenticate', async ({ page }) => {
   const loginUrl = process.env.HEALIX_TIERB_LOGIN_URL;
 
   if (email && password && loginUrl) {
+    // Written BEFORE the login attempt so a mid-login crash still leaves
+    // performedLogin:false on disk; overwritten with true only on success.
+    await writeMeta(false);
     await page.goto(loginUrl);
     await page.getByLabel(/email/i).fill(email);
     await page.getByLabel(/password/i).fill(password);
     await page.getByRole('button', { name: /sign in|log ?in|continue/i }).click();
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.context().storageState({ path: authFile });
+    await writeMeta(true);
     return;
   }
 
+  await writeMeta(false);
   try {
     await access(authFile);
   } catch {

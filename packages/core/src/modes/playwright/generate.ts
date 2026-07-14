@@ -374,3 +374,94 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   });
   return specs;
 }
+
+/** Per-call budget for a repair attempt (same as generation). */
+const REPAIR_TIMEOUT_MS = GEN_TIMEOUT_MS;
+
+/**
+ * Self-heal ONE defective spec: hand the model a failure bundle (spec source +
+ * runtime error + observed-element inventory) and ask for a corrected spec.
+ * The output passes the exact same gates as generation (must look like a
+ * Playwright spec, contain an expect, and clear the forbidden-API deny-list) —
+ * a repair may never weaken the security posture. Returns null when no safe
+ * repair was produced; the original file is only overwritten on success.
+ *
+ * Healing policy (borrowed from the strongest tools in this space): repair is
+ * for STRUCTURAL test defects — wrong route, drifted locator, over-strict
+ * assertion text. The caller only invokes this for failures triaged as
+ * test_is_wrong; app defects are surfaced, never patched around.
+ */
+export async function repairSpec(
+  ctx: TestModeContext,
+  spec: GeneratedSpec,
+  error: string,
+): Promise<GeneratedSpec | null> {
+  const tier = resolveTier(spec.tier);
+  const inventory = formatSnapshotInventory(ctx, tier);
+  const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
+  const boundedError = error.length > 4000 ? `${error.slice(0, 4000)}\n[...truncated]` : error;
+
+  const prompt = `You are repairing ONE broken Playwright test spec (TypeScript).
+
+The spec below FAILED when executed. The failure was triaged as a defect in the
+TEST itself (wrong navigation, drifted/hallucinated locator, over-strict
+assertion) — NOT an application bug. Produce a corrected version of the spec
+that verifies the same requirement honestly.
+
+Output ONLY the corrected TypeScript source. No markdown, no code fences, no explanation.
+
+Rules:
+- Keep the same requirement tag "${spec.reqTag ? `[REQ:${spec.reqTag}]` : spec.title}" in the title.
+- Preserve the test's INTENT: do not delete or weaken assertions just to make it pass;
+  fix HOW it verifies, not WHAT it verifies.
+- Begin with: import { test, expect } from '@playwright/test';
+- Use relative paths against the configured baseURL (${baseUrl}).
+- Include AT LEAST ONE concrete expect(...) assertion.
+- Be self-contained; import ONLY from '@playwright/test'.${inventory}
+
+Runtime error:
+"""
+${boundedError}
+"""
+
+Current spec source:
+"""
+${spec.contents}
+"""`;
+
+  let text = '';
+  try {
+    const res = await ctx.provider.complete(prompt, {
+      cwd: ctx.repoPath ?? undefined,
+      timeoutMs: REPAIR_TIMEOUT_MS,
+      readOnly: true,
+      signal: ctx.signal,
+    });
+    if (!res.ok) {
+      emit(ctx, `Repair provider error for "${spec.title}": ${res.detail}`);
+      return null;
+    }
+    text = res.text;
+  } catch (err) {
+    emit(ctx, `Repair threw for "${spec.title}": ${String(err)}`);
+    return null;
+  }
+
+  let source = stripCodeFences(text);
+  if (!source || !looksLikePlaywrightSpec(source) || !hasExpect(source)) {
+    emit(ctx, `Repair output for "${spec.title}" rejected (not a valid spec with expect())`);
+    return null;
+  }
+  const violations = findForbiddenApis(source);
+  if (violations.length > 0) {
+    emit(ctx, `Repair output for "${spec.title}" rejected (forbidden APIs): ${violations.join('; ')}`, {
+      violations,
+    });
+    return null;
+  }
+  source = ensureReqTag(source, spec.reqTag);
+  if (!source.endsWith('\n')) source += '\n';
+
+  await writeFile(spec.path, source, 'utf-8');
+  return { ...spec, contents: source };
+}

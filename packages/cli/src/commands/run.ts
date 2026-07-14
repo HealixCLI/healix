@@ -113,8 +113,16 @@ export function registerRun(program: Command): void {
     .addOption(new Option('--mode <mode>', 'exploration mode').choices(['codegen', 'computer-use']))
     .option('--yes', 'auto-approve the plan (skip the approval gate)', false)
     .option('--prd <text>', 'PRD / acceptance-criteria text to ground generation')
+    .option('--no-commit', 'do not bank/commit validated specs into the repo canonical suite')
     .action(
-      async (opts: { project: string; provider?: string; mode?: string; yes?: boolean; prd?: string }) => {
+      async (opts: {
+        project: string;
+        provider?: string;
+        mode?: string;
+        yes?: boolean;
+        prd?: string;
+        commit?: boolean;
+      }) => {
         const runOpts: RunOptions = {
           projectId: opts.project,
           autoApprove: opts.yes === true,
@@ -122,6 +130,7 @@ export function registerRun(program: Command): void {
         if (opts.provider) runOpts.provider = opts.provider as ProviderId;
         if (opts.mode) runOpts.explorationMode = opts.mode as ExplorationMode;
         if (opts.prd) runOpts.prd = opts.prd;
+        if (opts.commit === false) runOpts.commitSuite = false;
 
         const orchestrator = createOrchestrator();
         console.log('');

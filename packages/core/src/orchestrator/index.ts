@@ -1,5 +1,5 @@
 import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 import { projectsDir } from '../env/app-data.js';
 import { getStore, type HealixStore } from '../storage/store.js';
 import type { Project, Run, RunStatus, TestStatus, Tier } from '../storage/types.js';
@@ -21,7 +21,26 @@ import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
-import { buildPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import {
+  buildPlanPrompt,
+  parsePlan,
+  synthesizePlan,
+  type PlanRepoContext,
+  type PlanTopUpContext,
+} from './plan.js';
+import {
+  bankSpecs,
+  canonicalSuiteDir,
+  commitSuite,
+  coveredReqTags,
+  discoverSpecs,
+  gitDiffStat,
+  gitHead,
+  isGitWorkTree,
+  markStale,
+  readManifest,
+  seedRunSuite,
+} from '../suite/canonical.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
@@ -41,6 +60,8 @@ const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
 const TRIAGE_AI_LIMIT = 3;
 /** Consecutive best-effort store-write failures before we warn that persistence is down. */
 const STORE_FAILURE_WARN_THRESHOLD = 3;
+/** Max self-repair attempts per run (one provider call + one targeted re-run each). */
+const REPAIR_LIMIT = 2;
 
 /**
  * Run state machine for the Healix orchestrator. Every phase transition is
@@ -196,6 +217,12 @@ async function runPipeline(
   // Accumulated across phases so the report/summary survive partial failures.
   let plan: TestPlan | null = null;
   let specs: GeneratedSpec[] = [];
+  /** Specs seeded from the canonical (team-shared) suite; run but not re-generated. */
+  let seededSpecs: GeneratedSpec[] = [];
+  /** Everything the run executes: seeded + newly generated. */
+  let allSpecs: GeneratedSpec[] = [];
+  /** Titles of new specs self-repaired and verified green during HEAL. */
+  const repairedTitles: string[] = [];
   let outcome: ExecOutcome | null = null;
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
@@ -244,9 +271,65 @@ async function runPipeline(
       }
     }
 
-    plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+    // Top-up grounding: what the canonical suite (committed in the repo, shared
+    // with teammates) already covers, plus the app's git diff since the suite
+    // was last banked. Best-effort — no canonical suite means a fresh plan.
+    let topUp: PlanTopUpContext | undefined;
+    let canonicalTags = new Set<string>();
+    if (project.repoPath) {
+      try {
+        const canonical = await discoverSpecs(canonicalSuiteDir(project.repoPath));
+        canonicalTags = coveredReqTags(canonical);
+        if (canonical.length > 0) {
+          const manifest = await readManifest(canonicalSuiteDir(project.repoPath));
+          let diffStat: string | null = null;
+          if (manifest.lastRun?.commit) {
+            diffStat = await gitDiffStat(project.repoPath, manifest.lastRun.commit, overrides?.execCli);
+          }
+          topUp = { coveredTags: [...canonicalTags].sort(), diffStat };
+          emit(
+            'plan',
+            'info',
+            `Top-up run: canonical suite covers ${canonicalTags.size} requirement tag(s).`,
+            {
+              coveredTags: topUp.coveredTags,
+              hasDiff: diffStat !== null,
+            },
+          );
+        }
+      } catch (err) {
+        emit('plan', 'debug', `Canonical-suite inspection failed (planning fresh): ${errMsg(err)}`);
+      }
+    }
+
+    plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex, topUp);
     await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
+
+    // Stale flagging (append + flag policy): the plan named already-covered
+    // tags whose behavior the code diff likely changed. Flag them in the
+    // canonical manifest for human review — never delete or rewrite.
+    if (project.repoPath && plan.impactedReqTags && plan.impactedReqTags.length > 0) {
+      try {
+        const flagged = await markStale(
+          project.repoPath,
+          plan.impactedReqTags.filter((t) => canonicalTags.has(t)),
+          `code changed since generation (run ${runId})`,
+        );
+        if (flagged.length > 0) {
+          emit(
+            'plan',
+            'warn',
+            `Flagged ${flagged.length} existing spec(s) as stale — review recommended: ${flagged.join(', ')}`,
+            {
+              stale: flagged,
+            },
+          );
+        }
+      } catch (err) {
+        emit('plan', 'debug', `Stale flagging failed (continuing): ${errMsg(err)}`);
+      }
+    }
     setStatus('awaiting-approval');
 
     // ---- 4. APPROVE ----
@@ -472,9 +555,63 @@ async function runPipeline(
     emit('generate', 'info', 'Scaffolding suite.');
     try {
       await mode.scaffold(ctx);
+
+      // Top-up: seed the run suite with the canonical (team-shared) specs so
+      // they execute alongside anything new. Best-effort — a fresh project
+      // simply seeds nothing.
+      if (project.repoPath) {
+        try {
+          seededSpecs = await seedRunSuite(project.repoPath, ctx.projectDir);
+          if (seededSpecs.length > 0) {
+            emit(
+              'generate',
+              'info',
+              `Seeded ${seededSpecs.length} existing spec(s) from the canonical suite.`,
+              {
+                seeded: seededSpecs.map((s) => s.reqTag ?? s.title),
+              },
+            );
+          }
+        } catch (err) {
+          emit('generate', 'warn', `Canonical-suite seeding failed (generating everything): ${errMsg(err)}`);
+        }
+      }
+
+      // Dedup: drop plan items the seeded suite already covers. REQ tags are
+      // the deterministic identity; untagged items get one bounded AI coverage
+      // judgment (failure → treated as uncovered, i.e. generated — a duplicate
+      // beats a silent gap). Items whose tag the plan flagged as impacted by
+      // code changes ARE regenerated even though covered.
+      let planForGeneration = plan;
+      if (seededSpecs.length > 0) {
+        const seededTags = new Set(seededSpecs.map((s) => s.reqTag).filter((t): t is string => !!t));
+        const impacted = new Set(plan.impactedReqTags ?? []);
+        const skippedIds = new Set(
+          plan.items
+            .filter((it) => it.reqTag && seededTags.has(it.reqTag) && !impacted.has(it.reqTag))
+            .map((it) => it.id),
+        );
+        const untagged = plan.items.filter((it) => !it.reqTag);
+        if (untagged.length > 0) {
+          const coveredIds = await aiCoverageFilter(provider, untagged, seededSpecs, emit);
+          for (const id of coveredIds) skippedIds.add(id);
+        }
+        const items = plan.items.filter((it) => !skippedIds.has(it.id));
+        if (items.length !== plan.items.length) {
+          emit(
+            'generate',
+            'info',
+            `${plan.items.length - items.length} plan item(s) already covered by the existing suite; generating ${items.length} new.`,
+            { skipped: plan.items.length - items.length },
+          );
+        }
+        planForGeneration = { ...plan, items };
+      }
+
       emit('generate', 'info', 'Generating specs.');
-      specs = await mode.generate(ctx, plan);
-      for (const spec of specs) {
+      specs = await mode.generate(ctx, planForGeneration);
+      allSpecs = [...seededSpecs, ...specs];
+      for (const spec of allSpecs) {
         const test = store.insertTest({
           runId,
           title: spec.title,
@@ -484,7 +621,7 @@ async function runPipeline(
         });
         testIdByKey.set(stableKey(spec.reqTag, spec.title), test.id);
       }
-      emit('generate', 'info', `Generated ${specs.length} spec(s).`);
+      emit('generate', 'info', `Generated ${specs.length} new spec(s); suite totals ${allSpecs.length}.`);
     } catch (err) {
       emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
@@ -506,10 +643,14 @@ async function runPipeline(
     // ---- 8. EXECUTE ----
     if (checkCancelled()) return cancelRun('execute');
     setStatus('executing');
-    emit('execute', 'info', `Executing ${specs.length} spec(s).`);
+    emit(
+      'execute',
+      'info',
+      `Executing ${allSpecs.length} spec(s) (${seededSpecs.length} seeded, ${specs.length} new).`,
+    );
     try {
-      outcome = await mode.execute(ctx, specs);
-      persistResults(store, runId, specs, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
+      outcome = await mode.execute(ctx, allSpecs);
+      persistResults(store, runId, allSpecs, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
       emit('execute', 'info', `Execution complete: ${outcome.passed} passed, ${outcome.failed} failed.`, {
         passed: outcome.passed,
         failed: outcome.failed,
@@ -566,7 +707,7 @@ async function runPipeline(
         for (const r of failed) {
           // Recover the originating spec (by normalized title) to ground the triage
           // input with its requirement tag and source.
-          const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
+          const spec = allSpecs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
           const input: TriageInput = {
             title: r.title,
             error: r.error ?? '',
@@ -607,6 +748,72 @@ async function runPipeline(
       emit('triage', 'warn', `Triage phase error (continuing): ${errMsg(err)}`, { stack: errStack(err) });
     }
 
+    // ---- 9b. HEAL (best-effort self-repair of NEW specs) ----
+    // Policy (the safety line every serious tool draws): repair ONLY failures
+    // triaged as defects in the TEST itself — never app defects; "healing" an
+    // app bug into a passing test is defect leakage at its worst. Seeded
+    // (teammates') specs are never rewritten; they can only be stale-flagged.
+    if (checkCancelled()) return cancelRun('heal');
+    if (outcome && mode.repair && specs.length > 0) {
+      try {
+        let repairBudget = REPAIR_LIMIT;
+        for (const r of outcome.results) {
+          if (repairBudget <= 0) break;
+          if (r.status !== 'failed') continue;
+          const spec = findSpecForResult(specs, r.title);
+          if (!spec) continue; // seeded or unknown — not this run's to rewrite
+          const entry = triageEntries.find((t) => t.title === r.title);
+          if (entry?.triage.verdict !== 'test_is_wrong') continue;
+          repairBudget -= 1;
+          emit('heal', 'info', `Repairing "${r.title}" (triaged test_is_wrong).`);
+          let repaired: GeneratedSpec | null = null;
+          try {
+            repaired = await mode.repair(ctx, spec, r.error ?? '');
+          } catch (err) {
+            emit('heal', 'warn', `Repair attempt threw for "${r.title}": ${errMsg(err)}`);
+          }
+          if (!repaired) {
+            emit('heal', 'info', `No safe repair produced for "${r.title}"; keeping the failure.`);
+            continue;
+          }
+          // Verify the repair by re-running JUST that spec (dependencies like
+          // auth-setup still run). Only a green re-run changes the outcome.
+          let retest: ExecOutcome | null = null;
+          try {
+            retest = await mode.execute(ctx, [repaired], {
+              only: [relative(ctx.projectDir, repaired.path)],
+            });
+          } catch (err) {
+            emit('heal', 'warn', `Repaired spec re-run failed for "${r.title}": ${errMsg(err)}`);
+          }
+          const rr = retest?.results.find((x) => x.title === r.title || repaired.contents.includes(x.title));
+          if (rr && (rr.status === 'passed' || rr.status === 'flaky')) {
+            r.status = 'passed';
+            r.error = undefined;
+            outcome.failed = Math.max(0, outcome.failed - 1);
+            outcome.passed += 1;
+            const specIdx = specs.findIndex((s) => s.path === spec.path);
+            if (specIdx >= 0) specs[specIdx] = repaired;
+            const allIdx = allSpecs.findIndex((s) => s.path === spec.path);
+            if (allIdx >= 0) allSpecs[allIdx] = repaired;
+            repairedTitles.push(r.title);
+            if (retest) {
+              persistResults(store, runId, [repaired], retest, testIdByKey, noteStoreOk, noteStoreFailure);
+            }
+            emit('heal', 'info', `Repaired and verified "${r.title}".`);
+          } else {
+            emit(
+              'heal',
+              'info',
+              `Repair for "${r.title}" did not pass verification (${rr?.status ?? 'no result'}); keeping the original failure.`,
+            );
+          }
+        }
+      } catch (err) {
+        emit('heal', 'warn', `Heal phase error (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+      }
+    }
+
     // ---- 10. REPORT ----
     if (checkCancelled()) return cancelRun('report');
     setStatus('reporting');
@@ -642,6 +849,56 @@ async function runPipeline(
       }
     } catch (err) {
       emit('export', 'warn', `Export failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+    }
+
+    // ---- 11b. SUITE TOP-UP (bank validated specs; commit for teammates) ----
+    // Only NEW specs that actually PASSED are banked into the repo's canonical
+    // suite and committed (path-scoped, never pushed). Failures and blocked
+    // outcomes never reach the shared suite.
+    if (project.repoPath && opts.commitSuite !== false && specs.length > 0 && outcome) {
+      try {
+        const finalOutcome = outcome;
+        const toBank = specs.filter((s) => {
+          const res = finalOutcome.results.find(
+            (r) =>
+              stableKey(undefined, r.title) === stableKey(undefined, s.title) || s.contents.includes(r.title),
+          );
+          return res !== undefined && (res.status === 'passed' || res.status === 'flaky');
+        });
+        if (toBank.length > 0) {
+          const head = await gitHead(project.repoPath, overrides?.execCli);
+          const written = await bankSpecs(project.repoPath, ctx.projectDir, toBank, {
+            runId,
+            commit: head,
+          });
+          if (written.length > 0) {
+            emit('suite', 'info', `Banked ${toBank.length} validated spec(s) into the canonical suite.`, {
+              files: written,
+            });
+            if (await isGitWorkTree(project.repoPath, overrides?.execCli)) {
+              const repairedNote =
+                repairedTitles.length > 0 ? `, ${repairedTitles.length} self-repaired` : '';
+              const message = `test(healix): top up suite (+${toBank.length} spec${
+                toBank.length === 1 ? '' : 's'
+              }${repairedNote}) [${runId}]`;
+              const res = await commitSuite(project.repoPath, message, overrides?.execCli);
+              emit(
+                'suite',
+                res.committed ? 'info' : 'debug',
+                res.committed
+                  ? `Committed suite top-up: ${res.detail}`
+                  : `Suite commit skipped: ${res.detail}`,
+              );
+            } else {
+              emit('suite', 'info', 'Repo is not a git work tree; specs banked without commit.');
+            }
+          }
+        } else {
+          emit('suite', 'debug', 'No newly passing specs to bank.');
+        }
+      } catch (err) {
+        emit('suite', 'warn', `Suite banking failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+      }
     }
 
     // Honest final status:
@@ -782,8 +1039,9 @@ async function runPlanPhase(
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
   overrides?: OrchestratorOverrides,
   repoIndex?: PlanRepoContext,
+  topUp?: PlanTopUpContext,
 ): Promise<TestPlan> {
-  const prompt = buildPlanPrompt(project, opts, repoIndex);
+  const prompt = buildPlanPrompt(project, opts, repoIndex, topUp);
   // Attempt a single completion with one provider; classifies the outcome so the
   // caller can decide whether to retry with a fallback.
   const attempt = async (
@@ -900,6 +1158,19 @@ function extractReqTag(title: string): string | null {
   const m = title.match(/\[REQ:([^\]]+)\]/i);
   const tag = m?.[1]?.trim();
   return tag && tag.length > 0 ? tag : null;
+}
+
+/**
+ * Find the generated spec behind an execution-result title. Playwright reports
+ * the LEAF test title, which for describe-wrapped specs differs from the
+ * spec's own (tagged) title — so fall back to "the title appears verbatim in
+ * the spec source" when the stable key does not match.
+ */
+function findSpecForResult(specs: GeneratedSpec[], title: string): GeneratedSpec | undefined {
+  const key = stableKey(undefined, title);
+  return (
+    specs.find((s) => stableKey(undefined, s.title) === key) ?? specs.find((s) => s.contents.includes(title))
+  );
 }
 
 /** Stable identity for matching a result back to its spec: reqTag when present, else normalized title. */
@@ -1023,6 +1294,54 @@ async function writeJson(path: string, value: unknown): Promise<void> {
 
 function nowIso(): string {
   return new Date().toISOString();
+}
+
+/** Per-call budget for the AI coverage judgment on untagged plan items. */
+const COVERAGE_JUDGE_TIMEOUT_MS = 60_000;
+
+/**
+ * One bounded AI judgment: which UNTAGGED plan items does the existing suite
+ * already cover? Deterministic REQ-tag matching has already run; this handles
+ * only the remainder. Any failure (provider error, unparseable output) returns
+ * the empty set — items are then generated, because a duplicated test is
+ * recoverable while a silently skipped one is a coverage hole.
+ */
+async function aiCoverageFilter(
+  provider: ProviderAdapter,
+  untagged: TestPlan['items'],
+  existing: GeneratedSpec[],
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<Set<string>> {
+  const lines: string[] = [];
+  lines.push('You are deduplicating a test plan against an existing Playwright suite.');
+  lines.push('');
+  lines.push('Existing test titles:');
+  for (const spec of existing.slice(0, 100)) lines.push(`- ${spec.title}`);
+  lines.push('');
+  lines.push('Candidate new plan items (id | title | intent):');
+  for (const item of untagged) lines.push(`- ${item.id} | ${item.title} | ${item.intent}`);
+  lines.push('');
+  lines.push('Which candidate items are ALREADY covered by an existing test (same behavior verified)?');
+  lines.push('Respond with exactly one fenced JSON block: {"coveredItemIds": ["..."]} — [] when none.');
+  try {
+    const res = await provider.complete(lines.join('\n'), {
+      timeoutMs: COVERAGE_JUDGE_TIMEOUT_MS,
+      readOnly: true,
+    });
+    if (!res.ok || !res.text) return new Set();
+    const fenced = /```(?:json)?\s*([\s\S]*?)```/.exec(res.text);
+    const body = fenced?.[1] ?? res.text;
+    const start = body.indexOf('{');
+    if (start === -1) return new Set();
+    const parsed: unknown = JSON.parse(body.slice(start, body.lastIndexOf('}') + 1));
+    const ids = (parsed as { coveredItemIds?: unknown }).coveredItemIds;
+    if (!Array.isArray(ids)) return new Set();
+    const known = new Set(untagged.map((it) => it.id));
+    return new Set(ids.filter((id): id is string => typeof id === 'string' && known.has(id)));
+  } catch (err) {
+    emit('generate', 'debug', `AI coverage judgment failed (generating all untagged items): ${errMsg(err)}`);
+    return new Set();
+  }
 }
 
 /**

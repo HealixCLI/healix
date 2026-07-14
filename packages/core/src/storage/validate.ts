@@ -1,3 +1,4 @@
+import { isGitRemoteUrl } from '../target/clone.js';
 import type { ModeId, NewProject } from './types.js';
 
 /** Upper bound on an accepted base URL; guards against pathological input. */
@@ -64,12 +65,14 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
     };
   }
   // Repo path is a LOCAL filesystem path to an already-cloned checkout — it is
-  // later used as a child process's cwd, never fetched or cloned. A remote git
-  // URL (https://github.com/..., git@..., etc.) pasted in here looks plausible
-  // but silently breaks every run: rejecting it up front, with a pointer to the
-  // field that DOES want a URL, is far cheaper than a confusing failure deep in
-  // plan/codegen once the project is already saved.
-  if (repoPath && /^(https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(repoPath)) {
+  // later used as a child process's cwd. Callers that want to accept a remote
+  // git URL (desktop IPC, `healix project add`) clone it via cloneRepo() and
+  // pass the resulting local path in here; validateNewProject never fetches
+  // anything itself. This guard is the safety net for any caller that skips
+  // that step and hands a raw URL straight through — it fails fast, with a
+  // pointer to the field that DOES want a URL, instead of a confusing failure
+  // deep in plan/codegen once the project is already saved.
+  if (repoPath && isGitRemoteUrl(repoPath)) {
     return {
       ok: false,
       error: `Repo path must be a local folder path, not a URL (received "${repoPath}"). Clone the repo locally and point Repo path at that folder, or use Base URL for the running app instead.`,

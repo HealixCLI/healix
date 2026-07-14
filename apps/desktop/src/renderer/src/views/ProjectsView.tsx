@@ -260,6 +260,15 @@ function isValidBaseUrl(raw: string): boolean {
 }
 
 /**
+ * Mirror of core `isGitRemoteUrl` (packages/core/src/target/clone.ts). Duplicated
+ * for the same reason as isValidBaseUrl above — purely for an inline "will be
+ * cloned" hint; the main process is what actually clones and is the hard guard.
+ */
+function isGitRemoteUrl(raw: string): boolean {
+  return /^(https?:\/\/|git@|ssh:\/\/|git:\/\/)/i.test(raw.trim());
+}
+
+/**
  * Shared create/edit/view form. In create mode `project` is omitted and fields
  * start blank; in edit mode `project` seeds every field with its current value,
  * all still freely editable, and submitting calls the same onSubmit with the
@@ -295,6 +304,7 @@ function ProjectForm({
   const hasTarget = repoPath.trim().length > 0 || baseUrl.trim().length > 0;
   const baseUrlInvalid = baseUrl.trim().length > 0 && !isValidBaseUrl(baseUrl);
   const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !submitting;
+  const repoIsUrl = isGitRemoteUrl(repoPath);
 
   const submit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
@@ -336,14 +346,17 @@ function ProjectForm({
               disabled={readOnly}
             />
           </Field>
-          <Field label="Repo path (white-box)">
+          <Field label="Repo path or git URL (white-box)">
             <Input
               value={repoPath}
               onChange={(e) => setRepoPath(e.target.value)}
-              placeholder="/Users/me/code/acme"
+              placeholder="/Users/me/code/acme or https://github.com/org/repo"
               className="font-mono"
               disabled={readOnly}
             />
+            {repoIsUrl && (
+              <p className="mt-1 text-xs text-muted">Will be cloned locally when you create the project.</p>
+            )}
           </Field>
           <Field label="Base URL (black-box)">
             <Input
@@ -389,7 +402,15 @@ function ProjectForm({
                   Cancel
                 </Button>
                 <Button type="submit" disabled={!canSubmit}>
-                  {submitting ? 'Saving…' : isEdit ? 'Save changes' : 'Create project'}
+                  {submitting
+                    ? isEdit
+                      ? 'Saving…'
+                      : repoIsUrl
+                        ? 'Cloning repository…'
+                        : 'Creating…'
+                    : isEdit
+                      ? 'Save changes'
+                      : 'Create project'}
                 </Button>
               </div>
             </div>

@@ -153,6 +153,8 @@ const fakeTarget: TargetAdapter = {
       framework: null,
       packageManager: null,
       startCommand: null,
+      installCommand: null,
+      installDir: null,
       port: null,
       baseUrl: null,
     };
@@ -742,6 +744,8 @@ describe('orchestrator paths (offline DI seam)', () => {
           framework: 'express',
           packageManager: 'npm',
           startCommand: 'npm run start',
+          installCommand: 'npm install',
+          installDir: '.',
           port: null,
           baseUrl: null,
         };
@@ -797,6 +801,8 @@ describe('orchestrator paths (offline DI seam)', () => {
           framework: 'express',
           packageManager: 'npm',
           startCommand: 'npm run start',
+          installCommand: 'npm install',
+          installDir: '.',
           port: null,
           baseUrl: null,
         };

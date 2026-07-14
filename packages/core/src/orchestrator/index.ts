@@ -322,6 +322,15 @@ async function runPipeline(
           const handle = await target.launch({
             repoPath,
             startCommand: det.startCommand ?? undefined,
+            // Proactive install: derived alongside startCommand (correctly
+            // targeting a monorepo workspace subdir when that's what's being
+            // launched), and gated on node_modules already existing — see
+            // launch()'s ensureDependencies(). This runs BEFORE the reactive
+            // rung 1 recovery below ever gets a chance to, so for the common
+            // case (freshly cloned/never-installed repo) launch succeeds on
+            // this very first attempt.
+            installCommand: det.installCommand ?? undefined,
+            installDir: det.installDir ?? undefined,
             // det.baseUrl embeds the DETECTED port; when the allocated port
             // differs, omit it so launch() derives the URL from `port` and the
             // readiness poll targets the server this run actually started.
@@ -340,6 +349,10 @@ async function runPipeline(
         } catch (err) {
           launchError = err;
           // Recovery rung 1: missing dependencies → install once, retry once.
+          // A safety net for cases the proactive install above didn't cover
+          // (e.g. a stale/partial node_modules that still fails at runtime) —
+          // det.packageManager is the ROOT package manager, so this always
+          // installs at repoPath regardless of which subdir was launched.
           if (looksLikeMissingDeps(errMsg(err)) && det.packageManager && !checkCancelled()) {
             emit(
               'launch',

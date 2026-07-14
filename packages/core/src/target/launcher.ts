@@ -1,5 +1,7 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { existsSync } from 'node:fs';
 import net from 'node:net';
+import path from 'node:path';
 import process from 'node:process';
 import { logger } from '../logger.js';
 import type { LaunchHandle, LaunchOptions } from './types.js';
@@ -7,6 +9,9 @@ import { probeUrl } from './http-probe.js';
 
 const POLL_INTERVAL_MS = 500;
 const DEFAULT_READY_TIMEOUT_MS = 120_000;
+// Installs are slow (native deps, cold cache, no local registry mirror) —
+// give this far more room than the readiness poll.
+const DEFAULT_INSTALL_TIMEOUT_MS = 10 * 60_000;
 /** Bounded ring buffer of recent stderr lines for diagnostics on timeout. */
 const MAX_STDERR_LINES = 50;
 
@@ -27,6 +32,73 @@ function redactSecrets(text: string): string {
     )
     .replace(/\b[A-Za-z0-9+/_-]{32,}={0,2}\b/g, '***')
     .replace(/\b[0-9a-fA-F]{32,}\b/g, '***');
+}
+
+/**
+ * Run a one-shot shell command to completion (unlike the long-lived dev
+ * server, this is expected to exit on its own). Uses the same shell:true,
+ * single-command-string form as the startCommand spawn below so compound
+ * commands (`cd apps/web && npm install`) work identically on POSIX and
+ * Windows. Never rejects — resolves with the exit code (null on spawn error)
+ * and the combined stdout+stderr for error reporting.
+ */
+function runInstall(
+  command: string,
+  cwd: string,
+  timeoutMs: number,
+): Promise<{ code: number | null; output: string }> {
+  return new Promise((resolve) => {
+    const child = spawn(command, { cwd, env: process.env, shell: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    let output = '';
+    const push = (chunk: Buffer): void => {
+      output += chunk.toString('utf-8');
+    };
+    child.stdout?.on('data', push);
+    child.stderr?.on('data', push);
+    const timer = setTimeout(() => {
+      child.kill('SIGKILL');
+    }, timeoutMs);
+    child.on('close', (code) => {
+      clearTimeout(timer);
+      resolve({ code, output });
+    });
+    child.on('error', (err) => {
+      clearTimeout(timer);
+      resolve({ code: null, output: `${output}${String(err)}` });
+    });
+  });
+}
+
+/**
+ * Install dependencies before the dev server is spawned, but only when
+ * they're actually missing — a cloned repo (or a repo the user just pointed
+ * Healix at) has no node_modules yet, so its start command would otherwise
+ * fail immediately (module not found) and launch() would report a confusing
+ * "exited early" error instead of the real problem.
+ *
+ * Gated on installDir's node_modules rather than always running: re-running
+ * an install on every launch of an already-set-up project would be pure
+ * overhead (and surprising — it executes the repo's install scripts).
+ */
+async function ensureDependencies(opts: LaunchOptions): Promise<void> {
+  if (!opts.installCommand) return;
+  const repoPath = opts.repoPath ?? process.cwd();
+  const installDir = opts.installDir ?? '.';
+  const nodeModulesPath = path.join(repoPath, installDir, 'node_modules');
+  if (existsSync(nodeModulesPath)) return;
+
+  logger.info('target.launch: installing dependencies', { command: opts.installCommand, cwd: repoPath });
+  const { code, output } = await runInstall(
+    opts.installCommand,
+    repoPath,
+    opts.installTimeoutMs ?? DEFAULT_INSTALL_TIMEOUT_MS,
+  );
+  if (code !== 0) {
+    throw new Error(
+      `[healix] dependency install failed ('${opts.installCommand}', exit code ${code ?? 'null'}):\n${redactSecrets(output.trim().slice(-4000))}`,
+    );
+  }
+  logger.info('target.launch: dependencies installed', { cwd: repoPath });
 }
 
 /**
@@ -152,6 +224,8 @@ export async function launch(opts: LaunchOptions): Promise<LaunchHandle> {
   if (!startCommand || !startCommand.trim()) {
     throw new Error('[healix] TargetAdapter.launch: no startCommand provided.');
   }
+
+  await ensureDependencies(opts);
 
   const cwd = opts.repoPath ?? process.cwd();
   const baseUrl = deriveBaseUrl(opts);

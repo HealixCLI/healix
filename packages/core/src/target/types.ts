@@ -5,6 +5,20 @@ export interface DetectedProject {
   framework: string | null;
   packageManager: 'npm' | 'pnpm' | 'yarn' | 'bun' | null;
   startCommand: string | null;
+  /**
+   * Shell command that installs dependencies for the app startCommand will
+   * launch (e.g. "npm install", or "cd apps/web && npm install" for a
+   * workspace app resolved via the cd fallback). Null exactly when no package
+   * manager could be determined. Run (if needed — see installDir) before
+   * startCommand by launch().
+   */
+  installCommand: string | null;
+  /**
+   * Dir, relative to repoPath, whose node_modules indicates dependencies are
+   * already installed ("." for the repo root). Null exactly when
+   * installCommand is null.
+   */
+  installDir: string | null;
   port: number | null;
   baseUrl: string | null;
   /**
@@ -32,9 +46,14 @@ export interface LaunchHandle {
 export interface LaunchOptions {
   repoPath?: string;
   startCommand?: string;
+  /** Shell command that installs dependencies; run before startCommand when installDir's node_modules is missing. */
+  installCommand?: string;
+  /** Dir, relative to repoPath, whose node_modules gates whether installCommand runs. Defaults to "." (repoPath itself). */
+  installDir?: string;
   baseUrl?: string;
   port?: number;
   readyTimeoutMs?: number;
+  installTimeoutMs?: number;
   env?: Record<string, string>;
 }
 

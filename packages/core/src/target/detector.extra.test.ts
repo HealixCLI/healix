@@ -89,6 +89,8 @@ describe('detect (backend frameworks & non-JS markers)', () => {
     // No package.json and no lockfile -> no package manager / start command.
     expect(result.packageManager).toBeNull();
     expect(result.startCommand).toBeNull();
+    expect(result.installCommand).toBeNull();
+    expect(result.installDir).toBeNull();
     // A recognized framework still yields its default port/baseUrl.
     expect(result.port).toBe(8080);
     expect(result.baseUrl).toBe('http://localhost:8080');
@@ -152,6 +154,8 @@ describe('detect (monorepo workspace fallback)', () => {
     expect(result.kind).toBe('fullstack');
     expect(result.packageManager).toBe('pnpm');
     expect(result.startCommand).toBe('pnpm --filter @demo/web dev');
+    expect(result.installCommand).toBe('pnpm install');
+    expect(result.installDir).toBe('.');
     expect(result.port).toBe(3000);
     expect(result.baseUrl).toBe('http://localhost:3000');
     // The chosen subdir is surfaced in the detection notes.
@@ -169,6 +173,8 @@ describe('detect (monorepo workspace fallback)', () => {
     expect(result.framework).toBe('next');
     expect(result.packageManager).toBe('npm');
     expect(result.startCommand).toBe('npm run dev --workspace @demo/web');
+    expect(result.installCommand).toBe('npm install');
+    expect(result.installDir).toBe('.');
   });
 
   it('yarn workspaces: uses `yarn workspace <name> dev`', async () => {
@@ -180,6 +186,8 @@ describe('detect (monorepo workspace fallback)', () => {
     const result = await detect(dir);
 
     expect(result.startCommand).toBe('yarn workspace @demo/web dev');
+    expect(result.installCommand).toBe('yarn install');
+    expect(result.installDir).toBe('.');
   });
 
   it('no workspace declaration: falls back to `cd <dir> && <pm> run dev`', async () => {
@@ -194,6 +202,8 @@ describe('detect (monorepo workspace fallback)', () => {
 
     expect(result.framework).toBe('next');
     expect(result.startCommand).toBe('cd apps/web && npm run dev');
+    expect(result.installCommand).toBe('cd apps/web && npm install');
+    expect(result.installDir).toBe('apps/web');
     expect(result.notes?.some((n) => n.includes('apps/web'))).toBe(true);
   });
 
@@ -238,7 +248,50 @@ describe('detect (monorepo workspace fallback)', () => {
     // The root's own detection wins; the workspace app is never consulted.
     expect(result.framework).toBe('vite');
     expect(result.startCommand).toBe('pnpm dev');
+    expect(result.installCommand).toBe('pnpm install');
+    expect(result.installDir).toBe('.');
     expect(result.port).toBe(5173);
+  });
+
+  it('a root-level marker file with no start command does NOT block the workspace scan (OpenCut regression)', async () => {
+    // Reproduces a real bug: a monorepo whose root has NO package.json but DOES
+    // have a Cargo.toml (e.g. a Tauri desktop app alongside a web app) used to
+    // make inferFramework() guess "rust" from the marker file alone, and since
+    // guard used to require framework === null, the workspace scan that would
+    // have found the REAL launchable app under apps/web never ran — Healix
+    // reported "rust, no start command" and silently never launched anything.
+    const dir = makeRepo();
+    writeFile(dir, 'Cargo.toml', '[package]\nname = "desktop"\nversion = "0.1.0"\n');
+    const apiDir = path.join(dir, 'apps/api');
+    fs.mkdirSync(apiDir, { recursive: true });
+    // A sibling backend service with no dev/start script — must be skipped,
+    // exactly like the real apps/api (wrangler-only) in the source repo.
+    fs.writeFileSync(
+      path.join(apiDir, 'package.json'),
+      JSON.stringify({ name: '@demo/api', scripts: { deploy: 'wrangler deploy' } }),
+      'utf-8',
+    );
+    const webDir = path.join(dir, 'apps/web');
+    fs.mkdirSync(webDir, { recursive: true });
+    fs.writeFileSync(
+      path.join(webDir, 'package.json'),
+      JSON.stringify({
+        name: '@demo/web',
+        scripts: { dev: 'vite dev --port 5173', build: 'vite build' },
+        dependencies: { react: '^19.0.0', 'react-dom': '^19.0.0' },
+      }),
+      'utf-8',
+    );
+
+    const result = await detect(dir);
+
+    expect(result.framework).not.toBe('rust');
+    expect(result.startCommand).toBe('cd apps/web && npm run dev');
+    expect(result.installCommand).toBe('cd apps/web && npm install');
+    expect(result.installDir).toBe('apps/web');
+    expect(result.port).toBe(5173);
+    expect(result.baseUrl).toBe('http://localhost:5173');
+    expect(result.notes?.some((n) => n.includes('apps/web'))).toBe(true);
   });
 });
 

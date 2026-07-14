@@ -26,6 +26,7 @@ export * from './storage/types.js';
 // Target adapter (white-box / black-box)
 export { createTargetAdapter } from './target/index.js';
 export * from './target/types.js';
+export { isGitRemoteUrl, cloneRepo, type CloneRepoResult } from './target/clone.js';
 
 // Browser surface (computer-use + browser-use)
 export { createBrowserSurface } from './browser/index.js';
@@ -48,7 +49,14 @@ export { createTriageEngine } from './triage/index.js';
 export * from './triage/types.js';
 
 // Env + utilities
-export { appDataDir, ensureAppDataDir, dbPath, projectsDir, deleteProjectAssets } from './env/app-data.js';
+export {
+  appDataDir,
+  ensureAppDataDir,
+  dbPath,
+  projectsDir,
+  reposDir,
+  deleteProjectAssets,
+} from './env/app-data.js';
 export { logger, setLogLevel, type LogLevel } from './logger.js';
 export { runCli, which, type RunResult } from './exec/run-cli.js';
 export { notImplemented } from './util/not-implemented.js';

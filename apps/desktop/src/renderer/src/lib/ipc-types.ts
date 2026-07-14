@@ -46,6 +46,13 @@ export interface RunDetail {
   artifacts: string[];
   /** Absolute path to the run's rendered HTML report, when present on disk. */
   reportHtmlPath: string | null;
+  /**
+   * The plan persisted to disk at plan/plan.json, when present. Used to
+   * rebuild the approval gate for a run whose live state was lost (e.g. the
+   * Runs view was navigated away from) but that is still genuinely parked
+   * awaiting approval in the main process.
+   */
+  plan: TestPlan | null;
 }
 
 /**

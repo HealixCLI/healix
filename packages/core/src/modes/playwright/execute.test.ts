@@ -18,7 +18,7 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 import { spawn } from 'node:child_process';
 import type { GeneratedSpec, TestModeContext } from '../types.js';
-import { execute, suiteEnv } from './execute.js';
+import { execute, suiteEnv, parseReport, findAuthSetupOutcome, type AuthSignals } from './execute.js';
 
 function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
   return {
@@ -144,5 +144,167 @@ describe('execute — cooperative cancellation', () => {
     const outcome = await execute(makeCtx({ signal: controller.signal }), []);
     expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] });
     expect(spawn).not.toHaveBeenCalled();
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Structural Tier B classification (HLX-001 regression suite)
+// ---------------------------------------------------------------------------
+
+type PwReportArg = Parameters<typeof parseReport>[0];
+
+function report(
+  specs: Array<{
+    title: string;
+    file?: string;
+    projectName: string;
+    status: string;
+    error?: string;
+  }>,
+): PwReportArg {
+  return {
+    suites: [
+      {
+        title: 'suite',
+        specs: specs.map((s) => ({
+          title: s.title,
+          file: s.file ?? `tests/${s.projectName}/${s.title}.spec.ts`,
+          tests: [
+            {
+              status: s.status,
+              projectName: s.projectName,
+              results: [
+                {
+                  status: s.status,
+                  duration: 5,
+                  ...(s.error ? { error: { message: s.error } } : {}),
+                },
+              ],
+            },
+          ],
+        })),
+      },
+    ],
+  };
+}
+
+const LOGGED_IN: AuthSignals = { setupFailed: false, setupError: '', performedLogin: true };
+
+describe('parseReport — structural Tier B classification', () => {
+  it('keeps a Tier B failure FAILED when login succeeded, even if the error text mentions auth words (the old text-heuristic leak)', () => {
+    // Playwright embeds the failing source snippet in error output; a comment
+    // saying "storageState" used to downgrade this genuine failure to blocked.
+    const r = report([
+      {
+        title: 'badge shows count',
+        projectName: 'tierB-auth',
+        status: 'failed',
+        error:
+          'expect(locator).toHaveText failed\n' +
+          '  4 | // Authenticated via storageState; confirms the session is active\n' +
+          "  5 | await expect(badge).toHaveText('3');",
+      },
+    ]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.failed).toBe(1);
+    expect(parsed.blocked).toBe(0);
+    expect(parsed.results[0]?.status).toBe('failed');
+  });
+
+  it('marks Tier B skips/failures BLOCKED with the setup error when the auth setup itself failed', () => {
+    const auth: AuthSignals = {
+      setupFailed: true,
+      setupError: 'getByLabel(/email/i) not found on login page',
+      performedLogin: false,
+    };
+    const r = report([
+      {
+        title: 'authenticate',
+        file: 'fixtures/auth.setup.ts',
+        projectName: 'auth-setup',
+        status: 'failed',
+        error: 'getByLabel(/email/i) not found on login page',
+      },
+      { title: 'dashboard greeting', projectName: 'tierB-auth', status: 'skipped' },
+      { title: 'add task', projectName: 'tierB-auth', status: 'failed', error: 'timed out' },
+    ]);
+    const parsed = parseReport(r, auth);
+    const byTitle = Object.fromEntries(parsed.results.map((x) => [x.title, x]));
+    expect(byTitle['dashboard greeting']?.status).toBe('blocked');
+    expect(byTitle['dashboard greeting']?.error).toContain('Auth setup failed');
+    expect(byTitle['add task']?.status).toBe('blocked');
+    expect(parsed.blocked).toBe(2);
+    // the setup's own row stays an honest failure
+    expect(byTitle['authenticate']?.status).toBe('failed');
+  });
+
+  it('marks Tier B failures BLOCKED when the setup ran without credentials (anonymous session)', () => {
+    const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: false };
+    const r = report([
+      {
+        title: 'dashboard greeting',
+        projectName: 'tierB-auth',
+        status: 'failed',
+        error: 'expected /dashboard got /login',
+      },
+      { title: 'landing renders', projectName: 'tierA-public', status: 'passed' },
+    ]);
+    const parsed = parseReport(r, auth);
+    expect(parsed.results[0]?.status).toBe('blocked');
+    expect(parsed.results[0]?.error).toContain('without credentials');
+    expect(parsed.passed).toBe(1);
+  });
+
+  it('never downgrades when login state is unknown (older suites without the sidecar)', () => {
+    const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: null };
+    const r = report([
+      {
+        title: 'dashboard greeting',
+        projectName: 'tierB-auth',
+        status: 'failed',
+        error: 'unauthorized 401 session storageState',
+      },
+    ]);
+    const parsed = parseReport(r, auth);
+    expect(parsed.results[0]?.status).toBe('failed');
+    expect(parsed.blocked).toBe(0);
+  });
+
+  it('never touches non-Tier-B failures regardless of error text', () => {
+    const auth: AuthSignals = { setupFailed: true, setupError: 'boom', performedLogin: false };
+    const r = report([
+      {
+        title: 'login form present',
+        projectName: 'tierA-public',
+        status: 'failed',
+        error: 'sign in button storageState 401',
+      },
+    ]);
+    const parsed = parseReport(r, auth);
+    expect(parsed.results[0]?.status).toBe('failed');
+    expect(parsed.blocked).toBe(0);
+  });
+});
+
+describe('findAuthSetupOutcome', () => {
+  it('detects a failed auth-setup by project name or file and captures its error', () => {
+    const r = report([
+      {
+        title: 'authenticate',
+        file: 'fixtures/auth.setup.ts',
+        projectName: 'auth-setup',
+        status: 'failed',
+        error: 'no email field',
+      },
+      { title: 'other', projectName: 'tierA-public', status: 'passed' },
+    ]);
+    expect(findAuthSetupOutcome(r)).toEqual({ failed: true, error: 'no email field' });
+  });
+
+  it('reports failed:false when the setup passed', () => {
+    const r = report([
+      { title: 'authenticate', file: 'fixtures/auth.setup.ts', projectName: 'auth-setup', status: 'passed' },
+    ]);
+    expect(findAuthSetupOutcome(r)).toEqual({ failed: false, error: '' });
   });
 });

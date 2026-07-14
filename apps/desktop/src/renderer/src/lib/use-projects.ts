@@ -7,6 +7,8 @@ export interface ProjectsState {
   error: string | null;
   refresh: () => Promise<void>;
   create: (input: NewProject) => Promise<Project | null>;
+  /** Updates a project's editable fields (name, mode, repoPath, baseUrl). */
+  update: (id: string, input: NewProject) => Promise<Project | null>;
   /** Permanently deletes the project, its runs, and all on-disk assets. */
   remove: (id: string) => Promise<void>;
   /** Soft-archive (or restore) a project; all data is kept. */
@@ -54,6 +56,21 @@ export function useProjects(): ProjectsState {
     [refresh],
   );
 
+  const update = useCallback(
+    async (id: string, input: NewProject): Promise<Project | null> => {
+      setError(null);
+      try {
+        const updated = await window.healix.updateProject(id, input);
+        await refresh();
+        return updated;
+      } catch (err) {
+        setError(toMessage(err));
+        return null;
+      }
+    },
+    [refresh],
+  );
+
   const remove = useCallback(
     async (id: string): Promise<void> => {
       setError(null);
@@ -83,5 +100,5 @@ export function useProjects(): ProjectsState {
     [refresh],
   );
 
-  return { projects, loading, error, refresh, create, remove, archive };
+  return { projects, loading, error, refresh, create, update, remove, archive };
 }

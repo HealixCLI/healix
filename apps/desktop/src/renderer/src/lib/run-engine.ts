@@ -29,6 +29,15 @@ export interface RunEngineState {
   planDecided: boolean;
   summary: RunSummary | null;
   error: string | null;
+  /**
+   * True when this state came from hydrate() (re-attaching to a run whose live
+   * UI was lost) rather than from a start() this session. While true, the view
+   * showing this run is one choice among history rows, not force-shown the way
+   * a genuinely-just-started live run is — see RunsView's showLiveSurface.
+   * Cleared once the user actually resumes the run (approve(true)), at which
+   * point it behaves like any other live run for the rest of its lifecycle.
+   */
+  hydrated: boolean;
 }
 
 export interface RunEngine extends RunEngineState {
@@ -37,6 +46,16 @@ export interface RunEngine extends RunEngineState {
   /** Request cancellation of the active run; run:done ('cancelled') confirms. */
   cancel: () => Promise<void>;
   reset: () => void;
+  /**
+   * Re-attach to a run that is still genuinely parked awaiting approval in the
+   * main process (its approval promise is only lost on app restart, not on
+   * navigating away from this view) but whose live state here was lost because
+   * this component unmounted. Restores the plan gate so approve()/reject can
+   * reach it again.
+   */
+  hydrate: (args: { runId: string; plan: TestPlan }) => void;
+  /** Dismiss the current error banner without touching the rest of the state. */
+  clearError: () => void;
 }
 
 const INITIAL: RunEngineState = {
@@ -47,6 +66,7 @@ const INITIAL: RunEngineState = {
   planDecided: false,
   summary: null,
   error: null,
+  hydrated: false,
 };
 
 function nowLabel(): string {
@@ -135,14 +155,49 @@ export function useRunEngine(): RunEngine {
   const approve = useCallback(async (ok: boolean): Promise<void> => {
     const runId = activeRunId.current;
     if (!runId) return;
-    // A rejection is a cancellation, not an error — run:done confirms shortly.
+    // Computed before setState (not inside its updater), matching pushLine —
+    // an updater can run more than once (e.g. Strict Mode), which would double-
+    // increment a ref used inside it.
+    const rejectionLine: ConsoleLine | null = ok
+      ? null
+      : {
+          id: ++lineSeq.current,
+          level: 'info',
+          phase: 'approve',
+          message: 'Plan rejected — cancelling run.',
+          ts: nowLabel(),
+        };
+    // The gate closes immediately either way — approving moves straight into
+    // the run; rejecting is final from the user's perspective the moment they
+    // click it, even though the backend's own teardown is asynchronous and
+    // its authoritative 'cancelled' will still arrive shortly via run:done.
     setState((prev) => ({
       ...prev,
       planDecided: true,
-      phase: ok ? 'running' : prev.phase,
+      phase: ok ? 'running' : 'cancelled',
+      // Once decided (either way) this is no longer just one browsable history
+      // row among others — it's live/settled like any other run.
+      hydrated: false,
+      lines: rejectionLine ? [...prev.lines, rejectionLine] : prev.lines,
     }));
     try {
-      await window.healix.approveRun(runId, ok);
+      const result = await window.healix.approveRun(runId, ok);
+      if (!result.settled) {
+        // No live gate found on the backend for this runId — most likely
+        // orphaned by an app restart that happened after it started (the
+        // resolver lives only in that process's memory; persisted plan/status
+        // survive, it doesn't). The main process force-settles the DB row
+        // itself in this case (cancelled on reject, error on approve — an
+        // approved run that can't actually resume never runs); mirror that
+        // here so the local phase matches what's now persisted.
+        setState((prev) => ({
+          ...prev,
+          phase: ok ? 'error' : 'cancelled',
+          error: ok
+            ? "This run's approval session had already ended (most likely an app restart), so it couldn't actually resume — it's been marked as an error."
+            : "This run's approval session had already ended (most likely an app restart) before you responded — it's been marked as cancelled.",
+        }));
+      }
     } catch {
       // The gate may have already settled (e.g. run torn down); safe to ignore.
     }
@@ -155,7 +210,25 @@ export function useRunEngine(): RunEngine {
     // orchestrator, which winds down at the next phase boundary. We do NOT flip
     // the phase here — the authoritative 'cancelled' arrives via run:done.
     try {
-      await window.healix.cancelRun(runId);
+      const result = await window.healix.cancelRun(runId);
+      if (!result.cancelled) {
+        // Nothing was actually running on the backend for this runId — most
+        // likely orphaned by an app restart since it started (same class of
+        // gap as approve()'s !settled case). run:done will now never arrive,
+        // so without this the UI would show "Cancelling…"/"Running…" forever
+        // for a run that isn't running anywhere. The main process force-
+        // settles the DB row to 'cancelled' itself in this case (the user did
+        // explicitly ask to cancel it); mirror that phase here. Keep
+        // runId/identity (not a full reset) so the error banner stays scoped
+        // to THIS run via showLiveSurface, not shown for every run.
+        setState((prev) => ({
+          ...prev,
+          phase: 'cancelled',
+          hydrated: false,
+          error:
+            "This run wasn't actually active on the backend anymore (most likely ended by an app restart) — it's been marked as cancelled.",
+        }));
+      }
     } catch {
       // The run may have already settled; run:done tells the real story.
     }
@@ -167,7 +240,23 @@ export function useRunEngine(): RunEngine {
     setState(INITIAL);
   }, []);
 
-  return { ...state, start, approve, cancel, reset };
+  const hydrate = useCallback((args: { runId: string; plan: TestPlan }): void => {
+    activeRunId.current = args.runId;
+    lineSeq.current = 0;
+    setState({
+      ...INITIAL,
+      runId: args.runId,
+      phase: 'awaiting-approval',
+      plan: args.plan,
+      hydrated: true,
+    });
+  }, []);
+
+  const clearError = useCallback((): void => {
+    setState((prev) => ({ ...prev, error: null }));
+  }, []);
+
+  return { ...state, start, approve, cancel, reset, hydrate, clearError };
 }
 
 export const EXPLORATION_MODES: ReadonlyArray<{ value: ExplorationMode; label: string; hint: string }> = [

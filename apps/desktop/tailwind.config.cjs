@@ -5,20 +5,23 @@ module.exports = {
   theme: {
     extend: {
       colors: {
-        bg: '#0a0a0e',
-        panel: '#131318',
-        well: '#0d0d12',
-        border: '#26262e',
-        muted: '#8a8a96',
-        fg: '#e7e7ea',
+        // Backed by CSS variables (see index.css) so each token flips between its
+        // light and dark value with the `.dark` class, while still supporting
+        // Tailwind's `/opacity` modifiers (e.g. `bg-panel/60`).
+        bg: 'rgb(var(--color-bg) / <alpha-value>)',
+        panel: 'rgb(var(--color-panel) / <alpha-value>)',
+        well: 'rgb(var(--color-well) / <alpha-value>)',
+        border: 'rgb(var(--color-border) / <alpha-value>)',
+        muted: 'rgb(var(--color-muted) / <alpha-value>)',
+        fg: 'rgb(var(--color-fg) / <alpha-value>)',
         // Brand green — matches the Healix leaf gradient.
-        accent: '#46c878',
+        accent: 'rgb(var(--color-accent) / <alpha-value>)',
         // Cool blue for in-progress / informational states, so green stays
         // reserved for brand + success.
-        info: '#6ca5f2',
-        ok: '#3fb950',
-        warn: '#d29922',
-        err: '#f85149',
+        info: 'rgb(var(--color-info) / <alpha-value>)',
+        ok: 'rgb(var(--color-ok) / <alpha-value>)',
+        warn: 'rgb(var(--color-warn) / <alpha-value>)',
+        err: 'rgb(var(--color-err) / <alpha-value>)',
       },
       fontFamily: {
         mono: ['ui-monospace', 'SFMono-Regular', 'Menlo', 'monospace'],

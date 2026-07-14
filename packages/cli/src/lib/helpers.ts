@@ -8,7 +8,13 @@ import type { Run, RunStatus, TestCase, TestResult } from '@healix/core';
  */
 
 /** Run statuses that can no longer change. A terminal run cannot be cancelled. */
-export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = ['passed', 'failed', 'error', 'cancelled'];
+export const TERMINAL_RUN_STATUSES: readonly RunStatus[] = [
+  'passed',
+  'failed',
+  'blocked',
+  'error',
+  'cancelled',
+];
 
 export function isTerminalRunStatus(status: RunStatus): boolean {
   return TERMINAL_RUN_STATUSES.includes(status);

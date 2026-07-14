@@ -569,7 +569,7 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(done?.message).toMatch(/no runnable specs|verified nothing/i);
   });
 
-  it('FALSE-GREEN GUARD: an all-blocked outcome settles as error, not passed', async () => {
+  it('FALSE-GREEN GUARD: an all-blocked outcome settles as blocked, not passed', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'All Blocked Demo',
@@ -578,7 +578,7 @@ describe('orchestrator paths (offline DI seam)', () => {
     });
 
     // Specs generate fine, but every test is blocked (e.g. missing Tier-B auth):
-    // nothing actually passed, so the run must be 'error', never a false green.
+    // nothing was verified, so the run settles as 'blocked' — never a false green.
     const allBlocked: ExecOutcome = {
       passed: 0,
       failed: 0,
@@ -603,14 +603,62 @@ describe('orchestrator paths (offline DI seam)', () => {
       { onEvent: (e) => events.push(e) },
     );
 
-    expect(summary.status).toBe('error');
+    expect(summary.status).toBe('blocked');
     expect(summary.outcome?.blocked).toBe(2);
     expect(summary.outcome?.passed).toBe(0);
-    expect(store.getRun(summary.runId)?.status).toBe('error');
+    expect(store.getRun(summary.runId)?.status).toBe('blocked');
 
     const done = events.find((e) => e.phase === 'done');
-    expect(done?.level).toBe('error');
-    expect(done?.message).toMatch(/no tests passed|verified nothing/i);
+    expect(done?.level).toBe('warn');
+    expect(done?.message).toMatch(/blocked.*could not be verified/i);
+  });
+
+  it('MIXED-BLOCKED GUARD: passes + blocked settles as blocked (never passed) and blocked outcomes are triaged', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Mixed Blocked Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // The defect-leakage shape from the field: most tests pass, a couple are
+    // blocked. The old contract headlined this 'passed' and skipped triage for
+    // the blocked entries — hiding whatever sat behind them.
+    const mixed: ExecOutcome = {
+      passed: 8,
+      failed: 0,
+      blocked: 2,
+      flaky: 0,
+      results: [
+        { title: 'Home loads', status: 'passed', durationMs: 5 },
+        { title: 'Dashboard greeting', status: 'blocked', durationMs: 6, error: 'prerequisite failed' },
+        { title: 'Badge count', status: 'blocked', durationMs: 6, error: 'prerequisite failed' },
+      ],
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(mixed),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    expect(summary.status).toBe('blocked');
+    expect(store.getRun(summary.runId)?.status).toBe('blocked');
+
+    // Blocked outcomes reach triage (they used to be silently skipped).
+    const report = JSON.parse(await readFile(summary.reportPath as string, 'utf8')) as {
+      triage: Array<{ title: string }>;
+    };
+    const triagedTitles = report.triage.map((t) => t.title);
+    expect(triagedTitles).toContain('Dashboard greeting');
+    expect(triagedTitles).toContain('Badge count');
   });
 
   it('TRIAGE AI ESCALATION: a failed spec drives an AI-escalated triage call with a per-call abort signal', async () => {

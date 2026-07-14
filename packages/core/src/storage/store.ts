@@ -141,7 +141,7 @@ export class HealixStore {
     const result = this.db
       .prepare(
         `UPDATE runs SET status = 'error', finished_at = ?
-         WHERE status NOT IN ('passed', 'failed', 'error', 'cancelled') AND created_at < ?`,
+         WHERE status NOT IN ('passed', 'failed', 'blocked', 'error', 'cancelled') AND created_at < ?`,
       )
       .run(new Date().toISOString(), cutoff);
     return Number(result.changes ?? 0);

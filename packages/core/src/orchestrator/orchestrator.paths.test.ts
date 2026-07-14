@@ -768,7 +768,9 @@ describe('orchestrator paths (offline DI seam)', () => {
     const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
 
     // Rung 1 fired exactly once and the retried launch carried the run to green.
-    expect(installs).toEqual([['npm', 'install']]);
+    // (The suite top-up phase may also use the exec seam for git plumbing —
+    // only non-git invocations belong to the recovery ladder.)
+    expect(installs.filter((c) => c[0] !== 'git')).toEqual([['npm', 'install']]);
     expect(launches).toBe(2);
     expect(summary.status).toBe('passed');
   });
@@ -833,5 +835,230 @@ describe('orchestrator paths (offline DI seam)', () => {
     const launchError = events.find((e) => e.phase === 'launch' && e.level === 'error');
     expect(launchError?.message).toMatch(/could not be started/i);
   });
-});
+  it('SUITE TOP-UP: seeds the canonical suite, generates only uncovered items, banks + commits the new spec', async () => {
+    const { mkdir: mkdirP, writeFile: writeFileP } = await import('node:fs/promises');
+    const { execFileSync } = await import('node:child_process');
+    const { existsSync } = await import('node:fs');
 
+    // A real temp git repo holding the app + an existing canonical suite that
+    // already covers REQ-001 (as if a teammate committed it).
+    const repo = mkdtempSync(join(tmpdir(), 'healix-topup-repo-'));
+    const git = (...args: string[]): string => execFileSync('git', args, { cwd: repo, encoding: 'utf-8' });
+    git('init', '-q');
+    git('config', 'user.email', 'test@healix.dev');
+    git('config', 'user.name', 'Healix Test');
+    git('config', 'commit.gpgsign', 'false');
+    await writeFileP(join(repo, 'app.js'), 'console.log(1);\n', 'utf-8');
+    const canonicalSpecDir = join(repo, '.healix', 'suite', 'tests', 'tierA-public');
+    await mkdirP(canonicalSpecDir, { recursive: true });
+    await writeFileP(
+      join(canonicalSpecDir, 'home-loads.spec.ts'),
+      "import { test, expect } from '@playwright/test';\ntest('[REQ:REQ-001] Home loads', async ({ page }) => { await page.goto('/'); await expect(page).toHaveTitle(/./); });\n",
+      'utf-8',
+    );
+    git('add', '.');
+    git('commit', '-qm', 'app + teammate suite');
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({ name: 'TopUp Demo', mode: 'playwright', repoPath: repo });
+
+    // Custom mode: records the plan it is given, writes a REAL spec file for
+    // each item into the run suite, and reports every spec (seeded + new) green.
+    const plansSeen: TestPlan[] = [];
+    const mode: TestMode = {
+      ...makeFakeMode(ALL_PASS_OUTCOME),
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        plansSeen.push(plan);
+        const out: GeneratedSpec[] = [];
+        for (const item of plan.items) {
+          const rel = join('tests', 'tierB-auth', 'login-works.spec.ts');
+          const abs = join(ctx.projectDir, rel);
+          const contents = `import { test, expect } from '@playwright/test';\ntest('[REQ:${item.reqTag}] ${item.title}', async ({ page }) => { await page.goto('/login'); await expect(page).toHaveTitle(/./); });\n`;
+          await mkdirP(join(abs, '..'), { recursive: true });
+          await writeFileP(abs, contents, 'utf-8');
+          out.push({
+            path: abs,
+            title: `[REQ:${item.reqTag}] ${item.title}`,
+            reqTag: item.reqTag ?? 'X',
+            tier: 'tierB-auth',
+            contents,
+          });
+        }
+        return out;
+      },
+      async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        return {
+          passed: specs.length,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results: specs.map((s) => ({ title: s.title, status: 'passed' as const, durationMs: 3 })),
+        };
+      },
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+    expect(summary.status).toBe('passed');
+
+    // Dedup: REQ-001 was covered by the seeded suite, so generation received ONLY REQ-002.
+    expect(plansSeen).toHaveLength(1);
+    expect(plansSeen[0].items.map((i) => i.reqTag)).toEqual(['REQ-002']);
+
+    // The validated new spec was banked into the canonical suite...
+    expect(existsSync(join(repo, '.healix', 'suite', 'tests', 'tierB-auth', 'login-works.spec.ts'))).toBe(
+      true,
+    );
+    const manifestRaw = await readFile(join(repo, '.healix', 'suite', 'manifest.json'), 'utf8');
+    const manifest = JSON.parse(manifestRaw) as {
+      specs: Record<string, { file: string }>;
+      lastRun?: { runId: string };
+    };
+    expect(manifest.specs['REQ-002']?.file).toBe('tests/tierB-auth/login-works.spec.ts');
+    expect(manifest.lastRun?.runId).toBe(summary.runId);
+
+    // ...and committed with the healix top-up message, scoped to the suite dir.
+    const lastCommit = git('log', '-1', '--pretty=%s');
+    expect(lastCommit).toMatch(/test\(healix\): top up suite \(\+1 spec\)/);
+    const committedFiles = git('show', '--name-only', '--pretty=format:', 'HEAD').trim().split('\n');
+    expect(committedFiles).toContain('.healix/suite/tests/tierB-auth/login-works.spec.ts');
+    expect(committedFiles).toContain('.healix/suite/manifest.json');
+
+    rmSync(repo, { recursive: true, force: true });
+  });
+  it('HEAL: a test_is_wrong failure gets one repair + targeted re-run, and the outcome updates honestly', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Heal Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const badSpec: GeneratedSpec = {
+      path: '/virtual/tests/tierA-public/badge.spec.ts',
+      title: '[REQ:REQ-009] Badge shows count',
+      reqTag: 'REQ-009',
+      tier: 'tierA-public',
+      contents: "test('[REQ:REQ-009] Badge shows count', () => {});",
+    };
+    // Deterministic triage rule input: "resolved to 0 elements" → test_is_wrong.
+    const selectorError =
+      "Error: locator.click: Error: locator resolved to 0 elements — waiting for getByTestId('open-count')";
+
+    const executeCalls: Array<{ only?: string[] }> = [];
+    let repairCalls = 0;
+    const mode: TestMode = {
+      ...makeFakeMode(ALL_PASS_OUTCOME),
+      async generate(): Promise<GeneratedSpec[]> {
+        return [{ ...badSpec }];
+      },
+      async execute(_ctx, specs, opts): Promise<ExecOutcome> {
+        executeCalls.push({ ...(opts?.only ? { only: opts.only } : {}) });
+        if (opts?.only && opts.only.length > 0) {
+          // Targeted repair verification run: the repaired spec passes.
+          return {
+            passed: 1,
+            failed: 0,
+            blocked: 0,
+            flaky: 0,
+            results: [{ title: badSpec.title, status: 'passed', durationMs: 4 }],
+          };
+        }
+        return {
+          passed: 0,
+          failed: 1,
+          blocked: 0,
+          flaky: 0,
+          results: [{ title: badSpec.title, status: 'failed', durationMs: 9, error: selectorError }],
+        };
+      },
+      async repair(_ctx, spec): Promise<GeneratedSpec | null> {
+        repairCalls += 1;
+        return { ...spec, contents: spec.contents.replace('open-count', 'open-count-fixed') };
+      },
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    // Exactly one repair, verified by exactly one targeted re-run.
+    expect(repairCalls).toBe(1);
+    expect(executeCalls.filter((c) => c.only)).toHaveLength(1);
+    // The healed run settles green and the outcome reflects the repair.
+    expect(summary.status).toBe('passed');
+    expect(summary.outcome?.failed).toBe(0);
+    expect(summary.outcome?.passed).toBe(1);
+    expect(events.some((e) => e.phase === 'heal' && /Repaired and verified/.test(e.message))).toBe(true);
+  });
+
+  it('HEAL: app_is_wrong failures are NEVER repaired — the defect is surfaced, not masked', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No Mask Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const spec: GeneratedSpec = {
+      path: '/virtual/tests/tierA-public/badge.spec.ts',
+      title: '[REQ:REQ-007] Badge equals open count',
+      reqTag: 'REQ-007',
+      tier: 'tierA-public',
+      contents: "test('[REQ:REQ-007] Badge equals open count', () => {});",
+    };
+    // Deterministic triage: a content assertion (toHaveText …) → app_is_wrong.
+    const contentAssertError =
+      'Error: expect(locator).toHaveText(expected) failed\nExpected string: "3 open tasks"\nReceived string: "2 open tasks"';
+
+    let repairCalls = 0;
+    const mode: TestMode = {
+      ...makeFakeMode(ALL_PASS_OUTCOME),
+      async generate(): Promise<GeneratedSpec[]> {
+        return [{ ...spec }];
+      },
+      async execute(): Promise<ExecOutcome> {
+        return {
+          passed: 0,
+          failed: 1,
+          blocked: 0,
+          flaky: 0,
+          results: [{ title: spec.title, status: 'failed', durationMs: 9, error: contentAssertError }],
+        };
+      },
+      async repair(): Promise<GeneratedSpec | null> {
+        repairCalls += 1;
+        return spec;
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    expect(repairCalls).toBe(0);
+    expect(summary.status).toBe('failed');
+    expect(summary.outcome?.failed).toBe(1);
+  });
+});

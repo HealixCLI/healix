@@ -153,13 +153,15 @@ describe('execute — cooperative cancellation', () => {
 
 type PwReportArg = Parameters<typeof parseReport>[0];
 
-function report(specs: Array<{
-  title: string;
-  file?: string;
-  projectName: string;
-  status: string;
-  error?: string;
-}>): PwReportArg {
+function report(
+  specs: Array<{
+    title: string;
+    file?: string;
+    projectName: string;
+    status: string;
+    error?: string;
+  }>,
+): PwReportArg {
   return {
     suites: [
       {
@@ -216,7 +218,13 @@ describe('parseReport — structural Tier B classification', () => {
       performedLogin: false,
     };
     const r = report([
-      { title: 'authenticate', file: 'fixtures/auth.setup.ts', projectName: 'auth-setup', status: 'failed', error: 'getByLabel(/email/i) not found on login page' },
+      {
+        title: 'authenticate',
+        file: 'fixtures/auth.setup.ts',
+        projectName: 'auth-setup',
+        status: 'failed',
+        error: 'getByLabel(/email/i) not found on login page',
+      },
       { title: 'dashboard greeting', projectName: 'tierB-auth', status: 'skipped' },
       { title: 'add task', projectName: 'tierB-auth', status: 'failed', error: 'timed out' },
     ]);
@@ -233,7 +241,12 @@ describe('parseReport — structural Tier B classification', () => {
   it('marks Tier B failures BLOCKED when the setup ran without credentials (anonymous session)', () => {
     const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: false };
     const r = report([
-      { title: 'dashboard greeting', projectName: 'tierB-auth', status: 'failed', error: 'expected /dashboard got /login' },
+      {
+        title: 'dashboard greeting',
+        projectName: 'tierB-auth',
+        status: 'failed',
+        error: 'expected /dashboard got /login',
+      },
       { title: 'landing renders', projectName: 'tierA-public', status: 'passed' },
     ]);
     const parsed = parseReport(r, auth);
@@ -245,7 +258,12 @@ describe('parseReport — structural Tier B classification', () => {
   it('never downgrades when login state is unknown (older suites without the sidecar)', () => {
     const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: null };
     const r = report([
-      { title: 'dashboard greeting', projectName: 'tierB-auth', status: 'failed', error: 'unauthorized 401 session storageState' },
+      {
+        title: 'dashboard greeting',
+        projectName: 'tierB-auth',
+        status: 'failed',
+        error: 'unauthorized 401 session storageState',
+      },
     ]);
     const parsed = parseReport(r, auth);
     expect(parsed.results[0]?.status).toBe('failed');
@@ -255,7 +273,12 @@ describe('parseReport — structural Tier B classification', () => {
   it('never touches non-Tier-B failures regardless of error text', () => {
     const auth: AuthSignals = { setupFailed: true, setupError: 'boom', performedLogin: false };
     const r = report([
-      { title: 'login form present', projectName: 'tierA-public', status: 'failed', error: 'sign in button storageState 401' },
+      {
+        title: 'login form present',
+        projectName: 'tierA-public',
+        status: 'failed',
+        error: 'sign in button storageState 401',
+      },
     ]);
     const parsed = parseReport(r, auth);
     expect(parsed.results[0]?.status).toBe('failed');
@@ -266,7 +289,13 @@ describe('parseReport — structural Tier B classification', () => {
 describe('findAuthSetupOutcome', () => {
   it('detects a failed auth-setup by project name or file and captures its error', () => {
     const r = report([
-      { title: 'authenticate', file: 'fixtures/auth.setup.ts', projectName: 'auth-setup', status: 'failed', error: 'no email field' },
+      {
+        title: 'authenticate',
+        file: 'fixtures/auth.setup.ts',
+        projectName: 'auth-setup',
+        status: 'failed',
+        error: 'no email field',
+      },
       { title: 'other', projectName: 'tierA-public', status: 'passed' },
     ]);
     expect(findAuthSetupOutcome(r)).toEqual({ failed: true, error: 'no email field' });

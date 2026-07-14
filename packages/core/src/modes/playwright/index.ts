@@ -3,6 +3,7 @@ import { join, relative } from 'node:path';
 
 import type {
   ExecOutcome,
+  ExecuteOptions,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
@@ -10,7 +11,7 @@ import type {
   TestPlan,
 } from '../types.js';
 import { scaffold } from './scaffold.js';
-import { generate } from './generate.js';
+import { generate, repairSpec } from './generate.js';
 import { execute } from './execute.js';
 
 /** Directories whose presence is purely build/runtime noise — never traversed for export. */
@@ -73,8 +74,12 @@ export function createPlaywrightMode(): TestMode {
       return generate(ctx, plan);
     },
 
-    execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-      return execute(ctx, specs);
+    execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: ExecuteOptions): Promise<ExecOutcome> {
+      return execute(ctx, specs, opts);
+    },
+
+    repair(ctx: TestModeContext, spec: GeneratedSpec, error: string): Promise<GeneratedSpec | null> {
+      return repairSpec(ctx, spec, error);
     },
 
     async collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }> {

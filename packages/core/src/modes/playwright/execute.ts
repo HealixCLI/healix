@@ -93,7 +93,7 @@ interface RawCommand {
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
-function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
+function runPlaywright(ctx: TestModeContext, only: string[] = []): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
     // Cancelled before we even spawned — return immediately; nothing to kill.
     if (ctx.signal?.aborted) {
@@ -111,7 +111,9 @@ function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
     // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
-    const args = ['playwright', 'test'];
+    // A targeted pass (repair re-runs) appends spec paths as Playwright file
+    // filters; project dependencies (auth-setup) still run automatically.
+    const args = ['playwright', 'test', ...only];
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -430,7 +432,10 @@ function projectIsTierB(projectName: string | undefined): boolean {
 
 /** The auth-setup project/spec that produces the Tier B storageState. */
 function isAuthSetup(projectName: string | undefined, file: string | undefined): boolean {
-  return /auth[-._ ]?setup/i.test(String(projectName ?? '')) || /auth\.setup\.[cm]?[jt]sx?$/i.test(String(file ?? ''));
+  return (
+    /auth[-._ ]?setup/i.test(String(projectName ?? '')) ||
+    /auth\.setup\.[cm]?[jt]sx?$/i.test(String(file ?? ''))
+  );
 }
 
 /**
@@ -483,7 +488,11 @@ async function readSetupMeta(projectDir: string): Promise<boolean | null> {
   try {
     const raw = await readFile(join(projectDir, 'fixtures', '.auth', 'setup-meta.json'), 'utf-8');
     const meta: unknown = JSON.parse(raw);
-    if (meta && typeof meta === 'object' && typeof (meta as { performedLogin?: unknown }).performedLogin === 'boolean') {
+    if (
+      meta &&
+      typeof meta === 'object' &&
+      typeof (meta as { performedLogin?: unknown }).performedLogin === 'boolean'
+    ) {
       return (meta as { performedLogin: boolean }).performedLogin;
     }
   } catch {
@@ -559,7 +568,9 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       if (projectIsTierB(test.projectName)) {
         if (auth.setupFailed && (status === 'failed' || status === 'skipped')) {
           status = 'blocked';
-          errText = errText || `Auth setup failed — Tier B prerequisite not met.${auth.setupError ? `\n${auth.setupError}` : ''}`;
+          errText =
+            errText ||
+            `Auth setup failed — Tier B prerequisite not met.${auth.setupError ? `\n${auth.setupError}` : ''}`;
         } else if (status === 'failed' && auth.performedLogin === false) {
           status = 'blocked';
           errText = `Tier B ran without credentials (no HEALIX_TIERB_* configured; anonymous session).\n${errText}`;
@@ -681,7 +692,11 @@ function abortedOutcome(exitCode: number | null = null): ExecOutcome {
  * aborted outcome (raw.aborted) is returned so callers can distinguish
  * "cancelled" from "ran and everything failed".
  */
-export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+export async function execute(
+  ctx: TestModeContext,
+  specs: GeneratedSpec[],
+  opts: { only?: string[] } = {},
+): Promise<ExecOutcome> {
   emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
 
   if (specs.length === 0) {
@@ -699,7 +714,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
-  let cmd = await runPlaywright(ctx);
+  let cmd = await runPlaywright(ctx, opts.only ?? []);
 
   // Cancelled during (or right before) the run: partial results are
   // meaningless and would mislabel interrupted tests as failures — discard
@@ -721,7 +736,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
-    cmd = await runPlaywright(ctx);
+    cmd = await runPlaywright(ctx, opts.only ?? []);
 
     // The retry run can be cancelled too (as can the install before it).
     if (cmd.aborted || ctx.signal?.aborted) {

@@ -342,10 +342,15 @@ async function runPipeline(
     const mode = getMode(project.mode);
 
     // ---- 6. EXPLORE (best-effort) ----
+    // Runs in BOTH exploration modes whenever a live URL exists: the DOM
+    // snapshot grounds GENERATE in real selectors either way. Codegen mode
+    // used to skip this entirely, so its specs guessed routes/locators blind —
+    // the dominant source of test_is_wrong failures. Frame mirroring (the live
+    // browser view in the desktop app) stays a computer-use-only feature.
     if (checkCancelled()) return cancelRun('explore');
-    if (effectiveBaseUrl && ctx.explorationMode === 'computer-use') {
+    if (effectiveBaseUrl) {
       setStatus('exploring');
-      emit('explore', 'info', `Exploring ${effectiveBaseUrl} (computer-use).`);
+      emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
       // Live frame mirroring is best-effort and must never abort the run; the
       // subscription + browser teardown both happen in this phase's finally.
       let unsubFrames: (() => void) | null = null;
@@ -353,7 +358,7 @@ async function runPipeline(
         await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
         await browser.goto(effectiveBaseUrl);
         // Subscribe AFTER start/goto so the UI only mirrors the live page.
-        if (hooks?.onFrame) {
+        if (hooks?.onFrame && ctx.explorationMode === 'computer-use') {
           try {
             unsubFrames = browser.onFrame(hooks.onFrame);
           } catch (err) {
@@ -362,8 +367,8 @@ async function runPipeline(
         }
         const snap = await browser.snapshot();
         // Ground GENERATE in what we actually observed: the interactive-element
-        // inventory is fed into the generation prompt so computer-use specs
-        // target real selectors instead of guessing (was captured, then dropped).
+        // inventory is fed into the generation prompt so specs target real
+        // selectors instead of guessing (was captured, then dropped).
         ctx.snapshot = snap;
         emit('explore', 'info', `Explored "${snap.title}".`, {
           url: snap.url,
@@ -472,12 +477,15 @@ async function runPipeline(
     // few failures we additionally try AI analyze() with a short per-call timeout
     // and merge its verdict/confidence in; analyze() already falls back to
     // classify() internally, so the baseline is never lost. Triage never aborts.
+    // Blocked outcomes are triaged too: a blocked test is precisely where
+    // classification is least certain (was it really a prerequisite failure,
+    // or a mislabeled defect?), so skipping them hid defects from the report.
     if (checkCancelled()) return cancelRun('triage');
     setStatus('triaging');
     try {
-      const failed = outcome.results.filter((r) => r.status === 'failed');
+      const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
-        emit('triage', 'info', `Triaging ${failed.length} failure(s).`);
+        emit('triage', 'info', `Triaging ${failed.length} failure(s)/blocked outcome(s).`);
         const engine = createTriageEngine();
         let aiBudget = TRIAGE_AI_LIMIT;
         for (const r of failed) {
@@ -561,14 +569,18 @@ async function runPipeline(
       emit('export', 'warn', `Export failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
     }
 
-    // A run only "passes" when at least one test actually passed and none
-    // failed. A run that produced no runnable specs, or where every test was
-    // blocked (e.g. missing Tier-B auth), has verified nothing — reporting it
-    // 'passed' would be a false green (CI would go green having tested nothing),
-    // so it settles as 'error' with an explanatory event.
+    // Honest final status:
+    //  - any failure → 'failed';
+    //  - no failures but ≥1 blocked test → 'blocked' (a prerequisite such as
+    //    Tier-B auth was not met, so part of the plan was NOT verified —
+    //    headlining it 'passed' hid real defects behind blocked entries);
+    //  - all green with ≥1 pass → 'passed';
+    //  - nothing ran at all → 'error' ("verified nothing").
     let finalStatus: RunStatus;
     if (outcome.failed > 0) {
       finalStatus = 'failed';
+    } else if (outcome.blocked > 0) {
+      finalStatus = 'blocked';
     } else if (outcome.passed > 0) {
       finalStatus = 'passed';
     } else {
@@ -576,17 +588,20 @@ async function runPipeline(
     }
     setStatus(finalStatus, { finishedAt: nowIso() });
     if (finalStatus === 'error') {
-      const reason =
-        outcome.results.length === 0
-          ? 'no runnable specs were produced'
-          : `no tests passed (${outcome.blocked} blocked)`;
-      emit('done', 'error', `Run verified nothing: ${reason}.`, {
+      emit('done', 'error', 'Run verified nothing: no runnable specs were produced.', {
         runId,
         status: finalStatus,
         passed: outcome.passed,
         failed: outcome.failed,
         blocked: outcome.blocked,
       });
+    } else if (finalStatus === 'blocked') {
+      emit(
+        'done',
+        'warn',
+        `Run blocked: ${outcome.blocked} test(s) could not be verified (prerequisite failed); ${outcome.passed} passed.`,
+        { runId, status: finalStatus, passed: outcome.passed, blocked: outcome.blocked },
+      );
     } else {
       emit('done', 'info', `Run ${finalStatus}.`, { runId, status: finalStatus });
     }

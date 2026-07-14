@@ -377,7 +377,7 @@ function ArtifactsGallery({
   }, [focusFolder]);
 
   if (artifacts.length === 0) {
-    const running = !['passed', 'failed', 'error', 'cancelled'].includes(runStatus);
+    const running = !['passed', 'failed', 'blocked', 'error', 'cancelled'].includes(runStatus);
     return (
       <div className="flex h-full flex-col items-center justify-center gap-2 py-10 text-center">
         <Camera className="h-7 w-7 text-muted/50" />

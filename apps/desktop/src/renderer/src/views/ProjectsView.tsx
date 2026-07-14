@@ -11,8 +11,15 @@ import { Label } from '../components/ui/label';
 import { Select } from '../components/ui/select';
 import { useProjects } from '../lib/use-projects';
 
-/** Which form (if any) is currently shown: closed, creating a new project, or editing an existing one. */
-type FormState = { kind: 'closed' } | { kind: 'create' } | { kind: 'edit'; project: Project };
+/**
+ * Which form (if any) is currently shown: closed, creating a new project,
+ * editing an existing one, or viewing an existing one read-only.
+ */
+type FormState =
+  | { kind: 'closed' }
+  | { kind: 'create' }
+  | { kind: 'edit'; project: Project }
+  | { kind: 'view'; project: Project };
 
 export function ProjectsView({ onRunProject }: { onRunProject?: (project: Project) => void }) {
   const { projects, loading, error, create, update, remove, archive } = useProjects();
@@ -52,6 +59,14 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
           onDone={closeForm}
         />
       )}
+      {formState.kind === 'view' && (
+        <ProjectForm
+          project={formState.project}
+          readOnly
+          onEdit={() => setFormState({ kind: 'edit', project: formState.project })}
+          onDone={closeForm}
+        />
+      )}
 
       <section className="mt-6 flex flex-col gap-2">
         {loading && <p className="text-sm text-muted">Loading projects…</p>}
@@ -66,6 +81,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
           <ProjectRow
             key={p.id}
             project={p}
+            onView={() => setFormState({ kind: 'view', project: p })}
             onEdit={() => setFormState({ kind: 'edit', project: p })}
             onDelete={() => void remove(p.id)}
             onArchive={() => void archive(p.id, true)}
@@ -86,6 +102,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
               <ProjectRow
                 key={p.id}
                 project={p}
+                onView={() => setFormState({ kind: 'view', project: p })}
                 onEdit={() => setFormState({ kind: 'edit', project: p })}
                 onDelete={() => void remove(p.id)}
                 onUnarchive={() => void archive(p.id, false)}
@@ -110,6 +127,7 @@ function shortenPath(p: string, segments = 2): string {
 
 function ProjectRow({
   project,
+  onView,
   onEdit,
   onDelete,
   onArchive,
@@ -117,6 +135,7 @@ function ProjectRow({
   onRun,
 }: {
   project: Project;
+  onView: () => void;
   onEdit: () => void;
   onDelete: () => void;
   onArchive?: () => void;
@@ -127,9 +146,14 @@ function ProjectRow({
   return (
     <Card className={isArchived ? 'opacity-70' : undefined}>
       <CardContent className="flex items-center justify-between gap-3 px-4 py-2.5">
-        <div className="min-w-0">
+        <button
+          type="button"
+          onClick={onView}
+          className="min-w-0 flex-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+          title="View project details"
+        >
           <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-medium text-fg">{project.name}</span>
+            <span className="truncate text-sm font-medium text-fg hover:underline">{project.name}</span>
             <Badge tone="muted">{project.mode}</Badge>
             {isArchived && <Badge tone="muted">archived</Badge>}
           </div>
@@ -149,7 +173,7 @@ function ProjectRow({
             )}
             {!project.repoPath && !project.baseUrl && <span>No repo or URL set</span>}
           </div>
-        </div>
+        </button>
         <div className="flex shrink-0 items-center gap-1">
           {onRun && (
             <Button size="sm" variant="outline" onClick={onRun}>
@@ -236,22 +260,29 @@ function isValidBaseUrl(raw: string): boolean {
 }
 
 /**
- * Shared create/edit form. In create mode `project` is omitted and fields start
- * blank; in edit mode `project` seeds every field with its current value, all
- * still freely editable, and submitting calls the same onSubmit with the full
- * (possibly unchanged) NewProject shape — the caller decides whether that means
- * create() or update(project.id, ...).
+ * Shared create/edit/view form. In create mode `project` is omitted and fields
+ * start blank; in edit mode `project` seeds every field with its current value,
+ * all still freely editable, and submitting calls the same onSubmit with the
+ * full (possibly unchanged) NewProject shape — the caller decides whether that
+ * means create() or update(project.id, ...). In `readOnly` mode (always paired
+ * with a `project`) every field is shown but disabled, there is no submit —
+ * just an Edit button (if `onEdit` is given) and a Close button — so it's
+ * purely a details view with a way to switch into editing the same project.
  */
 function ProjectForm({
   project,
   onSubmit,
+  onEdit,
   onDone,
+  readOnly = false,
 }: {
   project?: Project;
-  onSubmit: (input: NewProject) => Promise<Project | null>;
+  onSubmit?: (input: NewProject) => Promise<Project | null>;
+  onEdit?: () => void;
   onDone: () => void;
+  readOnly?: boolean;
 }) {
-  const isEdit = project !== undefined;
+  const isEdit = project !== undefined && !readOnly;
   const [name, setName] = useState(project?.name ?? '');
   const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
   const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
@@ -267,7 +298,7 @@ function ProjectForm({
 
   const submit = async (e: FormEvent): Promise<void> => {
     e.preventDefault();
-    if (!canSubmit) return;
+    if (readOnly || !onSubmit || !canSubmit) return;
     setSubmitting(true);
     const saved = await onSubmit({
       name: trimmedName,
@@ -286,10 +317,12 @@ function ProjectForm({
     }
   };
 
+  const title = readOnly ? `View "${project?.name}"` : isEdit ? `Edit "${project?.name}"` : 'New project';
+
   return (
     <Card className="mt-5">
       <CardHeader>
-        <CardTitle>{isEdit ? `Edit "${project.name}"` : 'New project'}</CardTitle>
+        <CardTitle>{title}</CardTitle>
       </CardHeader>
       <CardContent>
         <form className="grid grid-cols-1 gap-4 sm:grid-cols-2" onSubmit={submit}>
@@ -298,8 +331,9 @@ function ProjectForm({
               value={name}
               onChange={(e) => setName(e.target.value)}
               placeholder="Acme web app"
-              autoFocus
+              autoFocus={!readOnly}
               required
+              disabled={readOnly}
             />
           </Field>
           <Field label="Repo path (white-box)">
@@ -308,6 +342,7 @@ function ProjectForm({
               onChange={(e) => setRepoPath(e.target.value)}
               placeholder="/Users/me/code/acme"
               className="font-mono"
+              disabled={readOnly}
             />
           </Field>
           <Field label="Base URL (black-box)">
@@ -317,29 +352,44 @@ function ProjectForm({
               placeholder="https://app.acme.test"
               className="font-mono"
               aria-invalid={baseUrlInvalid}
+              disabled={readOnly}
             />
-            {baseUrlInvalid && (
+            {!readOnly && baseUrlInvalid && (
               <p className="mt-1 text-xs text-err">Enter a valid http(s) URL, e.g. https://app.acme.test</p>
             )}
           </Field>
           <Field label="Mode">
-            <Select value={mode} onChange={(e) => setMode(e.target.value as 'playwright')}>
+            <Select value={mode} onChange={(e) => setMode(e.target.value as 'playwright')} disabled={readOnly}>
               <option value="playwright">playwright</option>
             </Select>
           </Field>
-          <div className="flex flex-wrap items-center justify-between gap-2 sm:col-span-2">
-            <p className={`text-xs ${hasTarget ? 'text-muted' : 'text-err'}`}>
-              A project needs a repo path or a base URL — set at least one.
-            </p>
-            <div className="flex items-end justify-end gap-2">
+          {readOnly ? (
+            <div className="flex items-center justify-end gap-2 sm:col-span-2">
+              {onEdit && (
+                <Button type="button" variant="outline" onClick={onEdit}>
+                  <Pencil className="h-3.5 w-3.5" />
+                  Edit
+                </Button>
+              )}
               <Button type="button" variant="ghost" onClick={onDone}>
-                Cancel
-              </Button>
-              <Button type="submit" disabled={!canSubmit}>
-                {submitting ? 'Saving…' : isEdit ? 'Save changes' : 'Create project'}
+                Close
               </Button>
             </div>
-          </div>
+          ) : (
+            <div className="flex flex-wrap items-center justify-between gap-2 sm:col-span-2">
+              <p className={`text-xs ${hasTarget ? 'text-muted' : 'text-err'}`}>
+                A project needs a repo path or a base URL — set at least one.
+              </p>
+              <div className="flex items-end justify-end gap-2">
+                <Button type="button" variant="ghost" onClick={onDone}>
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={!canSubmit}>
+                  {submitting ? 'Saving…' : isEdit ? 'Save changes' : 'Create project'}
+                </Button>
+              </div>
+            </div>
+          )}
         </form>
       </CardContent>
     </Card>

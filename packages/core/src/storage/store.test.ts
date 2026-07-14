@@ -176,6 +176,46 @@ describe('deleteProject cascade', () => {
   });
 });
 
+describe('updateProject', () => {
+  it('persists edited fields and returns the updated project', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'Original', baseUrl: 'https://original.test' });
+
+    const updated = s.updateProject(project.id, {
+      name: 'Renamed',
+      mode: 'playwright',
+      repoPath: '/Users/me/code/renamed',
+      baseUrl: null,
+    });
+
+    expect(updated).toMatchObject({
+      id: project.id,
+      name: 'Renamed',
+      repoPath: '/Users/me/code/renamed',
+      baseUrl: null,
+    });
+    // createdAt is preserved across the edit — only editable fields change.
+    expect(updated.createdAt).toBe(project.createdAt);
+    expect(s.getProject(project.id)).toMatchObject({ name: 'Renamed', repoPath: '/Users/me/code/renamed' });
+  });
+
+  it('throws and persists nothing when the edit would violate the invariant', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'Original', baseUrl: 'https://original.test' });
+
+    expect(() => s.updateProject(project.id, { name: 'Original' })).toThrow(/repo path or a base URL/i);
+    // Rejected edit must not have touched the stored row.
+    expect(s.getProject(project.id)).toMatchObject({ name: 'Original', baseUrl: 'https://original.test' });
+  });
+
+  it('throws for an unknown project id', async () => {
+    const s = await store();
+    expect(() => s.updateProject('prj_does_not_exist', { name: 'X', baseUrl: 'https://x.test' })).toThrow(
+      /not found/i,
+    );
+  });
+});
+
 describe('deleteRun cascade', () => {
   it('removes the run and its descendants without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();

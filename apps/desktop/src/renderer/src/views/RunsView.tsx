@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExplorationMode, Project } from '@healix/core';
-import { Loader2, Play, RotateCcw, Square } from 'lucide-react';
+import { Loader2, Play, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -42,6 +42,19 @@ const PHASE_LABEL: Record<RunPhase, string> = {
 /** Engine phases in which the run has settled and a new one can be started. */
 const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
 
+/**
+ * Pick the mode that matches how a project is actually configured: a repo path
+ * means white-box source is available, so Codegen can read and generate real
+ * specs from it (repo path wins when both are set); a base-URL-only project
+ * has no source to read, so Computer-use (live exploration) is the only mode
+ * that makes sense.
+ */
+function deriveMode(project: Project | undefined): ExplorationMode {
+  if (project?.repoPath) return 'codegen';
+  if (project?.baseUrl) return 'computer-use';
+  return 'codegen';
+}
+
 export function RunsView({ initialProjectId }: { initialProjectId?: string | null }) {
   const { projects, loading: projectsLoading } = useProjects();
   const engine = useRunEngine();
@@ -57,7 +70,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   // Session-only: resets to expanded on next launch.
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
 
-  const { detail, loading: detailLoading } = useRunDetail(selectedRunId);
+  const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
 
   // History rows may reference archived projects, so the lookup keeps ALL of
@@ -69,18 +82,45 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   }, [projects]);
   const runnable = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
 
-  // Default the selection to the deep-linked project, else the first project.
+  // Default the selection to the deep-linked project, else the first project —
+  // and derive Mode from whichever one that turns out to be (repo path vs.
+  // base URL), same as a manual project switch below.
   useEffect(() => {
     if (projectId) return;
-    if (initialProjectId && runnable.some((p) => p.id === initialProjectId)) {
-      setProjectId(initialProjectId);
-    } else if (runnable.length > 0) {
-      setProjectId(runnable[0].id);
-    }
+    const deepLinked = initialProjectId && runnable.find((p) => p.id === initialProjectId);
+    const picked = deepLinked || runnable[0];
+    if (!picked) return;
+    setProjectId(picked.id);
+    setMode(deriveMode(picked));
   }, [initialProjectId, runnable, projectId]);
 
   const isActive =
     engine.phase === 'starting' || engine.phase === 'running' || engine.phase === 'awaiting-approval';
+
+  // Re-attach to a run that's still genuinely parked awaiting approval in the
+  // main process — its approval promise only dies on app restart, not on
+  // navigating away from this view — but whose live engine state was lost
+  // because this component unmounted in the meantime. Triggered by explicitly
+  // selecting that run in history (not automatically on mount), so landing on
+  // Runs always shows the normal start-a-run screen, and other history rows
+  // stay freely browsable even while this one sits pending — see showLiveSurface.
+  const { hydrate } = engine;
+  useEffect(() => {
+    if (!selectedRunId || selectedRunId === engine.runId) return;
+    // useRunDetail keeps the PREVIOUS run's detail on screen until its own
+    // fetch for the new selectedRunId resolves — without this check, clicking
+    // a different history row could momentarily hydrate the engine with the
+    // prior row's stale plan/status before the real detail ever arrives.
+    if (!detail?.plan || detail.run?.id !== selectedRunId || detail.run.status !== 'awaiting-approval') {
+      return;
+    }
+    hydrate({ runId: selectedRunId, plan: detail.plan });
+    setProjectId(detail.run.projectId);
+    // The exploration mode (codegen vs. computer-use) isn't persisted on the
+    // run row — Run.mode is the test-framework mode ('playwright') — so it's
+    // re-derived from the project's config, same heuristic as a fresh pick.
+    setMode(deriveMode(projectsById.get(detail.run.projectId)));
+  }, [selectedRunId, detail, engine.runId, hydrate, projectsById]);
 
   // Clear the "Cancelling…" state once the run settles (run:done) or resets.
   useEffect(() => {
@@ -88,18 +128,26 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   }, [isActive]);
 
   // When a run finishes, refresh history and select the freshly-completed run.
+  // Also reload its detail bundle directly: setSelectedRunId(settledId) is a
+  // no-op re-render when it's already the current selection (e.g. rejecting/
+  // cancelling a run you were already viewing), so useRunDetail would
+  // otherwise never refetch and its status badge would stay stuck on
+  // whatever it read before the just-persisted change.
   const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
     if (SETTLED_PHASES.includes(engine.phase) && engine.runId) {
       if (lastSettledRef.current === engine.runId) return;
       lastSettledRef.current = engine.runId;
       const settledId = engine.runId;
-      void refreshRuns().then(() => setSelectedRunId(settledId));
+      void refreshRuns().then(() => {
+        setSelectedRunId(settledId);
+        void reloadDetail();
+      });
     }
     if (engine.phase === 'idle' || engine.phase === 'starting') {
       lastSettledRef.current = null;
     }
-  }, [engine.phase, engine.runId, refreshRuns]);
+  }, [engine.phase, engine.runId, refreshRuns, reloadDetail]);
 
   // Refresh as soon as the run gets an id, and again on every phase change
   // while active, so a brand-new run appears and phase transitions (e.g.
@@ -147,8 +195,13 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     setSelectedRunId(null);
   };
 
-  // The live run surface takes precedence; otherwise show the selected history detail.
-  const showLiveSurface = isActive || (engine.runId != null && selectedRunId == null);
+  // The live run surface takes precedence over a selected history detail — EXCEPT
+  // for a rehydrated (not-actually-live-this-session) pending approval, which is
+  // just one browsable history row: it only takes over while its OWN row is the
+  // one selected, so other rows stay freely inspectable while it sits pending.
+  const showLiveSurface = engine.hydrated
+    ? selectedRunId === engine.runId
+    : isActive || (engine.runId != null && selectedRunId == null);
 
   return (
     <div className="flex h-full min-h-0">
@@ -163,7 +216,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           runs={runs}
           loading={runsLoading}
           error={runsError}
-          selectedRunId={showLiveSurface ? null : selectedRunId}
+          selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
           onSelect={(id) => {
             setSelectedRunId(id);
           }}
@@ -197,7 +250,10 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 <Label className="mb-1.5 block">Project</Label>
                 <Select
                   value={projectId}
-                  onChange={(e) => setProjectId(e.target.value)}
+                  onChange={(e) => {
+                    setProjectId(e.target.value);
+                    setMode(deriveMode(projectsById.get(e.target.value)));
+                  }}
                   disabled={isActive || projectsLoading || runnable.length === 0}
                 >
                   {runnable.length === 0 && <option value="">No active projects — create one first</option>}
@@ -277,8 +333,10 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           </CardContent>
         </Card>
 
-        {/* Plan gate (only while parked) */}
-        {engine.plan && engine.phase === 'awaiting-approval' && (
+        {/* Plan gate: only while parked, AND only for the run currently being
+            shown — a rehydrated pending approval must not bleed into every
+            other history row's view (see showLiveSurface). */}
+        {showLiveSurface && engine.plan && engine.phase === 'awaiting-approval' && (
           <div className="mt-4 shrink-0">
             <PlanGate
               plan={engine.plan}
@@ -289,15 +347,32 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           </div>
         )}
 
-        {engine.error && (
-          <p className="mt-4 shrink-0 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
-            {engine.error}
-          </p>
+        {/* Scoped the same way as the plan gate: only for the run currently
+            being shown, so an error from one run doesn't linger while
+            browsing an unrelated one. Dismissable since some of these
+            (e.g. an orphaned approve/cancel) aren't otherwise self-clearing. */}
+        {showLiveSurface && engine.error && (
+          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+            <p>{engine.error}</p>
+            <button
+              type="button"
+              onClick={engine.clearError}
+              aria-label="Dismiss"
+              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
         )}
 
         {/* Live surface (active or just-started run) vs. historical detail */}
         {showLiveSurface ? (
-          <div className="mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
+          <div
+            className={cn(
+              'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
+              mode === 'computer-use' && 'lg:grid-cols-2',
+            )}
+          >
             <div className="flex min-h-0 flex-col">
               <Label className="mb-1.5 block">Console</Label>
               <div className="min-h-0 flex-1">
@@ -307,9 +382,14 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 />
               </div>
             </div>
-            <div className="min-h-0">
-              <LiveBrowser frame={frame} active={isActive} mode={mode} />
-            </div>
+            {/* Codegen never drives a live browser (it's white-box source generation,
+                not a computer-use exploration) — skip the panel entirely rather than
+                show a permanently-empty placeholder. */}
+            {mode === 'computer-use' && (
+              <div className="min-h-0">
+                <LiveBrowser frame={frame} active={isActive} mode={mode} />
+              </div>
+            )}
           </div>
         ) : (
           <div className="mt-4 min-h-0 flex-1">

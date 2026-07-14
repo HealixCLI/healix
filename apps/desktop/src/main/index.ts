@@ -167,6 +167,20 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
   });
 });
 
+ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProject): Promise<Project> => {
+  const store = await requireStore();
+  const { id, ...input } = payload ?? ({} as { id: string } & NewProject);
+  if (!id) throw new Error('Project id is required.');
+  const name = (input?.name ?? '').trim();
+  if (!name) throw new Error('Project name is required.');
+  return store.updateProject(id, {
+    name,
+    mode: input.mode ?? 'playwright',
+    repoPath: normalizeOptional(input.repoPath),
+    baseUrl: normalizeOptional(input.baseUrl),
+  });
+});
+
 ipcMain.handle('projects:delete', async (_e, id: string): Promise<{ ok: true; assetsRemoved: boolean }> => {
   const store = await requireStore();
   if (!id) throw new Error('Project id is required.');
@@ -307,19 +321,68 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
   return summary;
 });
 
-ipcMain.handle('run:approve', (_e, payload: { runId: string; ok: boolean }): { settled: boolean } => {
-  if (!payload?.runId) return { settled: false };
-  return { settled: settleApproval(payload.runId, payload.ok === true) };
-});
+/**
+ * Force-settle a run's persisted status directly, bypassing the (dead) live
+ * orchestrator promise. Used when the user made a decision (reject/cancel) on
+ * a run whose in-memory gate no longer exists — most likely orphaned by an
+ * app restart that happened after it started. Without this the row sits at
+ * whatever non-terminal status it was last at (e.g. 'awaiting-approval')
+ * until HealixStore.failOrphanedRuns() reaps it as 'error', hours later, even
+ * though the user just explicitly told us what they wanted to happen to it.
+ * Also appends the same Timeline event a live orchestrator would have logged
+ * for this decision, so the run's history reads the same either way.
+ */
+async function forceSettleOrphanedRun(
+  runId: string,
+  status: 'cancelled' | 'error',
+  eventMessage: string,
+): Promise<void> {
+  try {
+    const store = await getStore();
+    if (!store) return;
+    store.appendEvent(runId, 'approve', eventMessage, { level: 'info' });
+    store.updateRunStatus(runId, status, { finishedAt: new Date().toISOString() });
+  } catch {
+    /* best-effort — the janitor is the fallback if this fails too */
+  }
+}
 
-ipcMain.handle('run:cancel', (_e, payload: { runId: string }): { cancelled: boolean } => {
+ipcMain.handle(
+  'run:approve',
+  async (_e, payload: { runId: string; ok: boolean }): Promise<{ settled: boolean }> => {
+    if (!payload?.runId) return { settled: false };
+    const settled = settleApproval(payload.runId, payload.ok === true);
+    if (!settled) {
+      // Rejecting is a deliberate cancellation either way; approving a run
+      // that can no longer actually resume never runs, which is an error.
+      // Wording matches exactly what a live orchestrator logs for the same
+      // decisions (packages/core/src/orchestrator/index.ts).
+      await (payload.ok
+        ? forceSettleOrphanedRun(
+            payload.runId,
+            'error',
+            "Approved, but the run's session had already ended and it could not resume.",
+          )
+        : forceSettleOrphanedRun(payload.runId, 'cancelled', 'Plan rejected; cancelling run.'));
+    }
+    return { settled };
+  },
+);
+
+ipcMain.handle('run:cancel', async (_e, payload: { runId: string }): Promise<{ cancelled: boolean }> => {
   const runId = payload?.runId;
   if (!runId) return { cancelled: false };
   // A parked approval gate would hold the orchestrator before it ever checks
   // the abort signal, so cancelling also rejects any pending plan approval.
   settleApproval(runId, false);
   const controller = activeRuns.get(runId);
-  if (!controller) return { cancelled: false };
+  if (!controller) {
+    // Nothing live to abort — same orphaned-run situation as above. The user
+    // explicitly asked to cancel it, so that's the status it gets. Wording
+    // matches the live cancel path's own default message.
+    await forceSettleOrphanedRun(runId, 'cancelled', 'Run cancelled by caller.');
+    return { cancelled: false };
+  }
   controller.abort();
   return { cancelled: true };
 });
@@ -472,6 +535,8 @@ export interface RunDetail {
   artifacts: string[];
   /** Absolute path to the run's rendered HTML report, when present on disk. */
   reportHtmlPath: string | null;
+  /** The plan persisted to disk at plan/plan.json, when present. */
+  plan: TestPlan | null;
 }
 
 ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<RunDetail> => {
@@ -484,6 +549,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     suiteDir: null,
     artifacts: [],
     reportHtmlPath: null,
+    plan: null,
   };
   const runId = payload?.runId;
   if (!runId) return empty;
@@ -523,6 +589,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   let suiteDir: string | null = null;
   let artifacts: string[] = [];
   let reportHtmlPath: string | null = null;
+  let plan: TestPlan | null = null;
 
   if (run) {
     const runDir = join(projectsDir(), run.projectId, 'runs', runId);
@@ -532,9 +599,10 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     artifacts = await listFilesRecursive(join(runDir, 'suite', 'test-results'));
     const html = join(runDir, 'reports', 'report.html');
     if (await isFile(html)) reportHtmlPath = html;
+    plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
   }
 
-  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath };
+  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan };
 });
 
 // ---- helpers ----

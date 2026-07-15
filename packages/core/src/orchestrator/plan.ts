@@ -219,7 +219,9 @@ export function buildReviseItemPrompt(
   lines.push('a proposed test plan. Regenerate ONLY this item, incorporating their feedback.');
   lines.push('');
   lines.push(`Project name: ${project.name}`);
-  lines.push(`Testing scope: ${scopeLabel(scope)} — keep the item within these tier(s): ${tiers.join(', ')},`);
+  lines.push(
+    `Testing scope: ${scopeLabel(scope)} — keep the item within these tier(s): ${tiers.join(', ')},`,
+  );
   lines.push('unless the feedback clearly requires a different tier.');
   lines.push(`Test engine: ${project.mode}`);
   if (project.baseUrl) lines.push(`Base URL (black-box): ${project.baseUrl}`);
@@ -308,7 +310,10 @@ export async function reviseItem(
     return { ok: false, detail: err instanceof Error ? err.message : String(err) };
   }
   if (!completion.ok || !completion.text) {
-    return { ok: false, detail: completion.detail || `Provider "${provider.id}" returned no usable revision.` };
+    return {
+      ok: false,
+      detail: completion.detail || `Provider "${provider.id}" returned no usable revision.`,
+    };
   }
   const revised = parseReviseItemResponse(completion.text, opts.testingScope ?? 'both', item.id);
   if (!revised) {

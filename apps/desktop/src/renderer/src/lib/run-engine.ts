@@ -1,5 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { OrchestratorEvent, RunSummary, TestingScope, TestPlan } from '@healix/core';
+import type {
+  OrchestratorEvent,
+  PlanItemSnapshot,
+  PlanItemStatus,
+  RunSummary,
+  TestingScope,
+  TestPlan,
+  TestPlanItem,
+} from '@healix/core';
 import type { RunChannelMessage, StartRunArgs } from './ipc-types';
 
 export type RunPhase = 'idle' | 'starting' | 'running' | 'awaiting-approval' | 'done' | 'cancelled' | 'error';
@@ -24,9 +32,16 @@ export interface RunEngineState {
   phase: RunPhase;
   runId: string | null;
   lines: ConsoleLine[];
+  /** The AI's original, never-mutated proposed plan — ground truth for diffing. */
   plan: TestPlan | null;
-  /** Set once the user approves/rejects the active plan; clears the gate UI. */
+  /** Mutable draft the reviewer edits; this is what gets sent back on approveAndContinue. */
+  workingPlan: TestPlan | null;
+  /** Set once the user submits a final decision on the active plan; clears the gate UI. */
   planDecided: boolean;
+  /** itemId -> true while a plan:reviseItem call for that item is in flight. */
+  revisingItemIds: Set<string>;
+  /** itemId -> the last revise error for that item, if any. */
+  reviseErrors: Record<string, string>;
   summary: RunSummary | null;
   error: string | null;
   /**
@@ -34,15 +49,26 @@ export interface RunEngineState {
    * UI was lost) rather than from a start() this session. While true, the view
    * showing this run is one choice among history rows, not force-shown the way
    * a genuinely-just-started live run is — see RunsView's showLiveSurface.
-   * Cleared once the user actually resumes the run (approve(true)), at which
-   * point it behaves like any other live run for the rest of its lifecycle.
+   * Cleared once the user actually resumes the run (approveAndContinue), at
+   * which point it behaves like any other live run for the rest of its lifecycle.
    */
   hydrated: boolean;
 }
 
 export interface RunEngine extends RunEngineState {
   start: (args: StartRunArgs) => Promise<void>;
-  approve: (ok: boolean) => Promise<void>;
+  /** Approve a single item (whatever its current status). */
+  approveItem: (itemId: string) => void;
+  /** Reject a single item — excluded from generation entirely. */
+  rejectItem: (itemId: string) => void;
+  /** Directly edit an item's content; marks it 'edited' and snapshots the original on first touch. */
+  editItem: (itemId: string, patch: PlanItemSnapshot) => void;
+  /** Send an item + free-text feedback to the AI for regeneration; result returns to 'pending'. */
+  reviseItem: (itemId: string, suggestion: string, projectId: string) => Promise<void>;
+  /** Finalize: defaults any untouched item to 'approved', then submits the plan and resumes the run. */
+  approveAndContinue: () => Promise<void>;
+  /** Cancel the run outright, discarding the whole plan. */
+  rejectAll: () => Promise<void>;
   /** Request cancellation of the active run; run:done ('cancelled') confirms. */
   cancel: () => Promise<void>;
   reset: () => void;
@@ -50,8 +76,8 @@ export interface RunEngine extends RunEngineState {
    * Re-attach to a run that is still genuinely parked awaiting approval in the
    * main process (its approval promise is only lost on app restart, not on
    * navigating away from this view) but whose live state here was lost because
-   * this component unmounted. Restores the plan gate so approve()/reject can
-   * reach it again.
+   * this component unmounted. Restores the plan gate so the per-item actions
+   * and approveAndContinue()/rejectAll() can reach it again.
    */
   hydrate: (args: { runId: string; plan: TestPlan }) => void;
   /** Dismiss the current error banner without touching the rest of the state. */
@@ -63,7 +89,10 @@ const INITIAL: RunEngineState = {
   runId: null,
   lines: [],
   plan: null,
+  workingPlan: null,
   planDecided: false,
+  revisingItemIds: new Set(),
+  reviseErrors: {},
   summary: null,
   error: null,
   hydrated: false,
@@ -73,16 +102,57 @@ function nowLabel(): string {
   return new Date().toLocaleTimeString(undefined, { hour12: false });
 }
 
+/** Deep-clone a plan so the mutable working draft never aliases the original/incoming plan. */
+function clonePlan(plan: TestPlan): TestPlan {
+  return {
+    ...plan,
+    items: plan.items.map((item) => ({
+      ...item,
+      original: item.original ? { ...item.original } : undefined,
+      edits: item.edits ? item.edits.map((e) => ({ ...e, before: { ...e.before }, after: { ...e.after } })) : undefined,
+      revisions: item.revisions
+        ? item.revisions.map((r) => ({ ...r, before: { ...r.before }, after: { ...r.after } }))
+        : undefined,
+    })),
+  };
+}
+
+function mapItem(plan: TestPlan, itemId: string, fn: (item: TestPlanItem) => TestPlanItem): TestPlan {
+  return { ...plan, items: plan.items.map((it) => (it.id === itemId ? fn(it) : it)) };
+}
+
+function snapshotOf(item: TestPlanItem): PlanItemSnapshot {
+  return { title: item.title, reqTag: item.reqTag, tier: item.tier, intent: item.intent };
+}
+
+/**
+ * True for a status that still counts as "the reviewer hasn't made a final
+ * call" — both a never-touched item (undefined/'pending') and a freshly
+ * revised one ('revised') default to 'approved' on approveAndContinue if
+ * left untouched. Mirrors the orchestrator's own APPROVE-phase defaulting
+ * (packages/core/src/orchestrator/index.ts) so desktop and core agree.
+ */
+function needsDecision(status: PlanItemStatus | undefined): boolean {
+  return status === undefined || status === 'pending' || status === 'revised';
+}
+
 /**
  * Owns a single run's streamed lifecycle. Subscribes to window.healix.onRunEvent
  * for the duration it's mounted, filters by the active runId, and exposes a calm
- * console buffer + plan-gate + final summary the Run view renders.
+ * console buffer + per-item plan-gate + final summary the Run view renders.
  */
 export function useRunEngine(): RunEngine {
   const [state, setState] = useState<RunEngineState>(INITIAL);
   const lineSeq = useRef(0);
   // Track the active runId without re-subscribing on every change.
   const activeRunId = useRef<string | null>(null);
+  // Mirrors `state` for callbacks that need to read the LATEST value
+  // synchronously (setState's updater form doesn't run synchronously, so code
+  // immediately after a setState call can't rely on it having applied yet).
+  const stateRef = useRef(state);
+  useEffect(() => {
+    stateRef.current = state;
+  }, [state]);
 
   const pushLine = useCallback((level: OrchestratorEvent['level'], phase: string, message: string): void => {
     const id = ++lineSeq.current;
@@ -110,10 +180,14 @@ export function useRunEngine(): RunEngine {
           break;
         }
         case 'run:plan': {
+          const plan = msg.payload.plan;
           setState((prev) => ({
             ...prev,
-            plan: msg.payload.plan,
+            plan,
+            workingPlan: clonePlan(plan),
             planDecided: false,
+            revisingItemIds: new Set(),
+            reviseErrors: {},
             phase: 'awaiting-approval',
           }));
           break;
@@ -152,50 +226,159 @@ export function useRunEngine(): RunEngine {
     }
   }, []);
 
-  const approve = useCallback(async (ok: boolean): Promise<void> => {
+  const approveItem = useCallback((itemId: string): void => {
+    setState((prev) => {
+      if (!prev.workingPlan) return prev;
+      return { ...prev, workingPlan: mapItem(prev.workingPlan, itemId, (it) => ({ ...it, status: 'approved' })) };
+    });
+  }, []);
+
+  const rejectItem = useCallback((itemId: string): void => {
+    setState((prev) => {
+      if (!prev.workingPlan) return prev;
+      return { ...prev, workingPlan: mapItem(prev.workingPlan, itemId, (it) => ({ ...it, status: 'rejected' })) };
+    });
+  }, []);
+
+  const editItem = useCallback((itemId: string, patch: PlanItemSnapshot): void => {
+    setState((prev) => {
+      if (!prev.workingPlan) return prev;
+      return {
+        ...prev,
+        workingPlan: mapItem(prev.workingPlan, itemId, (it) => {
+          const before = snapshotOf(it);
+          const edits = [...(it.edits ?? []), { before, after: patch, editedAt: new Date().toISOString() }];
+          return {
+            ...it,
+            ...patch,
+            status: 'edited' as PlanItemStatus,
+            original: it.original ?? before,
+            edits,
+          };
+        }),
+      };
+    });
+  }, []);
+
+  const reviseItem = useCallback(async (itemId: string, suggestion: string, projectId: string): Promise<void> => {
     const runId = activeRunId.current;
     if (!runId) return;
-    // Computed before setState (not inside its updater), matching pushLine —
-    // an updater can run more than once (e.g. Strict Mode), which would double-
-    // increment a ref used inside it.
-    const rejectionLine: ConsoleLine | null = ok
-      ? null
-      : {
-          id: ++lineSeq.current,
-          level: 'info',
-          phase: 'approve',
-          message: 'Plan rejected — cancelling run.',
-          ts: nowLabel(),
-        };
-    // The gate closes immediately either way — approving moves straight into
-    // the run; rejecting is final from the user's perspective the moment they
-    // click it, even though the backend's own teardown is asynchronous and
-    // its authoritative 'cancelled' will still arrive shortly via run:done.
+    // Read the item to revise from the latest committed state (stateRef), not
+    // from a setState updater — updaters don't run synchronously, so code
+    // right after calling setState can't rely on their result yet.
+    const current = stateRef.current;
+    if (!current.workingPlan || current.planDecided) return;
+    const target = current.workingPlan.items.find((it) => it.id === itemId);
+    if (!target) return;
+
+    setState((prev) => {
+      if (!prev.workingPlan || prev.planDecided) return prev;
+      const nextRevising = new Set(prev.revisingItemIds);
+      nextRevising.add(itemId);
+      const nextErrors = { ...prev.reviseErrors };
+      delete nextErrors[itemId];
+      return { ...prev, revisingItemIds: nextRevising, reviseErrors: nextErrors };
+    });
+
+    let result: Awaited<ReturnType<typeof window.healix.reviseItem>>;
+    try {
+      result = await window.healix.reviseItem({ projectId, item: target, suggestion });
+    } catch (err) {
+      result = { ok: false, detail: err instanceof Error ? err.message : String(err) };
+    }
+
+    setState((prev) => {
+      // Stale reply: the run moved on (different run, or the gate was already
+      // decided) while this call was in flight — discard rather than mutate a
+      // plan that's no longer under review.
+      if (activeRunId.current !== runId || prev.planDecided || !prev.workingPlan) return prev;
+      const nextRevising = new Set(prev.revisingItemIds);
+      nextRevising.delete(itemId);
+      if (!result.ok) {
+        return { ...prev, revisingItemIds: nextRevising, reviseErrors: { ...prev.reviseErrors, [itemId]: result.detail } };
+      }
+      const revised = result.item;
+      return {
+        ...prev,
+        revisingItemIds: nextRevising,
+        workingPlan: mapItem(prev.workingPlan, itemId, (it) => {
+          const before = snapshotOf(it);
+          const after = snapshotOf(revised);
+          const revisions = [...(it.revisions ?? []), { suggestion, before, after, revisedAt: new Date().toISOString() }];
+          return {
+            ...it,
+            ...after,
+            // Re-enters review (badged distinctly from a never-touched
+            // 'pending' item) rather than auto-approving. needsDecision()
+            // treats 'revised' the same as 'pending', so approveAndContinue
+            // still defaults it to approved if left untouched further.
+            status: 'revised' as PlanItemStatus,
+            original: it.original ?? before,
+            revisions,
+          };
+        }),
+      };
+    });
+  }, []);
+
+  const approveAndContinue = useCallback(async (): Promise<void> => {
+    const runId = activeRunId.current;
+    if (!runId) return;
+    const current = stateRef.current;
+    if (!current.workingPlan) return;
+    const finalPlan: TestPlan = {
+      ...current.workingPlan,
+      items: current.workingPlan.items.map((it) =>
+        needsDecision(it.status) ? { ...it, status: 'approved' as PlanItemStatus } : it,
+      ),
+    };
+    setState((prev) => ({
+      ...prev,
+      workingPlan: finalPlan,
+      planDecided: true,
+      phase: 'running',
+      hydrated: false,
+    }));
+    try {
+      const result = await window.healix.approveRun(runId, { decision: 'proceed', plan: finalPlan });
+      if (!result.settled) {
+        setState((prev) => ({
+          ...prev,
+          phase: 'error',
+          error:
+            "This run's approval session had already ended (most likely an app restart), so it couldn't actually resume — it's been marked as an error.",
+        }));
+      }
+    } catch {
+      // The gate may have already settled (e.g. run torn down); safe to ignore.
+    }
+  }, []);
+
+  const rejectAll = useCallback(async (): Promise<void> => {
+    const runId = activeRunId.current;
+    if (!runId) return;
+    const rejectionLine: ConsoleLine = {
+      id: ++lineSeq.current,
+      level: 'info',
+      phase: 'approve',
+      message: 'Plan rejected — cancelling run.',
+      ts: nowLabel(),
+    };
     setState((prev) => ({
       ...prev,
       planDecided: true,
-      phase: ok ? 'running' : 'cancelled',
-      // Once decided (either way) this is no longer just one browsable history
-      // row among others — it's live/settled like any other run.
+      phase: 'cancelled',
       hydrated: false,
-      lines: rejectionLine ? [...prev.lines, rejectionLine] : prev.lines,
+      lines: [...prev.lines, rejectionLine],
     }));
     try {
-      const result = await window.healix.approveRun(runId, ok);
+      const result = await window.healix.approveRun(runId, { decision: 'cancel' });
       if (!result.settled) {
-        // No live gate found on the backend for this runId — most likely
-        // orphaned by an app restart that happened after it started (the
-        // resolver lives only in that process's memory; persisted plan/status
-        // survive, it doesn't). The main process force-settles the DB row
-        // itself in this case (cancelled on reject, error on approve — an
-        // approved run that can't actually resume never runs); mirror that
-        // here so the local phase matches what's now persisted.
         setState((prev) => ({
           ...prev,
-          phase: ok ? 'error' : 'cancelled',
-          error: ok
-            ? "This run's approval session had already ended (most likely an app restart), so it couldn't actually resume — it's been marked as an error."
-            : "This run's approval session had already ended (most likely an app restart) before you responded — it's been marked as cancelled.",
+          phase: 'cancelled',
+          error:
+            "This run's approval session had already ended (most likely an app restart) before you responded — it's been marked as cancelled.",
         }));
       }
     } catch {
@@ -214,13 +397,13 @@ export function useRunEngine(): RunEngine {
       if (!result.cancelled) {
         // Nothing was actually running on the backend for this runId — most
         // likely orphaned by an app restart since it started (same class of
-        // gap as approve()'s !settled case). run:done will now never arrive,
-        // so without this the UI would show "Cancelling…"/"Running…" forever
-        // for a run that isn't running anywhere. The main process force-
-        // settles the DB row to 'cancelled' itself in this case (the user did
-        // explicitly ask to cancel it); mirror that phase here. Keep
-        // runId/identity (not a full reset) so the error banner stays scoped
-        // to THIS run via showLiveSurface, not shown for every run.
+        // gap as approveAndContinue/rejectAll's !settled case). run:done will
+        // now never arrive, so without this the UI would show "Cancelling…"/
+        // "Running…" forever for a run that isn't running anywhere. The main
+        // process force-settles the DB row to 'cancelled' itself in this case
+        // (the user did explicitly ask to cancel it); mirror that phase here.
+        // Keep runId/identity (not a full reset) so the error banner stays
+        // scoped to THIS run via showLiveSurface, not shown for every run.
         setState((prev) => ({
           ...prev,
           phase: 'cancelled',
@@ -248,6 +431,7 @@ export function useRunEngine(): RunEngine {
       runId: args.runId,
       phase: 'awaiting-approval',
       plan: args.plan,
+      workingPlan: clonePlan(args.plan),
       hydrated: true,
     });
   }, []);
@@ -256,7 +440,20 @@ export function useRunEngine(): RunEngine {
     setState((prev) => ({ ...prev, error: null }));
   }, []);
 
-  return { ...state, start, approve, cancel, reset, hydrate, clearError };
+  return {
+    ...state,
+    start,
+    approveItem,
+    rejectItem,
+    editItem,
+    reviseItem,
+    approveAndContinue,
+    rejectAll,
+    cancel,
+    reset,
+    hydrate,
+    clearError,
+  };
 }
 
 /**

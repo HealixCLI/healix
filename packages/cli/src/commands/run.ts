@@ -5,6 +5,7 @@ import {
   createOrchestrator,
   type ExplorationMode,
   type OrchestratorEvent,
+  type PlanApprovalResult,
   type ProviderId,
   type RunOptions,
   type RunSummary,
@@ -43,8 +44,13 @@ function streamEvent(e: OrchestratorEvent): void {
   console.log(`  ${tag} ${levelColor(e.level)(e.message)}`);
 }
 
-/** Render the proposed plan and prompt for approval via stdin. Returns true to proceed. */
-async function promptApproval(plan: TestPlan): Promise<boolean> {
+/**
+ * Render the proposed plan and prompt for approval via stdin. The CLI keeps
+ * a whole-plan y/N flow (no per-item terminal UX) — "yes" approves every
+ * item as proposed; the orchestrator's own default-to-approved step handles
+ * items with no explicit status.
+ */
+async function promptApproval(plan: TestPlan): Promise<PlanApprovalResult> {
   console.log('');
   console.log(pc.bold('  Proposed test plan'));
   console.log(`  ${pc.dim(plan.summary || '(no summary)')}`);
@@ -63,7 +69,7 @@ async function promptApproval(plan: TestPlan): Promise<boolean> {
 
   if (!process.stdin.isTTY) {
     console.log(pc.yellow('  ⚠ No interactive terminal; declining plan. Re-run with --yes to auto-approve.'));
-    return false;
+    return { decision: 'cancel' };
   }
 
   const rl = createInterface({ input: process.stdin, output: process.stdout });
@@ -71,7 +77,7 @@ async function promptApproval(plan: TestPlan): Promise<boolean> {
     const answer = await new Promise<string>((res) => rl.question(pc.bold('  Approve plan? (y/N) '), res));
     const ok = /^y(es)?$/i.test(answer.trim());
     console.log('');
-    return ok;
+    return ok ? { decision: 'proceed', plan } : { decision: 'cancel' };
   } finally {
     rl.close();
   }

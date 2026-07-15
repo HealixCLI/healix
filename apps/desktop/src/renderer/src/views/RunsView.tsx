@@ -463,13 +463,19 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
         {/* Plan gate: only while parked, AND only for the run currently being
             shown — a rehydrated pending approval must not bleed into every
             other history row's view (see showLiveSurface). */}
-        {showLiveSurface && engine.plan && engine.phase === 'awaiting-approval' && (
+        {showLiveSurface && engine.workingPlan && engine.phase === 'awaiting-approval' && (
           <div className="mt-4 shrink-0">
             <PlanGate
-              plan={engine.plan}
+              plan={engine.workingPlan}
               decided={engine.planDecided}
-              onApprove={() => void engine.approve(true)}
-              onReject={() => void engine.approve(false)}
+              revisingItemIds={engine.revisingItemIds}
+              reviseErrors={engine.reviseErrors}
+              onApproveItem={engine.approveItem}
+              onRejectItem={engine.rejectItem}
+              onEditItem={engine.editItem}
+              onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
+              onApproveAndContinue={() => void engine.approveAndContinue()}
+              onRejectAll={() => void engine.rejectAll()}
             />
           </div>
         )}

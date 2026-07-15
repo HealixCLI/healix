@@ -58,8 +58,15 @@ export interface OrchestratorEvent {
   data?: unknown;
 }
 
-/** Returns true to approve the proposed plan, false to abort. */
-export type ApprovalGate = (plan: TestPlan) => Promise<boolean>;
+/**
+ * The finalized outcome of per-item plan review: 'proceed' carries the plan
+ * as the reviewer left it (items may be approved/rejected/edited/revised —
+ * see TestPlanItem.status), 'cancel' aborts the run entirely.
+ */
+export type PlanApprovalResult = { decision: 'proceed'; plan: TestPlan } | { decision: 'cancel' };
+
+/** Presents the proposed plan to a human reviewer and returns their finalized decision. */
+export type ApprovalGate = (plan: TestPlan) => Promise<PlanApprovalResult>;
 
 export interface OrchestratorHooks {
   onEvent?: (e: OrchestratorEvent) => void;

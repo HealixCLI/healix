@@ -481,7 +481,7 @@ export function PlanGate({
           <ShieldQuestion className="h-4 w-4 text-accent" />
           <span className="text-sm font-semibold">Plan review required</span>
         </div>
-        <Badge tone="default">{plan.items.length} tests</Badge>
+        <Badge tone="default">{plan.items.length} spec {plan.items.length === 1 ? 'file' : 'files'}</Badge>
       </div>
 
       <p className="mt-2 text-sm text-muted">{plan.summary}</p>

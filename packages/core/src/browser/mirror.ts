@@ -56,6 +56,12 @@ export class FrameMirror {
     if (this.timer !== undefined) {
       return;
     }
+    // Capture immediately rather than waiting for the first interval tick:
+    // callers only subscribe once the page is already loaded (post-goto), and
+    // a short-lived subscription (e.g. EXPLORE's single-snapshot window) can
+    // otherwise end before the first scheduled tick ever fires, leaving
+    // subscribers with zero frames.
+    void this.tick();
     this.timer = setInterval(() => {
       void this.tick();
     }, FRAME_INTERVAL_MS);

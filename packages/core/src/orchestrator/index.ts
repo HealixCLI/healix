@@ -534,7 +534,9 @@ async function runPipeline(
     // snapshot grounds GENERATE in real selectors either way. Codegen mode
     // used to skip this entirely, so its specs guessed routes/locators blind —
     // the dominant source of test_is_wrong failures. Frame mirroring (the live
-    // browser view in the desktop app) stays a computer-use-only feature.
+    // browser view in the desktop app) mirrors whenever a live URL exists too,
+    // not just for computer-use — a codegen project still drives a real
+    // browser here and during EXECUTE, so there's a real frame to show either way.
     if (checkCancelled()) return cancelRun('explore');
     if (suiteMode === 'reuse') {
       // No new specs are ever generated in reuse mode, so there is nothing for
@@ -546,13 +548,32 @@ async function runPipeline(
       // Live frame mirroring is best-effort and must never abort the run; the
       // subscription + browser teardown both happen in this phase's finally.
       let unsubFrames: (() => void) | null = null;
+      // Resolves the moment a frame is actually delivered to hooks.onFrame —
+      // used below to hold teardown open just long enough for the mirror's
+      // in-flight capture to land. Without this, a real screenshot capture
+      // (genuinely tens to hundreds of ms against a real browser) can still
+      // be in flight when this phase's own work (goto + one DOM snapshot)
+      // finishes first; unsubscribing/stopping the browser at that point
+      // silently drops the frame before it's ever delivered.
+      let firstFrame: Promise<void> | null = null;
       try {
         await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
         await browser.goto(effectiveBaseUrl);
         // Subscribe AFTER start/goto so the UI only mirrors the live page.
-        if (hooks?.onFrame && ctx.explorationMode === 'computer-use') {
+        if (hooks?.onFrame) {
           try {
-            unsubFrames = browser.onFrame(hooks.onFrame);
+            let resolveFirstFrame: () => void = () => undefined;
+            firstFrame = new Promise((resolve) => {
+              resolveFirstFrame = resolve;
+            });
+            let delivered = false;
+            unsubFrames = browser.onFrame((png) => {
+              hooks?.onFrame?.(png);
+              if (!delivered) {
+                delivered = true;
+                resolveFirstFrame();
+              }
+            });
           } catch (err) {
             emit('explore', 'debug', `Frame subscription failed (continuing): ${errMsg(err)}`);
           }
@@ -566,6 +587,13 @@ async function runPipeline(
           url: snap.url,
           interactiveElements: snap.interactiveElements.length,
         });
+        // Bounded best-effort wait: give the mirror a brief window to deliver
+        // its first frame if it hasn't already, so short explorations still
+        // get one before the browser tears down. Never blocks the run for
+        // more than this cap.
+        if (firstFrame) {
+          await Promise.race([firstFrame, delay(600)]);
+        }
       } catch (err) {
         emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
       } finally {
@@ -1235,6 +1263,10 @@ export function looksLikeMissingDeps(message: string): boolean {
   return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|command not found|not recognized as an internal|ENOENT|node_modules/i.test(
     message,
   );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function errMsg(err: unknown): string {

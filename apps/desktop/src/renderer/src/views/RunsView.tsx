@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExplorationMode, Project } from '@healix/core';
-import { Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
+import { Loader2, Play, RotateCcw } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -16,7 +16,6 @@ import { useProjects } from '../lib/use-projects';
 import { useRuns } from '../lib/use-runs';
 import { useRunDetail } from '../lib/use-run-detail';
 import { useLiveFrame } from '../lib/use-live-frame';
-import { cn } from '../lib/utils';
 import { EXPLORATION_MODES, useRunEngine, type RunPhase } from '../lib/run-engine';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
@@ -25,7 +24,6 @@ const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   running: 'default',
   'awaiting-approval': 'warn',
   done: 'ok',
-  cancelled: 'muted',
   error: 'err',
 };
 
@@ -35,25 +33,8 @@ const PHASE_LABEL: Record<RunPhase, string> = {
   running: 'running',
   'awaiting-approval': 'awaiting approval',
   done: 'done',
-  cancelled: 'cancelled',
   error: 'error',
 };
-
-/** Engine phases in which the run has settled and a new one can be started. */
-const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
-
-/**
- * Pick the mode that matches how a project is actually configured: a repo path
- * means white-box source is available, so Codegen can read and generate real
- * specs from it (repo path wins when both are set); a base-URL-only project
- * has no source to read, so Computer-use (live exploration) is the only mode
- * that makes sense.
- */
-function deriveMode(project: Project | undefined): ExplorationMode {
-  if (project?.repoPath) return 'codegen';
-  if (project?.baseUrl) return 'computer-use';
-  return 'codegen';
-}
 
 export function RunsView({ initialProjectId }: { initialProjectId?: string | null }) {
   const { projects, loading: projectsLoading } = useProjects();
@@ -64,112 +45,45 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [projectId, setProjectId] = useState<string>('');
   const [mode, setMode] = useState<ExplorationMode>('codegen');
   const [prd, setPrd] = useState('');
-  // Set once a PRD file is successfully uploaded; cleared if the user edits the
-  // textarea by hand, since the displayed text no longer matches the file.
-  const [prdFileName, setPrdFileName] = useState<string | null>(null);
-  const [prdFileBusy, setPrdFileBusy] = useState(false);
-  const [prdFileError, setPrdFileError] = useState<string | null>(null);
   const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
-  // True from the moment the user clicks Cancel until run:done settles the run.
-  const [cancelling, setCancelling] = useState(false);
-  // Session-only: resets to expanded on next launch.
-  const [historyCollapsed, setHistoryCollapsed] = useState(false);
 
-  const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
+  const { detail, loading: detailLoading } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
 
-  // History rows may reference archived projects, so the lookup keeps ALL of
-  // them; only the "start a run" selector is restricted to active projects.
   const projectsById = useMemo(() => {
     const m = new Map<string, Project>();
     for (const p of projects) m.set(p.id, p);
     return m;
   }, [projects]);
-  const runnable = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
 
-  // Default the selection to the deep-linked project, else the first project —
-  // and derive Mode from whichever one that turns out to be (repo path vs.
-  // base URL), same as a manual project switch below.
+  // Default the selection to the deep-linked project, else the first project.
   useEffect(() => {
     if (projectId) return;
-    const deepLinked = initialProjectId && runnable.find((p) => p.id === initialProjectId);
-    const picked = deepLinked || runnable[0];
-    if (!picked) return;
-    setProjectId(picked.id);
-    setMode(deriveMode(picked));
-  }, [initialProjectId, runnable, projectId]);
+    if (initialProjectId && projects.some((p) => p.id === initialProjectId)) {
+      setProjectId(initialProjectId);
+    } else if (projects.length > 0) {
+      setProjectId(projects[0].id);
+    }
+  }, [initialProjectId, projects, projectId]);
 
   const isActive =
-    engine.phase === 'starting' || engine.phase === 'running' || engine.phase === 'awaiting-approval';
-
-  // Re-attach to a run that's still genuinely parked awaiting approval in the
-  // main process — its approval promise only dies on app restart, not on
-  // navigating away from this view — but whose live engine state was lost
-  // because this component unmounted in the meantime. Triggered by explicitly
-  // selecting that run in history (not automatically on mount), so landing on
-  // Runs always shows the normal start-a-run screen, and other history rows
-  // stay freely browsable even while this one sits pending — see showLiveSurface.
-  const { hydrate } = engine;
-  useEffect(() => {
-    if (!selectedRunId || selectedRunId === engine.runId) return;
-    // useRunDetail keeps the PREVIOUS run's detail on screen until its own
-    // fetch for the new selectedRunId resolves — without this check, clicking
-    // a different history row could momentarily hydrate the engine with the
-    // prior row's stale plan/status before the real detail ever arrives.
-    if (!detail?.plan || detail.run?.id !== selectedRunId || detail.run.status !== 'awaiting-approval') {
-      return;
-    }
-    hydrate({ runId: selectedRunId, plan: detail.plan });
-    setProjectId(detail.run.projectId);
-    // The exploration mode (codegen vs. computer-use) isn't persisted on the
-    // run row — Run.mode is the test-framework mode ('playwright') — so it's
-    // re-derived from the project's config, same heuristic as a fresh pick.
-    setMode(deriveMode(projectsById.get(detail.run.projectId)));
-  }, [selectedRunId, detail, engine.runId, hydrate, projectsById]);
-
-  // Clear the "Cancelling…" state once the run settles (run:done) or resets.
-  useEffect(() => {
-    if (!isActive) setCancelling(false);
-  }, [isActive]);
+    engine.phase === 'starting' ||
+    engine.phase === 'running' ||
+    engine.phase === 'awaiting-approval';
 
   // When a run finishes, refresh history and select the freshly-completed run.
-  // Also reload its detail bundle directly: setSelectedRunId(settledId) is a
-  // no-op re-render when it's already the current selection (e.g. rejecting/
-  // cancelling a run you were already viewing), so useRunDetail would
-  // otherwise never refetch and its status badge would stay stuck on
-  // whatever it read before the just-persisted change.
   const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
-    if (SETTLED_PHASES.includes(engine.phase) && engine.runId) {
+    if ((engine.phase === 'done' || engine.phase === 'error') && engine.runId) {
       if (lastSettledRef.current === engine.runId) return;
       lastSettledRef.current = engine.runId;
       const settledId = engine.runId;
-      void refreshRuns().then(() => {
-        setSelectedRunId(settledId);
-        void reloadDetail();
-      });
+      void refreshRuns().then(() => setSelectedRunId(settledId));
     }
     if (engine.phase === 'idle' || engine.phase === 'starting') {
       lastSettledRef.current = null;
     }
-  }, [engine.phase, engine.runId, refreshRuns, reloadDetail]);
-
-  // Refresh as soon as the run gets an id, and again on every phase change
-  // while active, so a brand-new run appears and phase transitions (e.g.
-  // awaiting-approval) show up in the history rail without a manual refresh.
-  useEffect(() => {
-    if (!engine.runId || !isActive) return;
-    void refreshRuns();
-  }, [engine.runId, engine.phase, isActive, refreshRuns]);
-
-  // The orchestrator advances through several statuses (exploring/generating/
-  // executing/...) without changing engine.phase (it stays 'running'), so
-  // poll the same refresh while active to keep the status badge current.
-  useEffect(() => {
-    if (!isActive) return;
-    const id = setInterval(() => void refreshRuns(), 3000);
-    return () => clearInterval(id);
-  }, [isActive, refreshRuns]);
+  }, [engine.phase, engine.runId, refreshRuns]);
 
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === projectId) ?? null,
@@ -187,72 +101,33 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     });
   };
 
-  const cancel = (): void => {
-    if (cancelling || !engine.runId) return;
-    setCancelling(true);
-    // The engine phase stays as-is until the authoritative run:done arrives
-    // with status 'cancelled' (SETTLED_PHASES then refreshes the history).
-    void engine.cancel();
-  };
-
   const newRun = (): void => {
     engine.reset();
     setSelectedRunId(null);
   };
 
-  const uploadPrdFile = async (): Promise<void> => {
-    setPrdFileError(null);
-    setPrdFileBusy(true);
-    try {
-      const result = await window.healix.pickPrdFile();
-      if (result.canceled) return;
-      if (result.error) {
-        setPrdFileError(result.error);
-        return;
-      }
-      setPrd(result.text ?? '');
-      setPrdFileName(result.fileName ?? null);
-    } catch (err) {
-      setPrdFileError(err instanceof Error ? err.message : String(err));
-    } finally {
-      setPrdFileBusy(false);
-    }
-  };
-
-  // The live run surface takes precedence over a selected history detail — EXCEPT
-  // for a rehydrated (not-actually-live-this-session) pending approval, which is
-  // just one browsable history row: it only takes over while its OWN row is the
-  // one selected, so other rows stay freely inspectable while it sits pending.
-  const showLiveSurface = engine.hydrated
-    ? selectedRunId === engine.runId
-    : isActive || (engine.runId != null && selectedRunId == null);
+  // The live run surface takes precedence; otherwise show the selected history detail.
+  const showLiveSurface = isActive || (engine.runId != null && selectedRunId == null);
 
   return (
     <div className="flex h-full min-h-0">
       {/* History rail */}
-      <div
-        className={cn(
-          'flex shrink-0 flex-col border-r border-border pb-6 pt-8',
-          historyCollapsed ? 'w-12 items-center px-1' : 'w-64 px-4',
-        )}
-      >
+      <div className="flex w-64 shrink-0 flex-col border-r border-border px-4 pb-6 pt-8">
         <RunHistory
           runs={runs}
           loading={runsLoading}
           error={runsError}
-          selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
+          selectedRunId={showLiveSurface ? null : selectedRunId}
           onSelect={(id) => {
             setSelectedRunId(id);
           }}
           onRefresh={() => void refreshRuns()}
           projectsById={projectsById}
-          collapsed={historyCollapsed}
-          onToggleCollapse={() => setHistoryCollapsed((v) => !v)}
         />
       </div>
 
       {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8">
+      <div className="flex min-w-0 flex-1 flex-col px-8 pb-6 pt-8">
         <header className="flex items-end justify-between border-b border-border pb-5">
           <div>
             <h1 className="font-mono text-xl font-semibold tracking-tight">Runs</h1>
@@ -274,14 +149,11 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 <Label className="mb-1.5 block">Project</Label>
                 <Select
                   value={projectId}
-                  onChange={(e) => {
-                    setProjectId(e.target.value);
-                    setMode(deriveMode(projectsById.get(e.target.value)));
-                  }}
-                  disabled={isActive || projectsLoading || runnable.length === 0}
+                  onChange={(e) => setProjectId(e.target.value)}
+                  disabled={isActive || projectsLoading || projects.length === 0}
                 >
-                  {runnable.length === 0 && <option value="">No active projects — create one first</option>}
-                  {runnable.map((p) => (
+                  {projects.length === 0 && <option value="">No projects — create one first</option>}
+                  {projects.map((p) => (
                     <option key={p.id} value={p.id}>
                       {p.name}
                     </option>
@@ -306,6 +178,85 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 </p>
               </div>
               <div className="sm:col-span-2">
+                <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
+                <Textarea
+                  value={prd}
+                  onChange={(e) => setPrd(e.target.value)}
+                  placeholder="Paste requirements to ground test generation…"
+                  disabled={isActive}
+                />
+              </div>
+            </div>
+
+            <div className="mt-4 flex items-center justify-between">
+              <div className="text-xs text-muted">
+                {selectedProject ? (
+                  <span className="font-mono">
+                    {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
+                  </span>
+                ) : (
+                  'Select a project to begin.'
+                )}
+              </div>
+              <div className="flex items-center gap-2">
+                {(engine.phase === 'done' || engine.phase === 'error') && (
+                  <Button variant="ghost" onClick={newRun}>
+                    <RotateCcw className="h-4 w-4" />
+                    New run
+                  </Button>
+                )}
+                <Button onClick={start} disabled={!projectId || isActive}>
+                  {isActive ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                  {isActive ? 'Running…' : 'Start run'}
+                </Button>
+              </div>
+            </div>
+          </CardContent>
+        </Card>
+
+        {/* Plan gate (only while parked) */}
+        {engine.plan && engine.phase === 'awaiting-approval' && (
+          <div className="mt-4 shrink-0">
+            <PlanGate
+              plan={engine.plan}
+              decided={engine.planDecided}
+              onApprove={() => void engine.approve(true)}
+              onReject={() => void engine.approve(false)}
+            />
+          </div>
+        )}
+
+        {engine.error && (
+          <p className="mt-4 shrink-0 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+            {engine.error}
+          </p>
+        )}
+
+        {/* Live surface (active or just-started run) vs. historical detail */}
+        {showLiveSurface ? (
+          <div className="mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4 lg:grid-cols-2">
+            <div className="flex min-h-0 flex-col">
+              <Label className="mb-1.5 block">Console</Label>
+              <div className="min-h-0 flex-1">
+                <ConsoleLog
+                  lines={engine.lines}
+                  emptyHint="Start a run to stream live orchestrator events here."
+                />
+              </div>
+            </div>
+            <div className="min-h-0">
+              <LiveBrowser frame={frame} active={isActive} mode={mode} />
+            </div>
+          </div>
+        ) : (
+          <div className="mt-4 min-h-0 flex-1">
+            <RunDetailPanel detail={detail} loading={detailLoading} />
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
                 <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
                 <div className="relative">
                   <Textarea
@@ -351,115 +302,121 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                   </span>
                   <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
                 </div>
-                {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
-              </div>
-            </div>
+{ prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p> }
+              </div >
+            </div >
 
-            <div className="mt-4 flex min-w-0 items-center justify-between">
-              <div className="min-w-0 text-xs text-muted">
-                {selectedProject ? (
-                  <span
-                    className="block truncate font-mono"
-                    title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
-                  >
-                    {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
-                  </span>
-                ) : (
-                  'Select a project to begin.'
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {SETTLED_PHASES.includes(engine.phase) && (
-                  <Button variant="ghost" onClick={newRun}>
-                    <RotateCcw className="h-4 w-4" />
-                    New run
-                  </Button>
-                )}
-                {isActive && (
-                  <Button
-                    variant="outline"
-                    className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
-                    onClick={cancel}
-                    // No runId yet means there is nothing to abort (still 'starting').
-                    disabled={cancelling || !engine.runId}
-                  >
-                    <Square className="h-4 w-4" />
-                    {cancelling ? 'Cancelling…' : 'Cancel'}
-                  </Button>
-                )}
-                <Button onClick={start} disabled={!projectId || isActive}>
-                  {isActive ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                  {isActive ? 'Running…' : 'Start run'}
-                </Button>
-              </div>
-            </div>
-          </CardContent>
-        </Card>
+  <div className="mt-4 flex min-w-0 items-center justify-between">
+    <div className="min-w-0 text-xs text-muted">
+      {selectedProject ? (
+        <span
+          className="block truncate font-mono"
+          title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+        >
+          {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
+        </span>
+      ) : (
+        'Select a project to begin.'
+      )}
+    </div>
+    <div className="flex shrink-0 items-center gap-2">
+      {SETTLED_PHASES.includes(engine.phase) && (
+        <Button variant="ghost" onClick={newRun}>
+          <RotateCcw className="h-4 w-4" />
+          New run
+        </Button>
+      )}
+      {isActive && (
+        <Button
+          variant="outline"
+          className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
+          onClick={cancel}
+          // No runId yet means there is nothing to abort (still 'starting').
+          disabled={cancelling || !engine.runId}
+        >
+          <Square className="h-4 w-4" />
+          {cancelling ? 'Cancelling…' : 'Cancel'}
+        </Button>
+      )}
+      <Button onClick={start} disabled={!projectId || isActive}>
+        {isActive ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+        {isActive ? 'Running…' : 'Start run'}
+      </Button>
+    </div>
+  </div>
+          </CardContent >
+        </Card >
 
-        {/* Plan gate: only while parked, AND only for the run currently being
+{/* Plan gate: only while parked, AND only for the run currently being
             shown — a rehydrated pending approval must not bleed into every
             other history row's view (see showLiveSurface). */}
-        {showLiveSurface && engine.plan && engine.phase === 'awaiting-approval' && (
-          <div className="mt-4 shrink-0">
-            <PlanGate
-              plan={engine.plan}
-              decided={engine.planDecided}
-              onApprove={() => void engine.approve(true)}
-              onReject={() => void engine.approve(false)}
-            />
-          </div>
-        )}
+{
+  showLiveSurface && engine.plan && engine.phase === 'awaiting-approval' && (
+    <div className="mt-4 shrink-0">
+      <PlanGate
+        plan={engine.plan}
+        decided={engine.planDecided}
+        onApprove={() => void engine.approve(true)}
+        onReject={() => void engine.approve(false)}
+      />
+    </div>
+  )
+}
 
-        {/* Scoped the same way as the plan gate: only for the run currently
+{/* Scoped the same way as the plan gate: only for the run currently
             being shown, so an error from one run doesn't linger while
             browsing an unrelated one. Dismissable since some of these
             (e.g. an orphaned approve/cancel) aren't otherwise self-clearing. */}
-        {showLiveSurface && engine.error && (
-          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
-            <p>{engine.error}</p>
-            <button
-              type="button"
-              onClick={engine.clearError}
-              aria-label="Dismiss"
-              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        )}
+{
+  showLiveSurface && engine.error && (
+    <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+      <p>{engine.error}</p>
+      <button
+        type="button"
+        onClick={engine.clearError}
+        aria-label="Dismiss"
+        className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+      >
+        <X className="h-4 w-4" />
+      </button>
+    </div>
+  )
+}
 
-        {/* Live surface (active or just-started run) vs. historical detail */}
-        {showLiveSurface ? (
-          <div
-            className={cn(
-              'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
-              mode === 'computer-use' && 'lg:grid-cols-2',
-            )}
-          >
-            <div className="flex min-h-0 flex-col">
-              <Label className="mb-1.5 block">Console</Label>
-              <div className="min-h-0 flex-1">
-                <ConsoleLog
-                  lines={engine.lines}
-                  emptyHint="Start a run to stream live orchestrator events here."
-                />
-              </div>
-            </div>
-            {/* Codegen never drives a live browser (it's white-box source generation,
+{/* Live surface (active or just-started run) vs. historical detail */ }
+{
+  showLiveSurface ? (
+    <div
+      className={cn(
+        'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
+        mode === 'computer-use' && 'lg:grid-cols-2',
+      )}
+    >
+      <div className="flex min-h-0 flex-col">
+        <Label className="mb-1.5 block">Console</Label>
+        <div className="min-h-0 flex-1">
+          <ConsoleLog
+            lines={engine.lines}
+            emptyHint="Start a run to stream live orchestrator events here."
+          />
+        </div>
+      </div>
+      {/* Codegen never drives a live browser (it's white-box source generation,
                 not a computer-use exploration) — skip the panel entirely rather than
                 show a permanently-empty placeholder. */}
-            {mode === 'computer-use' && (
-              <div className="min-h-0">
-                <LiveBrowser frame={frame} active={isActive} mode={mode} />
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="mt-4 min-h-0 flex-1">
-            <RunDetailPanel detail={detail} loading={detailLoading} />
-          </div>
-        )}
-      </div>
+      {mode === 'computer-use' && (
+        <div className="min-h-0">
+          <LiveBrowser frame={frame} active={isActive} mode={mode} />
+        </div>
+      )}
     </div>
+  ) : (
+    <div className="mt-4 min-h-0 flex-1">
+      <RunDetailPanel detail={detail} loading={detailLoading} />
+    </div>
+  )
+}
+      </div >
+    </div >
   );
 }

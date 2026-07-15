@@ -1,7 +1,6 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ReactNode } from 'react';
+import { useMemo, useState } from 'react';
 import type { AgentEvent, TestCase, TestResult } from '@healix/core';
-import { Camera, FileText, FolderOpen, Image as ImageIcon, PackageOpen, X } from 'lucide-react';
+import { FileDown, FolderOpen, PackageOpen } from 'lucide-react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
@@ -11,13 +10,10 @@ import { asRunReport } from '../lib/ipc-types';
 import { cn } from '../lib/utils';
 import {
   artifactLeaf,
-  artifactUrl,
   eventLevelColor,
   formatDuration,
   formatTime,
-  groupArtifacts,
   runStatusTone,
-  slugMatches,
   testStatusTone,
 } from '../lib/run-format';
 
@@ -44,37 +40,14 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
   const rows = useMemo(() => joinResults(detail?.tests ?? [], detail?.results ?? []), [detail]);
 
   const suiteDir = detail?.suiteDir ?? null;
-  const artifacts = useMemo(() => detail?.artifacts ?? [], [detail?.artifacts]);
-  const groups = useMemo(() => groupArtifacts(artifacts), [artifacts]);
-  const mediaCount = useMemo(
-    () => groups.reduce((n, g) => n + g.images.length + g.videos.length, 0),
-    [groups],
-  );
-  // Folders (per-test) that actually contain screenshots/recordings — the
-  // targets a results row can jump to.
-  const mediaFolders = useMemo(
-    () => groups.filter((g) => g.images.length + g.videos.length > 0).map((g) => g.folder),
-    [groups],
-  );
-  // Media group the artifacts tab should scroll to (set by a results-row jump).
-  const [focusFolder, setFocusFolder] = useState<string | null>(null);
-
-  /**
-   * Jump from a results row to the Media tab. The row→folder match is a
-   * best-effort slug heuristic (Playwright slugifies test titles into folder
-   * names); when nothing matches we still switch tabs, landing at the top.
-   */
-  const showMedia = (title: string): void => {
-    setFocusFolder(mediaFolders.find((f) => slugMatches(title, f)) ?? null);
-    setTab('artifacts');
-  };
+  const artifacts = detail?.artifacts ?? [];
 
   const reveal = async (target: string): Promise<void> => {
     setBusy('reveal');
     setNote(null);
     try {
       const res = await window.healix.revealPath(target);
-      if (!res.ok) setNote('Could not open the path.');
+      if (!res.ok) setNote('Could not open the path in Finder.');
     } catch (err) {
       setNote(err instanceof Error ? err.message : String(err));
     } finally {
@@ -112,10 +85,10 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
   const { run } = detail;
 
   const TABS: ReadonlyArray<{ value: DetailTab; label: string }> = [
-    { value: 'timeline', label: `Timeline · ${detail.events.length}` },
-    { value: 'results', label: `Results · ${rows.length}` },
-    { value: 'triage', label: `Triage · ${triage.length}` },
-    { value: 'artifacts', label: `Media · ${mediaCount}` },
+    { value: 'timeline', label: `Timeline (${detail.events.length})` },
+    { value: 'results', label: `Results (${rows.length})` },
+    { value: 'triage', label: `Triage (${triage.length})` },
+    { value: 'artifacts', label: `Artifacts (${artifacts.length})` },
   ];
 
   return (
@@ -124,32 +97,16 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
         <div className="flex items-center gap-2">
           <Badge tone={runStatusTone(run.status)}>{run.status}</Badge>
           {run.mode && <span className="font-mono text-xs text-muted">{run.mode}</span>}
-          <span className="font-mono text-[11px] text-muted/70">{run.id}</span>
+          <span className="font-mono text-[11px] text-muted">{run.id}</span>
         </div>
         <div className="flex items-center gap-2">
-          {detail.reportHtmlPath && (
-            <Button
-              size="sm"
-              variant="ghost"
-              onClick={() => void reveal(detail.reportHtmlPath!)}
-              disabled={busy !== null}
-            >
-              <FileText className="h-4 w-4" />
-              Report
-            </Button>
-          )}
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={() => suiteDir && void reveal(suiteDir)}
-            disabled={!suiteDir || busy !== null}
-          >
+          <Button size="sm" variant="outline" onClick={() => suiteDir && void reveal(suiteDir)} disabled={!suiteDir || busy !== null}>
             <FolderOpen className="h-4 w-4" />
             Reveal suite
           </Button>
           <Button size="sm" onClick={exportSuite} disabled={!suiteDir || busy !== null}>
             <PackageOpen className="h-4 w-4" />
-            {busy === 'export' ? 'Exporting…' : 'Export suite'}
+            {busy === 'export' ? 'Exporting…' : 'Download / Export suite'}
           </Button>
         </div>
       </div>
@@ -157,29 +114,19 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
       {note && <p className="mt-2 break-all text-xs text-muted">{note}</p>}
 
       <div className="mt-3">
-        <Tabs
-          items={TABS}
-          value={tab}
-          onChange={(t) => {
-            // A manual tab switch drops any pending row→media scroll target.
-            setFocusFolder(null);
-            setTab(t);
-          }}
-        />
+        <Tabs items={TABS} value={tab} onChange={setTab} />
       </div>
 
       <div className="mt-3 min-h-0 flex-1 overflow-auto">
         {tab === 'timeline' && <Timeline events={detail.events} />}
-        {tab === 'results' && (
-          <ResultsTable rows={rows} mediaFolders={mediaFolders} onShowMedia={showMedia} />
-        )}
+        {tab === 'results' && <ResultsTable rows={rows} />}
         {tab === 'triage' && <TriageList entries={triage} />}
         {tab === 'artifacts' && (
-          <ArtifactsGallery
+          <ArtifactsList
             artifacts={artifacts}
             suiteDir={suiteDir}
-            runStatus={run.status}
-            focusFolder={focusFolder}
+            busy={busy !== null}
+            onReveal={reveal}
           />
         )}
       </div>
@@ -228,14 +175,14 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
 
 function Timeline({ events }: { events: AgentEvent[] }) {
   if (events.length === 0) {
-    return <EmptyHint>No events were recorded for this run.</EmptyHint>;
+    return <p className="text-xs text-muted">No events were recorded for this run.</p>;
   }
   return (
     <ol className="flex flex-col gap-1 font-mono text-xs leading-relaxed">
       {events.map((e) => (
         <li key={e.id} className="flex gap-2">
-          <span className="shrink-0 text-muted/60">{formatTime(e.createdAt)}</span>
-          <span className="w-20 shrink-0 truncate text-accent/70">{e.phase}</span>
+          <span className="shrink-0 text-muted/70">{formatTime(e.createdAt)}</span>
+          <span className="w-20 shrink-0 truncate text-accent/80">{e.phase}</span>
           <span className={cn('whitespace-pre-wrap break-words', eventLevelColor(e.level))}>{e.message}</span>
         </li>
       ))}
@@ -243,18 +190,9 @@ function Timeline({ events }: { events: AgentEvent[] }) {
   );
 }
 
-function ResultsTable({
-  rows,
-  mediaFolders,
-  onShowMedia,
-}: {
-  rows: JoinedRow[];
-  /** Artifact folders that contain media; drives the per-row camera button. */
-  mediaFolders: string[];
-  onShowMedia: (title: string) => void;
-}) {
+function ResultsTable({ rows }: { rows: JoinedRow[] }) {
   if (rows.length === 0) {
-    return <EmptyHint>No test results for this run.</EmptyHint>;
+    return <p className="text-xs text-muted">No test results for this run.</p>;
   }
   return (
     <Table>
@@ -265,62 +203,43 @@ function ResultsTable({
           <TableHead>Tier</TableHead>
           <TableHead className="text-right">Duration</TableHead>
           <TableHead className="text-right">Status</TableHead>
-          {/* Row → media jump column (icon only). */}
-          <TableHead className="w-8" />
         </TableRow>
       </TableHeader>
       <TableBody>
-        {rows.map((r) => {
-          // Best-effort: does any media folder look like this test's slug?
-          const hasMedia = mediaFolders.some((f) => slugMatches(r.title, f));
-          return (
-            <TableRow key={r.key}>
-              <TableCell className="max-w-[18rem]">
-                <span className="block truncate text-fg" title={r.title}>
-                  {r.title}
+        {rows.map((r) => (
+          <TableRow key={r.key}>
+            <TableCell className="max-w-[18rem]">
+              <span className="block truncate text-fg" title={r.title}>
+                {r.title}
+              </span>
+              {r.error && (
+                <span className="mt-0.5 block truncate font-mono text-[11px] text-err/80" title={r.error}>
+                  {r.error}
                 </span>
-                {r.error && (
-                  <span className="mt-0.5 block truncate font-mono text-[11px] text-err/80" title={r.error}>
-                    {r.error}
-                  </span>
-                )}
-              </TableCell>
-              <TableCell className="font-mono text-[11px] text-muted">{r.reqTag ?? '—'}</TableCell>
-              <TableCell className="font-mono text-[11px] text-muted">{r.tier ?? '—'}</TableCell>
-              <TableCell className="text-right text-xs text-muted">{formatDuration(r.durationMs)}</TableCell>
-              <TableCell className="text-right">
-                <Badge tone={testStatusTone(r.status)}>{r.status ?? 'pending'}</Badge>
-              </TableCell>
-              <TableCell className="w-8 pl-0 text-right">
-                {hasMedia && (
-                  <Button
-                    size="icon"
-                    variant="ghost"
-                    className="h-6 w-6"
-                    title="View screenshots / recordings"
-                    aria-label={`View media for ${r.title}`}
-                    onClick={() => onShowMedia(r.title)}
-                  >
-                    <Camera className="h-3.5 w-3.5" />
-                  </Button>
-                )}
-              </TableCell>
-            </TableRow>
-          );
-        })}
+              )}
+            </TableCell>
+            <TableCell className="font-mono text-[11px] text-muted">{r.reqTag ?? '—'}</TableCell>
+            <TableCell className="font-mono text-[11px] text-muted">{r.tier ?? '—'}</TableCell>
+            <TableCell className="text-right text-xs text-muted">{formatDuration(r.durationMs)}</TableCell>
+            <TableCell className="text-right">
+              <Badge tone={testStatusTone(r.status)}>{r.status ?? 'pending'}</Badge>
+            </TableCell>
+          </TableRow>
+        ))}
       </TableBody>
     </Table>
   );
 }
 
 function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
-  if (entries.length === 0) {
-    return <EmptyHint>No triage verdicts. Failures are triaged automatically when present.</EmptyHint>;
+  const items = entries;
+  if (items.length === 0) {
+    return <p className="text-xs text-muted">No triage verdicts. Failures are triaged automatically when present.</p>;
   }
   return (
     <ul className="flex flex-col gap-2">
-      {entries.map((t, i) => (
-        <li key={`${t.title}-${i}`} className="rounded-lg border border-border bg-panel/40 p-3">
+      {items.map((t, i) => (
+        <li key={`${t.title}-${i}`} className="rounded-md border border-border bg-bg/40 p-3">
           <div className="flex items-center justify-between gap-2">
             <span className="min-w-0 truncate text-sm text-fg" title={t.title}>
               {t.title}
@@ -332,7 +251,7 @@ function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
           </div>
           <p className="mt-1.5 text-xs leading-relaxed text-muted">{t.triage.rationale}</p>
           {t.triage.suggestedPatch && (
-            <pre className="mt-2 overflow-x-auto rounded-md bg-bg p-2 font-mono text-[11px] text-muted">
+            <pre className="mt-2 overflow-x-auto rounded bg-[#0d0d12] p-2 font-mono text-[11px] text-muted">
               {t.triage.suggestedPatch}
             </pre>
           )}
@@ -342,231 +261,57 @@ function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
   );
 }
 
-// ---- Artifacts gallery -------------------------------------------------------
-
-interface Preview {
-  src: string;
-  name: string;
-  abs: string;
-}
-
-/**
- * Screenshots and recordings captured by the suite, grouped per test.
- * Images open in a lightbox; videos play inline; everything can be revealed
- * in the file manager. When `focusFolder` is set (a results-row jump), the
- * matching group is scrolled into view on mount.
- */
-function ArtifactsGallery({
+function ArtifactsList({
   artifacts,
   suiteDir,
-  runStatus,
-  focusFolder = null,
+  busy,
+  onReveal,
 }: {
   artifacts: string[];
   suiteDir: string | null;
-  runStatus: string;
-  focusFolder?: string | null;
+  busy: boolean;
+  onReveal: (target: string) => void;
 }) {
-  const [preview, setPreview] = useState<Preview | null>(null);
-  const groups = useMemo(() => groupArtifacts(artifacts), [artifacts]);
-
-  // Scroll the focused group into view (once per focus change / mount).
-  const focusRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    focusRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
-  }, [focusFolder]);
-
   if (artifacts.length === 0) {
-    const running = !['passed', 'failed', 'blocked', 'error', 'cancelled'].includes(runStatus);
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 py-10 text-center">
-        <Camera className="h-7 w-7 text-muted/50" />
-        <p className="text-sm text-muted">
-          {running
-            ? 'Screenshots and recordings will appear here once tests execute.'
-            : 'No screenshots or recordings were captured for this run.'}
-        </p>
-        {!running && (
-          <p className="max-w-sm text-xs text-muted/70">
-            Runs started before capture-on-success was enabled only kept media for failures. Start a new run
-            to record every test.
-          </p>
-        )}
-      </div>
-    );
+    return <p className="text-xs text-muted">No artifacts were produced for this run.</p>;
   }
-
-  const absOf = (rel: string): string | null => (suiteDir ? `${suiteDir}/test-results/${rel}` : null);
-
   return (
-    <>
-      <div className="flex flex-col gap-4">
-        {groups.map((g) => {
-          const hasMedia = g.images.length + g.videos.length > 0;
-          const focused = focusFolder !== null && g.folder === focusFolder;
-          return (
-            <section
-              key={g.folder || '(root)'}
-              ref={
-                focused
-                  ? (el) => {
-                      focusRef.current = el;
-                    }
-                  : undefined
-              }
-              className={cn('rounded-lg border border-border bg-panel/40 p-3', focused && 'border-accent/50')}
-            >
-              <header className="mb-2 flex items-center justify-between gap-2">
-                <span
-                  className="min-w-0 truncate font-mono text-xs text-fg"
-                  title={g.folder || 'Suite output'}
-                >
-                  {g.folder || 'Suite output'}
+    <ul className="flex flex-col divide-y divide-border/50">
+      {artifacts.map((rel) => {
+        const abs = suiteDir ? joinPath(suiteDir, 'test-results', rel) : rel;
+        return (
+          <li key={rel} className="flex items-center justify-between gap-3 py-2">
+            <span className="flex min-w-0 items-center gap-2">
+              <FileDown className="h-3.5 w-3.5 shrink-0 text-muted" />
+              <span className="min-w-0">
+                <span className="block truncate text-xs text-fg" title={rel}>
+                  {artifactLeaf(rel)}
                 </span>
-                {hasMedia && (
-                  <span className="shrink-0 text-[11px] text-muted">
-                    {g.images.length > 0 && `${g.images.length} screenshot${g.images.length > 1 ? 's' : ''}`}
-                    {g.images.length > 0 && g.videos.length > 0 && ' · '}
-                    {g.videos.length > 0 && `${g.videos.length} recording${g.videos.length > 1 ? 's' : ''}`}
-                  </span>
-                )}
-              </header>
-
-              {g.videos.length > 0 && (
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                  {g.videos.map((rel) => {
-                    const abs = absOf(rel);
-                    return abs ? (
-                      <video
-                        key={rel}
-                        src={artifactUrl(abs)}
-                        controls
-                        preload="metadata"
-                        className="w-full rounded-md border border-border bg-black"
-                      />
-                    ) : null;
-                  })}
-                </div>
-              )}
-
-              {g.images.length > 0 && (
-                <div className={cn('grid grid-cols-2 gap-2 sm:grid-cols-3', g.videos.length > 0 && 'mt-2')}>
-                  {g.images.map((rel) => {
-                    const abs = absOf(rel);
-                    if (!abs) return null;
-                    const src = artifactUrl(abs);
-                    return (
-                      <button
-                        key={rel}
-                        type="button"
-                        onClick={() => setPreview({ src, name: artifactLeaf(rel), abs })}
-                        className="group relative overflow-hidden rounded-md border border-border bg-black transition-colors hover:border-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                        title={rel}
-                      >
-                        <img
-                          src={src}
-                          alt={artifactLeaf(rel)}
-                          loading="lazy"
-                          className="aspect-video w-full object-cover object-top transition-transform duration-200 group-hover:scale-[1.02]"
-                        />
-                        <span className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/80 to-transparent px-2 pb-1 pt-4 text-left text-[10px] text-white/80">
-                          {artifactLeaf(rel)}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-
-              {g.other.length > 0 && (
-                <ul className={cn('flex flex-col', hasMedia && 'mt-2 border-t border-border/50 pt-1')}>
-                  {g.other.map((rel) => {
-                    const abs = absOf(rel);
-                    return (
-                      <li key={rel} className="flex items-center justify-between gap-3 py-1">
-                        <span className="min-w-0 truncate font-mono text-[11px] text-muted" title={rel}>
-                          {artifactLeaf(rel)}
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="h-6 px-2 text-[11px]"
-                          onClick={() => abs && void window.healix.showItemInFolder(abs)}
-                          disabled={!abs}
-                        >
-                          <FolderOpen className="h-3 w-3" />
-                          Reveal
-                        </Button>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </section>
-          );
-        })}
-      </div>
-
-      {preview && <Lightbox preview={preview} onClose={() => setPreview(null)} />}
-    </>
+                <span className="block truncate font-mono text-[10px] text-muted" title={rel}>
+                  {rel}
+                </span>
+              </span>
+            </span>
+            <Button
+              size="sm"
+              variant="ghost"
+              onClick={() => onReveal(abs)}
+              disabled={busy || !suiteDir}
+            >
+              <FolderOpen className="h-3.5 w-3.5" />
+              Reveal in Finder
+            </Button>
+          </li>
+        );
+      })}
+    </ul>
   );
 }
 
-/** Full-screen image preview; closes on click, ✕, or Escape. */
-function Lightbox({ preview, onClose }: { preview: Preview; onClose: () => void }) {
-  useEffect(() => {
-    const onKey = (e: KeyboardEvent): void => {
-      if (e.key === 'Escape') onClose();
-    };
-    window.addEventListener('keydown', onKey);
-    return () => window.removeEventListener('keydown', onKey);
-  }, [onClose]);
-
-  return (
-    <div
-      className="fixed inset-0 z-50 flex flex-col bg-black/85 backdrop-blur-sm"
-      onClick={onClose}
-      role="dialog"
-      aria-label={preview.name}
-    >
-      <div className="flex items-center justify-between gap-2 px-4 py-3" onClick={(e) => e.stopPropagation()}>
-        <span className="flex min-w-0 items-center gap-2 text-xs text-white/80">
-          <ImageIcon className="h-3.5 w-3.5 shrink-0" />
-          <span className="truncate font-mono">{preview.name}</span>
-        </span>
-        <div className="flex items-center gap-2">
-          <Button
-            size="sm"
-            variant="ghost"
-            className="text-white/70 hover:bg-white/10 hover:text-white"
-            onClick={() => void window.healix.showItemInFolder(preview.abs)}
-          >
-            <FolderOpen className="h-3.5 w-3.5" />
-            Reveal in Finder
-          </Button>
-          <Button
-            size="icon"
-            variant="ghost"
-            className="h-8 w-8 text-white/70 hover:bg-white/10 hover:text-white"
-            onClick={onClose}
-            aria-label="Close preview"
-          >
-            <X className="h-4 w-4" />
-          </Button>
-        </div>
-      </div>
-      <div className="flex min-h-0 flex-1 items-center justify-center p-6 pt-0">
-        <img
-          src={preview.src}
-          alt={preview.name}
-          className="max-h-full max-w-full rounded-md object-contain shadow-2xl"
-          onClick={(e) => e.stopPropagation()}
-        />
-      </div>
-    </div>
-  );
-}
-
-function EmptyHint({ children }: { children: ReactNode }) {
-  return <p className="py-6 text-center text-xs text-muted">{children}</p>;
+/** Simple POSIX-style join (renderer has no node:path). */
+function joinPath(...parts: string[]): string {
+  return parts
+    .filter(Boolean)
+    .map((p, i) => (i === 0 ? p.replace(/\/+$/, '') : p.replace(/^\/+|\/+$/g, '')))
+    .join('/');
 }

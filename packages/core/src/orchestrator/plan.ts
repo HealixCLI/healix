@@ -19,28 +19,10 @@ interface RawPlan {
 const KNOWN_TIERS: ReadonlyArray<Tier> = ['tierA-public', 'tierB-auth', 'tierC-api'];
 
 /**
- * Hard cap on repo file paths interpolated into the planning prompt. The index
- * itself may carry hundreds of paths; the prompt only needs enough of them to
- * ground the plan in real routes/pages, and an unbounded list would blow the
- * provider's token budget on large repos.
- */
-const MAX_PLAN_PROMPT_FILES = 80;
-
-/** Bounded repo context for grounding the plan (see indexRepo / RepoIndex). */
-export interface PlanRepoContext {
-  summary: string;
-  files: string[];
-}
-
-/**
  * Build the planning prompt. Asks the model for a single fenced ```json block so
  * the response is machine-parseable, while still leaving room for prose.
- *
- * When `repoIndex` is provided (white-box runs), a bounded repo-context section
- * (summary + up to MAX_PLAN_PROMPT_FILES file paths) is appended so the plan is
- * grounded in the actual repo instead of the model guessing generic flows.
  */
-export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: PlanRepoContext): string {
+export function buildPlanPrompt(project: Project, opts: RunOptions): string {
   const lines: string[] = [];
   lines.push('You are Healix, an autonomous QA engineer. Produce a concise end-to-end test plan');
   lines.push('for the application under test described below.');
@@ -55,18 +37,6 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
     lines.push('"""');
     lines.push(opts.prd.trim());
     lines.push('"""');
-  }
-  if (repoIndex && repoIndex.summary.trim().length > 0) {
-    lines.push('');
-    lines.push('Repository context (indexed):');
-    lines.push(repoIndex.summary.trim());
-    const shown = repoIndex.files.slice(0, MAX_PLAN_PROMPT_FILES);
-    if (shown.length > 0) {
-      lines.push(`Repository files (first ${shown.length}):`);
-      for (const file of shown) lines.push(`- ${file}`);
-      const remaining = repoIndex.files.length - shown.length;
-      if (remaining > 0) lines.push(`... and ${remaining} more file(s) not listed.`);
-    }
   }
   lines.push('');
   lines.push('Respond with exactly one fenced JSON code block of the shape:');
@@ -115,10 +85,9 @@ export function parsePlan(text: string): TestPlan | null {
 
   if (items.length === 0) return null;
 
-  const summary =
-    typeof raw.summary === 'string' && raw.summary.trim().length > 0
-      ? raw.summary.trim()
-      : 'Generated test plan.';
+  const summary = typeof raw.summary === 'string' && raw.summary.trim().length > 0
+    ? raw.summary.trim()
+    : 'Generated test plan.';
 
   return { summary, items, raw };
 }
@@ -160,10 +129,9 @@ function normalizeItem(it: RawPlanItem): TestPlanItem | null {
   const title = typeof it.title === 'string' ? it.title.trim() : '';
   if (title.length === 0) return null;
   const intent = typeof it.intent === 'string' && it.intent.trim().length > 0 ? it.intent.trim() : title;
-  const reqTag =
-    typeof it.reqTag === 'string' && it.reqTag.trim().length > 0 && it.reqTag.trim() !== 'null'
-      ? it.reqTag.trim()
-      : undefined;
+  const reqTag = typeof it.reqTag === 'string' && it.reqTag.trim().length > 0 && it.reqTag.trim() !== 'null'
+    ? it.reqTag.trim()
+    : undefined;
   const tier = normalizeTier(it.tier);
   const item: TestPlanItem = { id: `pli_${nanoid(8)}`, title, tier, intent };
   if (reqTag) item.reqTag = reqTag;

@@ -334,26 +334,66 @@ async function generateOne(
   return { spec: null, reason: lastReason, violations: lastViolations };
 }
 
+/** Number of plan items generated concurrently. */
+const GEN_CONCURRENCY = 3;
+
+/**
+ * Run up to `concurrency` promises at a time from `tasks`. Returns results in
+ * the same order as `tasks` regardless of completion order.
+ */
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < tasks.length) {
+      const i = nextIndex++;
+      results[i] = await tasks[i]();
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 /**
  * For each plan item, ask the provider (read-only) for a single Playwright
  * spec, validate it (must look like a spec, contain >=1 expect, and pass the
  * forbidden-API gate), retry once stricter on failure, write it to
  * tests/<tier>/<slug>.spec.ts, and return the accepted specs.
+ *
+ * Runs up to GEN_CONCURRENCY items in parallel to increase throughput on
+ * plans with many items; per-item order doesn't matter since each spec is
+ * independent, but path de-dup (usedPaths) still guarantees unique files.
  */
 export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
   const items = plan.items ?? [];
-  emit(ctx, `Generating ${items.length} spec(s)`, { count: items.length });
+  emit(ctx, `Generating ${items.length} spec(s) (up to ${GEN_CONCURRENCY} in parallel)`, {
+    count: items.length,
+  });
 
   const specs: GeneratedSpec[] = [];
   const usedPaths = new Set<string>();
+  let completed = 0;
 
-  for (let i = 0; i < items.length; i += 1) {
-    const item = items[i];
+  // Path de-dup happens inside generateOne (before writeFile) via the shared
+  // usedPaths set, so each accepted spec persists to a unique file on disk
+  // even when several items are generated at once.
+  const tasks = items.map((item, i) => async () => {
     emit(ctx, `[${i + 1}/${items.length}] Generating "${item.title}"`, { id: item.id, tier: item.tier });
+    const outcome = await generateOne(ctx, item, usedPaths);
+    completed += 1;
+    emit(ctx, `Progress: ${completed}/${items.length} done`, { completed, total: items.length });
+    return { item, ...outcome };
+  });
 
-    // Path de-dup happens inside generateOne (before writeFile) via usedPaths,
-    // so each accepted spec persists to a unique file on disk.
-    const { spec, reason, violations } = await generateOne(ctx, item, usedPaths);
+  const outcomes = await runWithConcurrency(tasks, GEN_CONCURRENCY);
+
+  for (const { item, spec, reason, violations } of outcomes) {
     if (!spec) {
       // Include the violation list so the UI/logs show WHAT was forbidden,
       // not just that the spec was skipped.

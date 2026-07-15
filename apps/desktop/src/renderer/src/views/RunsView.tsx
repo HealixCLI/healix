@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ExplorationMode, Project, TestingScope } from '@healix/core';
+import type { Project, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
@@ -48,19 +48,6 @@ const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
 // lifetime historyCollapsed already documented for itself, just actually
 // honored across navigation instead of only within a single mount.
 let persistedSelectedRunId: string | null | undefined;
-
-/**
- * Mirrors the orchestrator's own internal derivation (deriveExplorationMode in
- * packages/core/src/orchestrator/index.ts) purely so this view knows whether
- * to show the Live Browser panel — NOT a user-facing choice. A repo path means
- * white-box source is available (codegen); a base-URL-only project has no
- * source to read, so computer-use (live exploration) is what will actually run.
- */
-function deriveExplorationMode(project: Project | undefined): ExplorationMode {
-  if (project?.repoPath) return 'codegen';
-  if (project?.baseUrl) return 'computer-use';
-  return 'codegen';
-}
 
 export function RunsView({ initialProjectId }: { initialProjectId?: string | null }) {
   const { projects, loading: projectsLoading } = useProjects();
@@ -216,9 +203,11 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     () => projects.find((p) => p.id === projectId) ?? null,
     [projects, projectId],
   );
-  // Display-only: whether the live browser panel is relevant, mirroring what
-  // the orchestrator will actually derive internally for this project.
-  const displayExplorationMode = deriveExplorationMode(selectedProject ?? undefined);
+  // The panel is relevant whenever the project has a live URL to mirror and
+  // the selected scope actually exercises the browser — not tied to
+  // repoPath/exploration mode, since a codegen project with a baseUrl still
+  // drives a real browser during EXPLORE and EXECUTE.
+  const showLiveBrowserPanel = !!selectedProject?.baseUrl && testingScope !== 'backend';
 
   const start = (): void => {
     if (!projectId || isActive) return;
@@ -503,7 +492,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           <div
             className={cn(
               'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
-              displayExplorationMode === 'computer-use' && 'lg:grid-cols-2',
+              showLiveBrowserPanel && 'lg:grid-cols-2',
             )}
           >
             <div className="flex min-h-0 flex-col">
@@ -515,12 +504,11 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 />
               </div>
             </div>
-            {/* Codegen never drives a live browser (it's white-box source generation,
-                not a computer-use exploration) — skip the panel entirely rather than
-                show a permanently-empty placeholder. */}
-            {displayExplorationMode === 'computer-use' && (
+            {/* Skip the panel entirely (rather than show a permanently-empty
+                placeholder) when there's no live URL, or the scope is API-only. */}
+            {showLiveBrowserPanel && (
               <div className="min-h-0">
-                <LiveBrowser frame={frame} active={isActive} mode={displayExplorationMode} />
+                <LiveBrowser frame={frame} active={isActive} />
               </div>
             )}
           </div>

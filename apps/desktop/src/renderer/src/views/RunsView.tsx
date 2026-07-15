@@ -42,6 +42,13 @@ const PHASE_LABEL: Record<RunPhase, string> = {
 /** Engine phases in which the run has settled and a new one can be started. */
 const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
 
+// App.tsx conditionally unmounts RunsView when the user switches to another
+// page, which would otherwise reset these on every navigation. Plain module
+// state survives that remount and resets only on the next app launch — same
+// lifetime historyCollapsed already documented for itself, just actually
+// honored across navigation instead of only within a single mount.
+let persistedSelectedRunId: string | null | undefined;
+
 /**
  * Mirrors the orchestrator's own internal derivation (deriveExplorationMode in
  * packages/core/src/orchestrator/index.ts) purely so this view knows whether
@@ -69,17 +76,40 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [prdFileName, setPrdFileName] = useState<string | null>(null);
   const [prdFileBusy, setPrdFileBusy] = useState(false);
   const [prdFileError, setPrdFileError] = useState<string | null>(null);
-  const [selectedRunId, setSelectedRunId] = useState<string | null>(null);
+  const [selectedRunId, setSelectedRunIdState] = useState<string | null>(
+    () => persistedSelectedRunId ?? null,
+  );
+  const setSelectedRunId = (id: string | null): void => {
+    persistedSelectedRunId = id;
+    setSelectedRunIdState(id);
+  };
   // True from the moment the user clicks Cancel until run:done settles the run.
   const [cancelling, setCancelling] = useState(false);
   // Session-only: resets to expanded on next launch.
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   // Collapsing "Start a run" frees most of the column for the report/timeline
-  // section below it — toggled via the centered chevron divider.
+  // section below it — toggled via the centered chevron divider. Always
+  // starts expanded so the run controls are immediately visible; collapsing
+  // is only ever an explicit, momentary choice via the chevron — switching
+  // to a different project's run panel, or any other remount of this view,
+  // resets back to expanded rather than remembering a previous collapse.
   const [formCollapsed, setFormCollapsed] = useState(false);
 
   const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
+
+  // The very first time this view is shown this session, default to the most
+  // recent run so its detail is visible immediately instead of an empty
+  // "select a run" placeholder. Only fires once — a `persistedSelectedRunId`
+  // of `undefined` means "never decided yet"; any later value (including an
+  // explicit null from starting a new run) means a choice was already made,
+  // so re-navigating back here won't stomp on it.
+  const autoSelectedOnce = useRef(persistedSelectedRunId !== undefined);
+  useEffect(() => {
+    if (autoSelectedOnce.current || runsLoading || runs.length === 0) return;
+    autoSelectedOnce.current = true;
+    setSelectedRunId(runs[0].id);
+  }, [runsLoading, runs]);
 
   // History rows may reference archived projects, so the lookup keeps ALL of
   // them; only the "start a run" selector is restricted to active projects.
@@ -98,6 +128,21 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     if (!picked) return;
     setProjectId(picked.id);
   }, [initialProjectId, runnable, projectId]);
+
+  // Switching the target project re-expands "Start a run" — a collapse is
+  // only ever a per-project, explicit choice via the chevron, never carried
+  // over to whichever project you look at next.
+  useEffect(() => {
+    if (!projectId) return;
+    setFormCollapsed(false);
+  }, [projectId]);
+
+  // Same rule for picking a different run from the history rail — a
+  // collapse never carries over to whichever run you look at next.
+  useEffect(() => {
+    if (!selectedRunId) return;
+    setFormCollapsed(false);
+  }, [selectedRunId]);
 
   const isActive =
     engine.phase === 'starting' || engine.phase === 'running' || engine.phase === 'awaiting-approval';
@@ -251,11 +296,11 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
       </div>
 
       {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8">
-        <header className="flex items-end justify-between border-b border-border pb-5">
+      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8 [@media(max-height:800px)]:pb-3 [@media(max-height:800px)]:pt-4">
+        <header className="flex items-end justify-between border-b border-border pb-5 [@media(max-height:800px)]:pb-2">
           <div>
             <h1 className="font-mono text-xl font-semibold tracking-tight">Runs</h1>
-            <p className="mt-1 text-sm text-muted">
+            <p className="mt-1 text-sm text-muted [@media(max-height:800px)]:hidden">
               Plan → approve → explore → generate → execute → triage → report.
             </p>
           </div>
@@ -263,7 +308,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
         </header>
 
         {/* Controls */}
-        <Card className="mt-5 shrink-0">
+        <Card className="mt-5 shrink-0 [@media(max-height:800px)]:mt-3">
           <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>Start a run</CardTitle>
             {formCollapsed && selectedProject && (

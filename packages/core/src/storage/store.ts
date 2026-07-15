@@ -29,6 +29,7 @@ export class HealixStore {
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
     const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
+    this.assertNameAvailable(name);
     const project: Project = {
       id: `prj_${nanoid(10)}`,
       name,
@@ -69,12 +70,28 @@ export class HealixStore {
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
     const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
+    this.assertNameAvailable(name, id);
     this.db
       .prepare(
         'UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ?, test_username = ?, test_password = ? WHERE id = ?',
       )
       .run(name, mode, repoPath, baseUrl, testUsername, testPassword, id);
     return { ...existing, name, mode, repoPath, baseUrl, testUsername, testPassword };
+  }
+
+  /**
+   * Block duplicate project creation/renaming: names collide case-
+   * insensitively (so "Acme" and "acme" can't coexist and confuse the Project
+   * picker), scoped to ACTIVE projects only — an archived project's name is
+   * free to reuse, since archiving is Healix's own "this is effectively gone"
+   * signal. `excludeId` lets updateProject rename a project without it
+   * colliding with itself.
+   */
+  private assertNameAvailable(name: string, excludeId = ''): void {
+    const clash = this.db
+      .prepare('SELECT id FROM projects WHERE lower(name) = lower(?) AND archived_at IS NULL AND id != ?')
+      .get(name, excludeId) as { id: string } | undefined;
+    if (clash) throw new Error(`A project named "${name}" already exists.`);
   }
 
   /** Soft-archive (or restore) a project. Archived projects keep all runs and assets. */

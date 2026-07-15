@@ -136,7 +136,14 @@ function makeProvider(replies: string[], calls: FakeCall[]): ProviderAdapter {
 const PLAN: TestPlan = {
   summary: 'one item',
   items: [
-    { id: 'REQ-1', title: 'Home page', reqTag: 'REQ-1', tier: 'tierA-public', intent: 'home page renders' },
+    {
+      id: 'REQ-1',
+      title: 'Home page',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      intent: 'home page renders',
+      scenarios: [{ kind: 'positive', description: 'home page renders' }],
+    },
   ],
 };
 
@@ -279,6 +286,7 @@ describe('generate — grounds the prompt in the observed DOM snapshot', () => {
           reqTag: 'REQ-9',
           tier: 'tierC-api',
           intent: 'GET /health returns 200',
+          scenarios: [{ kind: 'positive', description: 'GET /health returns 200' }],
         },
       ],
     };

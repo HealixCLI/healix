@@ -1,6 +1,6 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import type { PlanItemSnapshot, PlanItemStatus, Tier, TestPlan, TestPlanItem } from '@healix/core';
-import { Check, ChevronDown, ChevronUp, Loader2, Pencil, Sparkles, ShieldQuestion, X } from 'lucide-react';
+import type { PlanItemSnapshot, PlanItemStatus, PlanScenario, Tier, TestPlan, TestPlanItem } from '@healix/core';
+import { Check, ChevronDown, ChevronUp, Loader2, Pencil, Plus, Sparkles, ShieldQuestion, Trash2, X } from 'lucide-react';
 import { Button } from './ui/button';
 import { Badge, type BadgeTone } from './ui/badge';
 import { Input } from './ui/input';
@@ -19,6 +19,18 @@ const TIER_GUIDANCE: Record<Tier, string> = {
   'tierA-public': 'Tier A — public: unauthenticated flows.',
   'tierB-auth': 'Tier B — authenticated: flows requiring a logged-in user.',
   'tierC-api': 'Tier C — API: backend/API-level checks.',
+};
+
+const SCENARIO_KIND_TONE: Record<PlanScenario['kind'], BadgeTone> = {
+  positive: 'ok',
+  negative: 'err',
+  edge: 'warn',
+};
+
+const SCENARIO_KIND_LABEL: Record<PlanScenario['kind'], string> = {
+  positive: 'Positive',
+  negative: 'Negative',
+  edge: 'Edge',
 };
 
 const STATUS_TONE: Record<PlanItemStatus, BadgeTone> = {
@@ -78,6 +90,18 @@ function ModalShell({
   );
 }
 
+const SCENARIO_KINDS: ReadonlyArray<PlanScenario['kind']> = ['positive', 'negative', 'edge'];
+
+/** Local editable scenario row — carries a stable key so React doesn't remount rows on reorder/delete. */
+interface EditableScenario extends PlanScenario {
+  key: string;
+}
+
+let scenarioKeySeq = 0;
+function toEditable(scenarios: PlanScenario[]): EditableScenario[] {
+  return scenarios.map((s) => ({ ...s, key: `s${scenarioKeySeq++}` }));
+}
+
 function EditItemDialog({
   item,
   onSave,
@@ -91,8 +115,18 @@ function EditItemDialog({
   const [reqTag, setReqTag] = useState(item.reqTag ?? '');
   const [tier, setTier] = useState<Tier>(item.tier);
   const [intent, setIntent] = useState(item.intent);
+  const [scenarios, setScenarios] = useState<EditableScenario[]>(() => toEditable(item.scenarios));
 
-  const canSave = title.trim().length > 0 && intent.trim().length > 0;
+  const canSave =
+    title.trim().length > 0 &&
+    intent.trim().length > 0 &&
+    scenarios.some((s) => s.description.trim().length > 0);
+
+  const updateScenario = (key: string, patch: Partial<PlanScenario>): void =>
+    setScenarios((rows) => rows.map((r) => (r.key === key ? { ...r, ...patch } : r)));
+  const removeScenario = (key: string): void => setScenarios((rows) => rows.filter((r) => r.key !== key));
+  const addScenario = (): void =>
+    setScenarios((rows) => [...rows, { key: `s${scenarioKeySeq++}`, kind: 'positive', description: '' }]);
 
   return (
     <ModalShell title="Edit test item" onCancel={onCancel}>
@@ -132,10 +166,56 @@ function EditItemDialog({
           <Textarea
             id="edit-intent"
             className="mt-1"
-            rows={3}
+            rows={2}
             value={intent}
             onChange={(e) => setIntent(e.target.value)}
           />
+        </div>
+        <div>
+          <div className="flex items-center justify-between">
+            <Label>Scenarios</Label>
+            <button
+              type="button"
+              onClick={addScenario}
+              className="inline-flex items-center gap-1 text-[11px] text-accent hover:underline"
+            >
+              <Plus className="h-3 w-3" /> Add scenario
+            </button>
+          </div>
+          <div className="mt-1 flex flex-col gap-2">
+            {scenarios.map((s) => (
+              <div key={s.key} className="flex items-start gap-2">
+                <Select
+                  className="w-32 shrink-0"
+                  value={s.kind}
+                  onChange={(e) => updateScenario(s.key, { kind: e.target.value as PlanScenario['kind'] })}
+                >
+                  {SCENARIO_KINDS.map((k) => (
+                    <option key={k} value={k}>
+                      {SCENARIO_KIND_LABEL[k]}
+                    </option>
+                  ))}
+                </Select>
+                <Input
+                  className="flex-1"
+                  value={s.description}
+                  placeholder="Describe this test case"
+                  onChange={(e) => updateScenario(s.key, { description: e.target.value })}
+                />
+                <Button
+                  variant="outline"
+                  size="icon"
+                  aria-label="Remove scenario"
+                  onClick={() => removeScenario(s.key)}
+                >
+                  <Trash2 className="h-3.5 w-3.5" />
+                </Button>
+              </div>
+            ))}
+            {scenarios.length === 0 && (
+              <p className="text-xs text-muted">At least one scenario is required.</p>
+            )}
+          </div>
         </div>
       </div>
       <div className="mt-5 flex justify-end gap-2">
@@ -145,7 +225,15 @@ function EditItemDialog({
         <Button
           disabled={!canSave}
           onClick={() =>
-            onSave({ title: title.trim(), reqTag: reqTag.trim() || undefined, tier, intent: intent.trim() })
+            onSave({
+              title: title.trim(),
+              reqTag: reqTag.trim() || undefined,
+              tier,
+              intent: intent.trim(),
+              scenarios: scenarios
+                .filter((s) => s.description.trim().length > 0)
+                .map(({ kind, description }) => ({ kind, description: description.trim() })),
+            })
           }
         >
           Save
@@ -242,6 +330,11 @@ function PlanItemRow({
             </span>
             <Badge tone="muted">{item.tier}</Badge>
             {item.reqTag && <span className="font-mono text-[11px] text-muted">{item.reqTag}</span>}
+            {item.scenarios.map((s, i) => (
+              <Badge key={i} tone={SCENARIO_KIND_TONE[s.kind]}>
+                {SCENARIO_KIND_LABEL[s.kind]}
+              </Badge>
+            ))}
             <Badge tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Badge>
             <button
               type="button"
@@ -265,6 +358,19 @@ function PlanItemRow({
             <div className="mt-1.5 rounded-md bg-bg/60 p-2 text-xs text-muted">
               <p>{item.intent}</p>
               <p className="mt-1 italic">{TIER_GUIDANCE[item.tier]}</p>
+              {item.scenarios.length > 0 && (
+                <div className="mt-2">
+                  <div className="font-medium text-fg">Scenarios (one test each, same spec file)</div>
+                  <ul className="mt-1 flex flex-col gap-0.5">
+                    {item.scenarios.map((s, i) => (
+                      <li key={i} className="flex items-start gap-1.5">
+                        <Badge tone={SCENARIO_KIND_TONE[s.kind]}>{SCENARIO_KIND_LABEL[s.kind]}</Badge>
+                        <span>{s.description}</span>
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              )}
               {item.edits && item.edits.length > 0 && (
                 <div className="mt-2">
                   <div className="font-medium text-fg">Edits</div>

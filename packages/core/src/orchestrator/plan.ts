@@ -1,16 +1,26 @@
 import { nanoid } from 'nanoid';
 import type { Project, Tier } from '../storage/types.js';
-import type { TestingScope, TestPlan, TestPlanItem } from '../modes/types.js';
+import type { PlanScenario, TestingScope, TestPlan, TestPlanItem } from '../modes/types.js';
 import { tiersForScope } from '../modes/types.js';
 import type { ProviderAdapter } from '../providers/types.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 import type { RunOptions } from './types.js';
 
+const KNOWN_SCENARIO_KINDS: ReadonlyArray<PlanScenario['kind']> = ['positive', 'negative', 'edge'];
+
 /** Shape the model is asked to emit inside a fenced JSON block. */
+interface RawScenario {
+  kind?: unknown;
+  description?: unknown;
+}
+
 interface RawPlanItem {
   title?: unknown;
   reqTag?: unknown;
   tier?: unknown;
   intent?: unknown;
+  scenarios?: unknown;
+  unitKey?: unknown;
 }
 
 interface RawPlan {
@@ -28,10 +38,15 @@ const KNOWN_TIERS: ReadonlyArray<Tier> = ['tierA-public', 'tierB-auth', 'tierC-a
  */
 const MAX_PLAN_PROMPT_FILES = 80;
 
+/** Hard cap on functionality-index units interpolated into the planning prompt (see functionality-index.ts). */
+const MAX_PLAN_PROMPT_UNITS = 150;
+
 /** Bounded repo context for grounding the plan (see indexRepo / RepoIndex). */
 export interface PlanRepoContext {
   summary: string;
   files: string[];
+  /** Regex-extracted routes/endpoints (see indexFunctionality); optional, additive to files/summary. */
+  functionality?: FunctionalityUnit[];
 }
 
 /**
@@ -39,16 +54,24 @@ export interface PlanRepoContext {
  * the response is machine-parseable, while still leaving room for prose.
  *
  * When `repoIndex` is provided (white-box runs), a bounded repo-context section
- * (summary + up to MAX_PLAN_PROMPT_FILES file paths) is appended so the plan is
- * grounded in the actual repo instead of the model guessing generic flows.
+ * (summary + up to MAX_PLAN_PROMPT_FILES file paths, plus any extracted
+ * routes/endpoints) is appended so the plan is grounded in the actual repo
+ * instead of the model guessing generic flows.
+ *
+ * Unlike earlier revisions, this does NOT cap the number of scenarios: when a
+ * functionality inventory is available the model is asked to cover every
+ * distinct unit; item count is expected to scale with the app's real surface
+ * area, not an arbitrary "3-8" ceiling.
  */
 export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: PlanRepoContext): string {
   const scope = opts.testingScope ?? 'both';
   const tiers = tiersForScope(scope);
+  const units = repoIndex?.functionality ?? [];
 
   const lines: string[] = [];
-  lines.push('You are Healix, an autonomous QA engineer. Produce a concise end-to-end test plan');
-  lines.push('for the application under test described below.');
+  lines.push('You are Healix, an autonomous QA engineer. Produce a thorough end-to-end test plan');
+  lines.push('for the application under test described below, aiming for comprehensive coverage');
+  lines.push('of its real functionality — not just a handful of generic smoke checks.');
   lines.push('');
   lines.push(`Project name: ${project.name}`);
   lines.push(`Testing scope: ${scopeLabel(scope)} — ONLY plan tests for these tier(s): ${tiers.join(', ')}.`);
@@ -74,6 +97,16 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
       if (remaining > 0) lines.push(`... and ${remaining} more file(s) not listed.`);
     }
   }
+  if (units.length > 0) {
+    const shownUnits = units.slice(0, MAX_PLAN_PROMPT_UNITS);
+    lines.push('');
+    lines.push(
+      `Detected routes/endpoints (${shownUnits.length}${units.length > shownUnits.length ? ` of ${units.length}` : ''}) — produce one plan item per unit below that is testable within the in-scope tier(s), unless it is clearly not user/API-facing:`,
+    );
+    for (const u of shownUnits) lines.push(`- [${u.kind}] ${u.label} (unitKey: "${u.key}")`);
+    const remainingUnits = units.length - shownUnits.length;
+    if (remainingUnits > 0) lines.push(`... and ${remainingUnits} more unit(s) not listed.`);
+  }
   lines.push('');
   lines.push('Respond with exactly one fenced JSON code block of the shape:');
   lines.push('```json');
@@ -84,15 +117,50 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push('      "title": "short human title",');
   lines.push('      "reqTag": "REQ-001 or null",');
   lines.push(`      "tier": "${tiers.join('" | "')}",`);
-  lines.push('      "intent": "what this test verifies, in one or two sentences"');
+  lines.push('      "intent": "what this test verifies, in one or two sentences",');
+  lines.push('      "unitKey": "the unitKey from the detected list above, or null",');
+  lines.push('      "scenarios": [');
+  lines.push('        { "kind": "positive", "description": "the happy-path case" },');
+  lines.push('        { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
+  lines.push('        { "kind": "edge", "description": "a boundary condition, if applicable" }');
+  lines.push('      ]');
   lines.push('    }');
   lines.push('  ]');
   lines.push('}');
   lines.push('```');
   lines.push('');
-  lines.push(`Prefer 3-8 high-value scenarios, all within the "${tiers.join('", "')}" tier(s) above.`);
+  lines.push(
+    units.length > 0
+      ? 'Produce one item per distinct route/endpoint listed above that is testable in scope — do not skip any without good reason. Every item needs at least one "positive" scenario; add "negative" and "edge" scenarios only where genuinely applicable to that feature (do not fabricate them for a feature that has none).'
+      : 'Enumerate every distinct user-facing flow or API surface you can identify from the context above — do not artificially limit the number of items. Every item needs at least one "positive" scenario; add "negative" and "edge" scenarios only where genuinely applicable to that feature.',
+  );
+  lines.push(`All items must stay within the "${tiers.join('", "')}" tier(s) above.`);
   lines.push(tierGuidanceFor(tiers));
   return lines.join('\n');
+}
+
+/**
+ * Build a follow-up plan prompt scoped to ONLY the given uncovered functionality
+ * units — used by the orchestrator's coverage-feedback loop (see coverage.ts) to
+ * fill remaining gaps after an initial plan/generate/execute pass falls short of
+ * its coverage target, without re-asking for units already covered.
+ */
+export function buildGapFillPlanPrompt(
+  project: Project,
+  opts: RunOptions,
+  uncoveredUnits: FunctionalityUnit[],
+  repoIndex?: PlanRepoContext,
+): string {
+  const scopedIndex: PlanRepoContext = {
+    summary: repoIndex?.summary ?? '',
+    files: [],
+    functionality: uncoveredUnits,
+  };
+  const prompt = buildPlanPrompt(project, opts, scopedIndex);
+  const prefix =
+    'A previous pass already planned and tested other parts of this application. ' +
+    'The list below is ONLY the functionality still missing coverage — focus exclusively on these.\n\n';
+  return prefix + prompt;
 }
 
 function scopeLabel(scope: TestingScope): string {
@@ -168,6 +236,14 @@ export function synthesizePlan(project: Project, scope: TestingScope = 'both'): 
       intent: project.baseUrl
         ? `Send a basic request to ${project.baseUrl} and verify a successful HTTP response.`
         : 'Confirm the API responds to a basic health-check request.',
+      scenarios: [
+        {
+          kind: 'positive',
+          description: project.baseUrl
+            ? `Send a basic request to ${project.baseUrl} and verify a successful HTTP response.`
+            : 'Confirm the API responds to a basic health-check request.',
+        },
+      ],
     });
   } else if (project.baseUrl) {
     items.push({
@@ -175,12 +251,24 @@ export function synthesizePlan(project: Project, scope: TestingScope = 'both'): 
       title: 'Home page loads',
       tier: 'tierA-public',
       intent: `Navigate to ${project.baseUrl} and verify the page renders without console/network errors.`,
+      scenarios: [
+        {
+          kind: 'positive',
+          description: `Navigate to ${project.baseUrl} and verify the page renders without console/network errors.`,
+        },
+      ],
     });
     items.push({
       id: `pli_${nanoid(8)}`,
       title: 'Primary navigation works',
       tier: 'tierA-public',
       intent: 'Exercise the main navigation links and confirm each destination is reachable.',
+      scenarios: [
+        {
+          kind: 'positive',
+          description: 'Exercise the main navigation links and confirm each destination is reachable.',
+        },
+      ],
     });
   } else {
     items.push({
@@ -188,6 +276,9 @@ export function synthesizePlan(project: Project, scope: TestingScope = 'both'): 
       title: 'Smoke: application boots',
       tier: 'tierA-public',
       intent: 'Confirm the application under test starts and serves its entry point.',
+      scenarios: [
+        { kind: 'positive', description: 'Confirm the application under test starts and serves its entry point.' },
+      ],
     });
   }
   return {
@@ -236,7 +327,14 @@ export function buildReviseItemPrompt(
   lines.push('```json');
   lines.push(
     JSON.stringify(
-      { title: item.title, reqTag: item.reqTag ?? null, tier: item.tier, intent: item.intent },
+      {
+        title: item.title,
+        reqTag: item.reqTag ?? null,
+        tier: item.tier,
+        intent: item.intent,
+        unitKey: item.unitKey ?? null,
+        scenarios: item.scenarios,
+      },
       null,
       2,
     ),
@@ -254,9 +352,18 @@ export function buildReviseItemPrompt(
   lines.push('  "title": "short human title",');
   lines.push('  "reqTag": "REQ-001 or null",');
   lines.push(`  "tier": "${tiers.join('" | "')}",`);
-  lines.push('  "intent": "what this test verifies, in one or two sentences"');
+  lines.push('  "intent": "what this test verifies, in one or two sentences",');
+  lines.push('  "unitKey": "keep the current unitKey, or null",');
+  lines.push('  "scenarios": [');
+  lines.push('    { "kind": "positive", "description": "the happy-path case" },');
+  lines.push('    { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
+  lines.push('    { "kind": "edge", "description": "a boundary condition, if applicable" }');
+  lines.push('  ]');
   lines.push('}');
   lines.push('```');
+  lines.push(
+    'Include the full revised scenarios array (keep scenarios unaffected by the feedback as-is; revise only what the feedback requires).',
+  );
   lines.push(tierGuidanceFor(tiers));
   return lines.join('\n');
 }
@@ -322,6 +429,21 @@ export async function reviseItem(
   return { ok: true, item: revised };
 }
 
+/** Parse and normalize a raw scenarios array; unknown/malformed entries are dropped, not coerced into noise. */
+function normalizeScenarios(raw: unknown): PlanScenario[] {
+  if (!Array.isArray(raw)) return [];
+  const out: PlanScenario[] = [];
+  for (const entry of raw as RawScenario[]) {
+    if (!entry || typeof entry !== 'object') continue;
+    const description = typeof entry.description === 'string' ? entry.description.trim() : '';
+    if (description.length === 0) continue;
+    const kindRaw = typeof entry.kind === 'string' ? entry.kind.trim().toLowerCase() : '';
+    const kind = (KNOWN_SCENARIO_KINDS.find((k) => k === kindRaw) ?? 'positive') as PlanScenario['kind'];
+    out.push({ kind, description });
+  }
+  return out;
+}
+
 export function normalizeItem(it: RawPlanItem, scope: TestingScope): TestPlanItem | null {
   if (!it || typeof it !== 'object') return null;
   const title = typeof it.title === 'string' ? it.title.trim() : '';
@@ -331,9 +453,19 @@ export function normalizeItem(it: RawPlanItem, scope: TestingScope): TestPlanIte
     typeof it.reqTag === 'string' && it.reqTag.trim().length > 0 && it.reqTag.trim() !== 'null'
       ? it.reqTag.trim()
       : undefined;
+  const unitKey =
+    typeof it.unitKey === 'string' && it.unitKey.trim().length > 0 && it.unitKey.trim() !== 'null'
+      ? it.unitKey.trim()
+      : undefined;
   const tier = normalizeTier(it.tier, scope);
-  const item: TestPlanItem = { id: `pli_${nanoid(8)}`, title, tier, intent };
+  let scenarios = normalizeScenarios(it.scenarios);
+  // A malformed/missing scenarios array shouldn't sink an otherwise-usable item —
+  // fall back to a single positive scenario derived from intent, same as the
+  // pre-scenarios behavior where intent alone drove generation.
+  if (scenarios.length === 0) scenarios = [{ kind: 'positive', description: intent }];
+  const item: TestPlanItem = { id: `pli_${nanoid(8)}`, title, tier, intent, scenarios };
   if (reqTag) item.reqTag = reqTag;
+  if (unitKey) item.unitKey = unitKey;
   return item;
 }
 

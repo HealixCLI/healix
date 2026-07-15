@@ -28,12 +28,23 @@ export function tiersForScope(scope: TestingScope): Tier[] {
 /** Per-item plan review status. undefined is treated identically to 'pending' everywhere it's read. */
 export type PlanItemStatus = 'pending' | 'approved' | 'rejected' | 'edited' | 'revised';
 
+/**
+ * One concrete test case within a plan item's feature. 'positive' (happy path) is
+ * always required; 'negative' (invalid input/unauthorized/error path) and 'edge'
+ * (boundary condition) are included only where applicable to the feature.
+ */
+export interface PlanScenario {
+  kind: 'positive' | 'negative' | 'edge';
+  description: string;
+}
+
 /** Snapshot of a plan item's content fields, used for before/after audit history. */
 export interface PlanItemSnapshot {
   title: string;
   reqTag?: string;
   tier: Tier;
   intent: string;
+  scenarios: PlanScenario[];
 }
 
 /** One manual edit event on a plan item, oldest-first in TestPlanItem.edits. */
@@ -57,6 +68,19 @@ export interface TestPlanItem {
   reqTag?: string;
   tier: Tier;
   intent: string;
+  /**
+   * Concrete test cases to cover for this feature in one generated spec file.
+   * Always has at least one 'positive' entry; 'negative'/'edge' entries are
+   * present only when applicable to the feature.
+   */
+  scenarios: PlanScenario[];
+  /**
+   * Identity of the functionality-index unit (route/endpoint) this item targets,
+   * when the plan was grounded on a functionality inventory. Used for coverage
+   * matching; falls back to reqTag/title matching (see topup.ts's
+   * computeIdentityKey) when absent.
+   */
+  unitKey?: string;
   /**
    * Per-item review status, set only by the approval-gate flow (never by
    * parsePlan/synthesizePlan). undefined means "not yet reviewed" and is

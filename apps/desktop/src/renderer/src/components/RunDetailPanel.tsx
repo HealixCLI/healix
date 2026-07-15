@@ -1,8 +1,9 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { AgentEvent, TestCase, TestResult } from '@healix/core';
+import type { AgentEvent, TestCase, TestResult, TestStatus } from '@healix/core';
 import { Camera, FileText, FolderOpen, Image as ImageIcon, PackageOpen, X } from 'lucide-react';
 import { Badge } from './ui/badge';
+import type { BadgeTone } from './ui/badge';
 import { Button } from './ui/button';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
@@ -36,12 +37,29 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
   const [tab, setTab] = useState<DetailTab>('timeline');
   const [busy, setBusy] = useState<'reveal' | 'export' | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
   const triage = report?.triage ?? [];
 
   // Join results to their test rows so the table can show title / REQ / tier.
   const rows = useMemo(() => joinResults(detail?.tests ?? [], detail?.results ?? []), [detail]);
+  // A status filter only ever narrows the Results tab; other tabs ignore it.
+  const filteredRows = useMemo(
+    () => (statusFilter === 'all' ? rows : rows.filter((r) => (r.status ?? 'pending') === statusFilter)),
+    [rows, statusFilter],
+  );
+  const summary = useMemo(() => summarizeStatuses(rows), [rows]);
+
+  // Reset any active filter when a different run is opened.
+  useEffect(() => {
+    setStatusFilter('all');
+  }, [detail?.run?.id]);
+
+  const selectStatus = (status: TestStatus | 'all'): void => {
+    setStatusFilter((prev) => (prev === status ? 'all' : status));
+    setTab('results');
+  };
 
   const suiteDir = detail?.suiteDir ?? null;
   const artifacts = useMemo(() => detail?.artifacts ?? [], [detail?.artifacts]);
@@ -171,7 +189,10 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
       <div className="mt-3 min-h-0 flex-1 overflow-auto">
         {tab === 'timeline' && <Timeline events={detail.events} />}
         {tab === 'results' && (
-          <ResultsTable rows={rows} mediaFolders={mediaFolders} onShowMedia={showMedia} />
+          <div className="flex flex-col gap-3">
+            <TestSummary summary={summary} activeStatus={statusFilter} onSelect={selectStatus} />
+            <ResultsTable rows={filteredRows} mediaFolders={mediaFolders} onShowMedia={showMedia} />
+          </div>
         )}
         {tab === 'triage' && <TriageList entries={triage} />}
         {tab === 'artifacts' && (
@@ -224,6 +245,91 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
     durationMs: r.durationMs,
     error: r.error,
   }));
+}
+
+const STATUS_TILES: ReadonlyArray<{ status: TestStatus; label: string }> = [
+  { status: 'passed', label: 'Passed' },
+  { status: 'failed', label: 'Failed' },
+  { status: 'blocked', label: 'Blocked' },
+  { status: 'flaky', label: 'Flaky' },
+  { status: 'skipped', label: 'Skipped' },
+  { status: 'pending', label: 'Pending' },
+];
+
+type StatusCounts = Record<TestStatus, number>;
+
+function summarizeStatuses(rows: JoinedRow[]): StatusCounts {
+  const counts: StatusCounts = { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, pending: 0 };
+  for (const r of rows) {
+    const status = (r.status ?? 'pending') as TestStatus;
+    counts[status] = (counts[status] ?? 0) + 1;
+  }
+  return counts;
+}
+
+// Total is always the sum of the status tiles, since it's derived from the same rows.
+function TestSummary({
+  summary,
+  activeStatus,
+  onSelect,
+}: {
+  summary: StatusCounts;
+  activeStatus: TestStatus | 'all';
+  onSelect: (status: TestStatus | 'all') => void;
+}) {
+  const total = STATUS_TILES.reduce((n, t) => n + summary[t.status], 0);
+
+  return (
+    <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-7">
+      <SummaryTile
+        label="Total"
+        value={total}
+        tone="default"
+        active={activeStatus === 'all'}
+        onClick={() => onSelect('all')}
+      />
+      {STATUS_TILES.map((t) => (
+        <SummaryTile
+          key={t.status}
+          label={t.label}
+          value={summary[t.status]}
+          tone={testStatusTone(t.status)}
+          active={activeStatus === t.status}
+          onClick={() => onSelect(t.status)}
+        />
+      ))}
+    </div>
+  );
+}
+
+function SummaryTile({
+  label,
+  value,
+  tone,
+  active,
+  onClick,
+}: {
+  label: string;
+  value: number;
+  tone: BadgeTone;
+  active: boolean;
+  onClick: () => void;
+}) {
+  const valueColor =
+    tone === 'ok' ? 'text-ok' : tone === 'warn' ? 'text-warn' : tone === 'err' ? 'text-err' : 'text-fg';
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'rounded-lg border border-border bg-panel/40 px-3 py-2 text-left transition-colors hover:border-accent/50',
+        active && 'border-accent bg-accent/5',
+      )}
+    >
+      <div className="text-[11px] text-muted">{label}</div>
+      <div className={cn('mt-0.5 text-lg font-semibold leading-none', valueColor)}>{value}</div>
+    </button>
+  );
 }
 
 function Timeline({ events }: { events: AgentEvent[] }) {

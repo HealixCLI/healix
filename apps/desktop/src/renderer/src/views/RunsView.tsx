@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ExplorationMode, Project } from '@healix/core';
-import { Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
+import type { ExplorationMode, Project, TestingScope } from '@healix/core';
+import { ChevronDown, ChevronUp, Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -17,7 +17,7 @@ import { useRuns } from '../lib/use-runs';
 import { useRunDetail } from '../lib/use-run-detail';
 import { useLiveFrame } from '../lib/use-live-frame';
 import { cn } from '../lib/utils';
-import { EXPLORATION_MODES, useRunEngine, type RunPhase } from '../lib/run-engine';
+import { TESTING_SCOPES, useRunEngine, type RunPhase } from '../lib/run-engine';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
@@ -43,13 +43,13 @@ const PHASE_LABEL: Record<RunPhase, string> = {
 const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
 
 /**
- * Pick the mode that matches how a project is actually configured: a repo path
- * means white-box source is available, so Codegen can read and generate real
- * specs from it (repo path wins when both are set); a base-URL-only project
- * has no source to read, so Computer-use (live exploration) is the only mode
- * that makes sense.
+ * Mirrors the orchestrator's own internal derivation (deriveExplorationMode in
+ * packages/core/src/orchestrator/index.ts) purely so this view knows whether
+ * to show the Live Browser panel — NOT a user-facing choice. A repo path means
+ * white-box source is available (codegen); a base-URL-only project has no
+ * source to read, so computer-use (live exploration) is what will actually run.
  */
-function deriveMode(project: Project | undefined): ExplorationMode {
+function deriveExplorationMode(project: Project | undefined): ExplorationMode {
   if (project?.repoPath) return 'codegen';
   if (project?.baseUrl) return 'computer-use';
   return 'codegen';
@@ -62,7 +62,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const { runs, loading: runsLoading, error: runsError, refresh: refreshRuns } = useRuns();
 
   const [projectId, setProjectId] = useState<string>('');
-  const [mode, setMode] = useState<ExplorationMode>('codegen');
+  const [testingScope, setTestingScope] = useState<TestingScope>('both');
   const [prd, setPrd] = useState('');
   // Set once a PRD file is successfully uploaded; cleared if the user edits the
   // textarea by hand, since the displayed text no longer matches the file.
@@ -74,6 +74,9 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [cancelling, setCancelling] = useState(false);
   // Session-only: resets to expanded on next launch.
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
+  // Collapsing "Start a run" frees most of the column for the report/timeline
+  // section below it — toggled via the centered chevron divider.
+  const [formCollapsed, setFormCollapsed] = useState(false);
 
   const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
   const { frame } = useLiveFrame(engine.runId);
@@ -87,16 +90,13 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   }, [projects]);
   const runnable = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
 
-  // Default the selection to the deep-linked project, else the first project —
-  // and derive Mode from whichever one that turns out to be (repo path vs.
-  // base URL), same as a manual project switch below.
+  // Default the selection to the deep-linked project, else the first project.
   useEffect(() => {
     if (projectId) return;
     const deepLinked = initialProjectId && runnable.find((p) => p.id === initialProjectId);
     const picked = deepLinked || runnable[0];
     if (!picked) return;
     setProjectId(picked.id);
-    setMode(deriveMode(picked));
   }, [initialProjectId, runnable, projectId]);
 
   const isActive =
@@ -121,11 +121,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     }
     hydrate({ runId: selectedRunId, plan: detail.plan });
     setProjectId(detail.run.projectId);
-    // The exploration mode (codegen vs. computer-use) isn't persisted on the
-    // run row — Run.mode is the test-framework mode ('playwright') — so it's
-    // re-derived from the project's config, same heuristic as a fresh pick.
-    setMode(deriveMode(projectsById.get(detail.run.projectId)));
-  }, [selectedRunId, detail, engine.runId, hydrate, projectsById]);
+  }, [selectedRunId, detail, engine.runId, hydrate]);
 
   // Clear the "Cancelling…" state once the run settles (run:done) or resets.
   useEffect(() => {
@@ -175,6 +171,9 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     () => projects.find((p) => p.id === projectId) ?? null,
     [projects, projectId],
   );
+  // Display-only: whether the live browser panel is relevant, mirroring what
+  // the orchestrator will actually derive internally for this project.
+  const displayExplorationMode = deriveExplorationMode(selectedProject ?? undefined);
 
   const start = (): void => {
     if (!projectId || isActive) return;
@@ -182,7 +181,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     setSelectedRunId(null);
     void engine.start({
       projectId,
-      mode,
+      testingScope,
       prd: prd.trim() || undefined,
     });
   };
@@ -265,136 +264,156 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
 
         {/* Controls */}
         <Card className="mt-5 shrink-0">
-          <CardHeader>
+          <CardHeader className="flex flex-row items-center justify-between">
             <CardTitle>Start a run</CardTitle>
+            {formCollapsed && selectedProject && (
+              <span className="truncate font-mono text-xs text-muted">
+                {selectedProject.name} · {TESTING_SCOPES.find((s) => s.value === testingScope)?.label}
+              </span>
+            )}
           </CardHeader>
-          <CardContent>
-            <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
-              <div>
-                <Label className="mb-1.5 block">Project</Label>
-                <Select
-                  value={projectId}
-                  onChange={(e) => {
-                    setProjectId(e.target.value);
-                    setMode(deriveMode(projectsById.get(e.target.value)));
-                  }}
-                  disabled={isActive || projectsLoading || runnable.length === 0}
-                >
-                  {runnable.length === 0 && <option value="">No active projects — create one first</option>}
-                  {runnable.map((p) => (
-                    <option key={p.id} value={p.id}>
-                      {p.name}
-                    </option>
-                  ))}
-                </Select>
-              </div>
-              <div>
-                <Label className="mb-1.5 block">Mode</Label>
-                <Select
-                  value={mode}
-                  onChange={(e) => setMode(e.target.value as ExplorationMode)}
-                  disabled={isActive}
-                >
-                  {EXPLORATION_MODES.map((m) => (
-                    <option key={m.value} value={m.value}>
-                      {m.label}
-                    </option>
-                  ))}
-                </Select>
-                <p className="mt-1 text-[11px] text-muted">
-                  {EXPLORATION_MODES.find((m) => m.value === mode)?.hint}
-                </p>
-              </div>
-              <div className="sm:col-span-2">
-                <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
-                <div className="relative">
-                  <Textarea
-                    value={prd}
-                    onChange={(e) => {
-                      setPrd(e.target.value);
-                      // The text no longer reflects the uploaded file verbatim.
-                      setPrdFileName(null);
-                    }}
-                    placeholder="Paste requirements to ground test generation…"
+          {!formCollapsed && (
+            <CardContent>
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+                <div>
+                  <Label className="mb-1.5 block">Project</Label>
+                  <Select
+                    value={projectId}
+                    onChange={(e) => setProjectId(e.target.value)}
+                    disabled={isActive || projectsLoading || runnable.length === 0}
+                  >
+                    {runnable.length === 0 && <option value="">No active projects — create one first</option>}
+                    {runnable.map((p) => (
+                      <option key={p.id} value={p.id}>
+                        {p.name}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+                <div>
+                  <Label className="mb-1.5 block">Testing Scope</Label>
+                  <Select
+                    value={testingScope}
+                    onChange={(e) => setTestingScope(e.target.value as TestingScope)}
                     disabled={isActive}
-                    className="pr-9"
-                  />
-                  <button
-                    type="button"
-                    onClick={() => void uploadPrdFile()}
-                    disabled={isActive || prdFileBusy}
-                    aria-label="Upload a PRD file"
-                    title="Upload a PRD file"
-                    className={cn(
-                      'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
-                      'text-muted transition-colors hover:bg-panel hover:text-fg',
-                      'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
-                      'disabled:pointer-events-none disabled:opacity-50',
-                    )}
                   >
-                    {prdFileBusy ? (
-                      <Loader2 className="h-4 w-4 animate-spin" />
-                    ) : (
-                      <Plus className="h-4 w-4" />
-                    )}
-                  </button>
+                    {TESTING_SCOPES.map((s) => (
+                      <option key={s.value} value={s.value}>
+                        {s.label}
+                      </option>
+                    ))}
+                  </Select>
+                  <p className="mt-1 text-[11px] text-muted">
+                    {TESTING_SCOPES.find((s) => s.value === testingScope)?.hint}
+                  </p>
                 </div>
-                <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
-                  <span>
-                    {prdFileName ? (
-                      <>
-                        Selected file: <span className="font-mono text-fg">{prdFileName}</span>
-                      </>
-                    ) : (
-                      'No file selected — paste text above or upload a PRD.'
-                    )}
-                  </span>
-                  <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
+                <div className="sm:col-span-2">
+                  <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
+                  <div className="relative">
+                    <Textarea
+                      value={prd}
+                      onChange={(e) => {
+                        setPrd(e.target.value);
+                        // The text no longer reflects the uploaded file verbatim.
+                        setPrdFileName(null);
+                      }}
+                      placeholder="Paste requirements to ground test generation…"
+                      disabled={isActive}
+                      className="pr-9"
+                    />
+                    <button
+                      type="button"
+                      onClick={() => void uploadPrdFile()}
+                      disabled={isActive || prdFileBusy}
+                      aria-label="Upload a PRD file"
+                      title="Upload a PRD file"
+                      className={cn(
+                        'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
+                        'text-muted transition-colors hover:bg-panel hover:text-fg',
+                        'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
+                        'disabled:pointer-events-none disabled:opacity-50',
+                      )}
+                    >
+                      {prdFileBusy ? (
+                        <Loader2 className="h-4 w-4 animate-spin" />
+                      ) : (
+                        <Plus className="h-4 w-4" />
+                      )}
+                    </button>
+                  </div>
+                  <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
+                    <span>
+                      {prdFileName ? (
+                        <>
+                          Selected file: <span className="font-mono text-fg">{prdFileName}</span>
+                        </>
+                      ) : (
+                        'No file selected — paste text above or upload a PRD.'
+                      )}
+                    </span>
+                    <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
+                  </div>
+                  {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
                 </div>
-                {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
               </div>
-            </div>
 
-            <div className="mt-4 flex min-w-0 items-center justify-between">
-              <div className="min-w-0 text-xs text-muted">
-                {selectedProject ? (
-                  <span
-                    className="block truncate font-mono"
-                    title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
-                  >
-                    {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
-                  </span>
-                ) : (
-                  'Select a project to begin.'
-                )}
-              </div>
-              <div className="flex shrink-0 items-center gap-2">
-                {SETTLED_PHASES.includes(engine.phase) && (
-                  <Button variant="ghost" onClick={newRun}>
-                    <RotateCcw className="h-4 w-4" />
-                    New run
+              <div className="mt-4 flex min-w-0 items-center justify-between">
+                <div className="min-w-0 text-xs text-muted">
+                  {selectedProject ? (
+                    <span
+                      className="block truncate font-mono"
+                      title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+                    >
+                      {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
+                    </span>
+                  ) : (
+                    'Select a project to begin.'
+                  )}
+                </div>
+                <div className="flex shrink-0 items-center gap-2">
+                  {SETTLED_PHASES.includes(engine.phase) && (
+                    <Button variant="ghost" onClick={newRun}>
+                      <RotateCcw className="h-4 w-4" />
+                      New run
+                    </Button>
+                  )}
+                  {isActive && (
+                    <Button
+                      variant="outline"
+                      className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
+                      onClick={cancel}
+                      // No runId yet means there is nothing to abort (still 'starting').
+                      disabled={cancelling || !engine.runId}
+                    >
+                      <Square className="h-4 w-4" />
+                      {cancelling ? 'Cancelling…' : 'Cancel'}
+                    </Button>
+                  )}
+                  <Button onClick={start} disabled={!projectId || isActive}>
+                    {isActive ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
+                    {isActive ? 'Running…' : 'Start run'}
                   </Button>
-                )}
-                {isActive && (
-                  <Button
-                    variant="outline"
-                    className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
-                    onClick={cancel}
-                    // No runId yet means there is nothing to abort (still 'starting').
-                    disabled={cancelling || !engine.runId}
-                  >
-                    <Square className="h-4 w-4" />
-                    {cancelling ? 'Cancelling…' : 'Cancel'}
-                  </Button>
-                )}
-                <Button onClick={start} disabled={!projectId || isActive}>
-                  {isActive ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                  {isActive ? 'Running…' : 'Start run'}
-                </Button>
+                </div>
               </div>
-            </div>
-          </CardContent>
+            </CardContent>
+          )}
         </Card>
+
+        {/* Collapse toggle: centered chevron on a divider. Collapsing "Start a
+            run" down to just its header hands most of the column's height to
+            the report/timeline section below. */}
+        <div className="relative my-1 flex shrink-0 items-center">
+          <div className="h-px flex-1 bg-border" />
+          <button
+            type="button"
+            onClick={() => setFormCollapsed((v) => !v)}
+            aria-label={formCollapsed ? 'Expand start-a-run panel' : 'Collapse start-a-run panel'}
+            className="mx-2 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-border bg-panel text-muted transition-colors hover:border-muted/50 hover:text-fg"
+          >
+            {formCollapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
+          </button>
+          <div className="h-px flex-1 bg-border" />
+        </div>
 
         {/* Plan gate: only while parked, AND only for the run currently being
             shown — a rehydrated pending approval must not bleed into every
@@ -433,7 +452,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           <div
             className={cn(
               'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
-              mode === 'computer-use' && 'lg:grid-cols-2',
+              displayExplorationMode === 'computer-use' && 'lg:grid-cols-2',
             )}
           >
             <div className="flex min-h-0 flex-col">
@@ -448,9 +467,9 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
             {/* Codegen never drives a live browser (it's white-box source generation,
                 not a computer-use exploration) — skip the panel entirely rather than
                 show a permanently-empty placeholder. */}
-            {mode === 'computer-use' && (
+            {displayExplorationMode === 'computer-use' && (
               <div className="min-h-0">
-                <LiveBrowser frame={frame} active={isActive} mode={mode} />
+                <LiveBrowser frame={frame} active={isActive} mode={displayExplorationMode} />
               </div>
             )}
           </div>

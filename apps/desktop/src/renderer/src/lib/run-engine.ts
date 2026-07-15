@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import type { ExplorationMode, OrchestratorEvent, RunSummary, TestPlan } from '@healix/core';
+import type { OrchestratorEvent, RunSummary, TestingScope, TestPlan } from '@healix/core';
 import type { RunChannelMessage, StartRunArgs } from './ipc-types';
 
 export type RunPhase = 'idle' | 'starting' | 'running' | 'awaiting-approval' | 'done' | 'cancelled' | 'error';
@@ -259,7 +259,13 @@ export function useRunEngine(): RunEngine {
   return { ...state, start, approve, cancel, reset, hydrate, clearError };
 }
 
-export const EXPLORATION_MODES: ReadonlyArray<{ value: ExplorationMode; label: string; hint: string }> = [
-  { value: 'codegen', label: 'Codegen', hint: 'White-box: read the repo, generate runnable specs' },
-  { value: 'computer-use', label: 'Computer use', hint: 'Black-box: drive the live app like a user' },
+/**
+ * User-facing testing scope. The underlying exploration mechanism (codegen
+ * vs. computer-use) is no longer a user choice — it's derived internally from
+ * the project's config (repo path vs. base URL) and fully abstracted away.
+ */
+export const TESTING_SCOPES: ReadonlyArray<{ value: TestingScope; label: string; hint: string }> = [
+  { value: 'frontend', label: 'Frontend Testing', hint: 'UI-focused tests (public + authenticated flows)' },
+  { value: 'backend', label: 'Backend Testing', hint: 'API/backend tests only' },
+  { value: 'both', label: 'Both (Frontend + Backend)', hint: 'Full coverage across UI and API' },
 ];

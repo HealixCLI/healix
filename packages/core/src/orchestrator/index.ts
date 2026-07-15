@@ -8,12 +8,14 @@ import type { ProviderAdapter } from '../providers/types.js';
 import { getTestMode } from '../modes/registry.js';
 import type {
   ExecOutcome,
+  ExplorationMode,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
   TestModeContext,
   TestPlan,
 } from '../modes/types.js';
+import { tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { runCli } from '../exec/run-cli.js';
@@ -245,6 +247,13 @@ async function runPipeline(
     }
 
     plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+    // Enforce the testing-scope boundary as a backstop: plan.ts already asks
+    // the model for (and normalizes tiers to) only in-scope tiers, but this
+    // is the hard guarantee — filtered here, before approval/persistence, so
+    // the approval gate, plan.json, and the report all consistently reflect
+    // only what will actually be generated and executed.
+    const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
+    plan = { ...plan, items: plan.items.filter((it) => inScopeTiers.has(it.tier)) };
     await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
     setStatus('awaiting-approval');
@@ -417,10 +426,13 @@ async function runPipeline(
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
       baseUrl: effectiveBaseUrl,
+      testUsername: project.testUsername,
+      testPassword: project.testPassword,
       provider,
       target,
       browser,
-      explorationMode: opts.explorationMode ?? 'codegen',
+      explorationMode: opts.explorationMode ?? deriveExplorationMode(project),
+      testingScope: opts.testingScope ?? 'both',
       emit: ctxEmit,
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
@@ -812,7 +824,7 @@ async function runPlanPhase(
         signal: opts.signal,
       });
       if (completion.ok && completion.text) {
-        const parsed = parsePlan(completion.text);
+        const parsed = parsePlan(completion.text, opts.testingScope ?? 'both');
         if (parsed) return { plan: parsed };
         // ok but unparseable — not a provider fault, so don't retry on a different provider.
         emit('plan', 'warn', 'Could not parse plan JSON; synthesizing fallback.');
@@ -846,7 +858,7 @@ async function runPlanPhase(
   }
 
   emit('plan', 'warn', 'Synthesizing fallback plan.');
-  return synthesizePlan(project);
+  return synthesizePlan(project, opts.testingScope ?? 'both');
 }
 
 /**
@@ -909,6 +921,20 @@ function persistResults(
 }
 
 /** Pull the "[REQ:<tag>]" marker out of an executed test's title, if present. */
+/**
+ * Pick the exploration mechanism from how the project is actually configured:
+ * a repo path means white-box source is available, so Codegen can read and
+ * generate real specs from it (repo path wins when both are set); a base-URL-
+ * only project has no source to read, so Computer-use (live exploration) is
+ * the only mode that makes sense. No longer a user choice (see RunOptions.
+ * explorationMode, which still allows an explicit override for tests/CLI).
+ */
+function deriveExplorationMode(project: Project): ExplorationMode {
+  if (project.repoPath) return 'codegen';
+  if (project.baseUrl) return 'computer-use';
+  return 'codegen';
+}
+
 function extractReqTag(title: string): string | null {
   const m = title.match(/\[REQ:([^\]]+)\]/i);
   const tag = m?.[1]?.trim();

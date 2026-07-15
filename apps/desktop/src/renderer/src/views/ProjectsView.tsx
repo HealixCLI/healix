@@ -296,6 +296,8 @@ function ProjectForm({
   const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
   const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
   const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
+  const [testUsername, setTestUsername] = useState(project?.testUsername ?? '');
+  const [testPassword, setTestPassword] = useState(project?.testPassword ?? '');
   const [submitting, setSubmitting] = useState(false);
 
   // Same rules as core validateNewProject: a project needs a name, at least one
@@ -315,6 +317,8 @@ function ProjectForm({
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
+      testUsername: testUsername.trim() || null,
+      testPassword: testPassword.trim() || null,
     });
     setSubmitting(false);
     if (saved) {
@@ -322,6 +326,8 @@ function ProjectForm({
         setName('');
         setRepoPath('');
         setBaseUrl('');
+        setTestUsername('');
+        setTestPassword('');
       }
       onDone();
     }
@@ -379,6 +385,27 @@ function ProjectForm({
             >
               <option value="playwright">playwright</option>
             </Select>
+          </Field>
+          <div className="sm:col-span-2">
+            <h3 className="mb-1.5 text-sm font-semibold text-fg">Test credentials</h3>
+          </div>
+          <Field label="Test username / email">
+            <Input
+              value={testUsername}
+              onChange={(e) => setTestUsername(e.target.value)}
+              placeholder="you@example.com or a test username"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+          <Field label="Test password">
+            <Input
+              value={testPassword}
+              onChange={(e) => setTestPassword(e.target.value)}
+              placeholder="Password for the credential above"
+              className="font-mono"
+              disabled={readOnly}
+            />
           </Field>
           {readOnly ? (
             <div className="flex items-center justify-end gap-2 sm:col-span-2">

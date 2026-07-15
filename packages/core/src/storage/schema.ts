@@ -1,15 +1,17 @@
-export const SCHEMA_VERSION = 3;
+export const SCHEMA_VERSION = 4;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
 CREATE TABLE IF NOT EXISTS projects (
-  id          TEXT PRIMARY KEY,
-  name        TEXT NOT NULL,
-  mode        TEXT NOT NULL DEFAULT 'playwright',
-  repo_path   TEXT,
-  base_url    TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now')),
-  archived_at TEXT
+  id            TEXT PRIMARY KEY,
+  name          TEXT NOT NULL,
+  mode          TEXT NOT NULL DEFAULT 'playwright',
+  repo_path     TEXT,
+  base_url      TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  archived_at   TEXT,
+  test_username TEXT,
+  test_password TEXT
 );
 
 CREATE TABLE IF NOT EXISTS runs (

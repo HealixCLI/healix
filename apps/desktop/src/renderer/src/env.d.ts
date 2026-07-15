@@ -16,6 +16,9 @@ import type {
   RunDetail,
   StartRunArgs,
   RunChannelMessage,
+  SuiteDiffSummary,
+  TestCaseHistory,
+  ProjectMetrics,
 } from './lib/ipc-types';
 
 export interface HealixBridge {
@@ -51,6 +54,10 @@ export interface HealixBridge {
   // ---- run history ----
   listRuns: (projectId?: string) => Promise<Run[]>;
   runDetail: (runId: string) => Promise<RunDetail>;
+  lastSuccessfulRun: (projectId: string) => Promise<Run | null>;
+  suiteDiff: (runId: string) => Promise<SuiteDiffSummary | null>;
+  caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) => Promise<TestCaseHistory>;
+  projectMetrics: (projectId: string) => Promise<ProjectMetrics | null>;
 
   onRunEvent: (cb: (msg: RunChannelMessage) => void) => () => void;
 }

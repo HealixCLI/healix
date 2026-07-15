@@ -1,8 +1,8 @@
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 import { projectsDir } from '../env/app-data.js';
 import { getStore, type HealixStore } from '../storage/store.js';
-import type { Project, Run, RunStatus, TestStatus, Tier } from '../storage/types.js';
+import type { Project, Run, RunStatus, SuiteMode, TestCase, TestStatus, Tier } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
 import { getTestMode } from '../modes/registry.js';
@@ -24,6 +24,7 @@ import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
 import { buildPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import { diffAgainstBase } from './topup.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
@@ -92,7 +93,47 @@ async function runPipeline(
     return { runId: '', status: 'error' };
   }
 
-  const run = store.createRun(project.id, { provider: opts.provider ?? null, mode: project.mode });
+  // Top-up/reuse: resolve the base run BEFORE creating this run's own row —
+  // a missing base is a precondition failure, same category as "project not
+  // found" above, so it must never silently fall back to 'fresh'.
+  const suiteMode: SuiteMode = opts.suiteMode ?? 'fresh';
+  let baseRun: Run | null = null;
+  if (suiteMode === 'topup' || suiteMode === 'reuse') {
+    baseRun = opts.baseRunId ? store.getRun(opts.baseRunId) : store.getLastSuccessfulRun(project.id);
+    // An explicitly-pinned baseRunId isn't status-filtered by the store lookup
+    // above (unlike the auto-resolved path) — reject 'error'/'cancelled' pins
+    // here too, so a caller can't top-up/reuse from a run that never produced
+    // a real verdict or was aborted mid-way.
+    if (baseRun && (baseRun.status === 'error' || baseRun.status === 'cancelled')) {
+      baseRun = null;
+    }
+    if (!baseRun) {
+      hooks?.onEvent?.({
+        phase: 'plan',
+        level: 'error',
+        message: `No previous completed run to ${suiteMode} from for project "${project.name}" — run Fresh first.`,
+      });
+      return { runId: '', status: 'error' };
+    }
+  }
+  // Every base-run test with a known spec file — the only thing that gates
+  // carrying a test forward is having a physical file to copy, not its
+  // previous status.
+  const baseTestsWithSpec: TestCase[] = baseRun
+    ? store.listTests(baseRun.id).filter((t) => t.specPath)
+    : [];
+  // TOP-UP only carries forward proven-good (passing) tests — a failing/
+  // blocked test is left for the fresh exploration to decide whether it's
+  // still worth testing (and, if so, regenerate) rather than silently
+  // re-including a known-bad test unchanged.
+  const basePassingTests: TestCase[] = baseTestsWithSpec.filter((t) => t.status === 'passed');
+
+  const run = store.createRun(project.id, {
+    provider: opts.provider ?? null,
+    mode: project.mode,
+    suiteMode,
+    baseRunId: baseRun?.id ?? null,
+  });
   const runId = run.id;
   // Surface the canonical runId immediately so callers (e.g. the desktop app)
   // correlate events/approval to THIS run instead of pre-creating a duplicate.
@@ -231,29 +272,42 @@ async function runPipeline(
     // functions) so the plan phase can reuse its repo indexer for grounding.
     const target = makeTarget();
 
-    // Best-effort repo grounding: a white-box plan is dramatically better when
-    // the model can see the repo's real structure (routes/pages/dirs), but
-    // indexing must never block or break planning — any failure simply means
-    // "plan without repo context".
-    let repoIndex: PlanRepoContext | undefined;
-    if (project.repoPath) {
-      try {
-        const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
-        repoIndex = { summary: idx.summary, files: idx.files };
-        emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
-      } catch (err) {
-        emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+    if (suiteMode === 'reuse') {
+      // Reuse never plans/generates via AI — it re-executes the base run's
+      // ENTIRE suite as-is (every test with a known spec file, regardless of
+      // its previous status — a run that reruns only last time's winners
+      // isn't actually "the suite as-is"). Still synthesize a concrete,
+      // cancellable plan (zero AI cost) so the APPROVE gate shows something.
+      plan = {
+        summary: `Reusing ${baseTestsWithSpec.length} test(s) from run ${baseRun!.id} — no generation.`,
+        items: [],
+      };
+      emit('plan', 'info', 'Skipping AI planning (reuse mode).');
+    } else {
+      // Best-effort repo grounding: a white-box plan is dramatically better when
+      // the model can see the repo's real structure (routes/pages/dirs), but
+      // indexing must never block or break planning — any failure simply means
+      // "plan without repo context".
+      let repoIndex: PlanRepoContext | undefined;
+      if (project.repoPath) {
+        try {
+          const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
+          repoIndex = { summary: idx.summary, files: idx.files };
+          emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
+        } catch (err) {
+          emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+        }
       }
-    }
 
-    plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
-    // Enforce the testing-scope boundary as a backstop: plan.ts already asks
-    // the model for (and normalizes tiers to) only in-scope tiers, but this
-    // is the hard guarantee — filtered here, before approval/persistence, so
-    // the approval gate, plan.json, and the report all consistently reflect
-    // only what will actually be generated and executed.
-    const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
-    plan = { ...plan, items: plan.items.filter((it) => inScopeTiers.has(it.tier)) };
+      plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+      // Enforce the testing-scope boundary as a backstop: plan.ts already asks
+      // the model for (and normalizes tiers to) only in-scope tiers, but this
+      // is the hard guarantee — filtered here, before approval/persistence, so
+      // the approval gate, plan.json, and the report all consistently reflect
+      // only what will actually be generated and executed.
+      const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
+      plan = { ...plan, items: plan.items.filter((it) => inScopeTiers.has(it.tier)) };
+    }
     await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
     setStatus('awaiting-approval');
@@ -448,7 +502,11 @@ async function runPipeline(
     // the dominant source of test_is_wrong failures. Frame mirroring (the live
     // browser view in the desktop app) stays a computer-use-only feature.
     if (checkCancelled()) return cancelRun('explore');
-    if (effectiveBaseUrl) {
+    if (suiteMode === 'reuse') {
+      // No new specs are ever generated in reuse mode, so there is nothing for
+      // a DOM snapshot to ground — skip the live browser pass entirely.
+      emit('explore', 'debug', 'Skipping exploration (reuse mode).');
+    } else if (effectiveBaseUrl) {
       setStatus('exploring');
       emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
       // Live frame mirroring is best-effort and must never abort the run; the
@@ -497,8 +555,32 @@ async function runPipeline(
     emit('generate', 'info', 'Scaffolding suite.');
     try {
       await mode.scaffold(ctx);
-      emit('generate', 'info', 'Generating specs.');
-      specs = await mode.generate(ctx, plan);
+
+      let newSpecs: GeneratedSpec[] = [];
+      let carriedSpecs: GeneratedSpec[] = [];
+      if (suiteMode === 'reuse') {
+        emit(
+          'generate',
+          'info',
+          `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
+        );
+        carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
+      } else if (suiteMode === 'topup') {
+        const diff = diffAgainstBase(plan.items, basePassingTests);
+        emit(
+          'generate',
+          'info',
+          `Top-up: ${diff.toGenerate.length} new/missing spec(s), ${diff.carried.length} carried forward from run ${baseRun!.id}.`,
+        );
+        emit('generate', 'info', 'Generating specs.');
+        newSpecs = await mode.generate(ctx, { ...plan, items: diff.toGenerate });
+        carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
+      } else {
+        emit('generate', 'info', 'Generating specs.');
+        newSpecs = await mode.generate(ctx, plan);
+      }
+
+      specs = [...newSpecs, ...carriedSpecs];
       for (const spec of specs) {
         const test = store.insertTest({
           runId,
@@ -506,6 +588,7 @@ async function runPipeline(
           reqTag: spec.reqTag ?? null,
           tier: (spec.tier ?? null) as Tier | null,
           status: 'pending',
+          specPath: relative(ctx.projectDir, spec.path),
         });
         testIdByKey.set(stableKey(spec.reqTag, spec.title), test.id);
       }
@@ -946,6 +1029,47 @@ function stableKey(reqTag: string | null | undefined, title: string): string {
   const tag = reqTag?.trim();
   if (tag && tag.length > 0) return `req:${tag}`;
   return `title:${title.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+}
+
+/**
+ * Copy each carried-forward test's spec file from the base run's own suite dir
+ * into THIS run's suite dir (ctx.projectDir), and reconstruct a GeneratedSpec
+ * for it so it flows through EXECUTE/persistResults exactly like a freshly
+ * AI-generated one. A test with no on-disk file left (missing/moved since the
+ * base run) is skipped rather than failing the whole run — it simply won't be
+ * part of this run's suite, and a subsequent Fresh/Top-up run can regenerate it.
+ */
+async function hydrateCarriedSpecs(
+  ctx: TestModeContext,
+  projectId: string,
+  baseRunId: string,
+  tests: TestCase[],
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<GeneratedSpec[]> {
+  const baseSuiteDir = join(projectsDir(), projectId, 'runs', baseRunId, 'suite');
+  const specs: GeneratedSpec[] = [];
+  for (const t of tests) {
+    if (!t.specPath) continue;
+    const srcAbs = join(baseSuiteDir, t.specPath);
+    const destAbs = join(ctx.projectDir, t.specPath);
+    try {
+      await mkdir(dirname(destAbs), { recursive: true });
+      await copyFile(srcAbs, destAbs);
+      const contents = await readFile(destAbs, 'utf-8');
+      specs.push({
+        path: destAbs,
+        title: t.title,
+        reqTag: t.reqTag ?? undefined,
+        tier: (t.tier ?? 'tierA-public') as Tier,
+        contents,
+      });
+    } catch (err) {
+      emit('generate', 'warn', `Could not carry forward "${t.title}" (spec file unavailable): ${errMsg(err)}`, {
+        specPath: t.specPath,
+      });
+    }
+  }
+  return specs;
 }
 
 /** Build + write report.json and report.html. Returns the report path (best-effort). */

@@ -285,6 +285,92 @@ describe('deleteRun cascade', () => {
   });
 });
 
+describe('top-up suite lineage', () => {
+  it('round-trips suiteMode/baseRunId on runs and specPath on tests', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'lineage-project', baseUrl: 'https://lineage.test' });
+
+    const baseRun = s.createRun(project.id, { provider: null, mode: 'playwright' });
+    expect(baseRun.suiteMode).toBeNull();
+    expect(baseRun.baseRunId).toBeNull();
+
+    const topupRun = s.createRun(project.id, { suiteMode: 'topup', baseRunId: baseRun.id });
+    expect(topupRun.suiteMode).toBe('topup');
+    expect(topupRun.baseRunId).toBe(baseRun.id);
+    expect(s.getRun(topupRun.id)).toMatchObject({ suiteMode: 'topup', baseRunId: baseRun.id });
+
+    const test = s.insertTest({
+      runId: topupRun.id,
+      title: 'Login with valid credentials',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'passed',
+      specPath: 'tests/tierA-public/login.spec.ts',
+    });
+    expect(test.specPath).toBe('tests/tierA-public/login.spec.ts');
+    expect(s.listTests(topupRun.id)).toMatchObject([{ specPath: 'tests/tierA-public/login.spec.ts' }]);
+  });
+
+  it('defaults specPath to null when omitted (legacy-row shape)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'legacy-project', baseUrl: 'https://legacy.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({ runId: run.id, title: 'legacy test', reqTag: null, tier: null, status: 'pending' });
+    expect(test.specPath).toBeNull();
+    expect(s.listTests(run.id)).toMatchObject([{ specPath: null }]);
+  });
+});
+
+describe('getLastSuccessfulRun', () => {
+  it('returns null when the project has no runs at all', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'no-runs', baseUrl: 'https://no-runs.test' });
+    expect(s.getLastSuccessfulRun(project.id)).toBeNull();
+  });
+
+  it('returns null when every run is error or cancelled (never produced a real verdict)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'never-completed', baseUrl: 'https://never-completed.test' });
+    const errored = s.createRun(project.id);
+    s.updateRunStatus(errored.id, 'error', { finishedAt: new Date().toISOString() });
+    const cancelled = s.createRun(project.id);
+    s.updateRunStatus(cancelled.id, 'cancelled', { finishedAt: new Date().toISOString() });
+    expect(s.getLastSuccessfulRun(project.id)).toBeNull();
+  });
+
+  it('counts a failed or blocked run as eligible — not just a fully-passed one', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'partial-failures', baseUrl: 'https://partial-failures.test' });
+    const run = s.createRun(project.id);
+    s.updateRunStatus(run.id, 'failed', { finishedAt: new Date().toISOString() });
+    const last = s.getLastSuccessfulRun(project.id);
+    expect(last?.id).toBe(run.id);
+    expect(last?.status).toBe('failed');
+  });
+
+  it('picks the most recent eligible run, ignoring later error/cancelled runs and other projects', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'mixed-history', baseUrl: 'https://mixed-history.test' });
+    const other = s.createProject({ name: 'other-project', baseUrl: 'https://other-project.test' });
+
+    const firstPassed = s.createRun(project.id);
+    s.updateRunStatus(firstPassed.id, 'passed', { finishedAt: new Date().toISOString() });
+
+    const secondFailed = s.createRun(project.id);
+    s.updateRunStatus(secondFailed.id, 'failed', { finishedAt: new Date().toISOString() });
+
+    const laterCancelled = s.createRun(project.id);
+    s.updateRunStatus(laterCancelled.id, 'cancelled', { finishedAt: new Date().toISOString() });
+
+    const otherProjectPassed = s.createRun(other.id);
+    s.updateRunStatus(otherProjectPassed.id, 'passed', { finishedAt: new Date().toISOString() });
+
+    const last = s.getLastSuccessfulRun(project.id);
+    expect(last?.id).toBe(secondFailed.id);
+    expect(last?.status).toBe('failed');
+  });
+});
+
 describe('agent event ordering', () => {
   it('returns same-millisecond events in insertion order (stable rowid tiebreaker)', async () => {
     const s = await store();

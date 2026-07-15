@@ -52,15 +52,22 @@ const api = {
   // runs
   startRun: (args: {
     projectId: string;
-    mode?: string;
+    testingScope?: string;
     provider?: string;
     autoApprove?: boolean;
     prd?: string;
+    suiteMode?: string;
+    baseRunId?: string;
   }) => ipcRenderer.invoke('run:start', args),
   approveRun: (runId: string, ok: boolean) => ipcRenderer.invoke('run:approve', { runId, ok }),
   cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
+  lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),
+  suiteDiff: (runId: string) => ipcRenderer.invoke('runs:suiteDiff', { runId }),
+  caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
+    ipcRenderer.invoke('runs:caseHistory', { projectId, ...key }),
+  projectMetrics: (projectId: string) => ipcRenderer.invoke('runs:projectMetrics', { projectId }),
 
   // export / shell
   exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>

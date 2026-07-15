@@ -27,6 +27,7 @@ import {
   deleteProjectAssets,
   isGitRemoteUrl,
   cloneRepo,
+  computeIdentityKey,
   type NewProject,
   type Project,
   type TestingScope,
@@ -34,6 +35,7 @@ import {
   type TestPlan,
   type RunSummary,
   type Run,
+  type SuiteMode,
   type TestCase,
   type TestResult,
   type AgentEvent,
@@ -263,6 +265,10 @@ export interface StartRunArgs {
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;
+  /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
+  suiteMode?: SuiteMode;
+  /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
+  baseRunId?: string;
 }
 
 ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs): Promise<RunSummary> => {
@@ -298,6 +304,8 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
         testingScope: args.testingScope,
         autoApprove: args.autoApprove ?? false,
         prd: args.prd,
+        suiteMode: args.suiteMode,
+        baseRunId: args.baseRunId,
         signal: controller.signal,
       },
       {
@@ -675,6 +683,183 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   }
 
   return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan };
+});
+
+/** Most recent fully-passed run for a project — drives the Suite Mode toggle's enable/disable state. */
+ipcMain.handle('runs:lastSuccessful', async (_e, payload: { projectId: string }): Promise<Run | null> => {
+  const store = await getStore();
+  if (!store || !payload?.projectId) return null;
+  try {
+    return store.getLastSuccessfulRun(payload.projectId);
+  } catch {
+    return null;
+  }
+});
+
+export interface SuiteDiffSummary {
+  runId: string;
+  baseRunId: string | null;
+  addedCount: number;
+  carriedCount: number;
+  removedCount: number;
+  totalCount: number;
+}
+
+/** Added/carried/removed test counts for one run vs. the run it topped-up/reused from, computed on read. */
+ipcMain.handle('runs:suiteDiff', async (_e, payload: { runId: string }): Promise<SuiteDiffSummary | null> => {
+  const store = await getStore();
+  if (!store || !payload?.runId) return null;
+  const run = store.getRun(payload.runId);
+  if (!run) return null;
+
+  const tests = store.listTests(run.id);
+  const totalCount = tests.length;
+  if (!run.baseRunId) {
+    return { runId: run.id, baseRunId: null, addedCount: totalCount, carriedCount: 0, removedCount: 0, totalCount };
+  }
+
+  const baseTests = store.listTests(run.baseRunId);
+  const baseKeys = new Set(baseTests.map((t) => computeIdentityKey(t.reqTag, t.title)));
+  const thisKeys = new Set(tests.map((t) => computeIdentityKey(t.reqTag, t.title)));
+
+  let addedCount = 0;
+  let carriedCount = 0;
+  for (const t of tests) {
+    if (baseKeys.has(computeIdentityKey(t.reqTag, t.title))) carriedCount += 1;
+    else addedCount += 1;
+  }
+  let removedCount = 0;
+  for (const key of baseKeys) {
+    if (!thisKeys.has(key)) removedCount += 1;
+  }
+
+  return { runId: run.id, baseRunId: run.baseRunId, addedCount, carriedCount, removedCount, totalCount };
+});
+
+export interface TestCaseHistoryEntry {
+  runId: string;
+  runCreatedAt: string;
+  suiteMode: SuiteMode | null;
+  status: TestCase['status'];
+  durationMs: number | null;
+  specPath: string | null;
+}
+
+export interface TestCaseHistory {
+  identityKey: string;
+  currentTitle: string;
+  reqTag: string | null;
+  runHistory: TestCaseHistoryEntry[];
+}
+
+/**
+ * One test's lineage + pass/fail history: walks the base_run_id chain
+ * backward from the project's most recent run, matching a test by identity
+ * key (reqTag, else normalized title) at each link. The chain only extends as
+ * far back as an unbroken top-up/reuse lineage permits — a 'fresh' run has no
+ * base_run_id, so history naturally stops there.
+ */
+ipcMain.handle(
+  'runs:caseHistory',
+  async (
+    _e,
+    payload: { projectId: string; reqTag?: string; title?: string },
+  ): Promise<TestCaseHistory> => {
+    const empty: TestCaseHistory = { identityKey: '', currentTitle: '', reqTag: null, runHistory: [] };
+    if (!payload?.projectId || (!payload.reqTag && !payload.title)) return empty;
+    const store = await getStore();
+    if (!store) return empty;
+
+    const targetKey = computeIdentityKey(payload.reqTag ?? null, payload.title ?? '');
+    const runs = store.listRuns(payload.projectId); // newest-first
+    if (runs.length === 0) return empty;
+
+    const byId = new Map(runs.map((r) => [r.id, r]));
+    const chain: Run[] = [];
+    let current: Run | undefined = runs[0];
+    const seen = new Set<string>();
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      chain.push(current);
+      current = current.baseRunId ? byId.get(current.baseRunId) : undefined;
+    }
+
+    const runHistory: TestCaseHistoryEntry[] = [];
+    let currentTitle = '';
+    let reqTag: string | null = null;
+    for (const run of chain) {
+      const tests = store.listTests(run.id);
+      const match = tests.find((t) => computeIdentityKey(t.reqTag, t.title) === targetKey);
+      if (!match) continue;
+      if (!currentTitle) {
+        currentTitle = match.title;
+        reqTag = match.reqTag;
+      }
+      const result = store.listResults(run.id).find((r) => r.testId === match.id);
+      runHistory.push({
+        runId: run.id,
+        runCreatedAt: run.createdAt,
+        suiteMode: run.suiteMode,
+        status: match.status,
+        durationMs: result?.durationMs ?? null,
+        specPath: match.specPath,
+      });
+    }
+
+    return { identityKey: targetKey, currentTitle, reqTag, runHistory };
+  },
+);
+
+const METRICS_TREND_LIMIT = 20;
+
+export interface ProjectMetrics {
+  totalRuns: number;
+  lastRunAt: string | null;
+  /** Test count of the project's most recent run (any status), i.e. the current suite size. */
+  latestRunTestCount: number;
+  /** 0..1 over the trend window below; null when no results exist yet. */
+  passRate: number | null;
+  /** Oldest → newest, capped to the most recent METRICS_TREND_LIMIT runs. */
+  failureTrend: Array<{
+    runId: string;
+    runCreatedAt: string;
+    passed: number;
+    failed: number;
+    blocked: number;
+    total: number;
+  }>;
+}
+
+/** Project-level metrics for the dashboard Overview tab — pure aggregation over existing tables, no new schema. */
+ipcMain.handle('runs:projectMetrics', async (_e, payload: { projectId: string }): Promise<ProjectMetrics | null> => {
+  const store = await getStore();
+  if (!store || !payload?.projectId) return null;
+
+  const runs = store.listRuns(payload.projectId); // newest-first
+  const totalRuns = runs.length;
+  const lastRunAt = runs[0]?.createdAt ?? null;
+  const latestRunTestCount = runs[0] ? store.listTests(runs[0].id).length : 0;
+
+  const failureTrend = runs
+    .slice(0, METRICS_TREND_LIMIT)
+    .map((run) => {
+      const results = store.listResults(run.id);
+      return {
+        runId: run.id,
+        runCreatedAt: run.createdAt,
+        passed: results.filter((r) => r.status === 'passed').length,
+        failed: results.filter((r) => r.status === 'failed').length,
+        blocked: results.filter((r) => r.status === 'blocked').length,
+        total: results.length,
+      };
+    })
+    .reverse();
+
+  const totalResults = failureTrend.reduce((n, t) => n + t.total, 0);
+  const totalPassed = failureTrend.reduce((n, t) => n + t.passed, 0);
+  const passRate = totalResults > 0 ? totalPassed / totalResults : null;
+
+  return { totalRuns, lastRunAt, latestRunTestCount, passRate, failureTrend };
 });
 
 // ---- helpers ----

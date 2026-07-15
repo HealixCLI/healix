@@ -1,10 +1,11 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { AgentEvent, TestCase, TestResult, TestStatus } from '@healix/core';
-import { Camera, FileText, FolderOpen, Image as ImageIcon, PackageOpen, X } from 'lucide-react';
+import { Camera, FileText, FolderOpen, History, Image as ImageIcon, PackageOpen, X } from 'lucide-react';
 import { Badge } from './ui/badge';
-import type { BadgeTone } from './ui/badge';
 import { Button } from './ui/button';
+import { StatTile, StatTileRow } from './StatTiles';
+import { TestCaseHistoryDrawer } from './TestCaseHistoryDrawer';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
 import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
@@ -33,11 +34,21 @@ const VERDICT_TONE: Record<string, 'ok' | 'warn' | 'err' | 'muted' | 'default'> 
 };
 
 /** Full detail for a selected historical run: timeline, results, triage, artifacts. */
-export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; loading: boolean }) {
+export function RunDetailPanel({
+  detail,
+  loading,
+  onSelectRun,
+}: {
+  detail: RunDetail | null;
+  loading: boolean;
+  /** Jump to a different run (e.g. from the Test Case History drawer). Omit to disable those jumps. */
+  onSelectRun?: (runId: string) => void;
+}) {
   const [tab, setTab] = useState<DetailTab>('timeline');
   const [busy, setBusy] = useState<'reveal' | 'export' | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
+  const [historyCaseKey, setHistoryCaseKey] = useState<{ reqTag: string | null; title: string } | null>(null);
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
   const triage = report?.triage ?? [];
@@ -142,6 +153,11 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
         <div className="flex items-center gap-2">
           <Badge tone={runStatusTone(run.status)}>{run.status}</Badge>
           {run.mode && <span className="font-mono text-xs text-muted">{run.mode}</span>}
+          {run.suiteMode && run.suiteMode !== 'fresh' && (
+            <Badge tone="default" title={run.baseRunId ? `Based on run ${run.baseRunId}` : undefined}>
+              {run.suiteMode}
+            </Badge>
+          )}
           <span className="font-mono text-[11px] text-muted/70">{run.id}</span>
         </div>
         <div className="flex items-center gap-2">
@@ -191,7 +207,12 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
         {tab === 'results' && (
           <div className="flex flex-col gap-3">
             <TestSummary summary={summary} activeStatus={statusFilter} onSelect={selectStatus} />
-            <ResultsTable rows={filteredRows} mediaFolders={mediaFolders} onShowMedia={showMedia} />
+            <ResultsTable
+              rows={filteredRows}
+              mediaFolders={mediaFolders}
+              onShowMedia={showMedia}
+              onShowHistory={(row) => setHistoryCaseKey({ reqTag: row.reqTag, title: row.title })}
+            />
           </div>
         )}
         {tab === 'triage' && <TriageList entries={triage} />}
@@ -204,6 +225,25 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
           />
         )}
       </div>
+
+      {historyCaseKey && (
+        <TestCaseHistoryDrawer
+          caseKey={{
+            projectId: run.projectId,
+            reqTag: historyCaseKey.reqTag ?? undefined,
+            title: historyCaseKey.title,
+          }}
+          onClose={() => setHistoryCaseKey(null)}
+          onSelectRun={
+            onSelectRun
+              ? (runId) => {
+                  setHistoryCaseKey(null);
+                  onSelectRun(runId);
+                }
+              : undefined
+          }
+        />
+      )}
     </div>
   );
 }
@@ -280,16 +320,10 @@ function TestSummary({
   const total = STATUS_TILES.reduce((n, t) => n + summary[t.status], 0);
 
   return (
-    <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-7">
-      <SummaryTile
-        label="Total"
-        value={total}
-        tone="default"
-        active={activeStatus === 'all'}
-        onClick={() => onSelect('all')}
-      />
+    <StatTileRow className="mt-3">
+      <StatTile label="Total" value={total} tone="default" active={activeStatus === 'all'} onClick={() => onSelect('all')} />
       {STATUS_TILES.map((t) => (
-        <SummaryTile
+        <StatTile
           key={t.status}
           label={t.label}
           value={summary[t.status]}
@@ -298,37 +332,7 @@ function TestSummary({
           onClick={() => onSelect(t.status)}
         />
       ))}
-    </div>
-  );
-}
-
-function SummaryTile({
-  label,
-  value,
-  tone,
-  active,
-  onClick,
-}: {
-  label: string;
-  value: number;
-  tone: BadgeTone;
-  active: boolean;
-  onClick: () => void;
-}) {
-  const valueColor =
-    tone === 'ok' ? 'text-ok' : tone === 'warn' ? 'text-warn' : tone === 'err' ? 'text-err' : 'text-fg';
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'rounded-lg border border-border bg-panel/40 px-3 py-2 text-left transition-colors hover:border-accent/50',
-        active && 'border-accent bg-accent/5',
-      )}
-    >
-      <div className="text-[11px] text-muted">{label}</div>
-      <div className={cn('mt-0.5 text-lg font-semibold leading-none', valueColor)}>{value}</div>
-    </button>
+    </StatTileRow>
   );
 }
 
@@ -353,11 +357,13 @@ function ResultsTable({
   rows,
   mediaFolders,
   onShowMedia,
+  onShowHistory,
 }: {
   rows: JoinedRow[];
   /** Artifact folders that contain media; drives the per-row camera button. */
   mediaFolders: string[];
   onShowMedia: (title: string) => void;
+  onShowHistory: (row: JoinedRow) => void;
 }) {
   if (rows.length === 0) {
     return <EmptyHint>No test results for this run.</EmptyHint>;
@@ -371,8 +377,8 @@ function ResultsTable({
           <TableHead>Tier</TableHead>
           <TableHead className="text-right">Duration</TableHead>
           <TableHead className="text-right">Status</TableHead>
-          {/* Row → media jump column (icon only). */}
-          <TableHead className="w-8" />
+          {/* Row → media jump / history columns (icon only). */}
+          <TableHead className="w-16" />
         </TableRow>
       </TableHeader>
       <TableBody>
@@ -397,7 +403,17 @@ function ResultsTable({
               <TableCell className="text-right">
                 <Badge tone={testStatusTone(r.status)}>{r.status ?? 'pending'}</Badge>
               </TableCell>
-              <TableCell className="w-8 pl-0 text-right">
+              <TableCell className="w-16 pl-0 text-right">
+                <Button
+                  size="icon"
+                  variant="ghost"
+                  className="h-6 w-6"
+                  title="View test case history"
+                  aria-label={`View history for ${r.title}`}
+                  onClick={() => onShowHistory(r)}
+                >
+                  <History className="h-3.5 w-3.5" />
+                </Button>
                 {hasMedia && (
                   <Button
                     size="icon"

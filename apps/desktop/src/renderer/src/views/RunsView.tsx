@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ExplorationMode, Project, TestingScope } from '@healix/core';
+import type { ExplorationMode, Project, SuiteMode, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
@@ -15,9 +15,11 @@ import { RunDetailPanel } from '../components/RunDetailPanel';
 import { useProjects } from '../lib/use-projects';
 import { useRuns } from '../lib/use-runs';
 import { useRunDetail } from '../lib/use-run-detail';
+import { useLastSuccessfulRun } from '../lib/use-last-successful-run';
 import { useLiveFrame } from '../lib/use-live-frame';
 import { cn } from '../lib/utils';
-import { TESTING_SCOPES, useRunEngine, type RunPhase } from '../lib/run-engine';
+import { formatCreatedAt } from '../lib/run-format';
+import { SUITE_MODES, TESTING_SCOPES, useRunEngine, type RunPhase } from '../lib/run-engine';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
@@ -63,6 +65,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
 
   const [projectId, setProjectId] = useState<string>('');
   const [testingScope, setTestingScope] = useState<TestingScope>('both');
+  const [suiteMode, setSuiteMode] = useState<SuiteMode>('fresh');
   const [prd, setPrd] = useState('');
   // Set once a PRD file is successfully uploaded; cleared if the user edits the
   // textarea by hand, since the displayed text no longer matches the file.
@@ -79,7 +82,20 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const [formCollapsed, setFormCollapsed] = useState(false);
 
   const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
+  const { run: lastSuccessfulRun, reload: reloadLastSuccessful } = useLastSuccessfulRun(projectId || null);
   const { frame } = useLiveFrame(engine.runId);
+
+  const hasSuite = lastSuccessfulRun !== null;
+  // A different project may have no suite to top up/reuse yet — fall back to
+  // Fresh rather than leaving the toggle on an option that's about to be disabled.
+  useEffect(() => {
+    if (!hasSuite && suiteMode !== 'fresh') setSuiteMode('fresh');
+  }, [hasSuite, suiteMode]);
+  // Refresh "last successful run" once a run just settled, so the toggle picks
+  // up a run that only just became eligible as a top-up/reuse base.
+  useEffect(() => {
+    if (SETTLED_PHASES.includes(engine.phase)) void reloadLastSuccessful();
+  }, [engine.phase, reloadLastSuccessful]);
 
   // History rows may reference archived projects, so the lookup keeps ALL of
   // them; only the "start a run" selector is restricted to active projects.
@@ -182,6 +198,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     void engine.start({
       projectId,
       testingScope,
+      suiteMode,
       prd: prd.trim() || undefined,
     });
   };
@@ -274,7 +291,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           </CardHeader>
           {!formCollapsed && (
             <CardContent>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-2">
+              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
                 <div>
                   <Label className="mb-1.5 block">Project</Label>
                   <Select
@@ -307,7 +324,29 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                     {TESTING_SCOPES.find((s) => s.value === testingScope)?.hint}
                   </p>
                 </div>
-                <div className="sm:col-span-2">
+                <div>
+                  <Label className="mb-1.5 block">Suite Mode</Label>
+                  <Select
+                    value={suiteMode}
+                    onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}
+                    disabled={isActive}
+                  >
+                    {SUITE_MODES.map((m) => (
+                      <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
+                        {m.label}
+                      </option>
+                    ))}
+                  </Select>
+                  <p className="mt-1 text-[11px] text-muted">
+                    {SUITE_MODES.find((m) => m.value === suiteMode)?.hint}
+                  </p>
+                  {suiteMode !== 'fresh' && lastSuccessfulRun && (
+                    <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
+                      Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
+                    </p>
+                  )}
+                </div>
+                <div className="sm:col-span-3">
                   <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
                   <div className="relative">
                     <Textarea
@@ -475,7 +514,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           </div>
         ) : (
           <div className="mt-4 min-h-0 flex-1">
-            <RunDetailPanel detail={detail} loading={detailLoading} />
+            <RunDetailPanel detail={detail} loading={detailLoading} onSelectRun={setSelectedRunId} />
           </div>
         )}
       </div>

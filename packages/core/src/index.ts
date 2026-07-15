@@ -40,6 +40,7 @@ export * from './modes/types.js';
 // Orchestrator
 export { createOrchestrator } from './orchestrator/index.js';
 export * from './orchestrator/types.js';
+export { computeIdentityKey, diffAgainstBase, type SuiteDiff } from './orchestrator/topup.js';
 
 // Suite export
 export { exportSuite, type ExportOptions } from './export/index.js';

@@ -279,6 +279,113 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(done?.message).toContain('passed');
   });
 
+  it('MULTI-SCENARIO: one spec file with N scenario tests persists N test rows, not one', async () => {
+    // A single plan item with 3 scenarios (positive/negative/edge) generates ONE
+    // spec file containing 3 test() cases — Results/Total counts must reflect
+    // the 3 real test cases, not collapse to 1 row per spec file.
+    const multiScenarioPlan = {
+      summary: 'One feature, three scenarios.',
+      items: [
+        {
+          title: 'Checkout',
+          reqTag: 'REQ-100',
+          tier: 'tierA-public',
+          intent: 'Checkout flow works.',
+          scenarios: [
+            { kind: 'positive', description: 'completes with a valid card' },
+            { kind: 'negative', description: 'rejects an expired card' },
+            { kind: 'edge', description: 'handles a zero-total cart' },
+          ],
+        },
+      ],
+    };
+    const multiScenarioProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return {
+            provider: 'claude',
+            ok: true,
+            text: ['```json', JSON.stringify(multiScenarioPlan), '```'].join('\n'),
+            raw: multiScenarioPlan,
+            detail: 'OK',
+          };
+        }
+        return { provider: 'claude', ok: true, text: 'unused', raw: null, detail: 'OK' };
+      },
+    };
+
+    const checkoutSpec: GeneratedSpec = {
+      path: 'tests/checkout.spec.ts',
+      title: '[REQ:REQ-100] Checkout',
+      reqTag: 'REQ-100',
+      tier: 'tierA-public',
+      contents: '// checkout spec with 3 test() blocks',
+    };
+    const multiScenarioOutcome: ExecOutcome = {
+      passed: 2,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: '[REQ:REQ-100] positive: completes with a valid card', status: 'passed', durationMs: 10 },
+        { title: '[REQ:REQ-100] negative: rejects an expired card', status: 'failed', durationMs: 11 },
+        { title: '[REQ:REQ-100] edge: handles a zero-total cart', status: 'passed', durationMs: 12 },
+      ],
+    };
+    const multiScenarioMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(): Promise<GeneratedSpec[]> {
+        return [{ ...checkoutSpec }];
+      },
+      async execute(): Promise<ExecOutcome> {
+        return { ...multiScenarioOutcome, results: multiScenarioOutcome.results.map((r) => ({ ...r })) };
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'suite', files: [] };
+      },
+    };
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Multi Scenario Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const orchestrator = createOrchestrator({
+      provider: multiScenarioProvider,
+      getMode: () => multiScenarioMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    expect(summary.status).toBe('failed');
+    expect(summary.outcome?.passed).toBe(2);
+    expect(summary.outcome?.failed).toBe(1);
+
+    // One spec file, three scenarios → three distinct test rows, each carrying
+    // its own real scenario title and status — not one row per spec file.
+    const tests = store.listTests(summary.runId);
+    expect(tests).toHaveLength(3);
+    const statusByTitle = Object.fromEntries(tests.map((t) => [t.title, t.status]));
+    expect(statusByTitle['[REQ:REQ-100] positive: completes with a valid card']).toBe('passed');
+    expect(statusByTitle['[REQ:REQ-100] negative: rejects an expired card']).toBe('failed');
+    expect(statusByTitle['[REQ:REQ-100] edge: handles a zero-total cart']).toBe('passed');
+    expect(tests.every((t) => t.reqTag === 'REQ-100')).toBe(true);
+
+    // One result row per scenario, matched to its own test row (no collisions).
+    const results = store.listResults(summary.runId);
+    expect(results).toHaveLength(3);
+    expect(new Set(results.map((r) => r.testId)).size).toBe(3);
+  });
+
   it('APPROVAL-GATE reject: onPlan returning false cancels the run before execute', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

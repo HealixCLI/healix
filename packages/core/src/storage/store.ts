@@ -303,6 +303,14 @@ export class HealixStore {
     this.db.prepare('UPDATE tests SET status = ? WHERE id = ?').run(status, id);
   }
 
+  /**
+   * Replace a test row's placeholder title (synthesized at GENERATE time, before the
+   * model's actual scenario test title was known) with its real executed title.
+   */
+  updateTestTitle(id: string, title: string): void {
+    this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
+  }
+
   insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
     const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
     this.db

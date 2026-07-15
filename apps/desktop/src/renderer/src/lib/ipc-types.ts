@@ -5,6 +5,7 @@ import type {
   ProviderId,
   Run,
   RunSummary,
+  SuiteMode,
   TestCase,
   TestPlanItem,
   TestResult,
@@ -26,6 +27,10 @@ export interface StartRunArgs {
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;
+  /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
+  suiteMode?: SuiteMode;
+  /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
+  baseRunId?: string;
 }
 
 /** Result of attempting to launch a provider's subscription login flow. */
@@ -105,6 +110,51 @@ export function asRunReport(value: unknown): RunReportShape | null {
     triage,
     generatedAt: typeof v.generatedAt === 'string' ? v.generatedAt : undefined,
   };
+}
+
+/** Added/carried/removed test counts for one run vs. the run it topped-up/reused from. */
+export interface SuiteDiffSummary {
+  runId: string;
+  baseRunId: string | null;
+  addedCount: number;
+  carriedCount: number;
+  removedCount: number;
+  totalCount: number;
+}
+
+export interface TestCaseHistoryEntry {
+  runId: string;
+  runCreatedAt: string;
+  suiteMode: SuiteMode | null;
+  status: TestCase['status'];
+  durationMs: number | null;
+  specPath: string | null;
+}
+
+/** One test's lineage + pass/fail history, walked backward across a project's top-up/reuse run chain. */
+export interface TestCaseHistory {
+  identityKey: string;
+  currentTitle: string;
+  reqTag: string | null;
+  runHistory: TestCaseHistoryEntry[];
+}
+
+export interface FailureTrendPoint {
+  runId: string;
+  runCreatedAt: string;
+  passed: number;
+  failed: number;
+  blocked: number;
+  total: number;
+}
+
+/** Project-level metrics for the dashboard Overview tab. */
+export interface ProjectMetrics {
+  totalRuns: number;
+  lastRunAt: string | null;
+  latestRunTestCount: number;
+  passRate: number | null;
+  failureTrend: FailureTrendPoint[];
 }
 
 /** Result of a plan:reviseItem call — the AI-regenerated item, or a surfaced error. */

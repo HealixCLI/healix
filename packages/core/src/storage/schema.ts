@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 4;
+export const SCHEMA_VERSION = 5;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -15,23 +15,26 @@ CREATE TABLE IF NOT EXISTS projects (
 );
 
 CREATE TABLE IF NOT EXISTS runs (
-  id          TEXT PRIMARY KEY,
-  project_id  TEXT NOT NULL REFERENCES projects(id),
-  status      TEXT NOT NULL DEFAULT 'pending',
-  provider    TEXT,
-  mode        TEXT,
-  started_at  TEXT,
-  finished_at TEXT,
-  created_at  TEXT NOT NULL DEFAULT (datetime('now'))
+  id            TEXT PRIMARY KEY,
+  project_id    TEXT NOT NULL REFERENCES projects(id),
+  status        TEXT NOT NULL DEFAULT 'pending',
+  provider      TEXT,
+  mode          TEXT,
+  started_at    TEXT,
+  finished_at   TEXT,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  suite_mode    TEXT,
+  base_run_id   TEXT REFERENCES runs(id)
 );
 
 CREATE TABLE IF NOT EXISTS tests (
-  id       TEXT PRIMARY KEY,
-  run_id   TEXT NOT NULL REFERENCES runs(id),
-  title    TEXT NOT NULL,
-  req_tag  TEXT,
-  tier     TEXT,
-  status   TEXT
+  id        TEXT PRIMARY KEY,
+  run_id    TEXT NOT NULL REFERENCES runs(id),
+  title     TEXT NOT NULL,
+  req_tag   TEXT,
+  tier      TEXT,
+  status    TEXT,
+  spec_path TEXT
 );
 
 CREATE TABLE IF NOT EXISTS results (

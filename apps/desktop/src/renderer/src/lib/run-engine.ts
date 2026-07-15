@@ -4,6 +4,7 @@ import type {
   PlanItemSnapshot,
   PlanItemStatus,
   RunSummary,
+  SuiteMode,
   TestingScope,
   TestPlan,
   TestPlanItem,
@@ -483,4 +484,22 @@ export const TESTING_SCOPES: ReadonlyArray<{ value: TestingScope; label: string;
   { value: 'frontend', label: 'Frontend Testing', hint: 'UI-focused tests (public + authenticated flows)' },
   { value: 'backend', label: 'Backend Testing', hint: 'API/backend tests only' },
   { value: 'both', label: 'Both (Frontend + Backend)', hint: 'Full coverage across UI and API' },
+];
+
+/**
+ * Suite lifecycle for a run. Top-up/Reuse require an existing successful run
+ * to build on — RunsView disables them (not hides them) until one exists.
+ */
+export const SUITE_MODES: ReadonlyArray<{ value: SuiteMode; label: string; hint: string }> = [
+  { value: 'fresh', label: 'Generate fresh suite', hint: 'Regenerate every test from scratch.' },
+  {
+    value: 'topup',
+    label: 'Top up existing suite',
+    hint: 'Keep passing tests from the last successful run; generate only new/missing ones.',
+  },
+  {
+    value: 'reuse',
+    label: 'Run existing suite as-is',
+    hint: "Re-execute the last successful run's tests — no generation.",
+  },
 ];

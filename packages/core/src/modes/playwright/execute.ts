@@ -560,9 +560,20 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let blocked = 0;
   let flaky = 0;
 
-  const processSpec = (spec: PwSpec, suiteTitle: string): void => {
+  const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
     if (tests.length === 0) return;
+    // The auth-setup project's own fixture "test" (fixtures/auth.setup.ts) is
+    // Healix-internal plumbing, not a user-facing test case. A PASSING setup
+    // is uninteresting and must never appear in the report/results or get
+    // persisted as a test row — it can never be matched back to a generated
+    // spec, which used to inflate the total and silently poison future
+    // top-up/reuse's "which tests passed" accounting with an uncarryable
+    // phantom "passed" row every Tier B run. A FAILING setup, however, is
+    // kept — it's the reason Tier B got blocked and must stay visible for
+    // diagnosis (see the AuthSignals classification below), so the isAuthSetup
+    // check happens after `worst` is known, not as an early return here.
+    const isSetupSpec = tests.every((t) => isAuthSetup(t.projectName, spec.file ?? suiteFile));
     const title = stripAnsi(spec.title ?? suiteTitle ?? 'Unnamed test').trim();
 
     let worst: TestStatus = 'pending';
@@ -618,6 +629,10 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       worst = 'flaky';
     }
 
+    // Suppress only a passing (uninteresting) setup phantom; a failed one
+    // stays visible below since it's the actual root cause of a blocked Tier B.
+    if (isSetupSpec && worst !== 'failed') return;
+
     const item: ExecResultItem = {
       title,
       status: worst,
@@ -649,7 +664,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
 
   const walk = (suite: PwSuite, parentTitle: string): void => {
     const suiteTitle = parentTitle ? `${parentTitle} > ${suite.title ?? ''}` : (suite.title ?? '');
-    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle);
+    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle, suite.file);
     for (const child of suite.suites ?? []) walk(child, suiteTitle);
   };
 

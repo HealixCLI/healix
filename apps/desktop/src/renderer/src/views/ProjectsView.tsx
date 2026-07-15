@@ -68,12 +68,15 @@ export function ProjectsView({
         <p className="mt-4 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">{error}</p>
       )}
 
-      {formState.kind === 'create' && <ProjectForm onSubmit={create} onDone={closeForm} />}
+      {formState.kind === 'create' && (
+        <ProjectForm onSubmit={create} onDone={closeForm} existingActiveProjects={active} />
+      )}
       {formState.kind === 'edit' && (
         <ProjectForm
           project={formState.project}
           onSubmit={(input) => update(formState.project.id, input)}
           onDone={closeForm}
+          existingActiveProjects={active}
         />
       )}
       {formState.kind === 'view' && (
@@ -316,12 +319,15 @@ function ProjectForm({
   onEdit,
   onDone,
   readOnly = false,
+  existingActiveProjects = [],
 }: {
   project?: Project;
   onSubmit?: (input: NewProject) => Promise<Project | null>;
   onEdit?: () => void;
   onDone: () => void;
   readOnly?: boolean;
+  /** Active (non-archived) projects, for inline duplicate-name feedback. */
+  existingActiveProjects?: Project[];
 }) {
   const isEdit = project !== undefined && !readOnly;
   const [name, setName] = useState(project?.name ?? '');
@@ -338,7 +344,15 @@ function ProjectForm({
   const trimmedName = name.trim();
   const hasTarget = repoPath.trim().length > 0 || baseUrl.trim().length > 0;
   const baseUrlInvalid = baseUrl.trim().length > 0 && !isValidBaseUrl(baseUrl);
-  const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !submitting;
+  // Mirrors HealixStore's case-insensitive, active-projects-only duplicate
+  // guard — excludes the project being edited itself, so resubmitting an
+  // unchanged name never false-positives.
+  const nameTaken =
+    trimmedName.length > 0 &&
+    existingActiveProjects.some(
+      (p) => p.id !== project?.id && p.name.trim().toLowerCase() === trimmedName.toLowerCase(),
+    );
+  const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !nameTaken && !submitting;
   const repoIsUrl = isGitRemoteUrl(repoPath);
 
   const submit = async (e: FormEvent): Promise<void> => {
@@ -383,7 +397,11 @@ function ProjectForm({
               autoFocus={!readOnly}
               required
               disabled={readOnly}
+              aria-invalid={nameTaken}
             />
+            {!readOnly && nameTaken && (
+              <p className="mt-1 text-xs text-err">A project named "{trimmedName}" already exists.</p>
+            )}
           </Field>
           <Field label="Repo path or git URL (white-box)">
             <Input

@@ -1,11 +1,13 @@
 import type {
   AgentEvent,
   OrchestratorEvent,
+  PlanApprovalResult,
   ProviderId,
   Run,
   RunSummary,
   SuiteMode,
   TestCase,
+  TestPlanItem,
   TestResult,
   TestingScope,
   TestPlan,
@@ -154,6 +156,12 @@ export interface ProjectMetrics {
   passRate: number | null;
   failureTrend: FailureTrendPoint[];
 }
+
+/** Result of a plan:reviseItem call — the AI-regenerated item, or a surfaced error. */
+export type ReviseItemResult = { ok: true; item: TestPlanItem } | { ok: false; detail: string };
+
+/** Re-exported for call sites that only need the approve/cancel decision shape. */
+export type { PlanApprovalResult };
 
 /** Discriminated lifecycle messages delivered to onRunEvent subscribers. */
 export type RunChannelMessage =

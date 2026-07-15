@@ -242,6 +242,58 @@ describe('updateProject', () => {
   });
 });
 
+describe('duplicate project names', () => {
+  it('blocks creating a second active project with the same name', async () => {
+    const s = await store();
+    s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+
+    expect(() => s.createProject({ name: 'Acme', baseUrl: 'https://acme2.test' })).toThrow(/already exists/i);
+    // Rejected create must not have persisted a second row.
+    expect(s.listProjects()).toHaveLength(1);
+  });
+
+  it('matches names case-insensitively', async () => {
+    const s = await store();
+    s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+
+    expect(() => s.createProject({ name: 'ACME', baseUrl: 'https://acme2.test' })).toThrow(/already exists/i);
+    expect(() => s.createProject({ name: '  acme  ', baseUrl: 'https://acme3.test' })).toThrow(
+      /already exists/i,
+    );
+  });
+
+  it('allows reusing the name of an archived project', async () => {
+    const s = await store();
+    const original = s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+    s.setProjectArchived(original.id, true);
+
+    const recreated = s.createProject({ name: 'Acme', baseUrl: 'https://acme2.test' });
+    expect(recreated.id).not.toBe(original.id);
+    expect(s.listProjects().filter((p) => !p.archivedAt)).toHaveLength(1);
+  });
+
+  it('blocks renaming a project to collide with another active project', async () => {
+    const s = await store();
+    s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+    const other = s.createProject({ name: 'Beta', baseUrl: 'https://beta.test' });
+
+    expect(() => s.updateProject(other.id, { name: 'Acme', baseUrl: 'https://beta.test' })).toThrow(
+      /already exists/i,
+    );
+    // Rejected rename must not have touched the row.
+    expect(s.getProject(other.id)).toMatchObject({ name: 'Beta' });
+  });
+
+  it('allows updating a project without changing its own name (no self-collision)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+
+    const updated = s.updateProject(project.id, { name: 'Acme', baseUrl: 'https://acme-v2.test' });
+    expect(updated.name).toBe('Acme');
+    expect(updated.baseUrl).toBe('https://acme-v2.test');
+  });
+});
+
 describe('deleteRun cascade', () => {
   it('removes the run and its descendants without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();
@@ -315,7 +367,13 @@ describe('top-up suite lineage', () => {
     const s = await store();
     const project = s.createProject({ name: 'legacy-project', baseUrl: 'https://legacy.test' });
     const run = s.createRun(project.id);
-    const test = s.insertTest({ runId: run.id, title: 'legacy test', reqTag: null, tier: null, status: 'pending' });
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'legacy test',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
     expect(test.specPath).toBeNull();
     expect(s.listTests(run.id)).toMatchObject([{ specPath: null }]);
   });

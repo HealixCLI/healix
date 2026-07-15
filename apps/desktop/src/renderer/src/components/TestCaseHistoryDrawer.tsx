@@ -61,10 +61,7 @@ export function TestCaseHistoryDrawer({
           {!loading && history && history.runHistory.length > 0 && (
             <ul className="flex flex-col gap-2">
               {history.runHistory.map((entry) => (
-                <li
-                  key={entry.runId}
-                  className="rounded-lg border border-border bg-panel/40 p-3"
-                >
+                <li key={entry.runId} className="rounded-lg border border-border bg-panel/40 p-3">
                   <div className="flex items-center justify-between gap-2">
                     <button
                       type="button"

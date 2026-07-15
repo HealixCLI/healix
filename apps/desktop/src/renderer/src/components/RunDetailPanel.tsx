@@ -321,7 +321,13 @@ function TestSummary({
 
   return (
     <StatTileRow className="mt-3">
-      <StatTile label="Total" value={total} tone="default" active={activeStatus === 'all'} onClick={() => onSelect('all')} />
+      <StatTile
+        label="Total"
+        value={total}
+        tone="default"
+        active={activeStatus === 'all'}
+        onClick={() => onSelect('all')}
+      />
       {STATUS_TILES.map((t) => (
         <StatTile
           key={t.status}

@@ -23,6 +23,8 @@ export interface SuiteDiff {
  */
 export function diffAgainstBase(planItems: TestPlanItem[], basePassingTests: TestCase[]): SuiteDiff {
   const coveredKeys = new Set(basePassingTests.map((t) => computeIdentityKey(t.reqTag, t.title)));
-  const toGenerate = planItems.filter((item) => !coveredKeys.has(computeIdentityKey(item.reqTag, item.title)));
+  const toGenerate = planItems.filter(
+    (item) => !coveredKeys.has(computeIdentityKey(item.reqTag, item.title)),
+  );
   return { toGenerate, carried: basePassingTests };
 }

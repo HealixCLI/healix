@@ -86,9 +86,7 @@ export function ProjectDashboardView({
       </div>
 
       <div className="mt-4 min-h-0 flex-1 overflow-auto">
-        {tab === 'overview' && (
-          <OverviewTab metrics={metrics} diff={latestDiff} onSelectRun={openRun} />
-        )}
+        {tab === 'overview' && <OverviewTab metrics={metrics} diff={latestDiff} onSelectRun={openRun} />}
 
         {tab === 'history' && (
           <div className="flex h-full min-h-0 gap-4">
@@ -125,7 +123,8 @@ function OverviewTab({
   onSelectRun: (runId: string) => void;
 }) {
   const passRatePct = metrics?.passRate != null ? Math.round(metrics.passRate * 100) : null;
-  const passRateTone = passRatePct == null ? 'muted' : passRatePct >= 90 ? 'ok' : passRatePct >= 70 ? 'warn' : 'err';
+  const passRateTone =
+    passRatePct == null ? 'muted' : passRatePct >= 90 ? 'ok' : passRatePct >= 70 ? 'warn' : 'err';
 
   return (
     <div className="flex flex-col gap-6">

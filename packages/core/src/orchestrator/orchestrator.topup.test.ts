@@ -44,10 +44,7 @@ interface PlanItemSeed {
   intent: string;
 }
 
-function fakeProviderWithPlan(
-  items: PlanItemSeed[],
-  completeCalls: CompleteOptions[],
-): ProviderAdapter {
+function fakeProviderWithPlan(items: PlanItemSeed[], completeCalls: CompleteOptions[]): ProviderAdapter {
   const plan = { summary: 'canned plan', items };
   const fenced = ['```json', JSON.stringify(plan), '```'].join('\n');
   return {
@@ -78,7 +75,13 @@ function fakeProviderWithPlan(
       if (opts?.mode === 'plan') {
         return { provider: 'claude', ok: true, text: fenced, raw: plan, detail: 'OK' };
       }
-      return { provider: 'claude', ok: true, text: 'canned text (no actionable json)', raw: null, detail: 'OK' };
+      return {
+        provider: 'claude',
+        ok: true,
+        text: 'canned text (no actionable json)',
+        raw: null,
+        detail: 'OK',
+      };
     },
   };
 }
@@ -89,7 +92,10 @@ function fakeProviderWithPlan(
  * exercise real copy-forward file I/O), and records every call's item list so
  * tests can assert exactly which items were sent to AI generation.
  */
-function makeRealisticFakeMode(generateCalls: TestPlan[], failReqTags: ReadonlySet<string> = new Set()): TestMode {
+function makeRealisticFakeMode(
+  generateCalls: TestPlan[],
+  failReqTags: ReadonlySet<string> = new Set(),
+): TestMode {
   return {
     id: 'playwright',
     async scaffold(_ctx: TestModeContext): Promise<void> {
@@ -279,7 +285,7 @@ describe('orchestrator top-up / reuse suite modes', () => {
     }
   });
 
-  it('REUSE: zero AI calls at all, exact re-execution of the base run\'s passing tests', async () => {
+  it("REUSE: zero AI calls at all, exact re-execution of the base run's passing tests", async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Reuse Demo',

@@ -570,6 +570,54 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(stopCalled).toBe(true);
   });
 
+  it('LIVE FRAMES: codegen exploration with a live URL mirrors frames too (not computer-use-only)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Codegen With URL Demo',
+      mode: 'playwright',
+      repoPath: process.cwd(),
+      baseUrl: 'https://app.example.test',
+    });
+
+    const framingBrowser: BrowserSurface = {
+      async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
+      async goto(_url: string): Promise<void> {},
+      async screenshot(): Promise<Buffer> {
+        return Buffer.alloc(0);
+      },
+      async snapshot(): Promise<DomSnapshot> {
+        return { url: 'https://app.example.test', title: 'Home', interactiveElements: [] };
+      },
+      async click(_selector: string): Promise<void> {},
+      async clickAt(_point: Point): Promise<void> {},
+      async type(_selector: string, _text: string): Promise<void> {},
+      async pressKey(_key: string): Promise<void> {},
+      onFrame(cb: (png: Buffer) => void): () => void {
+        cb(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        return () => {};
+      },
+      async stop(): Promise<void> {},
+    };
+
+    const frames: Buffer[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => framingBrowser,
+    });
+
+    // No explorationMode override: deriveExplorationMode resolves 'codegen'
+    // here because the project has a repoPath. Frame mirroring must still fire.
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onFrame: (png) => frames.push(png) },
+    );
+
+    expect(['passed', 'failed']).toContain(summary.status);
+    expect(frames.length).toBeGreaterThanOrEqual(1);
+  });
+
   it('FALSE-GREEN GUARD: a run that generates zero specs settles as error, not passed', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

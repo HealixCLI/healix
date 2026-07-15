@@ -120,8 +120,10 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push('      "intent": "what this test verifies, in one or two sentences",');
   lines.push('      "unitKey": "the unitKey from the detected list above, or null",');
   lines.push('      "scenarios": [');
-  lines.push('        { "kind": "positive", "description": "the happy-path case" },');
+  lines.push('        { "kind": "positive", "description": "a happy-path case" },');
+  lines.push('        { "kind": "positive", "description": "another distinct happy-path case, if the feature has more than one" },');
   lines.push('        { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
+  lines.push('        { "kind": "negative", "description": "another distinct negative case, if applicable" },');
   lines.push('        { "kind": "edge", "description": "a boundary condition, if applicable" }');
   lines.push('      ]');
   lines.push('    }');
@@ -129,6 +131,11 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push('}');
   lines.push('```');
   lines.push('');
+  lines.push(
+    'The scenarios array is NOT limited to one entry per kind — include as many "positive", "negative", and ' +
+      '"edge" scenarios as the feature genuinely has (e.g. three distinct negative cases is fine; so is zero edge ' +
+      'cases for a feature with no real boundary condition). Never pad the list to force a fixed count.',
+  );
   lines.push(
     units.length > 0
       ? 'Produce one item per distinct route/endpoint listed above that is testable in scope — do not skip any without good reason. Every item needs at least one "positive" scenario; add "negative" and "edge" scenarios only where genuinely applicable to that feature (do not fabricate them for a feature that has none).'
@@ -361,6 +368,10 @@ export function buildReviseItemPrompt(
   lines.push('  ]');
   lines.push('}');
   lines.push('```');
+  lines.push(
+    'The scenarios array is NOT limited to one entry per kind — include as many "positive"/"negative"/"edge" ' +
+      'entries as the feature genuinely has; never pad it to force a fixed count.',
+  );
   lines.push(
     'Include the full revised scenarios array (keep scenarios unaffected by the feedback as-is; revise only what the feedback requires).',
   );

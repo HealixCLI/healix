@@ -1,10 +1,12 @@
 import type {
   AgentEvent,
   OrchestratorEvent,
+  PlanApprovalResult,
   ProviderId,
   Run,
   RunSummary,
   TestCase,
+  TestPlanItem,
   TestResult,
   TestingScope,
   TestPlan,
@@ -104,6 +106,12 @@ export function asRunReport(value: unknown): RunReportShape | null {
     generatedAt: typeof v.generatedAt === 'string' ? v.generatedAt : undefined,
   };
 }
+
+/** Result of a plan:reviseItem call — the AI-regenerated item, or a surfaced error. */
+export type ReviseItemResult = { ok: true; item: TestPlanItem } | { ok: false; detail: string };
+
+/** Re-exported for call sites that only need the approve/cancel decision shape. */
+export type { PlanApprovalResult };
 
 /** Discriminated lifecycle messages delivered to onRunEvent subscribers. */
 export type RunChannelMessage =

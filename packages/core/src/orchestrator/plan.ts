@@ -2,6 +2,7 @@ import { nanoid } from 'nanoid';
 import type { Project, Tier } from '../storage/types.js';
 import type { TestingScope, TestPlan, TestPlanItem } from '../modes/types.js';
 import { tiersForScope } from '../modes/types.js';
+import type { ProviderAdapter } from '../providers/types.js';
 import type { RunOptions } from './types.js';
 
 /** Shape the model is asked to emit inside a fenced JSON block. */
@@ -197,7 +198,126 @@ export function synthesizePlan(project: Project, scope: TestingScope = 'both'): 
   };
 }
 
-function normalizeItem(it: RawPlanItem, scope: TestingScope): TestPlanItem | null {
+/**
+ * Build a single-item revision prompt: the item's current content plus the
+ * human's free-text feedback, asking for exactly one revised JSON item.
+ * Reuses buildPlanPrompt's project/scope/repo-context boilerplate so the
+ * revision is grounded the same way the original plan was.
+ */
+export function buildReviseItemPrompt(
+  project: Project,
+  opts: RunOptions,
+  item: TestPlanItem,
+  suggestion: string,
+  repoIndex?: PlanRepoContext,
+): string {
+  const scope = opts.testingScope ?? 'both';
+  const tiers = tiersForScope(scope);
+
+  const lines: string[] = [];
+  lines.push('You are Healix, an autonomous QA engineer. A human reviewer is revising ONE item from');
+  lines.push('a proposed test plan. Regenerate ONLY this item, incorporating their feedback.');
+  lines.push('');
+  lines.push(`Project name: ${project.name}`);
+  lines.push(`Testing scope: ${scopeLabel(scope)} — keep the item within these tier(s): ${tiers.join(', ')},`);
+  lines.push('unless the feedback clearly requires a different tier.');
+  lines.push(`Test engine: ${project.mode}`);
+  if (project.baseUrl) lines.push(`Base URL (black-box): ${project.baseUrl}`);
+  if (project.repoPath) lines.push(`Repository path (white-box): ${project.repoPath}`);
+  if (repoIndex && repoIndex.summary.trim().length > 0) {
+    lines.push('');
+    lines.push('Repository context (indexed):');
+    lines.push(repoIndex.summary.trim());
+  }
+  lines.push('');
+  lines.push('Current item:');
+  lines.push('```json');
+  lines.push(
+    JSON.stringify(
+      { title: item.title, reqTag: item.reqTag ?? null, tier: item.tier, intent: item.intent },
+      null,
+      2,
+    ),
+  );
+  lines.push('```');
+  lines.push('');
+  lines.push('Reviewer feedback that MUST be incorporated:');
+  lines.push('"""');
+  lines.push(suggestion.trim());
+  lines.push('"""');
+  lines.push('');
+  lines.push('Respond with exactly one fenced JSON code block of the shape:');
+  lines.push('```json');
+  lines.push('{');
+  lines.push('  "title": "short human title",');
+  lines.push('  "reqTag": "REQ-001 or null",');
+  lines.push(`  "tier": "${tiers.join('" | "')}",`);
+  lines.push('  "intent": "what this test verifies, in one or two sentences"');
+  lines.push('}');
+  lines.push('```');
+  lines.push(tierGuidanceFor(tiers));
+  return lines.join('\n');
+}
+
+/**
+ * Parse a single revised item from a model completion. The revision replaces
+ * content, not identity — existingId is preserved so callers keyed on item id
+ * (renderer state, React keys) stay stable across a revision.
+ */
+export function parseReviseItemResponse(
+  text: string,
+  scope: TestingScope,
+  existingId: string,
+): TestPlanItem | null {
+  const candidate = extractJsonObject(text);
+  if (!candidate) return null;
+  let raw: RawPlanItem;
+  try {
+    raw = JSON.parse(candidate) as RawPlanItem;
+  } catch {
+    return null;
+  }
+  const normalized = normalizeItem(raw, scope);
+  if (!normalized) return null;
+  return { ...normalized, id: existingId };
+}
+
+/**
+ * Orchestrate a single-item revision: build the prompt, call the provider,
+ * parse the result. No provider-fallback retry on parse failure — the user is
+ * actively watching this call, so surfacing an error is better than silently
+ * substituting something unrelated.
+ */
+export async function reviseItem(
+  provider: ProviderAdapter,
+  project: Project,
+  opts: RunOptions,
+  item: TestPlanItem,
+  suggestion: string,
+  repoIndex?: PlanRepoContext,
+): Promise<{ ok: true; item: TestPlanItem } | { ok: false; detail: string }> {
+  const prompt = buildReviseItemPrompt(project, opts, item, suggestion, repoIndex);
+  let completion: Awaited<ReturnType<ProviderAdapter['complete']>>;
+  try {
+    completion = await provider.complete(prompt, {
+      mode: 'plan',
+      cwd: project.repoPath ?? undefined,
+      signal: opts.signal,
+    });
+  } catch (err) {
+    return { ok: false, detail: err instanceof Error ? err.message : String(err) };
+  }
+  if (!completion.ok || !completion.text) {
+    return { ok: false, detail: completion.detail || `Provider "${provider.id}" returned no usable revision.` };
+  }
+  const revised = parseReviseItemResponse(completion.text, opts.testingScope ?? 'both', item.id);
+  if (!revised) {
+    return { ok: false, detail: 'Could not parse a revised item from the provider response.' };
+  }
+  return { ok: true, item: revised };
+}
+
+export function normalizeItem(it: RawPlanItem, scope: TestingScope): TestPlanItem | null {
   if (!it || typeof it !== 'object') return null;
   const title = typeof it.title === 'string' ? it.title.trim() : '';
   if (title.length === 0) return null;

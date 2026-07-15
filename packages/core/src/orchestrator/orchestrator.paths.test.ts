@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createOrchestrator } from './index.js';
-import type { OrchestratorEvent } from './types.js';
+import type { OrchestratorEvent, PlanApprovalResult } from './types.js';
 import type { RunReport } from './report.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import { projectsDir } from '../env/app-data.js';
@@ -314,9 +314,9 @@ describe('orchestrator paths (offline DI seam)', () => {
     });
 
     let onPlanCalls = 0;
-    const onPlan = async (_plan: TestPlan): Promise<boolean> => {
+    const onPlan = async (_plan: TestPlan): Promise<PlanApprovalResult> => {
       onPlanCalls += 1;
-      return false;
+      return { decision: 'cancel' };
     };
 
     const summary = await orchestrator.run(
@@ -366,9 +366,9 @@ describe('orchestrator paths (offline DI seam)', () => {
     });
 
     const seenPlans: TestPlan[] = [];
-    const onPlan = async (plan: TestPlan): Promise<boolean> => {
+    const onPlan = async (plan: TestPlan): Promise<PlanApprovalResult> => {
       seenPlans.push(plan);
-      return false; // reject — we only care what the gate was shown, not execution.
+      return { decision: 'cancel' }; // reject — we only care what the gate was shown, not execution.
     };
 
     await orchestrator.run(

@@ -25,18 +25,65 @@ export function tiersForScope(scope: TestingScope): Tier[] {
   }
 }
 
-export interface TestPlanItem {
-  id: string;
+/** Per-item plan review status. undefined is treated identically to 'pending' everywhere it's read. */
+export type PlanItemStatus = 'pending' | 'approved' | 'rejected' | 'edited' | 'revised';
+
+/** Snapshot of a plan item's content fields, used for before/after audit history. */
+export interface PlanItemSnapshot {
   title: string;
   reqTag?: string;
   tier: Tier;
   intent: string;
 }
 
+/** One manual edit event on a plan item, oldest-first in TestPlanItem.edits. */
+export interface PlanItemEdit {
+  before: PlanItemSnapshot;
+  after: PlanItemSnapshot;
+  editedAt: string;
+}
+
+/** One revise-with-suggestion event on a plan item, oldest-first in TestPlanItem.revisions. */
+export interface PlanItemRevision {
+  suggestion: string;
+  before: PlanItemSnapshot;
+  after: PlanItemSnapshot;
+  revisedAt: string;
+}
+
+export interface TestPlanItem {
+  id: string;
+  title: string;
+  reqTag?: string;
+  tier: Tier;
+  intent: string;
+  /**
+   * Per-item review status, set only by the approval-gate flow (never by
+   * parsePlan/synthesizePlan). undefined means "not yet reviewed" and is
+   * treated identically to 'pending' by every reader.
+   */
+  status?: PlanItemStatus;
+  /**
+   * The AI's original proposal for this item, captured the first time it is
+   * edited or revised. Never overwritten again, so the first draft is always
+   * recoverable even after multiple edits/revisions.
+   */
+  original?: PlanItemSnapshot;
+  /** Audit trail of manual edits, oldest first. */
+  edits?: PlanItemEdit[];
+  /** Audit trail of revise-with-suggestion calls, oldest first. */
+  revisions?: PlanItemRevision[];
+}
+
 export interface TestPlan {
   summary: string;
   items: TestPlanItem[];
   raw?: unknown;
+}
+
+/** True unless the item was explicitly rejected during per-item plan review. */
+export function isPlanItemIncluded(item: TestPlanItem): boolean {
+  return item.status !== 'rejected';
 }
 
 export interface GeneratedSpec {

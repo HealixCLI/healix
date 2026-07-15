@@ -57,10 +57,15 @@ const api = {
     autoApprove?: boolean;
     prd?: string;
   }) => ipcRenderer.invoke('run:start', args),
-  approveRun: (runId: string, ok: boolean) => ipcRenderer.invoke('run:approve', { runId, ok }),
+  approveRun: (runId: string, decision: { decision: 'cancel' } | { decision: 'proceed'; plan: unknown }) =>
+    ipcRenderer.invoke('run:approve', { runId, ...decision }),
   cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
+
+  // per-item plan revision (AI-regenerates one item from human feedback)
+  reviseItem: (args: { projectId: string; item: unknown; suggestion: string }) =>
+    ipcRenderer.invoke('plan:reviseItem', args),
 
   // export / shell
   exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>

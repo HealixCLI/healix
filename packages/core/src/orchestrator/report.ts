@@ -50,10 +50,20 @@ export function renderReportHtml(report: RunReport): string {
   const flaky = outcome?.flaky ?? 0;
 
   const planRows = plan.items
-    .map(
-      (it) =>
-        `<tr><td>${esc(it.title)}</td><td>${esc(it.tier)}</td><td>${esc(it.reqTag ?? '')}</td><td>${esc(it.intent)}</td></tr>`,
-    )
+    .map((it) => {
+      const rejected = it.status === 'rejected';
+      const statusBadge =
+        it.status && it.status !== 'approved' ? ` <span class="tag">${esc(it.status)}</span>` : '';
+      const editCount = it.edits?.length ?? 0;
+      const revisionCount = it.revisions?.length ?? 0;
+      const historyNote =
+        editCount > 0 || revisionCount > 0
+          ? `<div class="hist">${editCount} edit(s), ${revisionCount} revision(s)</div>`
+          : '';
+      return `<tr class="${rejected ? 'rejected' : ''}"><td>${esc(it.title)}${statusBadge}</td><td>${esc(
+        it.tier,
+      )}</td><td>${esc(it.reqTag ?? '')}</td><td>${esc(it.intent)}${historyNote}</td></tr>`;
+    })
     .join('');
 
   const resultRows = (outcome?.results ?? [])
@@ -94,6 +104,10 @@ export function renderReportHtml(report: RunReport): string {
   th { font-weight: 600; }
   tr.status-failed td { background: #cf222e14; }
   tr.status-passed td:nth-child(2) { color: #1a7f37; }
+  tr.rejected td { opacity: .55; text-decoration: line-through; }
+  .tag { display: inline-block; font-size: .7rem; text-transform: uppercase; letter-spacing: .02em;
+    padding: 0 .35rem; border-radius: 4px; background: #8884; text-decoration: none; }
+  .hist { font-size: .75rem; color: #888; margin-top: .15rem; text-decoration: none; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   section { margin-bottom: 1rem; }
 </style>

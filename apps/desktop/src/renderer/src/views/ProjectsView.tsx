@@ -1,7 +1,18 @@
 import { useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { NewProject, Project } from '@healix/core';
-import { Archive, ArchiveRestore, Eye, EyeOff, FolderGit2, Globe, Pencil, Plus, Trash2 } from 'lucide-react';
+import {
+  Archive,
+  ArchiveRestore,
+  Eye,
+  EyeOff,
+  FolderGit2,
+  Globe,
+  LayoutDashboard,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
@@ -21,7 +32,13 @@ type FormState =
   | { kind: 'edit'; project: Project }
   | { kind: 'view'; project: Project };
 
-export function ProjectsView({ onRunProject }: { onRunProject?: (project: Project) => void }) {
+export function ProjectsView({
+  onRunProject,
+  onOpenDashboard,
+}: {
+  onRunProject?: (project: Project) => void;
+  onOpenDashboard?: (project: Project) => void;
+}) {
   const { projects, loading, error, create, update, remove, archive } = useProjects();
   const [formState, setFormState] = useState<FormState>({ kind: 'closed' });
 
@@ -89,6 +106,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
             onDelete={() => void remove(p.id)}
             onArchive={() => void archive(p.id, true)}
             onRun={onRunProject ? () => onRunProject(p) : undefined}
+            onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(p) : undefined}
           />
         ))}
       </section>
@@ -109,6 +127,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
                 onEdit={() => setFormState({ kind: 'edit', project: p })}
                 onDelete={() => void remove(p.id)}
                 onUnarchive={() => void archive(p.id, false)}
+                onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(p) : undefined}
               />
             ))}
           </div>
@@ -136,6 +155,7 @@ function ProjectRow({
   onArchive,
   onUnarchive,
   onRun,
+  onOpenDashboard,
 }: {
   project: Project;
   onView: () => void;
@@ -144,6 +164,7 @@ function ProjectRow({
   onArchive?: () => void;
   onUnarchive?: () => void;
   onRun?: () => void;
+  onOpenDashboard?: () => void;
 }) {
   const isArchived = Boolean(project.archivedAt);
   return (
@@ -178,6 +199,17 @@ function ProjectRow({
           </div>
         </button>
         <div className="flex shrink-0 items-center gap-1">
+          {onOpenDashboard && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={onOpenDashboard}
+              aria-label="Open project dashboard"
+              title="Open project dashboard"
+            >
+              <LayoutDashboard className="h-4 w-4" />
+            </Button>
+          )}
           {onRun && (
             <Button size="sm" variant="outline" onClick={onRun}>
               Run

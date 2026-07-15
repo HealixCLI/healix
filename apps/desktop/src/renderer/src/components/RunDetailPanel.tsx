@@ -1,10 +1,21 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { AgentEvent, TestCase, TestResult, TestStatus } from '@healix/core';
-import { Camera, FileText, FolderOpen, Image as ImageIcon, PackageOpen, X } from 'lucide-react';
+import {
+  Camera,
+  ChevronDown,
+  ChevronRight,
+  FileText,
+  FolderOpen,
+  History,
+  Image as ImageIcon,
+  PackageOpen,
+  X,
+} from 'lucide-react';
 import { Badge } from './ui/badge';
-import type { BadgeTone } from './ui/badge';
 import { Button } from './ui/button';
+import { StatTile, StatTileRow } from './StatTiles';
+import { TestCaseHistoryDrawer } from './TestCaseHistoryDrawer';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
 import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
@@ -33,11 +44,21 @@ const VERDICT_TONE: Record<string, 'ok' | 'warn' | 'err' | 'muted' | 'default'> 
 };
 
 /** Full detail for a selected historical run: timeline, results, triage, artifacts. */
-export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; loading: boolean }) {
+export function RunDetailPanel({
+  detail,
+  loading,
+  onSelectRun,
+}: {
+  detail: RunDetail | null;
+  loading: boolean;
+  /** Jump to a different run (e.g. from the Test Case History drawer). Omit to disable those jumps. */
+  onSelectRun?: (runId: string) => void;
+}) {
   const [tab, setTab] = useState<DetailTab>('timeline');
   const [busy, setBusy] = useState<'reveal' | 'export' | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
+  const [historyCaseKey, setHistoryCaseKey] = useState<{ reqTag: string | null; title: string } | null>(null);
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
   const triage = report?.triage ?? [];
@@ -51,9 +72,10 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
   );
   const summary = useMemo(() => summarizeStatuses(rows), [rows]);
 
-  // Reset any active filter when a different run is opened.
+  // Reset any active filter and tab when a different run is opened.
   useEffect(() => {
     setStatusFilter('all');
+    setTab('timeline');
   }, [detail?.run?.id]);
 
   const selectStatus = (status: TestStatus | 'all'): void => {
@@ -142,6 +164,11 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
         <div className="flex items-center gap-2">
           <Badge tone={runStatusTone(run.status)}>{run.status}</Badge>
           {run.mode && <span className="font-mono text-xs text-muted">{run.mode}</span>}
+          {run.suiteMode && run.suiteMode !== 'fresh' && (
+            <Badge tone="default" title={run.baseRunId ? `Based on run ${run.baseRunId}` : undefined}>
+              {run.suiteMode}
+            </Badge>
+          )}
           <span className="font-mono text-[11px] text-muted/70">{run.id}</span>
         </div>
         <div className="flex items-center gap-2">
@@ -186,24 +213,60 @@ export function RunDetailPanel({ detail, loading }: { detail: RunDetail | null; 
         />
       </div>
 
-      <div className="mt-3 min-h-0 flex-1 overflow-auto">
-        {tab === 'timeline' && <Timeline events={detail.events} />}
-        {tab === 'results' && (
-          <div className="flex flex-col gap-3">
-            <TestSummary summary={summary} activeStatus={statusFilter} onSelect={selectStatus} />
-            <ResultsTable rows={filteredRows} mediaFolders={mediaFolders} onShowMedia={showMedia} />
+      <div className="mt-3 flex min-h-0 flex-1 flex-col">
+        {tab === 'timeline' && (
+          <div className="min-h-0 flex-1 overflow-auto">
+            <Timeline events={detail.events} />
           </div>
         )}
-        {tab === 'triage' && <TriageList entries={triage} />}
+        {tab === 'results' && (
+          <div className="flex min-h-0 flex-1 flex-col gap-3">
+            <TestSummary summary={summary} activeStatus={statusFilter} onSelect={selectStatus} />
+            <div className="min-h-0 flex-1 overflow-auto">
+              <ResultsTable
+                rows={filteredRows}
+                mediaFolders={mediaFolders}
+                onShowMedia={showMedia}
+                onShowHistory={(row) => setHistoryCaseKey({ reqTag: row.reqTag, title: row.title })}
+              />
+            </div>
+          </div>
+        )}
+        {tab === 'triage' && (
+          <div className="min-h-0 flex-1 overflow-auto">
+            <TriageList entries={triage} />
+          </div>
+        )}
         {tab === 'artifacts' && (
-          <ArtifactsGallery
-            artifacts={artifacts}
-            suiteDir={suiteDir}
-            runStatus={run.status}
-            focusFolder={focusFolder}
-          />
+          <div className="min-h-0 flex-1 overflow-auto">
+            <ArtifactsGallery
+              artifacts={artifacts}
+              suiteDir={suiteDir}
+              runStatus={run.status}
+              focusFolder={focusFolder}
+            />
+          </div>
         )}
       </div>
+
+      {historyCaseKey && (
+        <TestCaseHistoryDrawer
+          caseKey={{
+            projectId: run.projectId,
+            reqTag: historyCaseKey.reqTag ?? undefined,
+            title: historyCaseKey.title,
+          }}
+          onClose={() => setHistoryCaseKey(null)}
+          onSelectRun={
+            onSelectRun
+              ? (runId) => {
+                  setHistoryCaseKey(null);
+                  onSelectRun(runId);
+                }
+              : undefined
+          }
+        />
+      )}
     </div>
   );
 }
@@ -278,10 +341,11 @@ function TestSummary({
   onSelect: (status: TestStatus | 'all') => void;
 }) {
   const total = STATUS_TILES.reduce((n, t) => n + summary[t.status], 0);
+  const rate = total > 0 ? Math.round((summary.passed / total) * 100) : null;
 
   return (
-    <div className="mt-3 grid grid-cols-3 gap-2 sm:grid-cols-7">
-      <SummaryTile
+    <StatTileRow className="mt-3 sm:grid-cols-8">
+      <StatTile
         label="Total"
         value={total}
         tone="default"
@@ -289,7 +353,7 @@ function TestSummary({
         onClick={() => onSelect('all')}
       />
       {STATUS_TILES.map((t) => (
-        <SummaryTile
+        <StatTile
           key={t.status}
           label={t.label}
           value={summary[t.status]}
@@ -298,37 +362,9 @@ function TestSummary({
           onClick={() => onSelect(t.status)}
         />
       ))}
-    </div>
-  );
-}
-
-function SummaryTile({
-  label,
-  value,
-  tone,
-  active,
-  onClick,
-}: {
-  label: string;
-  value: number;
-  tone: BadgeTone;
-  active: boolean;
-  onClick: () => void;
-}) {
-  const valueColor =
-    tone === 'ok' ? 'text-ok' : tone === 'warn' ? 'text-warn' : tone === 'err' ? 'text-err' : 'text-fg';
-  return (
-    <button
-      type="button"
-      onClick={onClick}
-      className={cn(
-        'rounded-lg border border-border bg-panel/40 px-3 py-2 text-left transition-colors hover:border-accent/50',
-        active && 'border-accent bg-accent/5',
-      )}
-    >
-      <div className="text-[11px] text-muted">{label}</div>
-      <div className={cn('mt-0.5 text-lg font-semibold leading-none', valueColor)}>{value}</div>
-    </button>
+      {/* Non-interactive — a pass rate isn't a status you can filter Results by. */}
+      <StatTile label="Rate" value={rate !== null ? `${rate}%` : '—'} />
+    </StatTileRow>
   );
 }
 
@@ -353,12 +389,24 @@ function ResultsTable({
   rows,
   mediaFolders,
   onShowMedia,
+  onShowHistory,
 }: {
   rows: JoinedRow[];
   /** Artifact folders that contain media; drives the per-row camera button. */
   mediaFolders: string[];
   onShowMedia: (title: string) => void;
+  onShowHistory: (row: JoinedRow) => void;
 }) {
+  const [expanded, setExpanded] = useState<Set<string>>(new Set());
+  const toggle = (key: string): void => {
+    setExpanded((prev) => {
+      const next = new Set(prev);
+      if (next.has(key)) next.delete(key);
+      else next.add(key);
+      return next;
+    });
+  };
+
   if (rows.length === 0) {
     return <EmptyHint>No test results for this run.</EmptyHint>;
   }
@@ -366,52 +414,110 @@ function ResultsTable({
     <Table>
       <TableHeader>
         <TableRow>
+          {/* Expand/collapse toggle column (icon only). */}
+          <TableHead className="w-8" />
           <TableHead>Title</TableHead>
           <TableHead>REQ</TableHead>
           <TableHead>Tier</TableHead>
           <TableHead className="text-right">Duration</TableHead>
           <TableHead className="text-right">Status</TableHead>
-          {/* Row → media jump column (icon only). */}
-          <TableHead className="w-8" />
+          {/* Row → media jump / history columns (icon only). */}
+          <TableHead className="w-16" />
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.map((r) => {
           // Best-effort: does any media folder look like this test's slug?
           const hasMedia = mediaFolders.some((f) => slugMatches(r.title, f));
+          const isOpen = expanded.has(r.key);
           return (
-            <TableRow key={r.key}>
-              <TableCell className="max-w-[18rem]">
-                <span className="block truncate text-fg" title={r.title}>
-                  {r.title}
-                </span>
-                {r.error && (
-                  <span className="mt-0.5 block truncate font-mono text-[11px] text-err/80" title={r.error}>
-                    {r.error}
+            <Fragment key={r.key}>
+              <TableRow
+                className="cursor-pointer hover:bg-panel/30"
+                onClick={() => toggle(r.key)}
+                aria-expanded={isOpen}
+              >
+                <TableCell className="w-8 pr-0">
+                  <span className="flex h-5 w-5 items-center justify-center text-muted">
+                    {isOpen ? (
+                      <ChevronDown className="h-3.5 w-3.5" />
+                    ) : (
+                      <ChevronRight className="h-3.5 w-3.5" />
+                    )}
                   </span>
-                )}
-              </TableCell>
-              <TableCell className="font-mono text-[11px] text-muted">{r.reqTag ?? '—'}</TableCell>
-              <TableCell className="font-mono text-[11px] text-muted">{r.tier ?? '—'}</TableCell>
-              <TableCell className="text-right text-xs text-muted">{formatDuration(r.durationMs)}</TableCell>
-              <TableCell className="text-right">
-                <Badge tone={testStatusTone(r.status)}>{r.status ?? 'pending'}</Badge>
-              </TableCell>
-              <TableCell className="w-8 pl-0 text-right">
-                {hasMedia && (
+                </TableCell>
+                <TableCell className="max-w-[18rem]">
+                  <span className="block truncate text-fg" title={r.title}>
+                    {r.title}
+                  </span>
+                  {r.error && (
+                    <span className="mt-0.5 block truncate font-mono text-[11px] text-err/80" title={r.error}>
+                      {r.error}
+                    </span>
+                  )}
+                </TableCell>
+                <TableCell className="font-mono text-[11px] text-muted">{r.reqTag ?? '—'}</TableCell>
+                <TableCell className="font-mono text-[11px] text-muted">{r.tier ?? '—'}</TableCell>
+                <TableCell className="text-right text-xs text-muted">
+                  {formatDuration(r.durationMs)}
+                </TableCell>
+                <TableCell className="text-right">
+                  <Badge tone={testStatusTone(r.status)}>{r.status ?? 'pending'}</Badge>
+                </TableCell>
+                <TableCell className="w-16 pl-0 text-right">
                   <Button
                     size="icon"
                     variant="ghost"
                     className="h-6 w-6"
-                    title="View screenshots / recordings"
-                    aria-label={`View media for ${r.title}`}
-                    onClick={() => onShowMedia(r.title)}
+                    title="View test case history"
+                    aria-label={`View history for ${r.title}`}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onShowHistory(r);
+                    }}
                   >
-                    <Camera className="h-3.5 w-3.5" />
+                    <History className="h-3.5 w-3.5" />
                   </Button>
-                )}
-              </TableCell>
-            </TableRow>
+                  {hasMedia && (
+                    <Button
+                      size="icon"
+                      variant="ghost"
+                      className="h-6 w-6"
+                      title="View screenshots / recordings"
+                      aria-label={`View media for ${r.title}`}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onShowMedia(r.title);
+                      }}
+                    >
+                      <Camera className="h-3.5 w-3.5" />
+                    </Button>
+                  )}
+                </TableCell>
+              </TableRow>
+              {isOpen && (
+                <TableRow className="bg-panel/40 hover:bg-panel/40">
+                  <TableCell colSpan={7} className="whitespace-normal py-3">
+                    <div className="flex flex-col gap-2">
+                      <p className="text-sm font-medium text-fg">{r.title}</p>
+                      <div className="flex flex-wrap items-center gap-3 text-xs text-muted">
+                        <span>
+                          Status: <Badge tone={testStatusTone(r.status)}>{r.status ?? 'pending'}</Badge>
+                        </span>
+                        <span>REQ: {r.reqTag ?? '—'}</span>
+                        <span>Tier: {r.tier ?? '—'}</span>
+                        <span>Duration: {formatDuration(r.durationMs)}</span>
+                      </div>
+                      {r.error && (
+                        <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-bg p-3 font-mono text-[11px] leading-relaxed text-err/90">
+                          {r.error}
+                        </pre>
+                      )}
+                    </div>
+                  </TableCell>
+                </TableRow>
+              )}
+            </Fragment>
           );
         })}
       </TableBody>

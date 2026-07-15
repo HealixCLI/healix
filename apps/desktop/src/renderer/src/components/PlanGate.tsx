@@ -104,7 +104,12 @@ function EditItemDialog({
         <div className="flex gap-3">
           <div className="flex-1">
             <Label htmlFor="edit-tier">Tier</Label>
-            <Select id="edit-tier" className="mt-1" value={tier} onChange={(e) => setTier(e.target.value as Tier)}>
+            <Select
+              id="edit-tier"
+              className="mt-1"
+              value={tier}
+              onChange={(e) => setTier(e.target.value as Tier)}
+            >
               {TIER_OPTIONS.map((t) => (
                 <option key={t.value} value={t.value}>
                   {t.label}
@@ -114,7 +119,12 @@ function EditItemDialog({
           </div>
           <div className="flex-1">
             <Label htmlFor="edit-reqtag">Req tag</Label>
-            <Input id="edit-reqtag" className="mt-1" value={reqTag} onChange={(e) => setReqTag(e.target.value)} />
+            <Input
+              id="edit-reqtag"
+              className="mt-1"
+              value={reqTag}
+              onChange={(e) => setReqTag(e.target.value)}
+            />
           </div>
         </div>
         <div>
@@ -184,7 +194,10 @@ function ReviseItemDialog({
         <Button variant="ghost" onClick={onCancel} disabled={revising}>
           Cancel
         </Button>
-        <Button disabled={revising || suggestion.trim().length === 0} onClick={() => onSubmit(suggestion.trim())}>
+        <Button
+          disabled={revising || suggestion.trim().length === 0}
+          onClick={() => onSubmit(suggestion.trim())}
+        >
           {revising ? <Loader2 className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
           {revising ? 'Revising…' : 'Revise with AI'}
         </Button>
@@ -224,7 +237,9 @@ function PlanItemRow({
         <span className="mt-0.5 w-5 shrink-0 text-right font-mono text-xs text-muted">{index + 1}.</span>
         <div className="min-w-0 flex-1">
           <div className="flex flex-wrap items-center gap-2">
-            <span className={cn('text-sm text-fg', status === 'rejected' && 'line-through')}>{item.title}</span>
+            <span className={cn('text-sm text-fg', status === 'rejected' && 'line-through')}>
+              {item.title}
+            </span>
             <Badge tone="muted">{item.tier}</Badge>
             {item.reqTag && <span className="font-mono text-[11px] text-muted">{item.reqTag}</span>}
             <Badge tone={STATUS_TONE[status]}>{STATUS_LABEL[status]}</Badge>
@@ -293,7 +308,13 @@ function PlanItemRow({
           >
             <X className="h-3.5 w-3.5" />
           </Button>
-          <Button variant="outline" size="icon" aria-label="Edit item" disabled={decided || revising} onClick={onEdit}>
+          <Button
+            variant="outline"
+            size="icon"
+            aria-label="Edit item"
+            disabled={decided || revising}
+            onClick={onEdit}
+          >
             <Pencil className="h-3.5 w-3.5" />
           </Button>
           <Button
@@ -303,7 +324,11 @@ function PlanItemRow({
             disabled={decided || revising}
             onClick={onRevise}
           >
-            {revising ? <Loader2 className="h-3.5 w-3.5 animate-spin" /> : <Sparkles className="h-3.5 w-3.5" />}
+            {revising ? (
+              <Loader2 className="h-3.5 w-3.5 animate-spin" />
+            ) : (
+              <Sparkles className="h-3.5 w-3.5" />
+            )}
           </Button>
         </div>
       </div>

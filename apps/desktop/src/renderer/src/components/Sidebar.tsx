@@ -3,7 +3,9 @@ import { FolderGit2, PlayCircle, Settings } from 'lucide-react';
 import { Leaf } from './Leaf';
 import { cn } from '../lib/utils';
 
-export type ViewId = 'projects' | 'runs' | 'settings';
+// 'project-dashboard' is a deep-link-only destination (reached from ProjectsView,
+// like 'runs' can be) — it never appears in the sidebar's own nav list below.
+export type ViewId = 'projects' | 'runs' | 'settings' | 'project-dashboard';
 
 interface NavItem {
   id: ViewId;

@@ -4,6 +4,7 @@ import type {
   PlanItemSnapshot,
   PlanItemStatus,
   RunSummary,
+  SuiteMode,
   TestingScope,
   TestPlan,
   TestPlanItem,
@@ -109,7 +110,9 @@ function clonePlan(plan: TestPlan): TestPlan {
     items: plan.items.map((item) => ({
       ...item,
       original: item.original ? { ...item.original } : undefined,
-      edits: item.edits ? item.edits.map((e) => ({ ...e, before: { ...e.before }, after: { ...e.after } })) : undefined,
+      edits: item.edits
+        ? item.edits.map((e) => ({ ...e, before: { ...e.before }, after: { ...e.after } }))
+        : undefined,
       revisions: item.revisions
         ? item.revisions.map((r) => ({ ...r, before: { ...r.before }, after: { ...r.after } }))
         : undefined,
@@ -229,14 +232,20 @@ export function useRunEngine(): RunEngine {
   const approveItem = useCallback((itemId: string): void => {
     setState((prev) => {
       if (!prev.workingPlan) return prev;
-      return { ...prev, workingPlan: mapItem(prev.workingPlan, itemId, (it) => ({ ...it, status: 'approved' })) };
+      return {
+        ...prev,
+        workingPlan: mapItem(prev.workingPlan, itemId, (it) => ({ ...it, status: 'approved' })),
+      };
     });
   }, []);
 
   const rejectItem = useCallback((itemId: string): void => {
     setState((prev) => {
       if (!prev.workingPlan) return prev;
-      return { ...prev, workingPlan: mapItem(prev.workingPlan, itemId, (it) => ({ ...it, status: 'rejected' })) };
+      return {
+        ...prev,
+        workingPlan: mapItem(prev.workingPlan, itemId, (it) => ({ ...it, status: 'rejected' })),
+      };
     });
   }, []);
 
@@ -260,66 +269,76 @@ export function useRunEngine(): RunEngine {
     });
   }, []);
 
-  const reviseItem = useCallback(async (itemId: string, suggestion: string, projectId: string): Promise<void> => {
-    const runId = activeRunId.current;
-    if (!runId) return;
-    // Read the item to revise from the latest committed state (stateRef), not
-    // from a setState updater — updaters don't run synchronously, so code
-    // right after calling setState can't rely on their result yet.
-    const current = stateRef.current;
-    if (!current.workingPlan || current.planDecided) return;
-    const target = current.workingPlan.items.find((it) => it.id === itemId);
-    if (!target) return;
+  const reviseItem = useCallback(
+    async (itemId: string, suggestion: string, projectId: string): Promise<void> => {
+      const runId = activeRunId.current;
+      if (!runId) return;
+      // Read the item to revise from the latest committed state (stateRef), not
+      // from a setState updater — updaters don't run synchronously, so code
+      // right after calling setState can't rely on their result yet.
+      const current = stateRef.current;
+      if (!current.workingPlan || current.planDecided) return;
+      const target = current.workingPlan.items.find((it) => it.id === itemId);
+      if (!target) return;
 
-    setState((prev) => {
-      if (!prev.workingPlan || prev.planDecided) return prev;
-      const nextRevising = new Set(prev.revisingItemIds);
-      nextRevising.add(itemId);
-      const nextErrors = { ...prev.reviseErrors };
-      delete nextErrors[itemId];
-      return { ...prev, revisingItemIds: nextRevising, reviseErrors: nextErrors };
-    });
+      setState((prev) => {
+        if (!prev.workingPlan || prev.planDecided) return prev;
+        const nextRevising = new Set(prev.revisingItemIds);
+        nextRevising.add(itemId);
+        const nextErrors = { ...prev.reviseErrors };
+        delete nextErrors[itemId];
+        return { ...prev, revisingItemIds: nextRevising, reviseErrors: nextErrors };
+      });
 
-    let result: Awaited<ReturnType<typeof window.healix.reviseItem>>;
-    try {
-      result = await window.healix.reviseItem({ projectId, item: target, suggestion });
-    } catch (err) {
-      result = { ok: false, detail: err instanceof Error ? err.message : String(err) };
-    }
-
-    setState((prev) => {
-      // Stale reply: the run moved on (different run, or the gate was already
-      // decided) while this call was in flight — discard rather than mutate a
-      // plan that's no longer under review.
-      if (activeRunId.current !== runId || prev.planDecided || !prev.workingPlan) return prev;
-      const nextRevising = new Set(prev.revisingItemIds);
-      nextRevising.delete(itemId);
-      if (!result.ok) {
-        return { ...prev, revisingItemIds: nextRevising, reviseErrors: { ...prev.reviseErrors, [itemId]: result.detail } };
+      let result: Awaited<ReturnType<typeof window.healix.reviseItem>>;
+      try {
+        result = await window.healix.reviseItem({ projectId, item: target, suggestion });
+      } catch (err) {
+        result = { ok: false, detail: err instanceof Error ? err.message : String(err) };
       }
-      const revised = result.item;
-      return {
-        ...prev,
-        revisingItemIds: nextRevising,
-        workingPlan: mapItem(prev.workingPlan, itemId, (it) => {
-          const before = snapshotOf(it);
-          const after = snapshotOf(revised);
-          const revisions = [...(it.revisions ?? []), { suggestion, before, after, revisedAt: new Date().toISOString() }];
+
+      setState((prev) => {
+        // Stale reply: the run moved on (different run, or the gate was already
+        // decided) while this call was in flight — discard rather than mutate a
+        // plan that's no longer under review.
+        if (activeRunId.current !== runId || prev.planDecided || !prev.workingPlan) return prev;
+        const nextRevising = new Set(prev.revisingItemIds);
+        nextRevising.delete(itemId);
+        if (!result.ok) {
           return {
-            ...it,
-            ...after,
-            // Re-enters review (badged distinctly from a never-touched
-            // 'pending' item) rather than auto-approving. needsDecision()
-            // treats 'revised' the same as 'pending', so approveAndContinue
-            // still defaults it to approved if left untouched further.
-            status: 'revised' as PlanItemStatus,
-            original: it.original ?? before,
-            revisions,
+            ...prev,
+            revisingItemIds: nextRevising,
+            reviseErrors: { ...prev.reviseErrors, [itemId]: result.detail },
           };
-        }),
-      };
-    });
-  }, []);
+        }
+        const revised = result.item;
+        return {
+          ...prev,
+          revisingItemIds: nextRevising,
+          workingPlan: mapItem(prev.workingPlan, itemId, (it) => {
+            const before = snapshotOf(it);
+            const after = snapshotOf(revised);
+            const revisions = [
+              ...(it.revisions ?? []),
+              { suggestion, before, after, revisedAt: new Date().toISOString() },
+            ];
+            return {
+              ...it,
+              ...after,
+              // Re-enters review (badged distinctly from a never-touched
+              // 'pending' item) rather than auto-approving. needsDecision()
+              // treats 'revised' the same as 'pending', so approveAndContinue
+              // still defaults it to approved if left untouched further.
+              status: 'revised' as PlanItemStatus,
+              original: it.original ?? before,
+              revisions,
+            };
+          }),
+        };
+      });
+    },
+    [],
+  );
 
   const approveAndContinue = useCallback(async (): Promise<void> => {
     const runId = activeRunId.current;
@@ -465,4 +484,22 @@ export const TESTING_SCOPES: ReadonlyArray<{ value: TestingScope; label: string;
   { value: 'frontend', label: 'Frontend Testing', hint: 'UI-focused tests (public + authenticated flows)' },
   { value: 'backend', label: 'Backend Testing', hint: 'API/backend tests only' },
   { value: 'both', label: 'Both (Frontend + Backend)', hint: 'Full coverage across UI and API' },
+];
+
+/**
+ * Suite lifecycle for a run. Top-up/Reuse require an existing successful run
+ * to build on — RunsView disables them (not hides them) until one exists.
+ */
+export const SUITE_MODES: ReadonlyArray<{ value: SuiteMode; label: string; hint: string }> = [
+  { value: 'fresh', label: 'Generate fresh suite', hint: 'Regenerate every test from scratch.' },
+  {
+    value: 'topup',
+    label: 'Top up existing suite',
+    hint: 'Keep passing tests from the last successful run; generate only new/missing ones.',
+  },
+  {
+    value: 'reuse',
+    label: 'Run existing suite as-is',
+    hint: "Re-execute the last successful run's tests — no generation.",
+  },
 ];

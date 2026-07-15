@@ -95,6 +95,12 @@ function migrate(db: DatabaseSync): void {
     // authenticated (tierB) flows.
     ensureColumn(db, 'projects', 'test_username', 'TEXT');
     ensureColumn(db, 'projects', 'test_password', 'TEXT');
+    // v5: top-up/reuse suite generation — which mode a run used, which prior
+    // run it built on, and which spec file backs each test (so a later run
+    // can copy a still-passing test's file forward instead of regenerating it).
+    ensureColumn(db, 'runs', 'suite_mode', 'TEXT');
+    ensureColumn(db, 'runs', 'base_run_id', 'TEXT');
+    ensureColumn(db, 'tests', 'spec_path', 'TEXT');
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     logger.info(`Database migrated to schema v${SCHEMA_VERSION}`);
   }

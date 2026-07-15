@@ -294,6 +294,23 @@ describe('parseReport — structural Tier B classification', () => {
     expect(byTitle['authenticate']?.status).toBe('failed');
   });
 
+  it('excludes a PASSING auth-setup spec from results entirely (no phantom test row)', () => {
+    // Regression: a passing auth-setup used to appear in `results` as a normal
+    // "test" that can never be matched back to a generated spec — inflating
+    // the total and, downstream, poisoning top-up/reuse's "which tests passed"
+    // accounting with an uncarryable phantom row every Tier B run.
+    const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: true };
+    const r = report([
+      { title: 'authenticate', file: 'fixtures/auth.setup.ts', projectName: 'auth-setup', status: 'passed' },
+      { title: 'dashboard greeting', projectName: 'tierB-auth', status: 'passed' },
+    ]);
+    const parsed = parseReport(r, auth);
+    expect(parsed.results.map((x) => x.title)).toEqual(['dashboard greeting']);
+    expect(parsed.results.some((x) => x.title === 'authenticate')).toBe(false);
+    // Only the real test counts toward the headline — the setup phantom does not.
+    expect(parsed.passed).toBe(1);
+  });
+
   it('marks Tier B failures BLOCKED when the setup ran without credentials (anonymous session)', () => {
     const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: false };
     const r = report([

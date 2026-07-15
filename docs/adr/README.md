@@ -21,6 +21,7 @@ Each ADR captures one decision: its context, the choice, and consequences. Forma
 | [0015](./0015-ci-export-integration.md)           | CI export & integration                                | Proposed (stub) |
 | [0016](./0016-telemetry-privacy.md)               | Telemetry & privacy (local-first)                      | Proposed (stub) |
 | [0017](./0017-update-distribution.md)             | Auto-update & distribution                             | Proposed (stub) |
+| [0018](./0018-persistent-topup-suites.md)         | Persistent, top-up test suites (copy-forward)          | Accepted        |
 
 ## Template
 

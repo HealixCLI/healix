@@ -318,7 +318,8 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
         onPlan: (plan: TestPlan) => {
           if (runId) safeSend(sender, 'run:plan', { runId, plan });
           // Auto-approve short-circuits the human gate.
-          if (args.autoApprove || !runId) return Promise.resolve<PlanApprovalResult>({ decision: 'proceed', plan });
+          if (args.autoApprove || !runId)
+            return Promise.resolve<PlanApprovalResult>({ decision: 'proceed', plan });
           return waitForApproval(runId, sender);
         },
         // Live browser mirroring for computer-use runs. Throttling (~2fps) and
@@ -377,10 +378,7 @@ async function forceSettleOrphanedRun(
 
 ipcMain.handle(
   'run:approve',
-  async (
-    _e,
-    payload: { runId: string } & PlanApprovalResult,
-  ): Promise<{ settled: boolean }> => {
+  async (_e, payload: { runId: string } & PlanApprovalResult): Promise<{ settled: boolean }> => {
     if (!payload?.runId) return { settled: false };
     const result: PlanApprovalResult =
       payload.decision === 'proceed' ? { decision: 'proceed', plan: payload.plan } : { decision: 'cancel' };

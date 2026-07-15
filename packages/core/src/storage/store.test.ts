@@ -199,6 +199,32 @@ describe('updateProject', () => {
     expect(s.getProject(project.id)).toMatchObject({ name: 'Renamed', repoPath: '/Users/me/code/renamed' });
   });
 
+  it('persists and round-trips test credentials through create, get, and update', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'Auth Project',
+      baseUrl: 'https://auth.test',
+      testUsername: 'tester@auth.test',
+      testPassword: 'hunter2',
+    });
+    expect(project.testUsername).toBe('tester@auth.test');
+    expect(project.testPassword).toBe('hunter2');
+    expect(s.getProject(project.id)).toMatchObject({
+      testUsername: 'tester@auth.test',
+      testPassword: 'hunter2',
+    });
+
+    const cleared = s.updateProject(project.id, {
+      name: 'Auth Project',
+      baseUrl: 'https://auth.test',
+      testUsername: null,
+      testPassword: null,
+    });
+    expect(cleared.testUsername).toBeNull();
+    expect(cleared.testPassword).toBeNull();
+    expect(s.getProject(project.id)).toMatchObject({ testUsername: null, testPassword: null });
+  });
+
   it('throws and persists nothing when the edit would violate the invariant', async () => {
     const s = await store();
     const project = s.createProject({ name: 'Original', baseUrl: 'https://original.test' });

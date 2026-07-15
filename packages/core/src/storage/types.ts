@@ -14,6 +14,10 @@ export interface Project {
   createdAt: string;
   /** Soft-archive timestamp; null = active. Archived projects keep all data. */
   archivedAt: string | null;
+  /** Login identifier (username or email) for authenticated (tierB) test flows. */
+  testUsername: string | null;
+  /** Password paired with testUsername. Stored locally, same as repoPath/baseUrl — never sent to the AI provider. */
+  testPassword: string | null;
 }
 
 export type RunStatus =
@@ -81,4 +85,6 @@ export interface NewProject {
   mode?: ModeId;
   repoPath?: string | null;
   baseUrl?: string | null;
+  testUsername?: string | null;
+  testPassword?: string | null;
 }

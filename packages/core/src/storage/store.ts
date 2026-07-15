@@ -28,7 +28,7 @@ export class HealixStore {
     // single source of truth for the invariant; the UI mirrors it for feedback.
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
-    const { name, mode, repoPath, baseUrl } = validation.value;
+    const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
     const project: Project = {
       id: `prj_${nanoid(10)}`,
       name,
@@ -37,31 +37,44 @@ export class HealixStore {
       baseUrl,
       createdAt: new Date().toISOString(),
       archivedAt: null,
+      testUsername,
+      testPassword,
     };
     this.db
       .prepare(
-        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at, test_username, test_password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(project.id, project.name, project.mode, project.repoPath, project.baseUrl, project.createdAt);
+      .run(
+        project.id,
+        project.name,
+        project.mode,
+        project.repoPath,
+        project.baseUrl,
+        project.createdAt,
+        project.testUsername,
+        project.testPassword,
+      );
     return project;
   }
 
   /**
-   * Update a project's editable fields (name, mode, repoPath, baseUrl). Runs the
-   * same validation as createProject — it is edited via the identical form, so
-   * the identical invariant (name required, at least one of repo/URL, a valid
-   * base URL) must hold. Throws if the project does not exist.
+   * Update a project's editable fields (name, mode, repoPath, baseUrl, test
+   * credentials). Runs the same validation as createProject — it is edited via
+   * the identical form, so the identical invariant (name required, at least one
+   * of repo/URL, a valid base URL) must hold. Throws if the project does not exist.
    */
   updateProject(id: string, input: NewProject): Project {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`Project not found: ${id}`);
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
-    const { name, mode, repoPath, baseUrl } = validation.value;
+    const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
     this.db
-      .prepare('UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ? WHERE id = ?')
-      .run(name, mode, repoPath, baseUrl, id);
-    return { ...existing, name, mode, repoPath, baseUrl };
+      .prepare(
+        'UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ?, test_username = ?, test_password = ? WHERE id = ?',
+      )
+      .run(name, mode, repoPath, baseUrl, testUsername, testPassword, id);
+    return { ...existing, name, mode, repoPath, baseUrl, testUsername, testPassword };
   }
 
   /** Soft-archive (or restore) a project. Archived projects keep all runs and assets. */
@@ -338,6 +351,8 @@ function rowToProject(r: Record<string, unknown>): Project {
     baseUrl: s(r.base_url),
     createdAt: String(r.created_at),
     archivedAt: s(r.archived_at),
+    testUsername: s(r.test_username),
+    testPassword: s(r.test_password),
   };
 }
 

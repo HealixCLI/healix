@@ -1,12 +1,12 @@
 import type {
   AgentEvent,
-  ExplorationMode,
   OrchestratorEvent,
   ProviderId,
   Run,
   RunSummary,
   TestCase,
   TestResult,
+  TestingScope,
   TestPlan,
 } from '@healix/core';
 
@@ -18,7 +18,9 @@ export interface ProviderSummary {
 
 export interface StartRunArgs {
   projectId: string;
-  mode?: ExplorationMode;
+  /** What to test — drives tier selection; the underlying exploration
+   * mechanism (codegen vs. computer-use) is derived internally. */
+  testingScope?: TestingScope;
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;

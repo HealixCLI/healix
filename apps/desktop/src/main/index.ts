@@ -29,7 +29,7 @@ import {
   cloneRepo,
   type NewProject,
   type Project,
-  type ExplorationMode,
+  type TestingScope,
   type ProviderId,
   type TestPlan,
   type RunSummary,
@@ -182,6 +182,8 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
     mode: input.mode ?? 'playwright',
     repoPath,
     baseUrl: normalizeOptional(input.baseUrl),
+    testUsername: normalizeOptional(input.testUsername),
+    testPassword: normalizeOptional(input.testPassword),
   });
 });
 
@@ -196,6 +198,8 @@ ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProjec
     mode: input.mode ?? 'playwright',
     repoPath: normalizeOptional(input.repoPath),
     baseUrl: normalizeOptional(input.baseUrl),
+    testUsername: normalizeOptional(input.testUsername),
+    testPassword: normalizeOptional(input.testPassword),
   });
 });
 
@@ -252,8 +256,10 @@ function settleApproval(runId: string, ok: boolean): boolean {
 
 export interface StartRunArgs {
   projectId: string;
-  /** Maps to the orchestrator's exploration mode (codegen | computer-use). */
-  mode?: ExplorationMode;
+  /** What to test — drives tier selection; the underlying exploration
+   * mechanism (codegen vs. computer-use) is derived internally from the
+   * project's config. */
+  testingScope?: TestingScope;
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;
@@ -289,7 +295,7 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
       {
         projectId: args.projectId,
         provider: args.provider,
-        explorationMode: args.mode,
+        testingScope: args.testingScope,
         autoApprove: args.autoApprove ?? false,
         prd: args.prd,
         signal: controller.signal,

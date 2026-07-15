@@ -1,6 +1,13 @@
 import type { ProviderAdapter, ProviderId } from '../providers/types.js';
 import type { ModeId, RunStatus } from '../storage/types.js';
-import type { ExecOutcome, ExplorationMode, SuiteBundle, TestMode, TestPlan } from '../modes/types.js';
+import type {
+  ExecOutcome,
+  ExplorationMode,
+  SuiteBundle,
+  TestingScope,
+  TestMode,
+  TestPlan,
+} from '../modes/types.js';
 import type { TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { HealixStore } from '../storage/store.js';
@@ -19,6 +26,18 @@ export type OrchestratorPhase =
 export interface RunOptions {
   projectId: string;
   provider?: ProviderId;
+  /**
+   * Which tiers to plan/generate/execute. The user-facing control — replaces
+   * choosing ExplorationMode directly. Defaults to 'both' (all tiers, current
+   * behavior) when omitted.
+   */
+  testingScope?: TestingScope;
+  /**
+   * How to explore/ground generation (white-box repo reading vs. black-box
+   * live browser). No longer a user choice: when omitted, the orchestrator
+   * derives it from the project's repoPath/baseUrl. Still overridable
+   * explicitly (tests, CLI) for callers that want to force one.
+   */
   explorationMode?: ExplorationMode;
   /** Skip the human approval gate (e.g. CI). */
   autoApprove?: boolean;

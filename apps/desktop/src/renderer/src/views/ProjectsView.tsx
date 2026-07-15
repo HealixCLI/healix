@@ -1,7 +1,7 @@
 import { useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { NewProject, Project } from '@healix/core';
-import { Archive, ArchiveRestore, FolderGit2, Globe, Pencil, Plus, Trash2 } from 'lucide-react';
+import { Archive, ArchiveRestore, Eye, EyeOff, FolderGit2, Globe, Pencil, Plus, Trash2 } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
@@ -296,6 +296,9 @@ function ProjectForm({
   const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
   const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
   const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
+  const [testUsername, setTestUsername] = useState(project?.testUsername ?? '');
+  const [testPassword, setTestPassword] = useState(project?.testPassword ?? '');
+  const [showTestPassword, setShowTestPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   // Same rules as core validateNewProject: a project needs a name, at least one
@@ -315,6 +318,8 @@ function ProjectForm({
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
+      testUsername: testUsername.trim() || null,
+      testPassword: testPassword.trim() || null,
     });
     setSubmitting(false);
     if (saved) {
@@ -322,6 +327,8 @@ function ProjectForm({
         setName('');
         setRepoPath('');
         setBaseUrl('');
+        setTestUsername('');
+        setTestPassword('');
       }
       onDone();
     }
@@ -379,6 +386,41 @@ function ProjectForm({
             >
               <option value="playwright">playwright</option>
             </Select>
+          </Field>
+          <div className="sm:col-span-2">
+            <h3 className="mb-1.5 text-sm font-semibold text-fg">Test credentials</h3>
+          </div>
+          <Field label="Test username / email">
+            <Input
+              value={testUsername}
+              onChange={(e) => setTestUsername(e.target.value)}
+              placeholder="you@example.com or a test username"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+          <Field label="Test password">
+            <div className="relative">
+              <Input
+                type={showTestPassword ? 'text' : 'password'}
+                value={testPassword}
+                onChange={(e) => setTestPassword(e.target.value)}
+                placeholder="Password for the credential above"
+                className="pr-9 font-mono"
+                autoComplete="new-password"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                onClick={() => setShowTestPassword((v) => !v)}
+                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+                aria-label={showTestPassword ? 'Hide test password' : 'Show test password'}
+                aria-pressed={showTestPassword}
+                tabIndex={-1}
+              >
+                {showTestPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
           </Field>
           {readOnly ? (
             <div className="flex items-center justify-end gap-2 sm:col-span-2">

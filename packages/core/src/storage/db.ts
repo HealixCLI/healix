@@ -91,6 +91,10 @@ function migrate(db: DatabaseSync): void {
     // v3: soft-archive flag on projects (pre-v3 DBs already have the table,
     // so the CREATE above won't add the column).
     ensureColumn(db, 'projects', 'archived_at', 'TEXT');
+    // v4: optional test credentials (login identifier + password) for
+    // authenticated (tierB) flows.
+    ensureColumn(db, 'projects', 'test_username', 'TEXT');
+    ensureColumn(db, 'projects', 'test_password', 'TEXT');
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     logger.info(`Database migrated to schema v${SCHEMA_VERSION}`);
   }

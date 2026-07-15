@@ -347,6 +347,46 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(rejected).toBeDefined();
   });
 
+  it('TESTING SCOPE: filters plan.items to the selected scope before the approval gate sees it', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Scope Filter Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // CANNED_PLAN carries one tierA-public item and one tierB-auth item — no
+    // tierC-api item at all — so a 'backend' scope must filter it down to
+    // zero items, and a 'frontend' scope must keep both.
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const seenPlans: TestPlan[] = [];
+    const onPlan = async (plan: TestPlan): Promise<boolean> => {
+      seenPlans.push(plan);
+      return false; // reject — we only care what the gate was shown, not execution.
+    };
+
+    await orchestrator.run(
+      { projectId: project.id, autoApprove: false, testingScope: 'backend' },
+      { onPlan },
+    );
+    await orchestrator.run(
+      { projectId: project.id, autoApprove: false, testingScope: 'frontend' },
+      { onPlan },
+    );
+
+    expect(seenPlans).toHaveLength(2);
+    const [backendPlan, frontendPlan] = seenPlans;
+    expect(backendPlan.items).toHaveLength(0);
+    expect(frontendPlan.items).toHaveLength(2);
+    expect(frontendPlan.items.map((it) => it.tier).sort()).toEqual(['tierA-public', 'tierB-auth']);
+  });
+
   it('PROVIDER FALLBACK: a ProviderRouter selects a ready fallback when the preferred provider is unhealthy', async () => {
     // The router fallback unit, driven purely by injected providers (the
     // orchestrator constructs its own router internally, so we exercise the

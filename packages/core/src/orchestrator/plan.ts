@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid';
 import type { Project, Tier } from '../storage/types.js';
-import type { TestPlan, TestPlanItem } from '../modes/types.js';
+import type { TestingScope, TestPlan, TestPlanItem } from '../modes/types.js';
+import { tiersForScope } from '../modes/types.js';
 import type { RunOptions } from './types.js';
 
 /** Shape the model is asked to emit inside a fenced JSON block. */
@@ -41,11 +42,15 @@ export interface PlanRepoContext {
  * grounded in the actual repo instead of the model guessing generic flows.
  */
 export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: PlanRepoContext): string {
+  const scope = opts.testingScope ?? 'both';
+  const tiers = tiersForScope(scope);
+
   const lines: string[] = [];
   lines.push('You are Healix, an autonomous QA engineer. Produce a concise end-to-end test plan');
   lines.push('for the application under test described below.');
   lines.push('');
   lines.push(`Project name: ${project.name}`);
+  lines.push(`Testing scope: ${scopeLabel(scope)} — ONLY plan tests for these tier(s): ${tiers.join(', ')}.`);
   lines.push(`Test engine: ${project.mode}`);
   if (project.baseUrl) lines.push(`Base URL (black-box): ${project.baseUrl}`);
   if (project.repoPath) lines.push(`Repository path (white-box): ${project.repoPath}`);
@@ -77,16 +82,36 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push('    {');
   lines.push('      "title": "short human title",');
   lines.push('      "reqTag": "REQ-001 or null",');
-  lines.push(`      "tier": "${KNOWN_TIERS.join('" | "')}",`);
+  lines.push(`      "tier": "${tiers.join('" | "')}",`);
   lines.push('      "intent": "what this test verifies, in one or two sentences"');
   lines.push('    }');
   lines.push('  ]');
   lines.push('}');
   lines.push('```');
   lines.push('');
-  lines.push('Prefer 3-8 high-value scenarios. Use tierA-public for unauthenticated flows,');
-  lines.push('tierB-auth for authenticated flows, and tierC-api for API-level checks.');
+  lines.push(`Prefer 3-8 high-value scenarios, all within the "${tiers.join('", "')}" tier(s) above.`);
+  lines.push(tierGuidanceFor(tiers));
   return lines.join('\n');
+}
+
+function scopeLabel(scope: TestingScope): string {
+  switch (scope) {
+    case 'frontend':
+      return 'Frontend testing';
+    case 'backend':
+      return 'Backend testing';
+    case 'both':
+      return 'Frontend + backend testing';
+  }
+}
+
+/** Tier-by-tier guidance, limited to whichever tiers are actually in scope. */
+function tierGuidanceFor(tiers: ReadonlyArray<Tier>): string {
+  const parts: string[] = [];
+  if (tiers.includes('tierA-public')) parts.push('tierA-public for unauthenticated flows');
+  if (tiers.includes('tierB-auth')) parts.push('tierB-auth for authenticated flows');
+  if (tiers.includes('tierC-api')) parts.push('tierC-api for API-level checks');
+  return `Use ${parts.join(', ')}.`;
 }
 
 /**
@@ -96,7 +121,7 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
  *   3. the first balanced top-level JSON object in the text.
  * Returns null when nothing parseable/usable is found.
  */
-export function parsePlan(text: string): TestPlan | null {
+export function parsePlan(text: string, scope: TestingScope = 'both'): TestPlan | null {
   const candidate = extractJsonObject(text);
   if (!candidate) return null;
 
@@ -110,7 +135,7 @@ export function parsePlan(text: string): TestPlan | null {
 
   const itemsRaw = Array.isArray(raw.items) ? (raw.items as RawPlanItem[]) : [];
   const items: TestPlanItem[] = itemsRaw
-    .map((it) => normalizeItem(it))
+    .map((it) => normalizeItem(it, scope))
     .filter((it): it is TestPlanItem => it !== null);
 
   if (items.length === 0) return null;
@@ -123,10 +148,27 @@ export function parsePlan(text: string): TestPlan | null {
   return { summary, items, raw };
 }
 
-/** Deterministic fallback plan when the model produced nothing usable. */
-export function synthesizePlan(project: Project): TestPlan {
+/**
+ * Deterministic fallback plan when the model produced nothing usable. Scope-
+ * aware: a backend-only scope must not fall back to tierA-public items, which
+ * the caller's tier filter would then discard entirely, leaving an empty plan.
+ */
+export function synthesizePlan(project: Project, scope: TestingScope = 'both'): TestPlan {
+  const tiers = tiersForScope(scope);
   const items: TestPlanItem[] = [];
-  if (project.baseUrl) {
+
+  if (!tiers.includes('tierA-public') && tiers.includes('tierC-api')) {
+    // Backend-only scope: a UI smoke check would be filtered out, so fall
+    // back to a basic API reachability check instead.
+    items.push({
+      id: `pli_${nanoid(8)}`,
+      title: 'API responds to a basic request',
+      tier: 'tierC-api',
+      intent: project.baseUrl
+        ? `Send a basic request to ${project.baseUrl} and verify a successful HTTP response.`
+        : 'Confirm the API responds to a basic health-check request.',
+    });
+  } else if (project.baseUrl) {
     items.push({
       id: `pli_${nanoid(8)}`,
       title: 'Home page loads',
@@ -155,7 +197,7 @@ export function synthesizePlan(project: Project): TestPlan {
   };
 }
 
-function normalizeItem(it: RawPlanItem): TestPlanItem | null {
+function normalizeItem(it: RawPlanItem, scope: TestingScope): TestPlanItem | null {
   if (!it || typeof it !== 'object') return null;
   const title = typeof it.title === 'string' ? it.title.trim() : '';
   if (title.length === 0) return null;
@@ -164,20 +206,28 @@ function normalizeItem(it: RawPlanItem): TestPlanItem | null {
     typeof it.reqTag === 'string' && it.reqTag.trim().length > 0 && it.reqTag.trim() !== 'null'
       ? it.reqTag.trim()
       : undefined;
-  const tier = normalizeTier(it.tier);
+  const tier = normalizeTier(it.tier, scope);
   const item: TestPlanItem = { id: `pli_${nanoid(8)}`, title, tier, intent };
   if (reqTag) item.reqTag = reqTag;
   return item;
 }
 
-function normalizeTier(value: unknown): Tier {
+function normalizeTier(value: unknown, scope: TestingScope): Tier {
   if (typeof value === 'string') {
     const v = value.trim();
     const match = KNOWN_TIERS.find((t) => t === v);
+    // A recognized tier is kept AS-IS even when it's outside the requested
+    // scope — the orchestrator applies the actual scope boundary as a filter
+    // right after planning (packages/core/src/orchestrator/index.ts), and
+    // that filter needs the item's real tier to correctly drop it. Coercing
+    // it into scope here would defeat that filter entirely (every item would
+    // already read as "in scope" by the time it got there).
     if (match) return match;
   }
-  // Unknown/hallucinated tiers clamp to a known default rather than leaking through.
-  return 'tierA-public';
+  // Only a genuinely unrecognized/hallucinated value has no real tier to
+  // preserve — for that (and only that) case, clamp to the first in-scope
+  // tier so the item survives as a usable guess instead of being dropped.
+  return tiersForScope(scope)[0];
 }
 
 /** Extract a JSON object string from arbitrary model output. */

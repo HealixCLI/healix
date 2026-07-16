@@ -321,18 +321,26 @@ export function RunsView({
   };
 
   // The live surface is shown ONLY for the run the engine is actually tracking
-  // (live-this-session or rehydrated) — selecting a DIFFERENT row in history
-  // always shows THAT run's own fetched detail instead, even while a run is
-  // actively executing in the background. This is what lets the user freely
-  // browse other runs/projects while the active run keeps going untouched:
-  // navigating between runs only ever fetches the data for the one selected.
+  // (live-this-session or rehydrated) AND only while it's still non-terminal.
+  // Selecting a DIFFERENT row in history always shows THAT run's own fetched
+  // detail instead, even while a run is actively executing in the background.
+  // This is what lets the user freely browse other runs/projects while the
+  // active run keeps going untouched: navigating between runs only ever
+  // fetches the data for the one selected.
+  //
+  // The `isActive` gate matters even for the CURRENTLY selected run: once it
+  // settles (SETTLED_PHASES effect above refreshes history + reloads detail),
+  // engine.runId keeps pointing at it and selectedRunId was set to the same
+  // id — without this gate the view would stay on the bare live Console
+  // forever, never showing RunDetailPanel's Report/Reveal suite/Export suite
+  // controls until the user clicked "New run" or picked a different history row.
   //
   // Before the engine has a real runId yet (the brief 'starting' window right
   // after clicking Start/Queue, before run:started arrives), fall back to
   // "was nothing else explicitly selected" so the just-started run's own
   // transient state is still shown rather than a blank/unrelated panel.
   const showLiveSurface =
-    engine.runId != null ? selectedRunId === engine.runId : isActive && selectedRunId == null;
+    engine.runId != null ? selectedRunId === engine.runId && isActive : isActive && selectedRunId == null;
 
   return (
     <div className="flex h-full min-h-0">

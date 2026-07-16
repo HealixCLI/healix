@@ -151,6 +151,20 @@ function splitErrorText(raw: string): { summary: string; rest: string } {
   return { summary, rest };
 }
 
+/**
+ * suggestedPatch's shape depends on the verdict (see TriageResult) — a
+ * corrected test snippet reads naturally as code, but an app-bug
+ * recommendation is prose (the triage engine never sees the app's own
+ * source), so it gets its own label and isn't wrapped in a <code> block.
+ */
+function renderSuggestedFix(verdict: TriageResult['verdict'], patch: string, className = ''): string {
+  const cls = className ? ` class="${className}"` : '';
+  if (verdict === 'test_is_wrong') {
+    return `<div${cls}><strong>Suggested test fix:</strong> <code>${esc(patch)}</code></div>`;
+  }
+  return `<div${cls}><strong>Recommended fix:</strong> ${esc(patch)}</div>`;
+}
+
 function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
   if (!error) return '';
   const { summary, rest } = splitErrorText(error);
@@ -162,11 +176,7 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
         VERDICT_LABEL[triage.triage.verdict] ?? triage.triage.verdict,
       )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span>
       <div>${esc(triage.triage.rationale)}</div>
-      ${
-        triage.triage.suggestedPatch
-          ? `<div><strong>Suggested fix:</strong> <code>${esc(triage.triage.suggestedPatch)}</code></div>`
-          : ''
-      }
+      ${triage.triage.suggestedPatch ? renderSuggestedFix(triage.triage.verdict, triage.triage.suggestedPatch) : ''}
     </div>`
     : '';
   return `<div class="err-summary">${esc(summary)}</div>${triageBlock}${detailsBlock}`;
@@ -228,9 +238,7 @@ export function renderReportHtml(report: RunReport): string {
         `<tr><td>${esc(t.title)}</td><td>${esc(t.triage.verdict)}</td><td>${esc(
           (t.triage.confidence * 100).toFixed(0),
         )}%</td><td>${esc(t.triage.rationale)}${
-          t.triage.suggestedPatch
-            ? `<div class="hist"><strong>Suggested fix:</strong> <code>${esc(t.triage.suggestedPatch)}</code></div>`
-            : ''
+          t.triage.suggestedPatch ? renderSuggestedFix(t.triage.verdict, t.triage.suggestedPatch, 'hist') : ''
         }</td></tr>`,
     )
     .join('');

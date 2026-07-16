@@ -14,6 +14,14 @@ export interface TriageResult {
   verdict: Verdict;
   confidence: number;
   rationale: string;
+  /**
+   * Recommended fix, present when the model could be concrete. Its shape
+   * depends on `verdict`: for `test_is_wrong` it's a corrected test code
+   * snippet; for `app_is_wrong` it's a prose recommendation for engineers
+   * (likely root cause + where to look), not literal app source — the
+   * triage engine never sees the app's codebase. Omitted for
+   * environment/flaky/ambiguous, where there is no code-level fix.
+   */
   suggestedPatch?: string;
 }
 

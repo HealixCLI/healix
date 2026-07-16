@@ -204,7 +204,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).not.toContain('C:\\runs\\r1');
   });
 
-  it('renders a suggested fix from triage when the engine provides one', () => {
+  it('renders an app-bug recommendation as prose under "Recommended fix", not a <code> test-patch block', () => {
     const outcome: ExecOutcome = {
       passed: 0,
       failed: 1,
@@ -231,8 +231,46 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
       ],
     });
     const html = renderReportHtml(report);
-    expect(html).toContain('Suggested fix');
+    expect(html).toContain('Recommended fix');
     expect(html).toContain('Fix the missing aria-label on the submit button.');
+    // Prose recommendation, not wrapped in a <code> block like a test patch.
+    expect(html).not.toContain('<code>Fix the missing aria-label on the submit button.</code>');
+  });
+
+  it('renders a test-code suggestion under "Suggested test fix" wrapped in <code>, for test_is_wrong verdicts', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: '[REQ:REQ-2] positive: fails', status: 'failed', durationMs: 5, error: 'stale locator' },
+      ],
+    };
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage: [
+        {
+          title: '[REQ:REQ-2] positive: fails',
+          error: 'stale locator',
+          triage: {
+            verdict: 'test_is_wrong',
+            confidence: 0.7,
+            rationale: 'The selector no longer matches the live UI.',
+            suggestedPatch: "await page.getByRole('button', { name: 'Submit' }).click();",
+          },
+        },
+      ],
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Suggested test fix');
+    // Apostrophes are HTML-escaped by esc(), same as everywhere else in the report.
+    expect(html).toContain(
+      '<code>await page.getByRole(&#39;button&#39;, { name: &#39;Submit&#39; }).click();</code>',
+    );
   });
 
   it('scales the Duration column ms -> s -> min -> hr instead of raw milliseconds', () => {

@@ -30,7 +30,7 @@ import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
-import { runExplorePhase } from './explore.js';
+import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
@@ -43,7 +43,7 @@ import {
   synthesizePlan,
   type PlanRepoContext,
 } from './plan.js';
-import { indexFunctionality, type FunctionalityUnit } from '../target/functionality-index.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 import { indexSource } from '../target/source-index.js';
 import { persistSourceContext } from '../target/context-store.js';
 import type { SourceContext } from '../target/source-context.js';
@@ -862,22 +862,34 @@ async function runPipeline(
       if (reachable) {
         setStatus('exploring');
         emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
-        // White-box only: feed functionality-index.ts's already-extracted static
-        // routes as extra crawl seeds, so routes with no visible in-app link
-        // (admin pages, wizard steps, deep settings) still get explored. Mirrors
-        // the identical independent best-effort indexing already done for PLAN
-        // (see indexFunctionality above) — cheap regex scan, never blocks EXPLORE.
-        let staticRoutePaths: string[] | undefined;
-        if (project.repoPath) {
-          try {
-            const functionality = await indexFunctionality(project.repoPath);
-            staticRoutePaths = functionality.units
-              .filter((u) => u.kind === 'route')
-              .map((u) => u.key.replace(/^route:/, ''));
-          } catch (err) {
-            emit('explore', 'debug', `Static route indexing failed (continuing): ${errMsg(err)}`);
+        // White-box only: feed the already-computed sourceContext's static routes as extra crawl
+        // seeds, so routes with no visible in-app link (admin pages, wizard steps, deep settings)
+        // still get explored. Reuses the SAME PLAN-phase sourceContext (see indexSource above)
+        // rather than re-indexing — this used to be an independent second indexFunctionality call.
+        // Endpoint (tierC, no DOM route) units are split out for their own HTTP reachability
+        // probe instead of a wasted browser navigation — see splitStaticUnitsForExplore.
+        const { routePaths: staticRoutePaths, endpointPaths } = splitStaticUnitsForExplore(
+          sourceContext?.units ?? [],
+        );
+        if (endpointPaths.length > 0) {
+          const probeBaseUrl = effectiveBaseUrl;
+          const probes = await Promise.all(
+            endpointPaths.map(async (p) => ({
+              path: p,
+              ...(await target.probeUrl(new URL(p, probeBaseUrl).toString(), 3_000)),
+            })),
+          );
+          const unreachable = probes.filter((p) => !p.reachable);
+          if (unreachable.length > 0) {
+            emit(
+              'explore',
+              'warn',
+              `${unreachable.length}/${probes.length} statically-detected API endpoint(s) did not respond.`,
+              { unreachable: unreachable.map((p) => p.path) },
+            );
           }
         }
+
         try {
           const exploration = await runExplorePhase({
             browser,
@@ -891,6 +903,26 @@ async function runPipeline(
             onFrame: hooks?.onFrame,
           });
           ctx.exploration = exploration;
+
+          // Auth-pattern-aware breadcrumb: a recognized auth library was detected in source but
+          // the crawl found no REAL login form — only the always-present common-path fallback
+          // candidates scoreLoginCandidates() adds when nothing crawled scores confidently (see
+          // browser/crawler.ts), which don't indicate an actual form was found. Likely a
+          // non-form/token auth mechanism (API keys, OAuth redirect, session cookie set
+          // server-side) that EXPLORE's form-based login detection can't see. Never blocks;
+          // surfaces the ambiguity instead of silently reporting "no login found" as if the app
+          // were simply unauthenticated.
+          const detectedLibraries = new Set(
+            (sourceContext?.authPatterns ?? []).flatMap((a) => a.libraries),
+          );
+          const hasCrawledLoginCandidate = exploration.loginCandidates.some((c) => c.source === 'crawled');
+          if (detectedLibraries.size > 0 && !hasCrawledLoginCandidate) {
+            emit(
+              'explore',
+              'warn',
+              `Detected auth librar${detectedLibraries.size === 1 ? 'y' : 'ies'} (${[...detectedLibraries].join(', ')}) in source, but no login form was found during exploration — this app may use non-form/token-based auth that EXPLORE cannot currently detect.`,
+            );
+          }
         } catch (err) {
           emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
         }

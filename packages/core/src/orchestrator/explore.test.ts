@@ -1,5 +1,9 @@
+import fs from 'node:fs';
+import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { assessExplorationUsefulness, runExplorePhase } from './explore.js';
+import { assessExplorationUsefulness, runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
+import { indexSource } from '../target/source-index.js';
 import type { OrchestratorEvent } from './types.js';
 import type {
   BrowserSurface,
@@ -64,7 +68,7 @@ function makeFakeBrowser(config: {
         cb(Buffer.from([1, 2, 3]));
       }
       return () => {
-        state.stopped = state.stopped; // no-op, unsub tracked separately below if needed
+        // no-op unsubscribe — unsub tracking (if a test needs it) happens separately below.
       };
     },
     async stop(): Promise<void> {
@@ -94,6 +98,47 @@ function makeEmit(): { emit: (phase: string, level: OrchestratorEvent['level'], 
     },
   };
 }
+
+describe('splitStaticUnitsForExplore()', () => {
+  function unit(kind: FunctionalityUnit['kind'], key: string): FunctionalityUnit {
+    return { key, kind, label: key, file: 'src/App.tsx' };
+  }
+
+  it('routes route-kind units to routePaths, stripping the "route:" prefix', () => {
+    const { routePaths } = splitStaticUnitsForExplore([unit('route', 'route:/dashboard'), unit('route', 'route:/settings')]);
+    expect(routePaths).toEqual(['/dashboard', '/settings']);
+  });
+
+  it('routes endpoint-kind units to endpointPaths, stripping the "endpoint:METHOD " prefix', () => {
+    const { endpointPaths } = splitStaticUnitsForExplore([
+      unit('endpoint', 'endpoint:GET /api/users/:id'),
+      unit('endpoint', 'endpoint:POST /api/orders'),
+    ]);
+    expect(endpointPaths).toEqual(['/api/users/:id', '/api/orders']);
+  });
+
+  it('never mixes route units into endpointPaths or vice versa', () => {
+    const result = splitStaticUnitsForExplore([unit('route', 'route:/home'), unit('endpoint', 'endpoint:GET /api/health')]);
+    expect(result.routePaths).toEqual(['/home']);
+    expect(result.endpointPaths).toEqual(['/api/health']);
+  });
+
+  it('ignores component-kind units entirely (neither crawl seed nor probe target)', () => {
+    const result = splitStaticUnitsForExplore([unit('component', 'component:Button')]);
+    expect(result.routePaths).toEqual([]);
+    expect(result.endpointPaths).toEqual([]);
+  });
+
+  it('caps endpointPaths at 10, never uncapping routePaths', () => {
+    const units = [
+      ...Array.from({ length: 20 }, (_, i) => unit('endpoint', `endpoint:GET /api/e${i}`)),
+      ...Array.from({ length: 20 }, (_, i) => unit('route', `route:/r${i}`)),
+    ];
+    const result = splitStaticUnitsForExplore(units);
+    expect(result.endpointPaths).toHaveLength(10);
+    expect(result.routePaths).toHaveLength(20);
+  });
+});
 
 describe('assessExplorationUsefulness()', () => {
   function crawlResult(overrides: Partial<CrawlWithAuthResult>): CrawlWithAuthResult {
@@ -372,3 +417,33 @@ describe('runExplorePhase()', () => {
     });
   });
 });
+
+// --- Isolated check against a real fixture repo (Item E3) -------------------
+// Confirms the split itself is correct against a real combined backend+frontend static-analysis
+// result — the orchestrator only ever passes routePaths to the browser crawl seed and
+// endpointPaths to the HTTP probe, so a correct split here is exactly what guarantees an API-only
+// unit never reaches a browser navigation.
+
+const RBAC_ROOT = path.join(
+  'C:',
+  'Users',
+  'AdroyFernandes',
+  'Documents',
+  'TestApps',
+  'Role-Based-Access-Control-RBAC-',
+);
+
+describe.skipIf(!fs.existsSync(RBAC_ROOT))(
+  'splitStaticUnitsForExplore against the real RBAC repo (isolated check)',
+  () => {
+    it('classifies real backend endpoints and real frontend routes into the correct bucket, never crossed', async () => {
+      const sourceContext = await indexSource(RBAC_ROOT, { maxUnits: 500 });
+      const { routePaths, endpointPaths } = splitStaticUnitsForExplore(sourceContext.units);
+
+      expect(endpointPaths).toContain('/api/users/:id');
+      expect(endpointPaths.every((p) => !p.startsWith('route:'))).toBe(true);
+      expect(routePaths).toContain('/userdashboard');
+      expect(routePaths.every((p) => !endpointPaths.includes(p))).toBe(true);
+    });
+  },
+);

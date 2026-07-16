@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -1145,5 +1145,48 @@ describe('orchestrator paths (offline DI seam)', () => {
     // black-box-only reachability gate must not probe it a second time.
     expect(probeCalls).toBe(0);
     expect(summary.status).toBe('passed');
+  });
+
+  it('AUTH-PATTERN BREADCRUMB: a recognized auth library with no discovered login form warns, never blocks', async () => {
+    // Real repo dir (not the DI seam) — indexSource() reads real files from disk, so this
+    // exercises the actual source-index.ts auth-pattern detection, not a mocked TargetAdapter.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-authpattern-'));
+    mkdirSync(join(repoPath, 'middleware'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'middleware', 'auth.js'),
+      "const jwt = require('jsonwebtoken');\nfunction verify(token) { return jwt.verify(token, 'secret'); }\nmodule.exports = { verify };\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Auth Pattern Breadcrumb Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      // fakeBrowser's snapshot() always returns zero interactiveElements — no password field is
+      // ever found, so loginCandidates stays empty despite the detected jsonwebtoken usage.
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    rmSync(repoPath, { recursive: true, force: true });
+
+    const warn = events.find((e) => e.phase === 'explore' && e.message.includes('jsonwebtoken'));
+    expect(warn).toBeDefined();
+    expect(warn?.level).toBe('warn');
+    expect(warn?.message).toContain('non-form/token-based auth');
+    // Never blocks the run — it's a breadcrumb, not a gate.
+    expect(['passed', 'failed']).toContain(summary.status);
   });
 });

@@ -10,6 +10,7 @@ import {
 } from '../browser/crawler.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { ExplorationArtifact } from '../modes/types.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 import type { OrchestratorEvent } from './types.js';
 
 export interface ExploreInput {
@@ -55,6 +56,29 @@ export function assessExplorationUsefulness(result: CrawlWithAuthResult): { usef
     return { useful: false, reason: 'crawled routes render a near-identical DOM (single-shell SPA collapse)' };
   }
   return { useful: true };
+}
+
+/** Cap on API-only units probed via HTTP instead of a browser crawl seed (see splitStaticUnitsForExplore). */
+const MAX_ENDPOINT_PROBES = 10;
+
+/**
+ * Split a static-analysis unit inventory (see target/source-index.ts) into the two shapes EXPLORE
+ * needs: `route` units seed the browser crawl (they render a page), while `endpoint` (tierC, no
+ * DOM route) units get a lightweight HTTP reachability probe instead — driving a browser to an
+ * API-only path wastes a navigation on something that was never going to render a page. Endpoint
+ * paths are capped at MAX_ENDPOINT_PROBES so a large API surface doesn't turn this into its own
+ * slow crawl.
+ */
+export function splitStaticUnitsForExplore(units: FunctionalityUnit[]): {
+  routePaths: string[];
+  endpointPaths: string[];
+} {
+  const routePaths = units.filter((u) => u.kind === 'route').map((u) => u.key.replace(/^route:/, ''));
+  const endpointPaths = units
+    .filter((u) => u.kind === 'endpoint')
+    .map((u) => u.key.replace(/^endpoint:(?:[A-Z]+ )?/, ''))
+    .slice(0, MAX_ENDPOINT_PROBES);
+  return { routePaths, endpointPaths };
 }
 
 /**

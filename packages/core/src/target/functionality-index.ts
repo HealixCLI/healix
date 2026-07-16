@@ -4,6 +4,12 @@ import { detect } from './detector.js';
 
 export type FunctionalityUnitKind = 'route' | 'endpoint' | 'component';
 
+/**
+ * Where a unit's data came from — used to resolve precedence when the same key is produced by
+ * more than one extractor (a spec is authoritative and wins over code-derived inference).
+ */
+export type FunctionalityUnitProvenance = 'code' | 'spec' | 'inferred';
+
 export interface FunctionalityUnit {
   /** Stable identity for coverage matching, e.g. "route:/checkout" or "endpoint:POST /api/orders". */
   key: string;
@@ -11,6 +17,16 @@ export interface FunctionalityUnit {
   /** Human-readable label for prompts/UIs, e.g. "GET /api/orders" or "page: /checkout". */
   label: string;
   file: string;
+  /** Defaults to 'code' at every existing call site; only spec-parser.ts sets 'spec'. */
+  provenance?: FunctionalityUnitProvenance;
+  /** HTTP method, when known independently of `label`/`key` parsing (spec-derived units). */
+  method?: string;
+  /** Authoritative request schema (e.g. from an OpenAPI/Postman spec), opaque JSON-Schema-ish shape. */
+  requestSchema?: unknown;
+  /** Authoritative response schema, same provenance as requestSchema. */
+  responseSchema?: unknown;
+  /** Whether this endpoint/route requires auth, when derivable from a spec's security scheme. */
+  authRequired?: boolean;
 }
 
 export interface FunctionalityIndex {

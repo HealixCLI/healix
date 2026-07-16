@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import type { ExplorationMode, Project, SuiteMode, TestingScope } from '@healix/core';
-import { ChevronDown, ChevronUp, Loader2, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
+import { ChevronDown, ChevronUp, Loader2, ListPlus, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -12,6 +12,7 @@ import { PlanGate } from '../components/PlanGate';
 import { LiveBrowser } from '../components/LiveBrowser';
 import { RunHistory } from '../components/RunHistory';
 import { RunDetailPanel } from '../components/RunDetailPanel';
+import { RunQueuePanel } from '../components/RunQueuePanel';
 import { useProjects } from '../lib/use-projects';
 import { useRuns } from '../lib/use-runs';
 import { useRunDetail } from '../lib/use-run-detail';
@@ -19,7 +20,8 @@ import { useLastSuccessfulRun } from '../lib/use-last-successful-run';
 import { useLiveFrame } from '../lib/use-live-frame';
 import { cn } from '../lib/utils';
 import { formatCreatedAt } from '../lib/run-format';
-import { SUITE_MODES, TESTING_SCOPES, useRunEngine, type RunPhase } from '../lib/run-engine';
+import { SUITE_MODES, TESTING_SCOPES, type RunEngine, type RunPhase } from '../lib/run-engine';
+import type { RunQueue } from '../lib/run-queue';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
@@ -53,9 +55,17 @@ const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['done', 'cancelled', 'error'];
 // honored across navigation instead of only within a single mount.
 let persistedSelectedRunId: string | null | undefined;
 
-export function RunsView({ initialProjectId }: { initialProjectId?: string | null }) {
+export function RunsView({
+  initialProjectId,
+  engine,
+  queue,
+}: {
+  initialProjectId?: string | null;
+  /** Lifted to App.tsx so the live run survives navigating away from and back to this view. */
+  engine: RunEngine;
+  queue: RunQueue;
+}) {
   const { projects, loading: projectsLoading } = useProjects();
-  const engine = useRunEngine();
   // History spans all projects so the user can review past runs across targets.
   const { runs, loading: runsLoading, error: runsError, refresh: refreshRuns } = useRuns();
 
@@ -77,6 +87,10 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   };
   // True from the moment the user clicks Cancel until run:done settles the run.
   const [cancelling, setCancelling] = useState(false);
+  // Set when the most recent "Queue run" click itself failed (e.g. the
+  // project was deleted in another window) — distinct from engine.error,
+  // which is scoped to the run the engine is actively tracking, not this button.
+  const [queueError, setQueueError] = useState<string | null>(null);
   // Session-only: resets to expanded on next launch.
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   // Collapsing "Start a run" frees most of the column for the report/timeline
@@ -165,6 +179,11 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   const { hydrate } = engine;
   useEffect(() => {
     if (!selectedRunId || selectedRunId === engine.runId) return;
+    // Never let browsing history steal the engine away from a genuinely live
+    // run in progress — e.g. glancing at an unrelated run that was orphaned
+    // mid-approval in a previous session must not hijack the run that's
+    // actually executing right now.
+    if (isActive && !engine.hydrated) return;
     // useRunDetail keeps the PREVIOUS run's detail on screen until its own
     // fetch for the new selectedRunId resolves — without this check, clicking
     // a different history row could momentarily hydrate the engine with the
@@ -174,7 +193,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     }
     hydrate({ runId: selectedRunId, plan: detail.plan });
     setProjectId(detail.run.projectId);
-  }, [selectedRunId, detail, engine.runId, hydrate]);
+  }, [selectedRunId, detail, engine.runId, engine.hydrated, isActive, hydrate]);
 
   // Clear the "Cancelling…" state once the run settles (run:done) or resets.
   useEffect(() => {
@@ -230,16 +249,28 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   // drives a real browser during EXPLORE and EXECUTE.
   const showLiveBrowserPanel = !!selectedProject?.baseUrl && testingScope !== 'backend';
 
-  const start = (): void => {
-    if (!projectId || isActive) return;
+  // Auto-dismiss after a few seconds — still manually dismissable in the meantime.
+  useEffect(() => {
+    if (!queueError) return;
+    const id = setTimeout(() => setQueueError(null), 8000);
+    return () => clearTimeout(id);
+  }, [queueError]);
+
+  const startOrQueue = (): void => {
+    if (!projectId) return;
+    const args = { projectId, testingScope, suiteMode, prd: prd.trim() || undefined };
+    if (isActive) {
+      // Explicit: the button reads "Queue run" whenever a run is already
+      // active — this never silently supersedes the run currently on screen.
+      setQueueError(null);
+      void engine.queueRun(args).catch((err) => {
+        setQueueError(err instanceof Error ? err.message : String(err));
+      });
+      return;
+    }
     // Showing live run UI rather than a historical detail.
     setSelectedRunId(null);
-    void engine.start({
-      projectId,
-      testingScope,
-      suiteMode,
-      prd: prd.trim() || undefined,
-    });
+    void engine.start(args);
   };
 
   const cancel = (): void => {
@@ -274,13 +305,19 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
     }
   };
 
-  // The live run surface takes precedence over a selected history detail — EXCEPT
-  // for a rehydrated (not-actually-live-this-session) pending approval, which is
-  // just one browsable history row: it only takes over while its OWN row is the
-  // one selected, so other rows stay freely inspectable while it sits pending.
-  const showLiveSurface = engine.hydrated
-    ? selectedRunId === engine.runId
-    : isActive || (engine.runId != null && selectedRunId == null);
+  // The live surface is shown ONLY for the run the engine is actually tracking
+  // (live-this-session or rehydrated) — selecting a DIFFERENT row in history
+  // always shows THAT run's own fetched detail instead, even while a run is
+  // actively executing in the background. This is what lets the user freely
+  // browse other runs/projects while the active run keeps going untouched:
+  // navigating between runs only ever fetches the data for the one selected.
+  //
+  // Before the engine has a real runId yet (the brief 'starting' window right
+  // after clicking Start/Queue, before run:started arrives), fall back to
+  // "was nothing else explicitly selected" so the just-started run's own
+  // transient state is still shown rather than a blank/unrelated panel.
+  const showLiveSurface =
+    engine.runId != null ? selectedRunId === engine.runId : isActive && selectedRunId == null;
 
   return (
     <div className="flex h-full min-h-0">
@@ -336,7 +373,10 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                   <Select
                     value={projectId}
                     onChange={(e) => setProjectId(e.target.value)}
-                    disabled={isActive || projectsLoading || runnable.length === 0}
+                    // Stays editable while a run is active — picking a different
+                    // project here configures the run that "Queue run" adds
+                    // behind it, not the one currently executing.
+                    disabled={projectsLoading || runnable.length === 0}
                   >
                     {runnable.length === 0 && <option value="">No active projects — create one first</option>}
                     {runnable.map((p) => (
@@ -351,7 +391,6 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                   <Select
                     value={testingScope}
                     onChange={(e) => setTestingScope(e.target.value as TestingScope)}
-                    disabled={isActive}
                   >
                     {TESTING_SCOPES.map((s) => (
                       <option key={s.value} value={s.value}>
@@ -365,11 +404,7 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                 </div>
                 <div>
                   <Label className="mb-1.5 block">Suite Mode</Label>
-                  <Select
-                    value={suiteMode}
-                    onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}
-                    disabled={isActive}
-                  >
+                  <Select value={suiteMode} onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}>
                     {SUITE_MODES.map((m) => (
                       <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
                         {m.label}
@@ -396,13 +431,12 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                         setPrdFileName(null);
                       }}
                       placeholder="Paste requirements to ground test generation…"
-                      disabled={isActive}
                       className="pr-9"
                     />
                     <button
                       type="button"
                       onClick={() => void uploadPrdFile()}
-                      disabled={isActive || prdFileBusy}
+                      disabled={prdFileBusy}
                       aria-label="Upload a PRD file"
                       title="Upload a PRD file"
                       className={cn(
@@ -467,15 +501,37 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
                       {cancelling ? 'Cancelling…' : 'Cancel'}
                     </Button>
                   )}
-                  <Button onClick={start} disabled={!projectId || isActive}>
-                    {isActive ? <Loader2 className="h-4 w-4 animate-spin" /> : <Play className="h-4 w-4" />}
-                    {isActive ? 'Running…' : 'Start run'}
+                  <Button onClick={startOrQueue} disabled={!projectId}>
+                    {isActive ? <ListPlus className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                    {isActive ? 'Queue run' : 'Start run'}
                   </Button>
                 </div>
               </div>
             </CardContent>
           )}
         </Card>
+
+        {queueError && (
+          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+            <p>{queueError}</p>
+            <button
+              type="button"
+              onClick={() => setQueueError(null)}
+              aria-label="Dismiss"
+              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
+        <RunQueuePanel
+          queue={queue.queue}
+          projectsById={projectsById}
+          onRemove={(id) => void queue.remove(id)}
+          error={queue.error}
+          onDismissError={queue.clearError}
+        />
 
         {/* Collapse toggle: centered chevron on a divider. Collapsing "Start a
             run" down to just its header hands most of the column's height to

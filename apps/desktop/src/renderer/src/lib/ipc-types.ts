@@ -218,6 +218,27 @@ export type ReviseItemResult = { ok: true; item: TestPlanItem } | { ok: false; d
 /** Re-exported for call sites that only need the approve/cancel decision shape. */
 export type { PlanApprovalResult };
 
+/** Result of run:start — either it began executing immediately, or it was queued behind another run. */
+export type StartRunResult =
+  | { queued: false; summary: RunSummary }
+  | { queued: true; queueEntryId: string; position: number };
+
+/** One request waiting in the run queue, as broadcast to every renderer. */
+export interface QueuedRunSummary {
+  id: string;
+  projectId: string;
+  projectName: string;
+  queuedAt: string;
+  testingScope?: TestingScope;
+  suiteMode?: SuiteMode;
+}
+
+/** The currently-executing run (if any), for a fresh renderer to hydrate its live view against. */
+export interface ActiveRunSnapshot {
+  runId: string;
+  projectId: string;
+}
+
 /** Discriminated lifecycle messages delivered to onRunEvent subscribers. */
 export type RunChannelMessage =
   | { channel: 'run:started'; payload: { runId: string; projectId: string } }
@@ -225,4 +246,8 @@ export type RunChannelMessage =
   | { channel: 'run:plan'; payload: { runId: string; plan: TestPlan } }
   | { channel: 'run:done'; payload: { runId: string; summary: RunSummary } }
   // Live browser mirror frame (JPEG, base64) for computer-use runs.
-  | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } };
+  | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } }
+  // Broadcast to every window whenever the pending-run queue changes.
+  | { channel: 'queue:updated'; payload: { queue: QueuedRunSummary[] } }
+  // Broadcast to every window when a queued run fails to start (before it ever got its own runId).
+  | { channel: 'queue:failed'; payload: { message: string } };

@@ -90,6 +90,8 @@ export interface RunEngineState {
 
 export interface RunEngine extends RunEngineState {
   start: (args: StartRunArgs) => Promise<void>;
+  /** Queue a run behind whatever is currently executing, instead of starting it directly. */
+  queueRun: (args: StartRunArgs) => Promise<void>;
   /** Approve a single item (whatever its current status). */
   approveItem: (itemId: string) => void;
   /** Reject a single item — excluded from generation entirely. */
@@ -185,7 +187,13 @@ function mergeFinalPlan(workingPlan: TestPlan | null, finalPlan: TestPlan): Test
 }
 
 function snapshotOf(item: TestPlanItem): PlanItemSnapshot {
-  return { title: item.title, reqTag: item.reqTag, tier: item.tier, intent: item.intent, scenarios: item.scenarios };
+  return {
+    title: item.title,
+    reqTag: item.reqTag,
+    tier: item.tier,
+    intent: item.intent,
+    scenarios: item.scenarios,
+  };
 }
 
 /**
@@ -225,18 +233,74 @@ export function useRunEngine(): RunEngine {
     }));
   }, []);
 
+  // One-time hydration on mount: this hook is now called once, at the App
+  // root, so a normal navigation never remounts it — but a fresh renderer
+  // (first load, or a future window re-create) could still mount while a run
+  // is already executing in the main process. Rebuild the console from its
+  // persisted event history instead of sitting idle until the next live
+  // event happens to arrive, so the log reads gap-free from the very start.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      let active: Awaited<ReturnType<typeof window.healix.getActiveRun>>;
+      try {
+        active = await window.healix.getActiveRun();
+      } catch {
+        return;
+      }
+      if (cancelled || !active || activeRunId.current) return;
+
+      let detail: Awaited<ReturnType<typeof window.healix.runDetail>>;
+      try {
+        detail = await window.healix.runDetail(active.runId);
+      } catch {
+        return;
+      }
+      if (cancelled || !detail.run || activeRunId.current) return;
+
+      activeRunId.current = active.runId;
+      const lines: ConsoleLine[] = detail.events.map((e) => ({
+        id: ++lineSeq.current,
+        level: e.level,
+        phase: e.phase,
+        message: e.message,
+        ts: new Date(e.createdAt).toLocaleTimeString(undefined, { hour12: false }),
+      }));
+      setState({
+        ...INITIAL,
+        runId: active.runId,
+        lines,
+        phase: detail.run.status === 'awaiting-approval' ? 'awaiting-approval' : 'running',
+        plan: detail.plan,
+        workingPlan: detail.plan ? clonePlan(detail.plan) : null,
+        hydrated: true,
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     const unsubscribe = window.healix.onRunEvent((msg: RunChannelMessage) => {
+      if (msg.channel === 'queue:updated' || msg.channel === 'queue:failed') return; // handled by useRunQueue, not this engine.
+
+      // run:started always wins, even over a DIFFERENT previously-tracked run:
+      // this is exactly how a queued request announces "it's my turn now" —
+      // the engine must adopt it and drop whatever the last (now-settled) run
+      // left behind, not filter it out for not matching the stale id.
+      if (msg.channel === 'run:started') {
+        activeRunId.current = msg.payload.runId;
+        lineSeq.current = 0;
+        setState({ ...INITIAL, runId: msg.payload.runId, phase: 'running' });
+        return;
+      }
+
       const incomingRunId = msg.payload.runId;
       // Ignore stray messages from a previous/other run.
       if (activeRunId.current && incomingRunId !== activeRunId.current) return;
 
       switch (msg.channel) {
-        case 'run:started': {
-          activeRunId.current = msg.payload.runId;
-          setState((prev) => ({ ...prev, runId: msg.payload.runId, phase: 'running' }));
-          break;
-        }
         case 'run:event': {
           const e = msg.payload.event;
           pushLine(e.level, String(e.phase), e.message);
@@ -310,7 +374,17 @@ export function useRunEngine(): RunEngine {
     try {
       // Note: startRun resolves only when the whole run finishes; the live
       // updates flow through onRunEvent. We still await to surface hard errors.
-      const summary = await window.healix.startRun(args);
+      const result = await window.healix.startRun(args);
+      if (result.queued) {
+        // Caller expected this to start immediately (a small race: another run
+        // began between this component's last idle check and this call landing)
+        // — it's sitting in the queue now instead. Drop back to idle; the
+        // queue view shows it, and run:started will pick the engine up
+        // automatically once it's actually this request's turn.
+        setState(INITIAL);
+        return;
+      }
+      const summary = result.summary;
       setState((prev) => ({
         ...prev,
         summary,
@@ -321,6 +395,18 @@ export function useRunEngine(): RunEngine {
       const message = err instanceof Error ? err.message : String(err);
       setState((prev) => ({ ...prev, phase: 'error', error: message }));
     }
+  }, []);
+
+  /**
+   * Queue a run request behind whatever is currently executing — see
+   * RunsView's "Queue run" action. Deliberately does not touch this engine's
+   * own state: the queued entry shows up via useRunQueue's queue:updated
+   * broadcast, and if a race means it actually starts immediately instead,
+   * this engine picks it up on its own via the (always-accepted) run:started
+   * broadcast — either way, nothing further to do here.
+   */
+  const queueRun = useCallback(async (args: StartRunArgs): Promise<void> => {
+    await window.healix.startRun(args);
   }, []);
 
   const approveItem = useCallback((itemId: string): void => {
@@ -556,6 +642,7 @@ export function useRunEngine(): RunEngine {
   return {
     ...state,
     start,
+    queueRun,
     approveItem,
     rejectItem,
     editItem,

@@ -7,17 +7,19 @@ import type {
   NewProject,
   ProviderId,
   Run,
-  RunSummary,
   SuiteBundle,
   TestPlanItem,
 } from '@healix/core';
 import type {
+  ActiveRunSnapshot,
   PickPrdFileResult,
   ProviderLoginResult,
   ProviderSummary,
+  QueuedRunSummary,
   ReviseItemResult,
   RunDetail,
   StartRunArgs,
+  StartRunResult,
   RunChannelMessage,
   SuiteDiffSummary,
   TestCaseHistory,
@@ -34,9 +36,14 @@ export interface HealixBridge {
   deleteProject: (id: string) => Promise<{ ok: true; assetsRemoved: boolean }>;
   archiveProject: (id: string, archived: boolean) => Promise<{ ok: true }>;
 
-  startRun: (args: StartRunArgs) => Promise<RunSummary>;
+  startRun: (args: StartRunArgs) => Promise<StartRunResult>;
   approveRun: (runId: string, decision: PlanApprovalResult) => Promise<{ settled: boolean }>;
   cancelRun: (runId: string) => Promise<{ cancelled: boolean }>;
+  getActiveRun: () => Promise<ActiveRunSnapshot | null>;
+
+  // ---- run queue ----
+  listQueue: () => Promise<QueuedRunSummary[]>;
+  queueRemove: (queueEntryId: string) => Promise<{ removed: boolean }>;
 
   // ---- per-item plan revision ----
   reviseItem: (args: {

@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { findSpecFiles, parseOpenApiSpec } from './spec-parser.js';
+import { findSpecFiles, parseOpenApiSpec, parsePostmanCollection } from './spec-parser.js';
 
 describe('parseOpenApiSpec', () => {
   it('parses an OpenAPI 3.x YAML doc into endpoint units with schemas and provenance', () => {
@@ -77,6 +77,68 @@ paths:
   });
 });
 
+describe('parsePostmanCollection', () => {
+  it('parses a flat collection (no folders), extracting method/path/schema from a raw JSON body', () => {
+    const collection = JSON.stringify({
+      info: { name: 'Fixture API' },
+      item: [
+        {
+          name: 'Create order',
+          request: {
+            method: 'POST',
+            url: { raw: '{{base_url}}/api/orders', host: ['{{base_url}}'], path: ['api', 'orders'] },
+            body: { mode: 'raw', raw: JSON.stringify({ item: 'widget' }) },
+          },
+        },
+      ],
+    });
+    const units = parsePostmanCollection(collection, 'Fixture.postman_collection.json');
+    expect(units).toHaveLength(1);
+    expect(units[0].key).toBe('endpoint:POST /api/orders');
+    expect(units[0].provenance).toBe('spec');
+    expect(units[0].requestSchema).toEqual({ item: 'widget' });
+  });
+
+  it('recurses into nested folders', () => {
+    const collection = JSON.stringify({
+      item: [
+        {
+          name: 'Auth',
+          item: [
+            {
+              name: 'Login',
+              request: { method: 'POST', url: { path: ['api', 'auth', 'login'] } },
+            },
+          ],
+        },
+      ],
+    });
+    const units = parsePostmanCollection(collection, 'c.postman_collection.json');
+    expect(units.map((u) => u.key)).toEqual(['endpoint:POST /api/auth/login']);
+  });
+
+  it('applies collection-level auth as the default, overridden per-request by `noauth`', () => {
+    const collection = JSON.stringify({
+      auth: { type: 'bearer' },
+      item: [
+        { name: 'Create', request: { method: 'POST', url: { path: ['x'] } } },
+        {
+          name: 'Login',
+          request: { method: 'POST', url: { path: ['login'] }, auth: { type: 'noauth' } },
+        },
+      ],
+    });
+    const units = parsePostmanCollection(collection, 'c.postman_collection.json');
+    expect(units.find((u) => u.key === 'endpoint:POST /x')?.authRequired).toBe(true);
+    expect(units.find((u) => u.key === 'endpoint:POST /login')?.authRequired).toBe(false);
+  });
+
+  it('returns [] for malformed JSON and for a doc with no `item` array', () => {
+    expect(parsePostmanCollection('not json', 'c.postman_collection.json')).toEqual([]);
+    expect(parsePostmanCollection(JSON.stringify({ info: {} }), 'c.postman_collection.json')).toEqual([]);
+  });
+});
+
 describe('findSpecFiles', () => {
   const tempDirs: string[] = [];
 
@@ -116,3 +178,47 @@ describe('findSpecFiles', () => {
     expect(findSpecFiles(dir)).toEqual([]);
   });
 });
+
+// --- Isolated check against real fixture Postman collections (Item C2) -----
+
+const FIXTURES_ROOT = path.join('C:', 'Users', 'AdroyFernandes', 'Documents', 'TestApps');
+const RBAC_COLLECTION = path.join(
+  FIXTURES_ROOT,
+  'Role-Based-Access-Control-RBAC-',
+  'RBAC-API.postman_collection.json',
+);
+const HERFY_COLLECTION = path.join(FIXTURES_ROOT, 'psv-ui-herfy-development', 'HerfyToken.postman_collection.json');
+
+describe.skipIf(!fs.existsSync(RBAC_COLLECTION))(
+  'parsePostmanCollection against the real RBAC-API.postman_collection.json (isolated check)',
+  () => {
+    it('recurses through real nested folders and applies collection-level bearer auth as the default', () => {
+      const content = fs.readFileSync(RBAC_COLLECTION, 'utf-8');
+      const units = parsePostmanCollection(content, 'RBAC-API.postman_collection.json');
+      const keys = units.map((u) => u.key);
+
+      expect(keys).toContain('endpoint:POST /api/auth/login');
+      expect(keys).toContain('endpoint:POST /api/users');
+      expect(keys).toContain('endpoint:GET /api/roles');
+
+      // Real fixture: Login requests explicitly override with auth: {type: 'noauth'}; other
+      // requests inherit the collection-level bearer auth and require it.
+      const login = units.find((u) => u.key === 'endpoint:POST /api/auth/login');
+      expect(login?.authRequired).toBe(false);
+      const createUser = units.find((u) => u.key === 'endpoint:POST /api/users');
+      expect(createUser?.authRequired).toBe(true);
+    });
+  },
+);
+
+describe.skipIf(!fs.existsSync(HERFY_COLLECTION))(
+  'parsePostmanCollection against the real HerfyToken.postman_collection.json (isolated check)',
+  () => {
+    it('extracts real flat (non-folder) requests with an absolute-URL host', () => {
+      const content = fs.readFileSync(HERFY_COLLECTION, 'utf-8');
+      const units = parsePostmanCollection(content, 'HerfyToken.postman_collection.json');
+      expect(units.length).toBeGreaterThan(0);
+      expect(units.map((u) => u.key)).toContain('endpoint:POST /v3/oauth/token/generate');
+    });
+  },
+);

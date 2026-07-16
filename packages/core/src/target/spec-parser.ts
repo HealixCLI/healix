@@ -83,6 +83,121 @@ export function parseOpenApiSpec(content: string, file: string): FunctionalityUn
   return units;
 }
 
+// --- Postman collection (v2.0/v2.1 schema) ---------------------------------
+
+interface PostmanUrl {
+  raw?: string;
+  path?: Array<string | { value?: string }>;
+}
+interface PostmanAuth {
+  type?: string;
+}
+interface PostmanRequest {
+  method?: string;
+  url?: PostmanUrl | string;
+  auth?: PostmanAuth;
+  body?: { mode?: string; raw?: string };
+}
+interface PostmanItem {
+  name?: string;
+  item?: PostmanItem[];
+  request?: PostmanRequest;
+}
+interface PostmanCollection {
+  info?: { name?: string };
+  auth?: PostmanAuth;
+  item?: PostmanItem[];
+}
+
+/** Postman path segments can be plain strings or `{value: string}` variable objects. */
+function pathSegment(seg: string | { value?: string }): string {
+  return typeof seg === 'string' ? seg : (seg.value ?? '');
+}
+
+/** Build a route path from a Postman request's `url`, preferring the parsed `path` segments over the raw string (which still carries the `{{host}}` template variable). */
+function postmanRoutePath(url: PostmanUrl | string | undefined): string | null {
+  if (!url) return null;
+  if (typeof url === 'string') {
+    // No parsed segments available — strip a leading scheme/variable host if present.
+    const stripped = url.replace(/^[a-z]+:\/\//i, '').replace(/^\{\{[^}]+\}\}/, '');
+    const slashIdx = stripped.indexOf('/');
+    return slashIdx === -1 ? '/' : stripped.slice(slashIdx);
+  }
+  if (url.path && url.path.length > 0) {
+    return `/${url.path.map(pathSegment).join('/')}`;
+  }
+  return postmanRoutePath(url.raw);
+}
+
+/** Best-effort JSON.parse of a raw request body — an example payload, not a strict schema, but the same "authoritative shape" concept as an OpenAPI requestSchema. */
+function parseRawBody(body: PostmanRequest['body']): unknown {
+  if (!body || body.mode !== 'raw' || !body.raw) return undefined;
+  try {
+    return JSON.parse(body.raw);
+  } catch {
+    return undefined;
+  }
+}
+
+function walkPostmanItems(
+  items: PostmanItem[] | undefined,
+  file: string,
+  collectionAuth: PostmanAuth | undefined,
+  out: FunctionalityUnit[],
+): void {
+  for (const item of items ?? []) {
+    if (item.item) {
+      walkPostmanItems(item.item, file, collectionAuth, out);
+      continue;
+    }
+    const req = item.request;
+    if (!req?.method) continue;
+    const routePath = postmanRoutePath(req.url);
+    if (!routePath) continue;
+
+    const method = req.method.toUpperCase();
+    const authType = req.auth?.type ?? collectionAuth?.type;
+    const authRequired = authType !== undefined && authType !== 'noauth';
+    const requestSchema = parseRawBody(req.body);
+
+    out.push({
+      key: `endpoint:${method} ${routePath}`,
+      kind: 'endpoint',
+      label: `${method} ${routePath}`,
+      file,
+      provenance: 'spec',
+      method,
+      authRequired,
+      ...(requestSchema !== undefined ? { requestSchema } : {}),
+    });
+  }
+}
+
+/**
+ * Parse a Postman v2.0/v2.1 collection export into FunctionalityUnits, recursing through
+ * arbitrarily nested folders (a collection's `item` array holds either a folder — itself another
+ * `item` array — or a leaf request). Path is taken from the request's parsed `url.path` segments
+ * when available (avoiding the `{{base_url}}` template variable that the raw URL string carries),
+ * falling back to stripping a scheme/variable prefix off the raw string otherwise. Per-request
+ * `auth: {type: 'noauth'}` overrides the collection-level default. Returns [] for anything that
+ * doesn't parse as JSON or has no top-level `item` array.
+ */
+export function parsePostmanCollection(content: string, file: string): FunctionalityUnit[] {
+  let doc: PostmanCollection;
+  try {
+    const parsed: unknown = JSON.parse(content);
+    if (!parsed || typeof parsed !== 'object') return [];
+    doc = parsed as PostmanCollection;
+  } catch {
+    return [];
+  }
+  if (!Array.isArray(doc.item)) return [];
+
+  const units: FunctionalityUnit[] = [];
+  walkPostmanItems(doc.item, file, doc.auth, units);
+  return units;
+}
+
 const SPEC_DIRS = ['docs', 'api', 'spec', 'openapi', 'swagger', 'src'];
 const SPEC_FILE_RE = /(openapi|swagger).*\.(json|ya?ml)$|\.postman_collection\.json$|\.(graphql|gql)$/i;
 /** Directories never descended into while looking for spec files, matching the rest of target/*.ts. */

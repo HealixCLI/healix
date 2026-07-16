@@ -74,6 +74,8 @@ const api = {
   approveRun: (runId: string, decision: { decision: 'cancel' } | { decision: 'proceed'; plan: unknown }) =>
     ipcRenderer.invoke('run:approve', { runId, ...decision }),
   cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
+  pauseRun: (runId: string) => ipcRenderer.invoke('run:pause', { runId }),
+  resumeRun: (runId: string) => ipcRenderer.invoke('run:resume', { runId }),
   getActiveRun: () => ipcRenderer.invoke('run:active'),
 
   // run queue (requests that arrived while another run was executing)

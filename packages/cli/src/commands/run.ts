@@ -38,7 +38,8 @@ function levelColor(level: OrchestratorEvent['level']): (s: string) => string {
   }
 }
 
-function streamEvent(e: OrchestratorEvent): void {
+/** Exported so `healix runs resume` (runs.ts) streams events identically. */
+export function streamEvent(e: OrchestratorEvent): void {
   const color = PHASE_COLOR[e.phase] ?? pc.white;
   const tag = color(`[${e.phase}]`);
   console.log(`  ${tag} ${levelColor(e.level)(e.message)}`);
@@ -83,7 +84,8 @@ async function promptApproval(plan: TestPlan): Promise<PlanApprovalResult> {
   }
 }
 
-function printSummary(summary: RunSummary): void {
+/** Exported so `healix runs resume` (runs.ts) prints the same summary shape `healix run` does. */
+export function printSummary(summary: RunSummary): void {
   console.log('');
   console.log(pc.bold('  Run summary'));
   console.log(`    ${pc.dim('runId')}    ${summary.runId}`);

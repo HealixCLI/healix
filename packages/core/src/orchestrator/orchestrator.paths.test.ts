@@ -125,6 +125,16 @@ const ALL_PASS_OUTCOME: ExecOutcome = {
 
 /** Build a fresh TestMode whose phases return canned, side-effect-free data. */
 function makeFakeMode(outcome: ExecOutcome): TestMode {
+  // Tier-aware: the orchestrator now invokes execute() once per in-scope tier
+  // (see EXECUTE's per-tier loop in orchestrator/index.ts) rather than once
+  // for the whole suite, so a canned outcome has to be split across those
+  // calls the same way a real mode would: a result whose title matches one of
+  // THIS call's specs belongs to this tier. A result matching no generated
+  // spec at all (e.g. a blocked-prerequisite entry with no corresponding
+  // spec, as in the MIXED-BLOCKED GUARD fixture) is delivered exactly once,
+  // on the first call, so it isn't dropped or double-counted.
+  let executeCallCount = 0;
+  const allGeneratedTitles = new Set(CANNED_SPECS.map((s) => s.title));
   return {
     id: 'playwright',
     async scaffold(_ctx: TestModeContext): Promise<void> {
@@ -133,8 +143,21 @@ function makeFakeMode(outcome: ExecOutcome): TestMode {
     async generate(_ctx: TestModeContext, _plan: TestPlan): Promise<GeneratedSpec[]> {
       return CANNED_SPECS.map((s) => ({ ...s }));
     },
-    async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
-      return { ...outcome, results: outcome.results.map((r) => ({ ...r })) };
+    async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+      executeCallCount += 1;
+      const specTitles = new Set(specs.map((s) => s.title));
+      const results = outcome.results
+        .filter(
+          (r) => specTitles.has(r.title) || (executeCallCount === 1 && !allGeneratedTitles.has(r.title)),
+        )
+        .map((r) => ({ ...r }));
+      return {
+        passed: results.filter((r) => r.status === 'passed').length,
+        failed: results.filter((r) => r.status === 'failed').length,
+        blocked: results.filter((r) => r.status === 'blocked').length,
+        flaky: results.filter((r) => r.status === 'flaky').length,
+        results,
+      };
     },
     async collectArtifacts(_ctx: TestModeContext): Promise<{ dir: string; files: string[] }> {
       return { dir: 'artifacts', files: ['test-results/x.png'] };

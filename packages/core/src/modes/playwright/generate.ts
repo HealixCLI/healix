@@ -3,9 +3,15 @@ import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
 import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
+import { ProviderUnavailableError } from '../types.js';
 import { TIERS, tierLabel } from './templates.js';
 
 const GEN_TIMEOUT_MS = 180_000;
+
+// Re-exported for call sites/tests that import it alongside generate() —
+// the class itself lives in modes/types.ts since it's shared across modes,
+// not Playwright-specific (see that definition for the full rationale).
+export { ProviderUnavailableError } from '../types.js';
 
 function emit(ctx: TestModeContext, message: string, data?: unknown): void {
   ctx.emit?.('generate', message, data);
@@ -260,6 +266,15 @@ interface GenOneOutcome {
   reason?: string;
   /** Deny-list violations from the LAST rejected attempt (for the skip event). */
   violations?: string[];
+  /**
+   * Set only when EVERY attempt failed at the provider-communication level
+   * (thrown, or `res.ok === false`) — never once got far enough to validate
+   * model output. Distinguishes "the AI produced something we rejected"
+   * (normal, not a systemic problem) from "we couldn't reach the provider at
+   * all" (see generate()'s ProviderUnavailableError, which resume/checkpoint
+   * treats very differently from an ordinary content-validation skip).
+   */
+  providerFailureDetail?: string;
 }
 
 /**
@@ -294,6 +309,11 @@ async function generateOne(
   let retryNote: string | null = null;
   let lastReason = 'no valid spec with an expect(...) after retry';
   let lastViolations: string[] | undefined;
+  // Tracks whether we EVER got far enough to validate model output — cleared
+  // the moment a completion succeeds, regardless of what content-validation
+  // does with it afterward. Stays set only when every attempt failed before
+  // that point (thrown, or ok:false), which is the systemic-outage signal.
+  let providerFailureDetail: string | undefined;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let text = '';
@@ -312,11 +332,14 @@ async function generateOne(
       });
       if (!res.ok) {
         emit(ctx, `Codegen provider error for "${item.title}" (attempt ${attempt + 1}): ${res.detail}`);
+        providerFailureDetail = res.detail;
         continue;
       }
+      providerFailureDetail = undefined;
       text = res.text;
     } catch (err) {
       emit(ctx, `Codegen threw for "${item.title}" (attempt ${attempt + 1}): ${String(err)}`);
+      providerFailureDetail = err instanceof Error ? err.message : String(err);
       continue;
     }
 
@@ -400,7 +423,7 @@ async function generateOne(
     };
   }
 
-  return { spec: null, reason: lastReason, violations: lastViolations };
+  return { spec: null, reason: lastReason, violations: lastViolations, providerFailureDetail };
 }
 
 /** Number of plan items generated concurrently. */
@@ -462,7 +485,8 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
 
   const outcomes = await runWithConcurrency(tasks, GEN_CONCURRENCY);
 
-  for (const { item, spec, reason, violations } of outcomes) {
+  let lastProviderFailureDetail: string | undefined;
+  for (const { item, spec, reason, violations, providerFailureDetail } of outcomes) {
     if (!spec) {
       // Include the violation list so the UI/logs show WHAT was forbidden,
       // not just that the spec was skipped.
@@ -470,11 +494,28 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
         id: item.id,
         ...(violations ? { violations } : {}),
       });
+      if (providerFailureDetail) lastProviderFailureDetail = providerFailureDetail;
       continue;
     }
 
     specs.push(spec);
     emit(ctx, `Wrote ${spec.path}`, { title: spec.title });
+  }
+
+  // Systemic outage check: every item failed, and NONE of them ever got past
+  // the provider-communication stage (every outcome carried a
+  // providerFailureDetail — a partial mix of provider- and content-failures
+  // is ordinary generation, not this). Only then is this a network/credits
+  // interruption worth checkpointing, rather than "the model produced
+  // nothing usable," which stays today's normal zero-specs outcome.
+  if (
+    items.length > 0 &&
+    specs.length === 0 &&
+    outcomes.every((o) => o.providerFailureDetail !== undefined)
+  ) {
+    throw new ProviderUnavailableError(
+      lastProviderFailureDetail ?? 'Provider unavailable during generation.',
+    );
   }
 
   emit(ctx, `Generation complete: ${specs.length}/${items.length} spec(s) accepted`, {

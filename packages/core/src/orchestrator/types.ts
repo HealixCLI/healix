@@ -105,11 +105,21 @@ export interface RunSummary {
 
 /**
  * Drives the run lifecycle: plan → approve → explore → generate → execute →
- * triage → report → export. Every phase is checkpointed to SQLite; resuming an
- * interrupted run is not implemented (a new run must be started).
+ * triage → report → export. Every phase is checkpointed to SQLite. A run that
+ * pauses (manually, or automatically on a network/credits interruption) also
+ * leaves a `checkpoint.json` (see orchestrator/checkpoint.ts) that `resume()`
+ * uses to continue without re-planning or redoing already-generated/executed
+ * work — see resume()'s own doc comment for exactly what is/isn't redone.
  */
 export interface Orchestrator {
   run(opts: RunOptions, hooks?: OrchestratorHooks): Promise<RunSummary>;
+  /**
+   * Continue a paused run from its last checkpoint. Redoes the cheap phases
+   * (launch/explore) from scratch but skips already-generated specs and
+   * already-completed execution tiers. Fails with status 'error' if the run
+   * has no checkpoint (nothing to resume from).
+   */
+  resume(runId: string, hooks?: OrchestratorHooks, signal?: AbortSignal): Promise<RunSummary>;
 }
 
 /**

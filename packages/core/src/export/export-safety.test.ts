@@ -86,8 +86,11 @@ describe('exportSuite safety', () => {
     await fs.writeFile(secretPath, 'TOP-SECRET-EXTERNAL-CONTENT', 'utf8');
 
     try {
-      await fs.symlink(secretPath, path.join(suiteDir, 'leak.txt'));
-      await fs.symlink(outsideDir, path.join(suiteDir, 'leak-dir'));
+      // Explicit type on the directory target: on Windows, fs.symlink()
+      // defaults to a 'file'-type link regardless of what the target actually
+      // is, and a mistyped dir symlink resolves/stats inconsistently there.
+      await fs.symlink(secretPath, path.join(suiteDir, 'leak.txt'), 'file');
+      await fs.symlink(outsideDir, path.join(suiteDir, 'leak-dir'), 'dir');
     } catch {
       // Symlink creation unsupported on this platform (e.g. Windows without
       // the required privilege) — nothing meaningful to assert.
@@ -119,8 +122,9 @@ describe('exportSuite safety', () => {
     await fs.writeFile(path.join(suiteDir, 'helper.ts'), 'export const inside = 42;\n', 'utf8');
 
     try {
-      // Relative link, target inside the suite root.
-      await fs.symlink('helper.ts', path.join(suiteDir, 'alias.ts'));
+      // Relative link, target inside the suite root. Explicit 'file' type —
+      // see the other test's comment on why Windows needs this spelled out.
+      await fs.symlink('helper.ts', path.join(suiteDir, 'alias.ts'), 'file');
     } catch {
       ctx.skip();
       return;

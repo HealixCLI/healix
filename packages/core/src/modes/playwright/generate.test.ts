@@ -17,7 +17,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../providers/types.js';
 import type { TestModeContext, TestPlan } from '../types.js';
-import { findForbiddenApis, generate } from './generate.js';
+import { findForbiddenApis, generate, ProviderUnavailableError } from './generate.js';
 
 // ---- Realistic spec fixtures -------------------------------------------------
 
@@ -133,6 +133,22 @@ function makeProvider(replies: string[], calls: FakeCall[]): ProviderAdapter {
   } as unknown as ProviderAdapter;
 }
 
+/** A provider whose every completion fails at the communication level (ok:false). */
+function makeFailingProvider(detail: string, calls: FakeCall[]): ProviderAdapter {
+  return {
+    id: 'claude',
+    label: 'Fake Claude',
+    capabilities: ['codegen'],
+    detect: vi.fn(),
+    health: vi.fn(),
+    plan: vi.fn(),
+    complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+      calls.push({ prompt, opts });
+      return { provider: 'claude', ok: false, text: '', raw: null, detail };
+    },
+  } as unknown as ProviderAdapter;
+}
+
 const PLAN: TestPlan = {
   summary: 'one item',
   items: [
@@ -143,6 +159,21 @@ const PLAN: TestPlan = {
       tier: 'tierA-public',
       intent: 'home page renders',
       scenarios: [{ kind: 'positive', description: 'home page renders' }],
+    },
+  ],
+};
+
+const TWO_ITEM_PLAN: TestPlan = {
+  summary: 'two items',
+  items: [
+    ...PLAN.items,
+    {
+      id: 'REQ-2',
+      title: 'Checkout page',
+      reqTag: 'REQ-2',
+      tier: 'tierA-public',
+      intent: 'checkout page renders',
+      scenarios: [{ kind: 'positive', description: 'checkout page renders' }],
     },
   ],
 };
@@ -310,5 +341,104 @@ describe('generate — grounds the prompt in the observed DOM snapshot', () => {
     expect(prompt).toContain('[data-testid="act-39"]'); // 40th (0-indexed) is shown
     expect(prompt).not.toContain('[data-testid="act-40"]'); // 41st is omitted
     expect(prompt).toContain('(+10 more not shown)');
+  });
+});
+
+describe('generate — ProviderUnavailableError (systemic outage signal)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-outage-test-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function makeCtx(provider: ProviderAdapter): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider,
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      emit: () => undefined,
+    };
+  }
+
+  it('throws when every item fails at the provider-communication level (both attempts, ok:false)', async () => {
+    const ctx = makeCtx(makeFailingProvider('connect ECONNREFUSED 127.0.0.1:443', calls));
+
+    await expect(generate(ctx, TWO_ITEM_PLAN)).rejects.toThrow(ProviderUnavailableError);
+    // Both items each got 2 attempts — never a content-validation stage reached.
+    expect(calls).toHaveLength(4);
+  });
+
+  it('does NOT throw when zero specs are produced solely due to content-validation failures', async () => {
+    // Both attempts return a spec that fails the forbidden-API gate — the
+    // provider communicated fine both times, so this is ordinary generation,
+    // not a systemic outage.
+    const ctx = makeCtx(makeProvider([CHILD_PROCESS_SPEC, CHILD_PROCESS_SPEC], calls));
+
+    const specs = await generate(ctx, PLAN);
+    expect(specs).toHaveLength(0);
+  });
+
+  it('does NOT throw on a mixed outcome (one item provider-failed, another content-rejected)', async () => {
+    let call = 0;
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        call += 1;
+        // REQ-1's two attempts both fail at the provider level; REQ-2's two
+        // attempts both return content that fails validation. Neither item
+        // produces a spec, but this must NOT be classified as a systemic
+        // outage — REQ-2 proves the provider is actually reachable.
+        if (prompt.includes('REQ-1')) {
+          return { provider: 'claude', ok: false, text: '', raw: null, detail: 'ECONNRESET' };
+        }
+        return { provider: 'claude', ok: true, text: CHILD_PROCESS_SPEC, raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), TWO_ITEM_PLAN);
+    expect(specs).toHaveLength(0);
+    expect(call).toBeGreaterThan(0);
+  });
+
+  it('does not throw when at least one spec is accepted, even if others fail at the provider level', async () => {
+    const cleanSpecFor = (reqTag: string): string => `import { test, expect } from '@playwright/test';
+
+test('[REQ:${reqTag}] renders', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        if (prompt.includes('REQ-1')) {
+          return { provider: 'claude', ok: false, text: '', raw: null, detail: 'ECONNRESET' };
+        }
+        return { provider: 'claude', ok: true, text: cleanSpecFor('REQ-2'), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), TWO_ITEM_PLAN);
+    expect(specs).toHaveLength(1);
   });
 });

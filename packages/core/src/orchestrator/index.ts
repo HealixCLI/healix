@@ -2,7 +2,16 @@ import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { dirname, join, relative } from 'node:path';
 import { projectsDir } from '../env/app-data.js';
 import { getStore, type HealixStore } from '../storage/store.js';
-import type { Project, Run, RunStatus, SuiteMode, TestCase, TestStatus, Tier } from '../storage/types.js';
+import type {
+  PauseReason,
+  Project,
+  Run,
+  RunStatus,
+  SuiteMode,
+  TestCase,
+  TestStatus,
+  Tier,
+} from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
 import { getTestMode } from '../modes/registry.js';
@@ -48,6 +57,13 @@ import {
   type ReportCoverageSummary,
   type ReportTriageEntry,
 } from './report.js';
+import {
+  classifyTransientFailure,
+  deleteCheckpoint,
+  readCheckpoint,
+  writeCheckpoint,
+  type ResumeCheckpoint,
+} from './checkpoint.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
@@ -60,6 +76,7 @@ import type {
 } from './types.js';
 
 export * from './types.js';
+export type { ResumeCheckpoint } from './checkpoint.js';
 
 /** Per-call budget for the best-effort AI triage enrichment. */
 const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
@@ -87,9 +104,14 @@ const PLAN_BATCH_UNIT_SIZE = 15;
 /**
  * Run state machine for the Healix orchestrator. Every phase transition is
  * checkpointed to SQLite (run status + events), so an interrupted run is fully
- * inspectable after the fact — but runs are NOT resumable: an interrupted run
- * stays in its last recorded state and a new run must be started. (Startup
- * reconciliation of orphaned rows lives in HealixStore.failOrphanedRuns().)
+ * inspectable after the fact. A run can also PAUSE — manually, or automatically
+ * on a network/credits interruption (never for a manual pause) — which leaves a
+ * `checkpoint.json` (see ./checkpoint.ts) alongside the SQLite row; `resume()`
+ * uses it to continue without re-planning or redoing already-generated specs
+ * or already-completed execution tiers. A run with no checkpoint (e.g. one that
+ * hard-errored, or predates this feature) is not resumable — the startup
+ * reconciliation in HealixStore.failOrphanedRuns() remains the fallback for
+ * those.
  *
  * `overrides` is a dependency-injection seam for testability: each dependency is
  * resolved as `override ?? current-default`, so `createOrchestrator()` with no
@@ -100,13 +122,70 @@ export function createOrchestrator(overrides?: OrchestratorOverrides): Orchestra
     run(opts: RunOptions, hooks?: OrchestratorHooks): Promise<RunSummary> {
       return runPipeline(opts, hooks, overrides);
     },
+    resume(runId: string, hooks?: OrchestratorHooks, signal?: AbortSignal): Promise<RunSummary> {
+      return resumePipeline(runId, hooks, overrides, signal);
+    },
   };
+}
+
+/**
+ * Load a paused run's checkpoint and re-enter runPipeline with it. Fails with
+ * status 'error' (no exception) when the run or its checkpoint can't be found —
+ * same "always return a summary" contract run() upholds.
+ */
+async function resumePipeline(
+  runId: string,
+  hooks?: OrchestratorHooks,
+  overrides?: OrchestratorOverrides,
+  signal?: AbortSignal,
+): Promise<RunSummary> {
+  const store = overrides?.store ?? (await getStore());
+  if (!store) {
+    hooks?.onEvent?.({
+      phase: 'plan',
+      level: 'error',
+      message: 'Storage unavailable (node:sqlite missing); cannot resume run.',
+    });
+    return { runId, status: 'error' };
+  }
+  const run = store.getRun(runId);
+  if (!run) {
+    hooks?.onEvent?.({ phase: 'plan', level: 'error', message: `Run not found: ${runId}` });
+    return { runId, status: 'error' };
+  }
+  const project = store.getProject(run.projectId);
+  if (!project) {
+    hooks?.onEvent?.({ phase: 'plan', level: 'error', message: `Project not found: ${run.projectId}` });
+    return { runId, status: 'error' };
+  }
+  const runDir = join(projectsDir(), project.id, 'runs', runId);
+  const checkpoint = await readCheckpoint(runDir);
+  if (!checkpoint) {
+    hooks?.onEvent?.({
+      phase: 'plan',
+      level: 'error',
+      message: `Run ${runId} has no checkpoint to resume from.`,
+    });
+    return { runId, status: 'error' };
+  }
+  const resumeOpts: RunOptions = {
+    projectId: project.id,
+    testingScope: checkpoint.runOptions.testingScope,
+    suiteMode: checkpoint.runOptions.suiteMode,
+    baseRunId: checkpoint.runOptions.baseRunId,
+    provider: checkpoint.runOptions.provider,
+    autoApprove: true,
+    prd: checkpoint.runOptions.prd,
+    signal,
+  };
+  return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
 }
 
 async function runPipeline(
   opts: RunOptions,
   hooks?: OrchestratorHooks,
   overrides?: OrchestratorOverrides,
+  resumeFrom?: { run: Run; checkpoint: ResumeCheckpoint },
 ): Promise<RunSummary> {
   const getMode = overrides?.getMode ?? getTestMode;
   const makeTarget = overrides?.makeTarget ?? createTargetAdapter;
@@ -165,19 +244,28 @@ async function runPipeline(
   // re-including a known-bad test unchanged.
   const basePassingTests: TestCase[] = baseTestsWithSpec.filter((t) => t.status === 'passed');
 
-  const run = store.createRun(project.id, {
-    provider: opts.provider ?? null,
-    mode: project.mode,
-    suiteMode,
-    baseRunId: baseRun?.id ?? null,
-  });
-  const runId = run.id;
-  // Surface the canonical runId immediately so callers (e.g. the desktop app)
-  // correlate events/approval to THIS run instead of pre-creating a duplicate.
-  try {
-    hooks?.onRunCreated?.(runId);
-  } catch {
-    // a callback fault must never abort the run
+  let run: Run;
+  let runId: string;
+  if (resumeFrom) {
+    // Continuing an existing paused row — never create a new one, never
+    // re-fire onRunCreated (the caller already knows this runId).
+    run = resumeFrom.run;
+    runId = run.id;
+  } else {
+    run = store.createRun(project.id, {
+      provider: opts.provider ?? null,
+      mode: project.mode,
+      suiteMode,
+      baseRunId: baseRun?.id ?? null,
+    });
+    runId = run.id;
+    // Surface the canonical runId immediately so callers (e.g. the desktop app)
+    // correlate events/approval to THIS run instead of pre-creating a duplicate.
+    try {
+      hooks?.onRunCreated?.(runId);
+    } catch {
+      // a callback fault must never abort the run
+    }
   }
   const runDir = join(projectsDir(), project.id, 'runs', runId);
 
@@ -212,7 +300,10 @@ async function runPipeline(
     }
   };
 
-  const setStatus = (status: RunStatus, patch: { startedAt?: string; finishedAt?: string } = {}): void => {
+  const setStatus = (
+    status: RunStatus,
+    patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
+  ): void => {
     currentStatus = status;
     try {
       store.updateRunStatus(runId, status, patch);
@@ -259,6 +350,11 @@ async function runPipeline(
     setStatus('cancelled', { finishedAt: nowIso() });
     return { runId, status: 'cancelled' };
   };
+  // A pause shares the same AbortController/signal as cancel — the caller
+  // distinguishes them via controller.abort('pause') vs. plain abort() — so
+  // every existing checkCancelled() boundary can also honor a pause request
+  // without a second signal to plumb through ctx/provider calls.
+  const isPauseRequested = (): boolean => checkCancelled() && signal?.reason === 'pause';
 
   try {
     await mkdir(join(runDir, 'plan'), { recursive: true });
@@ -271,12 +367,25 @@ async function runPipeline(
     return { runId, status: 'error' };
   }
 
-  setStatus('pending', { startedAt: nowIso() });
+  if (!resumeFrom) {
+    setStatus('pending', { startedAt: nowIso() });
+  }
 
   // Accumulated across phases so the report/summary survive partial failures.
-  let plan: TestPlan | null = null;
+  // On resume, GENERATE's output is seeded straight from the checkpoint (see
+  // hydrateCheckpointedSpecs below) rather than reconstructed here, since
+  // reading the spec files back requires ctx (not built yet at this point).
+  let plan: TestPlan | null = resumeFrom?.checkpoint.plan ?? null;
   let specs: GeneratedSpec[] = [];
-  let outcome: ExecOutcome | null = null;
+  let outcome: ExecOutcome | null = resumeFrom?.checkpoint.partialOutcome
+    ? {
+        passed: resumeFrom.checkpoint.partialOutcome.passed,
+        failed: resumeFrom.checkpoint.partialOutcome.failed,
+        blocked: resumeFrom.checkpoint.partialOutcome.blocked,
+        flaky: resumeFrom.checkpoint.partialOutcome.flaky,
+        results: resumeFrom.checkpoint.partialOutcome.results as ExecOutcome['results'],
+      }
+    : null;
   // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
   // loop, which needs the same functionality inventory the initial plan was grounded on.
   let repoIndex: PlanRepoContext | undefined;
@@ -287,7 +396,9 @@ async function runPipeline(
   // when the loop never runs (reuse mode, or no functionality inventory detected).
   let coverageSummary: ReportCoverageSummary | null = null;
   // Stable key -> testId, so EXECUTE reuses the rows inserted in GENERATE (no duplicates).
-  const testIdByKey = new Map<string, string>();
+  // Rehydrated from the checkpoint on resume so an EXECUTE-only resume updates
+  // the SAME rows GENERATE already inserted, instead of inserting duplicates.
+  const testIdByKey = new Map<string, string>(Object.entries(resumeFrom?.checkpoint.testIdByKey ?? {}));
   // The base URL the suite should actually target (may be overridden by a white-box launch).
   let effectiveBaseUrl: string | null = project.baseUrl;
   // White-box launch handle, stopped in the run's cleanup regardless of outcome.
@@ -303,148 +414,251 @@ async function runPipeline(
     generationStats.requestedItems += requested;
     generationStats.acceptedItems += accepted;
   };
+  // Assigned once ctx exists (after APPROVE); used by buildCheckpoint to make
+  // generatedSpecs' paths relative to the suite dir, matching TestCase.specPath.
+  let ctx: TestModeContext | undefined;
+
+  /**
+   * Snapshot everything accumulated so far into a ResumeCheckpoint. Cheap and
+   * called liberally: before/after each EXECUTE tier, and whenever GENERATE or
+   * EXECUTE hits a transient failure or a live pause request. `phase` is
+   * derived from progress, not from the caller: no specs yet means resume must
+   * redo GENERATE from scratch (nothing was lost); specs present means resume
+   * can jump straight to EXECUTE.
+   */
+  const buildCheckpoint = (completedTiers: Tier[]): ResumeCheckpoint => {
+    const effectivePlan: TestPlan = plan ?? { summary: 'No plan yet.', items: [] };
+    const suiteDir = ctx?.projectDir ?? join(runDir, 'suite');
+    return {
+      runId,
+      projectId: project.id,
+      phase: specs.length > 0 ? 'execute' : 'generate',
+      runOptions: {
+        testingScope: opts.testingScope,
+        suiteMode: opts.suiteMode,
+        baseRunId: opts.baseRunId,
+        provider: opts.provider,
+        autoApprove: opts.autoApprove,
+        prd: opts.prd,
+      },
+      plan: effectivePlan,
+      generatedItemIds: effectivePlan.items
+        .filter((it) => specs.some((s) => (s.reqTag ?? it.id) === (it.reqTag ?? it.id)))
+        .map((it) => it.id),
+      generatedSpecs: specs.map((s) => ({
+        path: relative(suiteDir, s.path),
+        title: s.title,
+        reqTag: s.reqTag,
+        tier: s.tier,
+      })),
+      completedTiers,
+      partialOutcome: outcome
+        ? {
+            passed: outcome.passed,
+            failed: outcome.failed,
+            blocked: outcome.blocked,
+            flaky: outcome.flaky,
+            results: outcome.results,
+          }
+        : undefined,
+      testIdByKey: Object.fromEntries(testIdByKey),
+      updatedAt: nowIso(),
+    };
+  };
+
+  /** Write a checkpoint and settle the run as 'paused' — a normal resolved outcome, never a rejection. */
+  const pauseRun = async (
+    phase: OrchestratorPhase | string,
+    reason: PauseReason,
+    completedTiers: Tier[] = [],
+  ): Promise<RunSummary> => {
+    await writeCheckpoint(runDir, buildCheckpoint(completedTiers));
+    emit(phase, 'warn', `Run paused (${reason}); checkpoint saved for resume.`, { reason });
+    setStatus('paused', { finishedAt: nowIso(), pauseReason: reason });
+    return { runId, status: 'paused' };
+  };
+
+  /** At a cancellation boundary: honor a live pause request as 'paused' (resumable); otherwise cancel as today. */
+  const pauseOrCancel = (
+    phase: OrchestratorPhase | string,
+    completedTiers: Tier[] = [],
+    cancelMessage?: string,
+  ): Promise<RunSummary> =>
+    isPauseRequested()
+      ? pauseRun(phase, 'manual', completedTiers)
+      : Promise.resolve(cancelMessage ? cancelRun(phase, cancelMessage) : cancelRun(phase));
 
   try {
     // ---- 3. PLAN ----
+    // A pause requested before a plan exists has nothing worth preserving —
+    // resuming would just redo everything anyway — so this one boundary
+    // (unlike every other below) always cancels rather than pausing.
     if (checkCancelled()) return cancelRun('plan');
     setStatus('planning');
-    emit('plan', 'info', 'Selecting planning provider.');
-    // An injected provider override bypasses the router entirely (used in tests).
-    // Otherwise resolveProvider handles BOTH paths and guarantees a ready+authenticated
-    // result: the auto path via router.select('plan'), and the explicit path by probing
-    // the requested provider's health and falling back to the other ready provider when
-    // it is unhealthy (emitting a warn). It returns undefined only when none are ready.
-    const provider = overrides?.provider ?? (await resolveProvider(opts.provider, emit));
-    if (!provider) {
-      emit('plan', 'error', 'No ready provider available for planning.');
-      setStatus('error', { finishedAt: nowIso() });
-      return { runId, status: 'error' };
-    }
-    emit('plan', 'info', `Planning with provider "${provider.id}".`);
-
+    let provider: ProviderAdapter | undefined;
+    let planForGeneration: TestPlan;
     // The target adapter is built before planning (it is a cheap bag of
-    // functions) so the plan phase can reuse its repo indexer for grounding.
+    // functions) so the plan phase can reuse its repo indexer for grounding,
+    // and LAUNCH needs it regardless of whether this is a resume.
     const target = makeTarget();
 
-    if (suiteMode === 'reuse') {
-      // Reuse never plans/generates via AI — it re-executes the base run's
-      // ENTIRE suite as-is (every test with a known spec file, regardless of
-      // its previous status — a run that reruns only last time's winners
-      // isn't actually "the suite as-is"). Still synthesize a concrete,
-      // cancellable plan (zero AI cost) so the APPROVE gate shows something.
-      plan = {
-        summary: `Reusing ${baseTestsWithSpec.length} test(s) from run ${baseRun!.id} — no generation.`,
-        items: [],
-        planSource: 'reuse',
-      };
-      emit('plan', 'info', 'Skipping AI planning (reuse mode).');
+    if (resumeFrom) {
+      // Resuming: the plan was already finalized and approved before the
+      // pause/interruption — replanning or re-showing the approval gate would
+      // waste tokens and re-litigate an already-made decision. Only the
+      // provider needs re-resolving (cheap: a health probe, no tokens spent).
+      emit('plan', 'info', `Resuming run (paused at "${resumeFrom.checkpoint.phase}").`);
+      provider = overrides?.provider ?? (await resolveProvider(opts.provider, emit));
+      if (!provider) {
+        emit('plan', 'error', 'No ready provider available to resume.');
+        setStatus('error', { finishedAt: nowIso() });
+        return { runId, status: 'error' };
+      }
+      plan = resumeFrom.checkpoint.plan;
+      await writeJson(join(runDir, 'plan', 'plan.json'), plan);
+      emit('plan', 'info', `Resumed plan: ${plan.items.length} item(s).`);
+      setStatus('awaiting-approval');
+      if (checkCancelled()) return await pauseOrCancel('approve');
+      planForGeneration = { ...plan, items: plan.items.filter(isPlanItemIncluded) };
+      emit('approve', 'info', 'Approval gate skipped — plan was already approved before pause.');
     } else {
-      // Best-effort repo grounding: a white-box plan is dramatically better when
-      // the model can see the repo's real structure (routes/pages/dirs), but
-      // indexing must never block or break planning — any failure simply means
-      // "plan without repo context".
-      if (project.repoPath) {
-        try {
-          const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
-          repoIndex = { summary: idx.summary, files: idx.files };
-          emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
-        } catch (err) {
-          emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
-        }
-        try {
-          const functionality = await indexFunctionality(project.repoPath);
-          if (functionality.units.length > 0) {
-            repoIndex = { ...(repoIndex ?? { summary: '', files: [] }), functionality: functionality.units };
+      emit('plan', 'info', 'Selecting planning provider.');
+      // An injected provider override bypasses the router entirely (used in tests).
+      // Otherwise resolveProvider handles BOTH paths and guarantees a ready+authenticated
+      // result: the auto path via router.select('plan'), and the explicit path by probing
+      // the requested provider's health and falling back to the other ready provider when
+      // it is unhealthy (emitting a warn). It returns undefined only when none are ready.
+      provider = overrides?.provider ?? (await resolveProvider(opts.provider, emit));
+      if (!provider) {
+        emit('plan', 'error', 'No ready provider available for planning.');
+        setStatus('error', { finishedAt: nowIso() });
+        return { runId, status: 'error' };
+      }
+      emit('plan', 'info', `Planning with provider "${provider.id}".`);
+
+      if (suiteMode === 'reuse') {
+        // Reuse never plans/generates via AI — it re-executes the base run's
+        // ENTIRE suite as-is (every test with a known spec file, regardless of
+        // its previous status — a run that reruns only last time's winners
+        // isn't actually "the suite as-is"). Still synthesize a concrete,
+        // cancellable plan (zero AI cost) so the APPROVE gate shows something.
+        plan = {
+          summary: `Reusing ${baseTestsWithSpec.length} test(s) from run ${baseRun!.id} — no generation.`,
+          items: [],
+          planSource: 'reuse',
+        };
+        emit('plan', 'info', 'Skipping AI planning (reuse mode).');
+      } else {
+        // Best-effort repo grounding: a white-box plan is dramatically better when
+        // the model can see the repo's real structure (routes/pages/dirs), but
+        // indexing must never block or break planning — any failure simply means
+        // "plan without repo context".
+        if (project.repoPath) {
+          try {
+            const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
+            repoIndex = { summary: idx.summary, files: idx.files };
+            emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
+          } catch (err) {
+            emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+          }
+          try {
+            const functionality = await indexFunctionality(project.repoPath);
+            if (functionality.units.length > 0) {
+              repoIndex = {
+                ...(repoIndex ?? { summary: '', files: [] }),
+                functionality: functionality.units,
+              };
+              emit(
+                'plan',
+                'debug',
+                `Detected ${functionality.units.length} functionality unit(s) for plan grounding.`,
+              );
+            }
+          } catch (err) {
             emit(
               'plan',
               'debug',
-              `Detected ${functionality.units.length} functionality unit(s) for plan grounding.`,
+              `Functionality indexing failed (planning without route context): ${errMsg(err)}`,
             );
           }
-        } catch (err) {
-          emit(
-            'plan',
-            'debug',
-            `Functionality indexing failed (planning without route context): ${errMsg(err)}`,
-          );
         }
-      }
 
-      plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
-      // Enforce the testing-scope boundary as a backstop: plan.ts already asks
-      // the model for (and normalizes tiers to) only in-scope tiers, but this
-      // is the hard guarantee — filtered here, before approval/persistence, so
-      // the approval gate, plan.json, and the report all consistently reflect
-      // only what will actually be generated and executed.
-      const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
-      plan = { ...plan, items: plan.items.filter((it) => inScopeTiers.has(it.tier)) };
-    }
-    await writeJson(join(runDir, 'plan', 'plan.json'), plan);
-    emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
-    setStatus('awaiting-approval');
-
-    // ---- 4. APPROVE ----
-    if (checkCancelled()) return cancelRun('approve');
-    // What GENERATE actually receives: the full audited plan (all items,
-    // whatever their status) filtered to non-rejected items. Identical to
-    // `plan` itself when there's no approval gate (auto-approve / no hook).
-    let planForGeneration: TestPlan = plan;
-    if (!opts.autoApprove && hooks?.onPlan) {
-      emit('approve', 'info', 'Awaiting plan approval.');
-      let result: PlanApprovalResult = { decision: 'cancel' };
-      try {
-        // Race the (potentially indefinite) human approval gate against abort:
-        // a run cancelled while parked at the gate must resolve 'cancelled',
-        // not hang forever awaiting an approval that will never come. The
-        // gate's eventual result is simply discarded after an abort.
-        const gate = await raceAbort(hooks.onPlan(plan), signal);
-        if (gate === ABORTED) {
-          return cancelRun('approve', 'Run cancelled while awaiting approval.');
-        }
-        result = gate;
-      } catch (err) {
-        emit('approve', 'warn', `Approval gate threw: ${errMsg(err)}`, { stack: errStack(err) });
-        result = { decision: 'cancel' };
+        plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+        // Enforce the testing-scope boundary as a backstop: plan.ts already asks
+        // the model for (and normalizes tiers to) only in-scope tiers, but this
+        // is the hard guarantee — filtered here, before approval/persistence, so
+        // the approval gate, plan.json, and the report all consistently reflect
+        // only what will actually be generated and executed.
+        const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
+        plan = { ...plan, items: plan.items.filter((it) => inScopeTiers.has(it.tier)) };
       }
-      if (result.decision === 'cancel') {
-        emit('approve', 'info', 'Plan rejected; cancelling run.');
-        setStatus('cancelled', { finishedAt: nowIso() });
-        return { runId, status: 'cancelled' };
-      }
-      // Finalize: per-item review is opt-in, so any item the reviewer left
-      // without a final decision — undefined/'pending' (never touched), or
-      // 'revised' (regenerated by AI but not explicitly re-approved) —
-      // defaults to 'approved' here, at the trust boundary rather than in a
-      // particular caller's UI, so every caller (desktop, CLI, tests) gets
-      // the same guarantee.
-      const finalizedItems = result.plan.items.map((it) =>
-        it.status === undefined || it.status === 'pending' || it.status === 'revised'
-          ? { ...it, status: 'approved' as const }
-          : it,
-      );
-      plan = { ...result.plan, items: finalizedItems };
-      // Overwrite the pre-approval draft with the finalized, fully-audited
-      // plan (statuses + edit/revision history) — this becomes the
-      // authoritative "what was actually run" version that plan.json,
-      // runs:detail, and the report all read from here on.
       await writeJson(join(runDir, 'plan', 'plan.json'), plan);
-      const includedItems = plan.items.filter(isPlanItemIncluded);
-      if (includedItems.length === 0) {
-        // Every item was rejected — a deliberate empty plan, not a pipeline
-        // failure, so this reads as a cancellation rather than falling into
-        // the "verified nothing" error path further down.
-        emit('approve', 'info', 'All plan items were rejected; cancelling run.');
-        setStatus('cancelled', { finishedAt: nowIso() });
-        return { runId, status: 'cancelled' };
+      emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
+      setStatus('awaiting-approval');
+
+      // ---- 4. APPROVE ----
+      if (checkCancelled()) return await pauseOrCancel('approve');
+      // What GENERATE actually receives: the full audited plan (all items,
+      // whatever their status) filtered to non-rejected items. Identical to
+      // `plan` itself when there's no approval gate (auto-approve / no hook).
+      planForGeneration = plan;
+      if (!opts.autoApprove && hooks?.onPlan) {
+        emit('approve', 'info', 'Awaiting plan approval.');
+        let result: PlanApprovalResult = { decision: 'cancel' };
+        try {
+          // Race the (potentially indefinite) human approval gate against abort:
+          // a run cancelled while parked at the gate must resolve 'cancelled',
+          // not hang forever awaiting an approval that will never come. The
+          // gate's eventual result is simply discarded after an abort.
+          const gate = await raceAbort(hooks.onPlan(plan), signal);
+          if (gate === ABORTED) {
+            return await pauseOrCancel('approve', [], 'Run cancelled while awaiting approval.');
+          }
+          result = gate;
+        } catch (err) {
+          emit('approve', 'warn', `Approval gate threw: ${errMsg(err)}`, { stack: errStack(err) });
+          result = { decision: 'cancel' };
+        }
+        if (result.decision === 'cancel') {
+          emit('approve', 'info', 'Plan rejected; cancelling run.');
+          setStatus('cancelled', { finishedAt: nowIso() });
+          return { runId, status: 'cancelled' };
+        }
+        // Finalize: per-item review is opt-in, so any item the reviewer left
+        // without a final decision — undefined/'pending' (never touched), or
+        // 'revised' (regenerated by AI but not explicitly re-approved) —
+        // defaults to 'approved' here, at the trust boundary rather than in a
+        // particular caller's UI, so every caller (desktop, CLI, tests) gets
+        // the same guarantee.
+        const finalizedItems = result.plan.items.map((it) =>
+          it.status === undefined || it.status === 'pending' || it.status === 'revised'
+            ? { ...it, status: 'approved' as const }
+            : it,
+        );
+        plan = { ...result.plan, items: finalizedItems };
+        // Overwrite the pre-approval draft with the finalized, fully-audited
+        // plan (statuses + edit/revision history) — this becomes the
+        // authoritative "what was actually run" version that plan.json,
+        // runs:detail, and the report all read from here on.
+        await writeJson(join(runDir, 'plan', 'plan.json'), plan);
+        const includedItems = plan.items.filter(isPlanItemIncluded);
+        if (includedItems.length === 0) {
+          // Every item was rejected — a deliberate empty plan, not a pipeline
+          // failure, so this reads as a cancellation rather than falling into
+          // the "verified nothing" error path further down.
+          emit('approve', 'info', 'All plan items were rejected; cancelling run.');
+          setStatus('cancelled', { finishedAt: nowIso() });
+          return { runId, status: 'cancelled' };
+        }
+        planForGeneration = { ...plan, items: includedItems };
+        emit(
+          'approve',
+          'info',
+          `Plan approved: ${includedItems.length} of ${plan.items.length} item(s) proceeding.`,
+        );
+      } else {
+        emit('approve', 'info', opts.autoApprove ? 'Auto-approved.' : 'No approval gate; proceeding.');
       }
-      planForGeneration = { ...plan, items: includedItems };
-      emit(
-        'approve',
-        'info',
-        `Plan approved: ${includedItems.length} of ${plan.items.length} item(s) proceeding.`,
-      );
-    } else {
-      emit('approve', 'info', opts.autoApprove ? 'Auto-approved.' : 'No approval gate; proceeding.');
     }
 
     // ---- 5. ctx ----
@@ -460,7 +674,7 @@ async function runPipeline(
     //      generating and executing an entire suite against a dead URL — every
     //      result was junk and the provider tokens were wasted.
     // The handle is always stopped in the run's cleanup.
-    if (checkCancelled()) return cancelRun('launch');
+    if (checkCancelled()) return await pauseOrCancel('launch');
     if (!project.baseUrl && project.repoPath) {
       const repoPath = project.repoPath;
       emit('launch', 'info', `[launch] Detecting app in ${repoPath}.`);
@@ -582,7 +796,7 @@ async function runPipeline(
       }
     }
 
-    const ctx: TestModeContext = {
+    ctx = {
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
       baseUrl: effectiveBaseUrl,
@@ -609,7 +823,7 @@ async function runPipeline(
     // browser view in the desktop app) mirrors whenever a live URL exists too,
     // not just for computer-use — a codegen project still drives a real
     // browser here and during EXECUTE, so there's a real frame to show either way.
-    if (checkCancelled()) return cancelRun('explore');
+    if (checkCancelled()) return await pauseOrCancel('explore');
     if (suiteMode === 'reuse') {
       // No new specs are ever generated in reuse mode, so there is nothing for
       // a DOM snapshot to ground — skip the live browser pass entirely.
@@ -684,77 +898,157 @@ async function runPipeline(
     }
 
     // ---- 7. GENERATE ----
-    if (checkCancelled()) return cancelRun('generate');
+    if (checkCancelled()) return await pauseOrCancel('generate');
     setStatus('generating');
-    emit('generate', 'info', 'Scaffolding suite.');
-    try {
-      await mode.scaffold(ctx);
-
-      let newSpecs: GeneratedSpec[] = [];
-      let carriedSpecs: GeneratedSpec[] = [];
-      let newSpecItems: TestPlanItem[] = [];
-      if (suiteMode === 'reuse') {
-        emit(
-          'generate',
-          'info',
-          `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
-        );
-        carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
-      } else if (suiteMode === 'topup') {
-        const diff = diffAgainstBase(planForGeneration.items, basePassingTests);
-        emit(
-          'generate',
-          'info',
-          `Top-up: ${diff.toGenerate.length} new/missing spec(s), ${diff.carried.length} carried forward from run ${baseRun!.id}.`,
-        );
-        emit('generate', 'info', 'Generating specs.');
-        newSpecs = await mode.generate(ctx, { ...planForGeneration, items: diff.toGenerate });
-        newSpecItems = diff.toGenerate;
-        trackGeneration(diff.toGenerate.length, newSpecs.length);
-        carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
-      } else {
-        emit('generate', 'info', 'Generating specs.');
-        newSpecs = await mode.generate(ctx, planForGeneration);
-        newSpecItems = planForGeneration.items;
-        trackGeneration(planForGeneration.items.length, newSpecs.length);
-      }
-
-      specs = [...newSpecs, ...carriedSpecs];
-      // Freshly generated specs register ONE test row per scenario the plan
-      // requested (see registerSpecRows) so Total/Passed/Failed/etc. reflect
-      // real test-case counts, matching the report — not spec-file counts.
-      // Carried-forward specs (copied bytes from a prior run, already at
-      // whatever granularity that run used) get a single row, as before.
-      for (const spec of newSpecs)
-        registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
-      for (const spec of carriedSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
-      emit('generate', 'info', `Generated ${specs.length} spec(s).`);
-    } catch (err) {
-      emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
-      setStatus('error', { finishedAt: nowIso() });
-      const summary = await finalizeReport(
-        runDir,
-        run,
-        project,
-        currentStatus,
-        plan,
-        outcome,
-        triageEntries,
-        artifactFiles,
-        noteStoreOk,
-        noteStoreFailure,
-        { generationStats, coverage: coverageSummary },
+    if (resumeFrom && resumeFrom.checkpoint.phase === 'execute') {
+      // GENERATE already fully completed before the pause/interruption (the
+      // checkpoint's own phase says so) — restore specs from disk instead of
+      // re-invoking the AI. See the "honest scope" note on hydrateCheckpointedSpecs.
+      emit(
+        'generate',
+        'info',
+        `Resuming: ${resumeFrom.checkpoint.generatedSpecs.length} spec(s) already generated; skipping regeneration.`,
       );
-      return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
+      try {
+        await mode.scaffold(ctx);
+        specs = await hydrateCheckpointedSpecs(ctx, resumeFrom.checkpoint);
+      } catch (err) {
+        emit('generate', 'error', `Could not restore checkpointed specs: ${errMsg(err)}`, {
+          stack: errStack(err),
+        });
+        setStatus('error', { finishedAt: nowIso() });
+        const summary = await finalizeReport(
+          runDir,
+          run,
+          project,
+          currentStatus,
+          plan,
+          outcome,
+          triageEntries,
+          artifactFiles,
+          noteStoreOk,
+          noteStoreFailure,
+          { generationStats, coverage: coverageSummary },
+        );
+        return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
+      }
+    } else {
+      emit('generate', 'info', 'Scaffolding suite.');
+      try {
+        await mode.scaffold(ctx);
+
+        let newSpecs: GeneratedSpec[] = [];
+        let carriedSpecs: GeneratedSpec[] = [];
+        let newSpecItems: TestPlanItem[] = [];
+        if (suiteMode === 'reuse') {
+          emit(
+            'generate',
+            'info',
+            `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
+          );
+          carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
+        } else if (suiteMode === 'topup') {
+          const diff = diffAgainstBase(planForGeneration.items, basePassingTests);
+          emit(
+            'generate',
+            'info',
+            `Top-up: ${diff.toGenerate.length} new/missing spec(s), ${diff.carried.length} carried forward from run ${baseRun!.id}.`,
+          );
+          emit('generate', 'info', 'Generating specs.');
+          newSpecs = await mode.generate(ctx, { ...planForGeneration, items: diff.toGenerate });
+          newSpecItems = diff.toGenerate;
+          trackGeneration(diff.toGenerate.length, newSpecs.length);
+          carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
+        } else {
+          emit('generate', 'info', 'Generating specs.');
+          newSpecs = await mode.generate(ctx, planForGeneration);
+          newSpecItems = planForGeneration.items;
+          trackGeneration(planForGeneration.items.length, newSpecs.length);
+        }
+
+        specs = [...newSpecs, ...carriedSpecs];
+        // Freshly generated specs register ONE test row per scenario the plan
+        // requested (see registerSpecRows) so Total/Passed/Failed/etc. reflect
+        // real test-case counts, matching the report — not spec-file counts.
+        // Carried-forward specs (copied bytes from a prior run, already at
+        // whatever granularity that run used) get a single row, as before.
+        for (const spec of newSpecs)
+          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+        for (const spec of carriedSpecs)
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
+        emit('generate', 'info', `Generated ${specs.length} spec(s).`);
+        // Checkpoint immediately: if the process dies between here and EXECUTE
+        // finishing, resume skips straight to EXECUTE with zero regeneration.
+        await writeCheckpoint(runDir, buildCheckpoint([]));
+      } catch (err) {
+        // A pause request aborts ctx.signal, which is exactly what kills an
+        // in-flight provider call — so a live pause surfaces here as some
+        // generic "aborted"-flavored error, not a recognizable network/credits
+        // signature. Check isPauseRequested() FIRST: it's the direct cause,
+        // regardless of what the resulting error message happens to say.
+        if (isPauseRequested()) {
+          return await pauseRun('generate', 'manual', []);
+        }
+        // Otherwise, a systemic provider outage (see ProviderUnavailableError/
+        // generate.ts) is worth pausing+resuming rather than hard-failing —
+        // anything else (a genuine bug/bad config) keeps failing as before.
+        const classified = classifyTransientFailure(errMsg(err));
+        if (classified) {
+          return await pauseRun('generate', classified, []);
+        }
+        emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
+        setStatus('error', { finishedAt: nowIso() });
+        const summary = await finalizeReport(
+          runDir,
+          run,
+          project,
+          currentStatus,
+          plan,
+          outcome,
+          triageEntries,
+          artifactFiles,
+          noteStoreOk,
+          noteStoreFailure,
+          { generationStats, coverage: coverageSummary },
+        );
+        return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
+      }
     }
 
     // ---- 8. EXECUTE ----
-    if (checkCancelled()) return cancelRun('execute');
+    // Split into one Playwright invocation per in-scope tier (mode.execute's
+    // `onlyTier` option) rather than one call for the whole suite: Playwright's
+    // JSON reporter doesn't give reliable partial results if the process dies
+    // mid-suite, so a tier boundary is the finest granularity a checkpoint can
+    // safely rely on. Already-completed tiers (from a resumed checkpoint) are
+    // skipped entirely.
+    if (checkCancelled()) return await pauseOrCancel('execute');
     setStatus('executing');
-    emit('execute', 'info', `Executing ${specs.length} spec(s).`);
+    const alreadyDoneTiers = new Set<Tier>(
+      resumeFrom?.checkpoint.phase === 'execute' ? resumeFrom.checkpoint.completedTiers : [],
+    );
+    const tiersToRun = tiersForScope(opts.testingScope ?? 'both').filter(
+      (t) => !alreadyDoneTiers.has(t) && specs.some((s) => s.tier === t),
+    );
+    if (!outcome) outcome = { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+    const completedTiers: Tier[] = [...alreadyDoneTiers];
+    emit(
+      'execute',
+      'info',
+      `Executing ${specs.length} spec(s) across ${tiersToRun.length} tier(s)` +
+        (completedTiers.length > 0 ? ` (${completedTiers.length} tier(s) already done).` : '.'),
+    );
     try {
-      outcome = await mode.execute(ctx, specs);
-      persistResults(store, runId, specs, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
+      for (const tier of tiersToRun) {
+        if (checkCancelled()) return await pauseOrCancel('execute', completedTiers);
+        const tierSpecs = specs.filter((s) => s.tier === tier);
+        emit('execute', 'info', `Executing tier ${tier} (${tierSpecs.length} spec(s)).`);
+        const tierOutcome = await mode.execute(ctx, tierSpecs, { onlyTier: tier });
+        persistResults(store, runId, tierSpecs, tierOutcome, testIdByKey, noteStoreOk, noteStoreFailure);
+        outcome = mergeExecOutcomes(outcome, tierOutcome);
+        completedTiers.push(tier);
+        await writeCheckpoint(runDir, buildCheckpoint(completedTiers));
+      }
       emit('execute', 'info', `Execution complete: ${outcome.passed} passed, ${outcome.failed} failed.`, {
         passed: outcome.passed,
         failed: outcome.failed,
@@ -762,6 +1056,16 @@ async function runPipeline(
         flaky: outcome.flaky,
       });
     } catch (err) {
+      // Same reasoning as GENERATE's catch: a live pause aborts ctx.signal,
+      // which is what actually kills an in-flight Playwright invocation — so
+      // check isPauseRequested() before trying to pattern-match the error text.
+      if (isPauseRequested()) {
+        return await pauseRun('execute', 'manual', completedTiers);
+      }
+      const classified = classifyTransientFailure(errMsg(err));
+      if (classified) {
+        return await pauseRun('execute', classified, completedTiers);
+      }
       emit('execute', 'error', `Execution failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
       const summary = await finalizeReport(
@@ -804,7 +1108,7 @@ async function runPipeline(
     // since they are strictly additive within the tiers/scope already approved
     // in the initial plan — every iteration still emits a clear message so this
     // is never silent about what it's adding or why it stopped.
-    if (checkCancelled()) return cancelRun('generate');
+    if (checkCancelled()) return await pauseOrCancel('generate', completedTiers);
     if (suiteMode === 'reuse' || !repoIndex?.functionality || repoIndex.functionality.length === 0) {
       emit('generate', 'debug', 'Skipping coverage loop (reuse mode or no functionality inventory).');
     } else {
@@ -944,7 +1248,7 @@ async function runPipeline(
     // Blocked outcomes are triaged too: a blocked test is precisely where
     // classification is least certain (was it really a prerequisite failure,
     // or a mislabeled defect?), so skipping them hid defects from the report.
-    if (checkCancelled()) return cancelRun('triage');
+    if (checkCancelled()) return await pauseOrCancel('triage', completedTiers);
     setStatus('triaging');
     try {
       const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
@@ -1013,7 +1317,7 @@ async function runPipeline(
     }
 
     // ---- 10. REPORT ----
-    if (checkCancelled()) return cancelRun('report');
+    if (checkCancelled()) return await pauseOrCancel('report', completedTiers);
     setStatus('reporting');
     if (generationStats.requestedItems > generationStats.acceptedItems) {
       const dropped = generationStats.requestedItems - generationStats.acceptedItems;
@@ -1044,7 +1348,7 @@ async function runPipeline(
     // ---- 11. EXPORT (best-effort) ----
     // Prefer the mode's own export() for the suite bundle; fall back to the
     // standalone exportSuite() if it throws. Either way, never abort the run.
-    if (checkCancelled()) return cancelRun('export');
+    if (checkCancelled()) return await pauseOrCancel('export', completedTiers);
     let suite: RunSummary['suite'];
     try {
       emit('export', 'info', 'Exporting suite bundle.');
@@ -1131,6 +1435,15 @@ async function runPipeline(
       } catch (err) {
         emit('launch', 'warn', `[launch] Failed to stop app: ${errMsg(err)}`, { stack: errStack(err) });
       }
+    }
+    // A checkpoint is only meaningful while the run is 'paused' — once it
+    // reaches any other terminal state, there is nothing left to resume, so
+    // clean it up rather than leaving a stale file behind.
+    // (Cast: TS narrows `currentStatus` to its try-entry type ('pending') for
+    // any read inside `finally`, since it can't prove how far the try got
+    // before throwing — the runtime value can genuinely be 'paused' here.)
+    if ((currentStatus as RunStatus) !== 'paused') {
+      await deleteCheckpoint(runDir);
     }
   }
 }
@@ -1610,6 +1923,28 @@ async function hydrateCarriedSpecs(
         },
       );
     }
+  }
+  return specs;
+}
+
+/**
+ * Reconstruct GeneratedSpec[] for a resumed run's already-generated specs by
+ * reading each file back from disk. Unlike hydrateCarriedSpecs (which copies
+ * bytes from a DIFFERENT run's suite dir for top-up/reuse), this is the SAME
+ * run directory the original attempt wrote into — nothing to copy, only to
+ * read back. Throws if a file has gone missing since the checkpoint was
+ * written (e.g. manually deleted) — resume treats that as a hard error rather
+ * than silently continuing with a smaller suite than the checkpoint promised.
+ */
+async function hydrateCheckpointedSpecs(
+  ctx: TestModeContext,
+  checkpoint: ResumeCheckpoint,
+): Promise<GeneratedSpec[]> {
+  const specs: GeneratedSpec[] = [];
+  for (const s of checkpoint.generatedSpecs) {
+    const abs = join(ctx.projectDir, s.path);
+    const contents = await readFile(abs, 'utf-8');
+    specs.push({ path: abs, title: s.title, reqTag: s.reqTag, tier: s.tier, contents });
   }
   return specs;
 }

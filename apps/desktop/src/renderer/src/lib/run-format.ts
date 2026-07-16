@@ -103,10 +103,22 @@ export function formatTime(iso: string | null): string {
   return d.toLocaleTimeString(undefined, { hour12: false });
 }
 
+/** Scales ms -> s -> min -> hr so a long run reads as "23m 52s" instead of a raw "1432.3s". */
 export function formatDuration(ms: number | null | undefined): string {
   if (ms == null) return '—';
   if (ms < 1000) return `${ms}ms`;
-  return `${(ms / 1000).toFixed(1)}s`;
+  const totalSeconds = ms / 1000;
+  // Round once, up front, so the sub-minute display and the minute/hour
+  // branch boundary agree (otherwise e.g. 59.96s would print "60.0s" while
+  // still taking the seconds-only branch instead of rolling over to "1m 0s").
+  const roundedSeconds = Math.round(totalSeconds);
+  if (roundedSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const totalMinutes = Math.floor(roundedSeconds / 60);
+  const seconds = roundedSeconds % 60;
+  if (totalMinutes < 60) return `${totalMinutes}m ${seconds}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
 }
 
 /** Human label for each AgentEvent phase code, in pipeline order. Phases with no label (e.g. 'launch', 'export', 'done') are folded into the total but not broken out individually. */

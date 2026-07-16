@@ -1057,4 +1057,93 @@ describe('orchestrator paths (offline DI seam)', () => {
     const launchError = events.find((e) => e.phase === 'launch' && e.level === 'error');
     expect(launchError?.message).toMatch(/could not be started/i);
   });
+
+  it('REACHABILITY GATE: an unreachable black-box baseUrl skips exploration but the run still completes', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Unreachable BaseUrl Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    let started = false;
+    const untouchedBrowser: BrowserSurface = {
+      ...fakeBrowser,
+      async start(_opts?: BrowserSurfaceOptions): Promise<void> {
+        started = true;
+      },
+    };
+    const unreachableTarget: TargetAdapter = {
+      ...fakeTarget,
+      async probeUrl(_url: string): Promise<UrlProbe> {
+        return { reachable: false };
+      },
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => unreachableTarget,
+      makeBrowser: () => untouchedBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    // The run never crawled a dead URL, but still runs generate/execute to completion.
+    expect(started).toBe(false);
+    expect(['passed', 'failed']).toContain(summary.status);
+    const warn = events.find((e) => e.phase === 'explore' && e.level === 'warn');
+    expect(warn?.message).toMatch(/not reachable/i);
+  });
+
+  it('REACHABILITY GATE: a white-box launch skips the redundant reachability probe', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'WhiteBox No Double Probe',
+      mode: 'playwright',
+      repoPath: join(tmpdir(), 'healix-fake-repo'),
+    });
+
+    let probeCalls = 0;
+    const target: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        return {
+          kind: 'frontend',
+          framework: 'react',
+          packageManager: 'npm',
+          startCommand: 'npm run dev',
+          installCommand: 'npm install',
+          installDir: '.',
+          port: null,
+          baseUrl: null,
+        };
+      },
+      async launch(): Promise<LaunchHandle> {
+        return { baseUrl: 'http://127.0.0.1:4198', pid: null, async stop(): Promise<void> {} };
+      },
+      async probeUrl(url: string): Promise<UrlProbe> {
+        probeCalls += 1;
+        return fakeTarget.probeUrl(url);
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => target,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    // launch()'s own readiness race already proved the URL reachable — the new
+    // black-box-only reachability gate must not probe it a second time.
+    expect(probeCalls).toBe(0);
+    expect(summary.status).toBe('passed');
+  });
 });

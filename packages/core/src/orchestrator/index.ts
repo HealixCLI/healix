@@ -829,69 +829,90 @@ async function runPipeline(
       // a DOM snapshot to ground — skip the live browser pass entirely.
       emit('explore', 'debug', 'Skipping exploration (reuse mode).');
     } else if (effectiveBaseUrl) {
-      setStatus('exploring');
-      emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
-      // Live frame mirroring is best-effort and must never abort the run; the
-      // subscription + browser teardown both happen in this phase's finally.
-      let unsubFrames: (() => void) | null = null;
-      // Resolves the moment a frame is actually delivered to hooks.onFrame —
-      // used below to hold teardown open just long enough for the mirror's
-      // in-flight capture to land. Without this, a real screenshot capture
-      // (genuinely tens to hundreds of ms against a real browser) can still
-      // be in flight when this phase's own work (goto + one DOM snapshot)
-      // finishes first; unsubscribing/stopping the browser at that point
-      // silently drops the frame before it's ever delivered.
-      let firstFrame: Promise<void> | null = null;
-      try {
-        await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
-        await browser.goto(effectiveBaseUrl);
-        // Subscribe AFTER start/goto so the UI only mirrors the live page.
-        if (hooks?.onFrame) {
-          try {
-            let resolveFirstFrame: () => void = () => undefined;
-            firstFrame = new Promise((resolve) => {
-              resolveFirstFrame = resolve;
-            });
-            let delivered = false;
-            unsubFrames = browser.onFrame((png) => {
-              hooks?.onFrame?.(png);
-              if (!delivered) {
-                delivered = true;
-                resolveFirstFrame();
-              }
-            });
-          } catch (err) {
-            emit('explore', 'debug', `Frame subscription failed (continuing): ${errMsg(err)}`);
+      // Black-box projects (a user-supplied baseUrl with no locally-spawned
+      // dev server) never had that URL verified reachable — white-box
+      // launches already prove readiness via launch()'s own probeUrl race.
+      // Without this, an unreachable black-box baseUrl fell straight into
+      // browser.goto()'s own timeout, and then GENERATE/EXECUTE still ran
+      // blind against a dead app.
+      let reachable = true;
+      if (!launchHandle) {
+        const probe = await target.probeUrl(effectiveBaseUrl, 8_000);
+        reachable = probe.reachable;
+        if (!reachable) {
+          emit(
+            'explore',
+            'warn',
+            `Base URL ${effectiveBaseUrl} is not reachable; skipping exploration.`,
+            { probe },
+          );
+        }
+      }
+      if (reachable) {
+        setStatus('exploring');
+        emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
+        // Live frame mirroring is best-effort and must never abort the run; the
+        // subscription + browser teardown both happen in this phase's finally.
+        let unsubFrames: (() => void) | null = null;
+        // Resolves the moment a frame is actually delivered to hooks.onFrame —
+        // used below to hold teardown open just long enough for the mirror's
+        // in-flight capture to land. Without this, a real screenshot capture
+        // (genuinely tens to hundreds of ms against a real browser) can still
+        // be in flight when this phase's own work (goto + one DOM snapshot)
+        // finishes first; unsubscribing/stopping the browser at that point
+        // silently drops the frame before it's ever delivered.
+        let firstFrame: Promise<void> | null = null;
+        try {
+          await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
+          await browser.goto(effectiveBaseUrl);
+          // Subscribe AFTER start/goto so the UI only mirrors the live page.
+          if (hooks?.onFrame) {
+            try {
+              let resolveFirstFrame: () => void = () => undefined;
+              firstFrame = new Promise((resolve) => {
+                resolveFirstFrame = resolve;
+              });
+              let delivered = false;
+              unsubFrames = browser.onFrame((png) => {
+                hooks?.onFrame?.(png);
+                if (!delivered) {
+                  delivered = true;
+                  resolveFirstFrame();
+                }
+              });
+            } catch (err) {
+              emit('explore', 'debug', `Frame subscription failed (continuing): ${errMsg(err)}`);
+            }
           }
-        }
-        const snap = await browser.snapshot();
-        // Ground GENERATE in what we actually observed: the interactive-element
-        // inventory is fed into the generation prompt so specs target real
-        // selectors instead of guessing (was captured, then dropped).
-        ctx.snapshot = snap;
-        emit('explore', 'info', `Explored "${snap.title}".`, {
-          url: snap.url,
-          interactiveElements: snap.interactiveElements.length,
-        });
-        // Bounded best-effort wait: give the mirror a brief window to deliver
-        // its first frame if it hasn't already, so short explorations still
-        // get one before the browser tears down. Never blocks the run for
-        // more than this cap.
-        if (firstFrame) {
-          await Promise.race([firstFrame, delay(600)]);
-        }
-      } catch (err) {
-        emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
-      } finally {
-        // Always unsubscribe before stopping the browser, both best-effort.
-        if (unsubFrames) {
-          try {
-            unsubFrames();
-          } catch {
-            /* never let unsubscribe crash the run */
+          const snap = await browser.snapshot();
+          // Ground GENERATE in what we actually observed: the interactive-element
+          // inventory is fed into the generation prompt so specs target real
+          // selectors instead of guessing (was captured, then dropped).
+          ctx.snapshot = snap;
+          emit('explore', 'info', `Explored "${snap.title}".`, {
+            url: snap.url,
+            interactiveElements: snap.interactiveElements.length,
+          });
+          // Bounded best-effort wait: give the mirror a brief window to deliver
+          // its first frame if it hasn't already, so short explorations still
+          // get one before the browser tears down. Never blocks the run for
+          // more than this cap.
+          if (firstFrame) {
+            await Promise.race([firstFrame, delay(600)]);
           }
+        } catch (err) {
+          emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+        } finally {
+          // Always unsubscribe before stopping the browser, both best-effort.
+          if (unsubFrames) {
+            try {
+              unsubFrames();
+            } catch {
+              /* never let unsubscribe crash the run */
+            }
+          }
+          await browser.stop().catch(() => undefined);
         }
-        await browser.stop().catch(() => undefined);
       }
     } else {
       emit('explore', 'debug', 'Skipping exploration.');

@@ -219,7 +219,8 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
-  const scenarios = item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
+  const scenarios =
+    item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
 
   const tierGuidance =
@@ -409,10 +410,7 @@ const GEN_CONCURRENCY = 3;
  * Run up to `concurrency` promises at a time from `tasks`. Returns results in
  * the same order as `tasks` regardless of completion order.
  */
-async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-): Promise<T[]> {
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   let nextIndex = 0;
 

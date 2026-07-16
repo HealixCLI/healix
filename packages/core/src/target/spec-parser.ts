@@ -206,10 +206,13 @@ const MAX_SPEC_FILES = 25;
 const MAX_DEPTH = 4;
 
 /**
- * Find likely OpenAPI/Swagger/Postman/GraphQL spec files by scanning a bounded set of
- * conventional directories (docs/api/spec/openapi/swagger/src) up to MAX_DEPTH deep, capped at
+ * Find likely OpenAPI/Swagger/Postman/GraphQL spec files: the repo root's own top-level files
+ * (a Postman export or `openapi.yaml` dropped next to package.json is common in practice — found
+ * via a real fixture during development) plus a bounded recursive scan of conventional
+ * directories (docs/api/spec/openapi/swagger/src), up to MAX_DEPTH deep, capped at
  * MAX_SPEC_FILES. This is a targeted scan, not a full repo walk — spec files are expected to live
- * in one of these directories in practice, so scanning the whole tree would be wasted work.
+ * at the root or in one of these directories in practice, so scanning the whole tree would be
+ * wasted work.
  */
 export function findSpecFiles(repoPath: string): string[] {
   const root = path.resolve(repoPath);
@@ -233,6 +236,19 @@ export function findSpecFiles(repoPath: string): string[] {
       } else if (entry.isFile() && SPEC_FILE_RE.test(entry.name)) {
         found.push(abs);
       }
+    }
+  }
+
+  let rootEntries: fs.Dirent[] = [];
+  try {
+    rootEntries = fs.readdirSync(root, { withFileTypes: true });
+  } catch {
+    return found;
+  }
+  for (const entry of rootEntries) {
+    if (found.length >= MAX_SPEC_FILES) return found;
+    if (entry.isFile() && !entry.isSymbolicLink() && SPEC_FILE_RE.test(entry.name)) {
+      found.push(path.join(root, entry.name));
     }
   }
 

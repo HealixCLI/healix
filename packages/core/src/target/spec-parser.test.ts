@@ -177,6 +177,13 @@ describe('findSpecFiles', () => {
     const dir = makeRepo();
     expect(findSpecFiles(dir)).toEqual([]);
   });
+
+  it('finds a Postman collection dropped at the repo root (not inside any conventional dir)', () => {
+    const dir = makeRepo();
+    fs.writeFileSync(path.join(dir, 'MyApi.postman_collection.json'), '{}');
+    const found = findSpecFiles(dir).map((f) => path.relative(dir, f));
+    expect(found).toContain('MyApi.postman_collection.json');
+  });
 });
 
 // --- Isolated check against real fixture Postman collections (Item C2) -----

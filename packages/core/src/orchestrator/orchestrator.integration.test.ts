@@ -143,7 +143,9 @@ const fakeMode: TestMode = {
     const specTitles = new Set(specs.map((s) => s.title));
     const results = CANNED_OUTCOME.results
       .filter(
-        (r) => specTitles.has(r.title) || (fakeModeExecuteCallCount === 1 && !fakeModeAllGeneratedTitles.has(r.title)),
+        (r) =>
+          specTitles.has(r.title) ||
+          (fakeModeExecuteCallCount === 1 && !fakeModeAllGeneratedTitles.has(r.title)),
       )
       .map((r) => ({ ...r }));
     return {

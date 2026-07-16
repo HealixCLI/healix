@@ -427,7 +427,10 @@ async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunS
  * executeRun's finally), so the "one run at a time" gate and the queue both
  * treat it identically to a brand-new run.
  */
-async function resumeRun(runId: string, send: (channel: string, payload: unknown) => void): Promise<RunSummary> {
+async function resumeRun(
+  runId: string,
+  send: (channel: string, payload: unknown) => void,
+): Promise<RunSummary> {
   const controller = new AbortController();
   activeRuns.set(runId, controller);
 
@@ -1309,7 +1312,9 @@ async function reconcileRunsOnBoot(): Promise<void> {
     toResume.push({ ...run, status: 'paused', pauseReason });
   }
   if (failedNow > 0) {
-    console.log(`[healix] boot: marked ${failedNow} uncheckpointed in-flight run(s) as error (nothing to resume from).`);
+    console.log(
+      `[healix] boot: marked ${failedNow} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
+    );
   }
 
   for (const run of toResume) {

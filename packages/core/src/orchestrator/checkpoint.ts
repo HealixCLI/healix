@@ -39,7 +39,13 @@ export interface ResumeCheckpoint {
     failed: number;
     blocked: number;
     flaky: number;
-    results: Array<{ title: string; status: string; durationMs?: number; error?: string; artifacts?: string[] }>;
+    results: Array<{
+      title: string;
+      status: string;
+      durationMs?: number;
+      error?: string;
+      artifacts?: string[];
+    }>;
   };
   /**
    * Stable-key -> testId rows already inserted for this run (see index.ts's

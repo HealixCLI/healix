@@ -2,7 +2,12 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { classifyTransientFailure, readCheckpoint, writeCheckpoint, type ResumeCheckpoint } from './checkpoint.js';
+import {
+  classifyTransientFailure,
+  readCheckpoint,
+  writeCheckpoint,
+  type ResumeCheckpoint,
+} from './checkpoint.js';
 
 const tempDirs: string[] = [];
 
@@ -53,9 +58,9 @@ describe('classifyTransientFailure', () => {
   it('classifies connection/DNS/timeout errors as network', () => {
     expect(classifyTransientFailure('connect ECONNREFUSED 127.0.0.1:443')).toBe('network');
     expect(classifyTransientFailure('getaddrinfo ENOTFOUND api.anthropic.com')).toBe('network');
-    expect(classifyTransientFailure('request to https://api.anthropic.com failed, reason: fetch failed')).toBe(
-      'network',
-    );
+    expect(
+      classifyTransientFailure('request to https://api.anthropic.com failed, reason: fetch failed'),
+    ).toBe('network');
     expect(classifyTransientFailure('socket hang up')).toBe('network');
   });
 

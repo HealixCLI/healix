@@ -758,11 +758,10 @@ export async function execute(
   opts?: { onlyTier?: Tier },
 ): Promise<ExecOutcome> {
   const onlyTier = opts?.onlyTier;
-  emit(
-    ctx,
-    `Executing ${specs.length} spec(s) via Playwright${onlyTier ? ` (${onlyTier} only)` : ''}`,
-    { count: specs.length, onlyTier },
-  );
+  emit(ctx, `Executing ${specs.length} spec(s) via Playwright${onlyTier ? ` (${onlyTier} only)` : ''}`, {
+    count: specs.length,
+    onlyTier,
+  });
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');

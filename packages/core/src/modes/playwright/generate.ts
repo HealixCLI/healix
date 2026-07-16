@@ -513,7 +513,9 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
     specs.length === 0 &&
     outcomes.every((o) => o.providerFailureDetail !== undefined)
   ) {
-    throw new ProviderUnavailableError(lastProviderFailureDetail ?? 'Provider unavailable during generation.');
+    throw new ProviderUnavailableError(
+      lastProviderFailureDetail ?? 'Provider unavailable during generation.',
+    );
   }
 
   emit(ctx, `Generation complete: ${specs.length}/${items.length} spec(s) accepted`, {

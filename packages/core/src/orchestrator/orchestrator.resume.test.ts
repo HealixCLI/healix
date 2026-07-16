@@ -84,8 +84,20 @@ const fakeProvider: ProviderAdapter = {
 };
 
 const CANNED_SPECS: GeneratedSpec[] = [
-  { path: 'tests/home.spec.ts', title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', contents: '// home' },
-  { path: 'tests/login.spec.ts', title: 'Login works', reqTag: 'REQ-002', tier: 'tierB-auth', contents: '// login' },
+  {
+    path: 'tests/home.spec.ts',
+    title: 'Home loads',
+    reqTag: 'REQ-001',
+    tier: 'tierA-public',
+    contents: '// home',
+  },
+  {
+    path: 'tests/login.spec.ts',
+    title: 'Login works',
+    reqTag: 'REQ-002',
+    tier: 'tierB-auth',
+    contents: '// login',
+  },
 ];
 
 const fakeTarget: TargetAdapter = {
@@ -137,7 +149,11 @@ interface ExecuteProbe {
 }
 
 /** TestMode whose execute() throws for a specific tier's call (once), simulating a mid-suite interruption. */
-function makeInterruptibleMode(probe: ExecuteProbe, failOnTier: string | null, failMessage: string): TestMode {
+function makeInterruptibleMode(
+  probe: ExecuteProbe,
+  failOnTier: string | null,
+  failMessage: string,
+): TestMode {
   let failed = false;
   return {
     id: 'playwright',
@@ -156,7 +172,11 @@ function makeInterruptibleMode(probe: ExecuteProbe, failOnTier: string | null, f
       }
       return specs;
     },
-    async execute(_ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: string }): Promise<ExecOutcome> {
+    async execute(
+      _ctx: TestModeContext,
+      specs: GeneratedSpec[],
+      opts?: { onlyTier?: string },
+    ): Promise<ExecOutcome> {
       const tier = opts?.onlyTier ?? specs[0]?.tier ?? 'unknown';
       probe.executeCallsByTier.push(tier);
       if (!failed && failOnTier !== null && tier === failOnTier) {
@@ -206,7 +226,8 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     const probe: ExecuteProbe = { generateCalls: 0, executeCallsByTier: [] };
     const orchestrator = createOrchestrator({
       provider: fakeProvider,
-      getMode: () => makeInterruptibleMode(probe, 'tierB-auth', 'request to provider failed, reason: fetch failed'),
+      getMode: () =>
+        makeInterruptibleMode(probe, 'tierB-auth', 'request to provider failed, reason: fetch failed'),
       makeTarget: () => fakeTarget,
       makeBrowser: () => fakeBrowser,
     });
@@ -452,7 +473,12 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
       mode: 'playwright',
       baseUrl: 'https://app.example.test',
     });
-    const run = store.createRun(project.id, { provider: null, mode: 'playwright', suiteMode: 'fresh', baseRunId: null });
+    const run = store.createRun(project.id, {
+      provider: null,
+      mode: 'playwright',
+      suiteMode: 'fresh',
+      baseRunId: null,
+    });
 
     const orchestrator = createOrchestrator({
       provider: fakeProvider,

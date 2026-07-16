@@ -41,7 +41,9 @@ export interface HealixBridge {
   approveRun: (runId: string, decision: PlanApprovalResult) => Promise<{ settled: boolean }>;
   cancelRun: (runId: string) => Promise<{ cancelled: boolean }>;
   pauseRun: (runId: string) => Promise<{ paused: boolean }>;
-  resumeRun: (runId: string) => Promise<{ resumed: true; summary: RunSummary } | { resumed: false; reason: string }>;
+  resumeRun: (
+    runId: string,
+  ) => Promise<{ resumed: true; summary: RunSummary } | { resumed: false; reason: string }>;
   getActiveRun: () => Promise<ActiveRunSnapshot | null>;
 
   // ---- run queue ----

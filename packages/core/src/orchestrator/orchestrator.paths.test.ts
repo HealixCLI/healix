@@ -147,7 +147,9 @@ function makeFakeMode(outcome: ExecOutcome): TestMode {
       executeCallCount += 1;
       const specTitles = new Set(specs.map((s) => s.title));
       const results = outcome.results
-        .filter((r) => specTitles.has(r.title) || (executeCallCount === 1 && !allGeneratedTitles.has(r.title)))
+        .filter(
+          (r) => specTitles.has(r.title) || (executeCallCount === 1 && !allGeneratedTitles.has(r.title)),
+        )
         .map((r) => ({ ...r }));
       return {
         passed: results.filter((r) => r.status === 'passed').length,

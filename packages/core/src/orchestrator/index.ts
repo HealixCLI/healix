@@ -141,7 +141,11 @@ async function resumePipeline(
 ): Promise<RunSummary> {
   const store = overrides?.store ?? (await getStore());
   if (!store) {
-    hooks?.onEvent?.({ phase: 'plan', level: 'error', message: 'Storage unavailable (node:sqlite missing); cannot resume run.' });
+    hooks?.onEvent?.({
+      phase: 'plan',
+      level: 'error',
+      message: 'Storage unavailable (node:sqlite missing); cannot resume run.',
+    });
     return { runId, status: 'error' };
   }
   const run = store.getRun(runId);
@@ -560,7 +564,10 @@ async function runPipeline(
           try {
             const functionality = await indexFunctionality(project.repoPath);
             if (functionality.units.length > 0) {
-              repoIndex = { ...(repoIndex ?? { summary: '', files: [] }), functionality: functionality.units };
+              repoIndex = {
+                ...(repoIndex ?? { summary: '', files: [] }),
+                functionality: functionality.units,
+              };
               emit(
                 'plan',
                 'debug',
@@ -568,7 +575,11 @@ async function runPipeline(
               );
             }
           } catch (err) {
-            emit('plan', 'debug', `Functionality indexing failed (planning without route context): ${errMsg(err)}`);
+            emit(
+              'plan',
+              'debug',
+              `Functionality indexing failed (planning without route context): ${errMsg(err)}`,
+            );
           }
         }
 
@@ -902,7 +913,9 @@ async function runPipeline(
         await mode.scaffold(ctx);
         specs = await hydrateCheckpointedSpecs(ctx, resumeFrom.checkpoint);
       } catch (err) {
-        emit('generate', 'error', `Could not restore checkpointed specs: ${errMsg(err)}`, { stack: errStack(err) });
+        emit('generate', 'error', `Could not restore checkpointed specs: ${errMsg(err)}`, {
+          stack: errStack(err),
+        });
         setStatus('error', { finishedAt: nowIso() });
         const summary = await finalizeReport(
           runDir,
@@ -961,7 +974,8 @@ async function runPipeline(
         // whatever granularity that run used) get a single row, as before.
         for (const spec of newSpecs)
           registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
-        for (const spec of carriedSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
+        for (const spec of carriedSpecs)
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.

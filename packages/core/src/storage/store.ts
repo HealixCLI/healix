@@ -269,7 +269,9 @@ export class HealixStore {
    */
   listAutoResumableRuns(): Run[] {
     const rows = this.db
-      .prepare(`SELECT * FROM runs WHERE status = 'paused' AND pause_reason != 'manual' ORDER BY created_at ASC`)
+      .prepare(
+        `SELECT * FROM runs WHERE status = 'paused' AND pause_reason != 'manual' ORDER BY created_at ASC`,
+      )
       .all() as Array<Record<string, unknown>>;
     return rows.map(rowToRun);
   }

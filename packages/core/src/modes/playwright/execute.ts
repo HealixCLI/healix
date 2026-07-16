@@ -530,13 +530,28 @@ async function readSetupMeta(projectDir: string): Promise<boolean | null> {
   return null;
 }
 
+/**
+ * `result.error` and `result.errors[]` usually overlap heavily — Playwright
+ * repeats the same failure (message + stack + call log) across both fields,
+ * which used to print the same "Test timeout of 60000ms exceeded." block
+ * two or three times in a row. Take the richest single field per error
+ * (stack already includes the message and call log) and drop exact repeats.
+ */
 function errorText(result: PwResult | undefined): string {
   if (!result) return '';
-  const parts: string[] = [];
-  if (result.error)
-    parts.push(result.error.message ?? '', result.error.stack ?? '', result.error.value ?? '');
-  for (const e of result.errors ?? []) parts.push(e.message ?? '', e.stack ?? '', e.value ?? '');
-  return stripAnsi(parts.filter(Boolean).join('\n')).trim();
+  const candidates: PwError[] = [];
+  if (result.error) candidates.push(result.error);
+  for (const e of result.errors ?? []) candidates.push(e);
+
+  const seen = new Set<string>();
+  const blocks: string[] = [];
+  for (const err of candidates) {
+    const text = stripAnsi(err.stack || err.message || err.value || '').trim();
+    if (!text || seen.has(text)) continue;
+    seen.add(text);
+    blocks.push(text);
+  }
+  return blocks.join('\n---\n').trim();
 }
 
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {

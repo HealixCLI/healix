@@ -86,6 +86,58 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('Fix the missing aria-label on the submit button.');
   });
 
+  it('shows a one-line error summary with the full call log tucked behind a details toggle', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          status: 'failed',
+          durationMs: 5,
+          error:
+            'Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole(\'button\')\nat spec.ts:7:18',
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<div class="err-summary">Error: locator.click: Test timeout of 60000ms exceeded.</div>');
+    expect(html).toContain('<details><summary>Full details</summary>');
+    expect(html).toContain('Call log:');
+  });
+
+  it('inlines the matching triage verdict/rationale under a failed row instead of only in a separate table', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: '[REQ:REQ-1] positive: fails', status: 'failed', durationMs: 5, error: 'boom' }],
+    };
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          error: 'boom',
+          triage: { verdict: 'app_is_wrong', confidence: 0.9, rationale: 'Real defect.' },
+        },
+      ],
+    });
+    const html = renderReportHtml(report);
+    // Inline diagnosis appears once per matching row, inside the Results table's error cell.
+    expect(html).toContain('class="diagnosis"');
+    expect(html).toContain('App defect');
+    expect(html).toContain('90% confidence');
+    expect(html).toContain('Real defect.');
+  });
+
   it('omits the coverage card/section entirely when coverage was never computed (e.g. reuse mode)', () => {
     const report = buildReport({ run, project, plan, outcome: null, triage: [] });
     expect(report.coverage).toBeNull();

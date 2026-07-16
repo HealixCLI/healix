@@ -62,6 +62,48 @@ function baseName(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
+const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
+  app_is_wrong: 'App defect',
+  test_is_wrong: 'Test defect',
+  environment: 'Environment',
+  flaky: 'Flaky',
+  ambiguous: 'Ambiguous',
+};
+
+/**
+ * Split a raw Playwright error blob into a one-line summary (for the row
+ * itself) and the remaining call log / stack trace (tucked behind a
+ * <details> toggle) — a full multi-paragraph dump inline made the Results
+ * table unreadable at a glance.
+ */
+function splitErrorText(raw: string): { summary: string; rest: string } {
+  const lines = raw.split('\n');
+  const summary = (lines[0] ?? '').trim() || raw.trim();
+  const rest = lines.slice(1).join('\n').trim();
+  return { summary, rest };
+}
+
+function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
+  if (!error) return '';
+  const { summary, rest } = splitErrorText(error);
+  const detailsBlock = rest
+    ? `<details><summary>Full details</summary><pre>${esc(rest)}</pre></details>`
+    : '';
+  const triageBlock = triage
+    ? `<div class="diagnosis"><span class="tag verdict-${esc(triage.triage.verdict)}">${esc(
+        VERDICT_LABEL[triage.triage.verdict] ?? triage.triage.verdict,
+      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span>
+      <div>${esc(triage.triage.rationale)}</div>
+      ${
+        triage.triage.suggestedPatch
+          ? `<div><strong>Suggested fix:</strong> <code>${esc(triage.triage.suggestedPatch)}</code></div>`
+          : ''
+      }
+    </div>`
+    : '';
+  return `<div class="err-summary">${esc(summary)}</div>${triageBlock}${detailsBlock}`;
+}
+
 /** Render a self-contained, dependency-free HTML report. */
 export function renderReportHtml(report: RunReport): string {
   const { run, project, plan, outcome, triage, coverage } = report;
@@ -88,6 +130,10 @@ export function renderReportHtml(report: RunReport): string {
     })
     .join('');
 
+  // Triage is keyed by title so a failed row can show its verdict/rationale
+  // inline instead of forcing readers to cross-reference a separate table.
+  const triageByTitle = new Map<string, ReportTriageEntry>(triage.map((t) => [t.title, t]));
+
   const resultRows = (outcome?.results ?? [])
     .map((r) => {
       const artifactNote =
@@ -96,7 +142,7 @@ export function renderReportHtml(report: RunReport): string {
           : '';
       return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${
         r.durationMs != null ? esc(String(r.durationMs)) + ' ms' : ''
-      }</td><td>${esc(r.error ?? '')}${artifactNote}</td></tr>`;
+      }</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
     })
     .join('');
 
@@ -158,7 +204,17 @@ export function renderReportHtml(report: RunReport): string {
     padding: 0 .35rem; border-radius: 4px; background: #8884; text-decoration: none; }
   .hist { font-size: .75rem; color: #888; margin-top: .15rem; text-decoration: none; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: .75rem; margin: .35rem 0 0; }
   section { margin-bottom: 1rem; }
+  .err-summary { font-weight: 600; }
+  .diagnosis { margin-top: .35rem; font-size: .8rem; }
+  .diagnosis .hist { display: inline; }
+  .verdict-app_is_wrong { background: #cf222e30; }
+  .verdict-test_is_wrong { background: #9a670030; }
+  .verdict-environment { background: #9a670030; }
+  .verdict-flaky { background: #9a670030; }
+  .verdict-ambiguous { background: #88848430; }
+  details summary { cursor: pointer; font-size: .75rem; color: #888; }
 </style>
 </head>
 <body>

@@ -1,12 +1,25 @@
 import type { Project, Run } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** One triaged failure, attached to the report. */
 export interface ReportTriageEntry {
   title: string;
   error: string;
   triage: TriageResult;
+}
+
+/**
+ * Serializable snapshot of the coverage-feedback loop's final state (see
+ * orchestrator/coverage.ts's CoverageResult) — a plain object instead of a
+ * Set, so it survives JSON.stringify/report.json round-tripping intact.
+ */
+export interface ReportCoverageSummary {
+  ratio: number;
+  coveredCount: number;
+  totalCount: number;
+  uncovered: FunctionalityUnit[];
 }
 
 /** Serializable run report written to reports/report.json. */
@@ -18,6 +31,8 @@ export interface RunReport {
   triage: ReportTriageEntry[];
   /** Artifact files collected from the mode after execution (relative paths). */
   artifacts: string[];
+  /** Functionality-unit coverage reached by the coverage-feedback loop; null when it didn't run (e.g. reuse mode, or no functionality inventory). */
+  coverage: ReportCoverageSummary | null;
   generatedAt: string;
 }
 
@@ -28,6 +43,7 @@ export function buildReport(input: {
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
   artifacts?: string[];
+  coverage?: ReportCoverageSummary | null;
 }): RunReport {
   return {
     run: input.run,
@@ -36,13 +52,19 @@ export function buildReport(input: {
     outcome: input.outcome,
     triage: input.triage,
     artifacts: input.artifacts ?? [],
+    coverage: input.coverage ?? null,
     generatedAt: new Date().toISOString(),
   };
 }
 
+/** Last path segment, for display only — avoids printing a full local filesystem path into the report. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
 /** Render a self-contained, dependency-free HTML report. */
 export function renderReportHtml(report: RunReport): string {
-  const { run, project, plan, outcome, triage } = report;
+  const { run, project, plan, outcome, triage, coverage } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
@@ -67,12 +89,15 @@ export function renderReportHtml(report: RunReport): string {
     .join('');
 
   const resultRows = (outcome?.results ?? [])
-    .map(
-      (r) =>
-        `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${
-          r.durationMs != null ? esc(String(r.durationMs)) + ' ms' : ''
-        }</td><td>${esc(r.error ?? '')}</td></tr>`,
-    )
+    .map((r) => {
+      const artifactNote =
+        r.artifacts && r.artifacts.length > 0
+          ? `<div class="hist">${r.artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`
+          : '';
+      return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${
+        r.durationMs != null ? esc(String(r.durationMs)) + ' ms' : ''
+      }</td><td>${esc(r.error ?? '')}${artifactNote}</td></tr>`;
+    })
     .join('');
 
   const triageRows = triage
@@ -80,9 +105,33 @@ export function renderReportHtml(report: RunReport): string {
       (t) =>
         `<tr><td>${esc(t.title)}</td><td>${esc(t.triage.verdict)}</td><td>${esc(
           (t.triage.confidence * 100).toFixed(0),
-        )}%</td><td>${esc(t.triage.rationale)}</td></tr>`,
+        )}%</td><td>${esc(t.triage.rationale)}${
+          t.triage.suggestedPatch
+            ? `<div class="hist"><strong>Suggested fix:</strong> <code>${esc(t.triage.suggestedPatch)}</code></div>`
+            : ''
+        }</td></tr>`,
     )
     .join('');
+
+  const coverageSection =
+    coverage != null
+      ? `<section>
+    <h2>Coverage</h2>
+    <p>${coverage.coveredCount}/${coverage.totalCount} functionality unit(s) covered (${Math.round(
+      coverage.ratio * 100,
+    )}%).</p>
+    ${
+      coverage.uncovered.length > 0
+        ? `<table>
+      <thead><tr><th>Uncovered unit</th><th>Kind</th><th>File</th></tr></thead>
+      <tbody>${coverage.uncovered
+        .map((u) => `<tr><td>${esc(u.label)}</td><td>${esc(u.kind)}</td><td>${esc(u.file)}</td></tr>`)
+        .join('')}</tbody>
+    </table>`
+        : ''
+    }
+  </section>`
+      : '';
 
   return `<!doctype html>
 <html lang="en">
@@ -124,7 +173,14 @@ export function renderReportHtml(report: RunReport): string {
     <div class="card"><div class="n fail">${failed}</div><div>failed</div></div>
     <div class="card"><div class="n warn">${blocked}</div><div>blocked</div></div>
     <div class="card"><div class="n warn">${flaky}</div><div>flaky</div></div>
+    ${
+      coverage != null
+        ? `<div class="card"><div class="n">${Math.round(coverage.ratio * 100)}%</div><div>coverage</div></div>`
+        : ''
+    }
   </div>
+
+  ${coverageSection}
 
   <section>
     <h2>Plan</h2>

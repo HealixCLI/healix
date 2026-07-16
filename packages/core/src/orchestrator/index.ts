@@ -34,7 +34,7 @@ import {
   FRESH_COVERAGE_TARGET,
   TOPUP_COVERAGE_TARGET,
 } from './coverage.js';
-import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
+import { buildReport, renderReportHtml, type ReportCoverageSummary, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
@@ -254,6 +254,9 @@ async function runPipeline(
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
   let artifactFiles: string[] = [];
+  // Final state of the coverage-feedback loop, surfaced in the report; stays null
+  // when the loop never runs (reuse mode, or no functionality inventory detected).
+  let coverageSummary: ReportCoverageSummary | null = null;
   // Stable key -> testId, so EXECUTE reuses the rows inserted in GENERATE (no duplicates).
   const testIdByKey = new Map<string, string>();
   // The base URL the suite should actually target (may be overridden by a white-box launch).
@@ -859,6 +862,12 @@ async function runPipeline(
         );
       }
       await writeJson(join(runDir, 'plan', 'plan.json'), plan);
+      coverageSummary = {
+        ratio: coverage.ratio,
+        coveredCount: coverage.coveredUnitKeys.size,
+        totalCount: units.length,
+        uncovered: coverage.uncovered,
+      };
     }
 
     // ---- 9. TRIAGE (best-effort) ----
@@ -876,42 +885,58 @@ async function runPipeline(
       if (failed.length > 0) {
         emit('triage', 'info', `Triaging ${failed.length} failure(s)/blocked outcome(s).`);
         const engine = createTriageEngine();
-        let aiBudget = TRIAGE_AI_LIMIT;
-        for (const r of failed) {
+
+        // classify() is synchronous/deterministic — run it for every failure up
+        // front as the baseline (and the fallback if AI enrichment below fails).
+        const baseline = failed.map((r) => {
           // Recover the originating spec (by normalized title) to ground the triage
           // input with its requirement tag and source.
           const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
+          // Surface a captured trace/screenshot to the AI prompt (see
+          // prompt.ts's "TRACE PATH" block) — this was collected by execute.ts
+          // but never threaded through before, so triage only ever "knew" a
+          // trace existed by chance, never which file.
+          const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
           const input: TriageInput = {
             title: r.title,
             error: r.error ?? '',
             ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
             ...(spec?.contents ? { specSource: spec.contents } : {}),
+            ...(tracePath ? { tracePath } : {}),
           };
-          // Deterministic baseline always wins as the starting point and the fallback.
-          let triage: ReportTriageEntry['triage'];
+          let triage: ReportTriageEntry['triage'] | null = null;
           try {
             triage = engine.classify(input);
           } catch (err) {
             emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
-            continue;
           }
-          // Best-effort AI enrichment for the first N failures, bounded per call.
-          if (aiBudget > 0) {
-            aiBudget -= 1;
+          return { r, input, triage };
+        });
+
+        // Best-effort AI enrichment for the first N failures, run CONCURRENTLY
+        // (each with its own bounded AbortController) rather than one at a
+        // time — triage was previously the run's most serial phase, adding up
+        // to TRIAGE_AI_LIMIT * TRIAGE_ANALYZE_TIMEOUT_MS of pure wall-clock.
+        const aiCandidates = baseline.filter((b) => b.triage !== null).slice(0, TRIAGE_AI_LIMIT);
+        await Promise.all(
+          aiCandidates.map(async (b) => {
             const controller = new AbortController();
             try {
               const enriched = await withTimeoutAbort(
-                engine.analyze(input, provider, controller.signal),
+                engine.analyze(b.input, provider, controller.signal),
                 TRIAGE_ANALYZE_TIMEOUT_MS,
                 controller,
               );
-              if (enriched) triage = enriched;
+              if (enriched) b.triage = enriched;
             } catch (err) {
               // Timeout / analyze() threw — keep the deterministic baseline.
-              emit('triage', 'debug', `AI triage skipped for "${r.title}": ${errMsg(err)}`);
+              emit('triage', 'debug', `AI triage skipped for "${b.r.title}": ${errMsg(err)}`);
             }
-          }
-          triageEntries.push({ title: r.title, error: r.error ?? '', triage });
+          }),
+        );
+
+        for (const b of baseline) {
+          if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
         }
         emit('triage', 'info', `Triaged ${triageEntries.length} failure(s).`);
       } else {
@@ -937,6 +962,7 @@ async function runPipeline(
         artifactFiles,
         noteStoreOk,
         noteStoreFailure,
+        coverageSummary,
       )
     ).reportPath;
 
@@ -1013,6 +1039,7 @@ async function runPipeline(
           artifactFiles,
           noteStoreOk,
           noteStoreFailure,
+          coverageSummary,
         )
       ).reportPath;
     } catch {
@@ -1187,7 +1214,16 @@ function registerSpecRows(
       status: 'pending',
       specPath,
     });
-    testIdByKey.set(base, test.id);
+    // `base` ignores title when reqTag is set (see stableKey), so repeated calls
+    // for the same reqTag — as happens once per scenario when carrying a
+    // multi-scenario spec forward — would otherwise collide on one bare key
+    // and silently overwrite each other's row, orphaning all but the last.
+    // Index each occurrence instead, mirroring the `${base}#i` scheme below,
+    // so persistResults' positional matching finds every one of them.
+    let i = 0;
+    while (testIdByKey.has(`${base}#${i}`)) i += 1;
+    testIdByKey.set(`${base}#${i}`, test.id);
+    if (i === 0) testIdByKey.set(base, test.id);
     return;
   }
 
@@ -1376,6 +1412,7 @@ async function finalizeReport(
   artifacts: string[],
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
+  coverage: ReportCoverageSummary | null = null,
 ): Promise<{ reportPath: string | undefined }> {
   const effectivePlan: TestPlan = plan ?? { summary: 'No plan generated.', items: [] };
   const report = buildReport({
@@ -1385,6 +1422,7 @@ async function finalizeReport(
     outcome,
     triage,
     artifacts,
+    coverage,
   });
   const reportPath = join(runDir, 'reports', 'report.json');
   try {

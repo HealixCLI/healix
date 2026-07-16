@@ -2,6 +2,7 @@ import type { ProviderAdapter } from '../providers/types.js';
 import type { TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
+import type { SourceContext } from '../target/source-context.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
 
 /** Result of the multi-page/multi-role EXPLORE crawl, grounding GENERATE. */
@@ -196,6 +197,8 @@ export interface TestModeContext {
   testingScope?: TestingScope;
   /** Multi-page/multi-role EXPLORE crawl artifact; grounds generation. */
   exploration?: ExplorationArtifact;
+  /** White-box static-analysis result (routes/endpoints/forms/auth patterns), set during PLAN; grounds generation and triage with real source-file citations. */
+  sourceContext?: SourceContext;
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;

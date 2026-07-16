@@ -10,6 +10,7 @@
  *     skip event; provider calls always request readOnly (codegen must never
  *     mutate the user's repo).
  */
+import { existsSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -17,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../providers/types.js';
 import type { TestModeContext, TestPlan } from '../types.js';
+import { indexSource } from '../../target/source-index.js';
 import { findForbiddenApis, generate, ProviderUnavailableError } from './generate.js';
 
 // ---- Realistic spec fixtures -------------------------------------------------
@@ -397,6 +399,167 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
   });
 });
 
+// ---- source-context grounding: ctx.sourceContext feeds real file/schema/form citations --------
+
+const SRC_CITED_SPEC = `import { test, expect } from '@playwright/test';
+
+// [SRC:routes/userRoutes.js]
+test('[REQ:REQ-1] home page renders', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+
+describe('generate — grounds the prompt in white-box source context (sourceContext)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-srcctx-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const PLAN_WITH_UNIT_KEY: TestPlan = {
+    summary: 'one item',
+    items: [{ ...PLAN.items[0], unitKey: 'endpoint:GET /api/users/:id' }],
+  };
+
+  function ctxWith(
+    sourceContext: TestModeContext['sourceContext'],
+    replies: string[] = [SRC_CITED_SPEC],
+  ): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider(replies, calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      sourceContext,
+    };
+  }
+
+  it('adds no source grounding when the item has no unitKey', async () => {
+    await generate(ctxWith({ units: [], forms: [], authPatterns: [], selectorHints: [], specSources: [], summary: '', truncated: false }), PLAN);
+    expect(calls[0].prompt).not.toContain('Source grounding');
+  });
+
+  it('adds no source grounding when the unitKey matches nothing in sourceContext', async () => {
+    await generate(ctxWith({ units: [], forms: [], authPatterns: [], selectorHints: [], specSources: [], summary: '', truncated: false }), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('Source grounding');
+  });
+
+  it('cites the real source file and requires the [SRC:...] comment when the unitKey matches', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+          method: 'GET',
+        },
+      ],
+      forms: [],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('routes/userRoutes.js');
+    expect(prompt).toContain('[SRC:routes/userRoutes.js]');
+  });
+
+  it('includes authoritative schema/auth info for a spec-provenance unit', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'docs/openapi.yaml',
+          method: 'GET',
+          provenance: 'spec',
+          authRequired: true,
+          responseSchema: { type: 'object', properties: { id: { type: 'string' } } },
+        },
+      ],
+      forms: [],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: ['docs/openapi.yaml'],
+      summary: '',
+      truncated: false,
+    };
+    await generate(
+      ctxWith(sourceContext, [SRC_CITED_SPEC.replace('routes/userRoutes.js', 'docs/openapi.yaml')]),
+      PLAN_WITH_UNIT_KEY,
+    );
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('authoritative API spec');
+    expect(prompt).toContain('do not invent request/response fields');
+    expect(prompt).toContain('Auth required: yes');
+    expect(prompt).toContain('"id":{"type":"string"}');
+  });
+
+  it('includes real form fields observed in the matched unit\'s file', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [{ name: 'email', type: 'email', required: true }],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).toContain('email (email, required)');
+  });
+
+  it('rejects and retries a spec missing its mandatory [SRC:...] citation, accepting a corrected retry', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    const specs = await generate(ctxWith(sourceContext, [CLEAN_SPEC, SRC_CITED_SPEC]), PLAN_WITH_UNIT_KEY);
+
+    expect(specs).toHaveLength(1);
+    expect(calls).toHaveLength(2);
+    expect(calls[1].prompt).toContain('[SRC:routes/userRoutes.js]');
+    expect(specs[0].contents).toContain('[SRC:routes/userRoutes.js]');
+  });
+});
+
 describe('generate — ProviderUnavailableError (systemic outage signal)', () => {
   let projectDir: string;
   let calls: FakeCall[];
@@ -494,4 +657,64 @@ test('[REQ:${reqTag}] renders', async ({ page }) => {
     const specs = await generate(makeCtx(provider), TWO_ITEM_PLAN);
     expect(specs).toHaveLength(1);
   });
+});
+
+// --- Isolated check against a real fixture repo (Item E2) -------------------
+// Runs indexSource() against the real RBAC backend to get a genuine matched unit, then confirms
+// generate() cites its real file and the citation gate rejects a spec that omits it.
+
+describe('generate — grounded against a real indexSource() result (isolated check)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-real-srcctx-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const RBAC_ROOT = join(
+    'C:',
+    'Users',
+    'AdroyFernandes',
+    'Documents',
+    'TestApps',
+    'Role-Based-Access-Control-RBAC-',
+  );
+
+  it.skipIf(!existsSync(RBAC_ROOT))(
+    'cites the real backend file for a plan item mapped to a real RBAC endpoint unit',
+    async () => {
+      const sourceContext = await indexSource(RBAC_ROOT, { maxUnits: 500 });
+      const unit = sourceContext.units.find((u) => u.key === 'endpoint:GET /api/users/:id');
+      expect(unit).toBeDefined();
+
+      const plan: TestPlan = {
+        summary: 'one item',
+        items: [{ ...PLAN.items[0], unitKey: unit!.key }],
+      };
+
+      const citedSpec = SRC_CITED_SPEC.replace('routes/userRoutes.js', unit!.file);
+      const specs = await generate(
+        {
+          projectDir,
+          baseUrl: 'http://localhost:3000',
+          provider: makeProvider([CLEAN_SPEC, citedSpec], calls),
+          target: {} as TestModeContext['target'],
+          browser: {} as TestModeContext['browser'],
+          sourceContext,
+        },
+        plan,
+      );
+
+      // First attempt (CLEAN_SPEC) has no citation and is rejected; the retry succeeds.
+      expect(calls).toHaveLength(2);
+      expect(calls[0].prompt).toContain(unit!.file);
+      expect(specs).toHaveLength(1);
+      expect(specs[0].contents).toContain(`[SRC:${unit!.file}]`);
+    },
+  );
 });

@@ -817,6 +817,7 @@ async function runPipeline(
       browser,
       explorationMode: opts.explorationMode ?? deriveExplorationMode(project),
       testingScope: opts.testingScope ?? 'both',
+      sourceContext,
       emit: ctxEmit,
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just

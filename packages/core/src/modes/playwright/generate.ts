@@ -175,6 +175,17 @@ function countReqTagOccurrences(source: string, reqTag: string): number {
   return [...source.matchAll(re)].length;
 }
 
+/** Retry note when a source-grounded item's output is missing its mandatory [SRC:file] citation. */
+function retryNoteMissingSrcCitation(file: string): string {
+  return `Your previous output was rejected because it didn't include a "// [SRC:${file}]" comment. Add exactly that comment, naming this file, somewhere in the generated spec so its grounding is traceable.`;
+}
+
+/** True iff a "// [SRC:<file>]"-shaped comment naming this exact file appears anywhere in the source. */
+function hasSrcCitation(source: string, file: string): boolean {
+  const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\[SRC:${escaped}\\]`).test(source);
+}
+
 /** Retry note when the previous attempt used forbidden APIs (deny-list gate). */
 function retryNoteForbidden(violations: string[]): string {
   return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '@playwright/test'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
@@ -252,12 +263,65 @@ function formatScenarios(scenarios: PlanScenario[]): string {
   return scenarios.map((s, i) => `${i + 1}. [${s.kind}] ${s.description}`).join('\n');
 }
 
+/** Cap on a JSON-stringified schema's length injected into the prompt, so one huge spec-derived schema can't blow it up. */
+const MAX_SCHEMA_CHARS = 600;
+
+function truncateJson(value: unknown, maxChars: number): string {
+  let json: string;
+  try {
+    json = JSON.stringify(value) ?? 'null';
+  } catch {
+    return 'null';
+  }
+  return json.length > maxChars ? `${json.slice(0, maxChars)}…` : json;
+}
+
+/**
+ * Render white-box static-analysis grounding for the plan item's matched source unit (see
+ * target/source-index.ts), when one exists: the real source file (with a mandatory `[SRC:...]`
+ * citation requirement, enforced by generateOne()'s own gate below — the same closed-loop pattern
+ * already used for the `[REQ:...]` tag), authoritative request/response schema + auth-requiredness
+ * for spec-derived (provenance: 'spec') units, and any real form fields observed in that file.
+ * Returns '' when the item has no unitKey or nothing in sourceContext matches it.
+ */
+function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string {
+  const unit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+  if (!unit) return '';
+
+  const lines: string[] = [
+    '',
+    '',
+    `Source grounding — this feature maps to real source at ${unit.file}${unit.method ? ` (${unit.method})` : ''}.`,
+    `You MUST include a comment "// [SRC:${unit.file}]" somewhere in the generated spec, naming this exact file, so its grounding is traceable.`,
+  ];
+
+  if (unit.provenance === 'spec') {
+    lines.push(
+      'This endpoint is defined in an authoritative API spec below — do not invent request/response fields beyond what is shown.',
+    );
+    if (unit.requestSchema !== undefined) lines.push(`Request shape: ${truncateJson(unit.requestSchema, MAX_SCHEMA_CHARS)}`);
+    if (unit.responseSchema !== undefined) lines.push(`Response shape: ${truncateJson(unit.responseSchema, MAX_SCHEMA_CHARS)}`);
+    if (unit.authRequired !== undefined) lines.push(`Auth required: ${unit.authRequired ? 'yes' : 'no'}.`);
+  }
+
+  const form = ctx.sourceContext?.forms.find((f) => f.file === unit.file);
+  if (form && form.fields.length > 0) {
+    const fieldList = form.fields
+      .map((f) => `${f.name} (${f.type}${f.required ? ', required' : ''})`)
+      .join(', ');
+    lines.push(`Real form fields observed in ${unit.file}: ${fieldList}.`);
+  }
+
+  return lines.join('\n');
+}
+
 function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
   const routingGuidance = formatRoutingGuidance(ctx);
+  const sourceGrounding = formatSourceGrounding(ctx, item);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
@@ -284,7 +348,7 @@ Requirements:
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
 - Be self-contained and runnable; do not import local helpers.
-- ${tierGuidance}${strictNote}${inventory}${routingGuidance}
+- ${tierGuidance}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -419,6 +483,20 @@ async function generateOne(
       );
       retryNote = retryNoteMissingPerTestTag(reqTag);
       lastReason = `[REQ:${reqTag}] missing from individual test titles after retry`;
+      continue;
+    }
+
+    // Source-citation gate: only enforced when this item actually matched a real
+    // source-context unit (formatSourceGrounding only demands the citation in that case) — an
+    // item with no unitKey/match has no file to cite, so nothing to gate here.
+    const matchedUnit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+    if (matchedUnit && !hasSrcCitation(source, matchedUnit.file)) {
+      emit(
+        ctx,
+        `Output for "${item.title}" is missing its [SRC:${matchedUnit.file}] citation (attempt ${attempt + 1}); retrying`,
+      );
+      retryNote = retryNoteMissingSrcCitation(matchedUnit.file);
+      lastReason = `missing [SRC:${matchedUnit.file}] citation after retry`;
       continue;
     }
 

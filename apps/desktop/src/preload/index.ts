@@ -11,9 +11,18 @@ export type RunChannelMessage =
   | { channel: 'run:plan'; payload: { runId: string; plan: unknown } }
   | { channel: 'run:done'; payload: { runId: string; summary: unknown } }
   // Live browser mirror frame (JPEG, base64) for computer-use runs.
-  | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } };
+  | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } }
+  // Broadcast to every window whenever the pending-run queue changes.
+  | { channel: 'queue:updated'; payload: { queue: unknown[] } };
 
-const RUN_CHANNELS = ['run:started', 'run:event', 'run:plan', 'run:done', 'run:frame'] as const;
+const RUN_CHANNELS = [
+  'run:started',
+  'run:event',
+  'run:plan',
+  'run:done',
+  'run:frame',
+  'queue:updated',
+] as const;
 
 const api = {
   // existing
@@ -62,6 +71,12 @@ const api = {
   approveRun: (runId: string, decision: { decision: 'cancel' } | { decision: 'proceed'; plan: unknown }) =>
     ipcRenderer.invoke('run:approve', { runId, ...decision }),
   cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
+  getActiveRun: () => ipcRenderer.invoke('run:active'),
+
+  // run queue (requests that arrived while another run was executing)
+  listQueue: () => ipcRenderer.invoke('queue:list'),
+  queueRemove: (queueEntryId: string) => ipcRenderer.invoke('queue:remove', { queueEntryId }),
+
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
   lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),

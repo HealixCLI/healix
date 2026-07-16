@@ -260,6 +260,41 @@ function settleApproval(runId: string, result: PlanApprovalResult): boolean {
   return true;
 }
 
+/**
+ * A run request that arrived while another run was active. Queued explicitly
+ * (the renderer only calls this path when the user chose "Queue run", not
+ * "Run now") and started automatically, in order, once the run ahead of it
+ * settles — see startNextQueued(). Planning/approval for a queued entry never
+ * happens ahead of time; it's just "project + options waiting its turn."
+ */
+interface QueuedRunRequest {
+  id: string;
+  projectId: string;
+  projectName: string;
+  args: StartRunArgs;
+  queuedAt: string;
+  sender: WebContents;
+}
+
+/** FIFO queue of pending run requests. Only ever mutated by run:start, queue:remove, and startNextQueued. */
+const runQueue: QueuedRunRequest[] = [];
+
+/** Serializable (no WebContents) view of the queue, sent to every renderer. */
+function serializeQueue(): Array<
+  Omit<QueuedRunRequest, 'sender' | 'args'> & { testingScope?: TestingScope; suiteMode?: SuiteMode }
+> {
+  return runQueue.map(({ sender: _sender, args, ...rest }) => ({
+    ...rest,
+    testingScope: args.testingScope,
+    suiteMode: args.suiteMode,
+  }));
+}
+
+/** Send a message to every open window — queue updates aren't scoped to whichever window started a particular run. */
+function broadcastAll(channel: string, payload: unknown): void {
+  for (const win of BrowserWindow.getAllWindows()) safeSend(win.webContents, channel, payload);
+}
+
 export interface StartRunArgs {
   projectId: string;
   /** What to test — drives tier selection; the underlying exploration
@@ -275,23 +310,13 @@ export interface StartRunArgs {
   baseRunId?: string;
 }
 
-ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs): Promise<RunSummary> => {
-  if (!args?.projectId) throw new Error('A projectId is required to start a run.');
-  // One run at a time: every run shares the single live-browser mirror surface
-  // and the target adapter binds fixed local ports, so concurrent runs would
-  // fight over both. Guard here until the run pipeline is multi-tenant.
-  if (activeRuns.size > 0) {
-    throw new Error('A run is already in progress. Cancel it or wait for it to finish.');
-  }
-  const sender = event.sender;
-
-  // The orchestrator owns the canonical runId. We learn it via the onRunCreated
-  // hook (fired right after the run row is created, before any phase event) and
-  // correlate run:started / approval / events to THAT id — no duplicate run row.
-  const store = await requireStore();
-  const project = store.getProject(args.projectId);
-  if (!project) throw new Error(`Project not found: ${args.projectId}`);
-
+/**
+ * Run the orchestrator end-to-end for `args`, streaming events to `sender`.
+ * Shared by the immediate ("Run now") and queued ("Queue run", once its turn
+ * comes) paths — the only difference between them is what happens BEFORE
+ * this is called (queued requests wait in runQueue first).
+ */
+async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunSummary> {
   let runId: string | null = null;
 
   // One controller per run; run:cancel aborts it and the orchestrator winds the
@@ -356,6 +381,82 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
 
   safeSend(sender, 'run:done', { runId: runId ?? summary.runId, summary });
   return summary;
+}
+
+/**
+ * Pop the next queued request (if any) and run it, chaining onward to the one
+ * after that once IT settles — this is what makes the queue actually drain
+ * itself, one at a time, without any renderer involvement.
+ */
+async function startNextQueued(): Promise<void> {
+  const next = runQueue.shift();
+  if (!next) return;
+  broadcastAll('queue:updated', { queue: serializeQueue() });
+  await executeRun(next.args, next.sender);
+  void startNextQueued();
+}
+
+ipcMain.handle(
+  'run:start',
+  async (
+    event: IpcMainInvokeEvent,
+    args: StartRunArgs,
+  ): Promise<
+    { queued: false; summary: RunSummary } | { queued: true; queueEntryId: string; position: number }
+  > => {
+    if (!args?.projectId) throw new Error('A projectId is required to start a run.');
+
+    const store = await requireStore();
+    const project = store.getProject(args.projectId);
+    if (!project) throw new Error(`Project not found: ${args.projectId}`);
+
+    // One run EXECUTES at a time — every run shares the single live-browser
+    // mirror surface and the target adapter binds fixed local ports, so
+    // concurrent execution would fight over both. A request that arrives
+    // while another is active queues instead of being rejected; it starts
+    // automatically once the run ahead of it finishes (see startNextQueued).
+    if (activeRuns.size > 0) {
+      const entry: QueuedRunRequest = {
+        id: `q_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        projectId: args.projectId,
+        projectName: project.name,
+        args,
+        queuedAt: new Date().toISOString(),
+        sender: event.sender,
+      };
+      runQueue.push(entry);
+      broadcastAll('queue:updated', { queue: serializeQueue() });
+      return { queued: true, queueEntryId: entry.id, position: runQueue.length };
+    }
+
+    const summary = await executeRun(args, event.sender);
+    void startNextQueued();
+    return { queued: false, summary };
+  },
+);
+
+ipcMain.handle('queue:remove', (_e, payload: { queueEntryId: string }): { removed: boolean } => {
+  const index = runQueue.findIndex((q) => q.id === payload?.queueEntryId);
+  if (index === -1) return { removed: false };
+  runQueue.splice(index, 1);
+  broadcastAll('queue:updated', { queue: serializeQueue() });
+  return { removed: true };
+});
+
+ipcMain.handle('queue:list', (): ReturnType<typeof serializeQueue> => serializeQueue());
+
+/** Snapshot of the currently-executing run (if any), for a fresh renderer to hydrate its live view against. */
+ipcMain.handle('run:active', async (): Promise<{ runId: string; projectId: string } | null> => {
+  const [runId] = activeRuns.keys();
+  if (!runId) return null;
+  const store = await getStore();
+  if (!store) return null;
+  try {
+    const run = store.getRun(runId);
+    return run ? { runId, projectId: run.projectId } : null;
+  } catch {
+    return null;
+  }
 });
 
 /**

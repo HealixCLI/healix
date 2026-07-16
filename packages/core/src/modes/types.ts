@@ -1,7 +1,18 @@
 import type { ProviderAdapter } from '../providers/types.js';
 import type { TargetAdapter } from '../target/types.js';
 import type { BrowserSurface, DomSnapshot } from '../browser/types.js';
+import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
+
+/** Result of the multi-page/multi-role EXPLORE crawl, grounding GENERATE. */
+export interface ExplorationArtifact {
+  crawl: CrawlWithAuthResult;
+  routing: RoutePrefixInfo;
+  loginCandidates: LoginCandidate[];
+  /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
+  useful: boolean;
+  uselessReason?: string;
+}
 
 export type ExplorationMode = 'computer-use' | 'codegen';
 
@@ -173,6 +184,8 @@ export interface TestModeContext {
   testingScope?: TestingScope;
   /** DOM snapshot captured during computer-use exploration; grounds generation. */
   snapshot?: DomSnapshot;
+  /** Multi-page/multi-role EXPLORE crawl artifact; the richer replacement for `snapshot`. */
+  exploration?: ExplorationArtifact;
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;

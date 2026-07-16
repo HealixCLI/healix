@@ -266,3 +266,104 @@ export async function crawlWithAuth(
     authVerified: true,
   };
 }
+
+export interface RoutePrefixInfo {
+  hashRouted: boolean;
+  /** The leading hash segment(s) shared across every visited hash-URL, e.g. "#/SK". */
+  invariantPrefix?: string;
+}
+
+/**
+ * Observes the app's own redirect (e.g. `/` -> `#/SK/home`) to isolate the
+ * invariant locale/region segment of a hash-routed SPA, so GENERATE can be
+ * told to preserve it instead of guessing a plain path. With only one
+ * crawled hash route, the safest default is the FIRST segment only (the
+ * common region/locale-prefix shape); with more routes, the true invariant
+ * prefix is the longest common leading segment run across all of them.
+ */
+export function detectRoutePrefix(_requestedUrl: string, routes: CrawledRoute[]): RoutePrefixInfo {
+  const hashUrls = routes.map((r) => r.url).filter((u) => u.includes('#'));
+  if (hashUrls.length === 0) {
+    return { hashRouted: false };
+  }
+
+  const segLists = hashUrls
+    .map((u) => {
+      try {
+        return new URL(u).hash;
+      } catch {
+        return '';
+      }
+    })
+    .map((hash) => hash.replace(/^#\/?/, '').split('/').filter(Boolean));
+
+  const first = segLists[0];
+  if (!first || first.length === 0) {
+    return { hashRouted: true };
+  }
+
+  let commonLen: number;
+  if (segLists.length === 1) {
+    commonLen = Math.min(1, first.length);
+  } else {
+    commonLen = first.length;
+    for (const segs of segLists.slice(1)) {
+      let i = 0;
+      while (i < commonLen && i < segs.length && segs[i] === first[i]) i += 1;
+      commonLen = i;
+    }
+  }
+
+  if (commonLen === 0) {
+    return { hashRouted: true };
+  }
+  return { hashRouted: true, invariantPrefix: `#/${first.slice(0, commonLen).join('/')}` };
+}
+
+export interface LoginCandidate {
+  url: string;
+  score: number;
+  source: 'crawled' | 'common-path';
+}
+
+const LOGIN_TEXT_RE = /log[- ]?in|sign[- ]?in|prihl[aá]si/i;
+/** Bounded last-resort fallback tried only when the crawl found no confident candidate. */
+const COMMON_LOGIN_PATHS = ['/login', '/signin', '/auth/login'];
+/** Minimum score treated as "confident" (crawled candidates only — see scoreLoginCandidates). */
+const CONFIDENT_SCORE = 3;
+
+/**
+ * Ranks crawled routes as login candidates: highest for an actual password
+ * field, plus points for URL/title text matches. Falls back to a small
+ * common-paths list — reconciled against any detected hash/region prefix
+ * instead of a naive path join — only when nothing crawled scores
+ * confidently.
+ */
+export function scoreLoginCandidates(
+  routes: CrawledRoute[],
+  routing: RoutePrefixInfo,
+  baseUrl: string,
+): LoginCandidate[] {
+  const candidates: LoginCandidate[] = [];
+  for (const route of routes) {
+    let score = 0;
+    if (route.hasPasswordField) score += 3;
+    if (LOGIN_TEXT_RE.test(route.url)) score += 2;
+    if (LOGIN_TEXT_RE.test(route.title)) score += 1;
+    if (score > 0) candidates.push({ url: route.url, score, source: 'crawled' });
+  }
+  candidates.sort((a, b) => b.score - a.score);
+
+  if (!candidates.some((c) => c.score >= CONFIDENT_SCORE)) {
+    for (const path of COMMON_LOGIN_PATHS) {
+      const relative = routing.hashRouted ? `${routing.invariantPrefix ?? '#'}${path}` : path;
+      try {
+        candidates.push({ url: new URL(relative, baseUrl).toString(), score: 1, source: 'common-path' });
+      } catch {
+        // Malformed baseUrl — skip this fallback candidate rather than throw.
+      }
+    }
+  }
+
+  return candidates;
+}

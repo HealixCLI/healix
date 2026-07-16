@@ -1,4 +1,4 @@
-import type { RunStatus, TestStatus } from '@healix/core';
+import type { AgentEvent, Run, RunStatus, TestStatus } from '@healix/core';
 import type { BadgeTone } from '../components/ui/badge';
 
 const RUN_STATUS_TONE: Partial<Record<RunStatus, BadgeTone>> = {
@@ -107,6 +107,67 @@ export function formatDuration(ms: number | null | undefined): string {
   if (ms == null) return '—';
   if (ms < 1000) return `${ms}ms`;
   return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/** Human label for each AgentEvent phase code, in pipeline order. Phases with no label (e.g. 'launch', 'export', 'done') are folded into the total but not broken out individually. */
+const STAGE_LABELS: Record<string, string> = {
+  plan: 'Planning',
+  approve: 'Approval wait',
+  explore: 'Context gathering',
+  generate: 'Test generation',
+  execute: 'Execution',
+  triage: 'Triage',
+  report: 'Reporting',
+};
+
+export interface StageDuration {
+  phase: string;
+  label: string;
+  ms: number;
+}
+
+/**
+ * Per-stage wall-clock breakdown derived from AgentEvent timestamps. A
+ * stage's duration runs from its first event to the first event of the next
+ * known phase (or the last event overall, for the final stage) — this
+ * captures real elapsed time between log lines, not just time spent logging.
+ */
+export function computeStageDurations(events: AgentEvent[]): StageDuration[] {
+  const timed = events
+    .map((e) => ({ phase: e.phase, t: new Date(e.createdAt).getTime() }))
+    .filter((e) => !Number.isNaN(e.t))
+    .sort((a, b) => a.t - b.t);
+  if (timed.length === 0) return [];
+
+  const firstSeen = new Map<string, number>();
+  for (const e of timed) {
+    if (e.phase in STAGE_LABELS && !firstSeen.has(e.phase)) firstSeen.set(e.phase, e.t);
+  }
+  const ordered = [...firstSeen.entries()].sort((a, b) => a[1] - b[1]);
+  if (ordered.length === 0) return [];
+
+  const lastEventTime = timed[timed.length - 1].t;
+  return ordered.map(([phase, start], i) => {
+    const end = i + 1 < ordered.length ? ordered[i + 1][1] : lastEventTime;
+    return { phase, label: STAGE_LABELS[phase], ms: Math.max(0, end - start) };
+  });
+}
+
+/** Total run duration: prefers the run's own started/finished timestamps, falling back to the event span. */
+export function computeTotalDurationMs(run: Pick<Run, 'startedAt' | 'finishedAt'>, events: AgentEvent[]): number | null {
+  if (run.startedAt && run.finishedAt) {
+    const start = new Date(run.startedAt).getTime();
+    const end = new Date(run.finishedAt).getTime();
+    if (!Number.isNaN(start) && !Number.isNaN(end)) return Math.max(0, end - start);
+  }
+  const times = events.map((e) => new Date(e.createdAt).getTime()).filter((t) => !Number.isNaN(t));
+  if (times.length === 0) return null;
+  return Math.max(0, Math.max(...times) - Math.min(...times));
+}
+
+/** Multi-line tooltip text for a stage breakdown, e.g. for a StatTile's hover title. */
+export function formatStageBreakdown(stages: StageDuration[]): string {
+  return stages.map((s) => `${s.label}: ${formatDuration(s.ms)}`).join('\n');
 }
 
 /** Trim a (possibly nested) artifact path to its leaf name for tidy lists. */

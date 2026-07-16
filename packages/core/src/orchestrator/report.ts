@@ -62,6 +62,24 @@ function baseName(path: string): string {
   return path.split(/[\\/]/).pop() || path;
 }
 
+/** Scales ms -> s -> "Xm Ys" -> "Xh Ym" so a slow scenario reads as "23m 52s" instead of a raw "1432300 ms". */
+function formatDuration(ms: number | null | undefined): string {
+  if (ms == null) return '';
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = ms / 1000;
+  // Round once, up front, so the sub-minute display and the minute/hour
+  // branch boundary agree (otherwise e.g. 59.96s would print "60.0s" while
+  // still taking the seconds-only branch instead of rolling over to "1m 0s").
+  const roundedSeconds = Math.round(totalSeconds);
+  if (roundedSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const totalMinutes = Math.floor(roundedSeconds / 60);
+  const seconds = roundedSeconds % 60;
+  if (totalMinutes < 60) return `${totalMinutes}m ${seconds}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
+}
+
 const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
   app_is_wrong: 'App defect',
   test_is_wrong: 'Test defect',
@@ -140,9 +158,9 @@ export function renderReportHtml(report: RunReport): string {
         r.artifacts && r.artifacts.length > 0
           ? `<div class="hist">${r.artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`
           : '';
-      return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${
-        r.durationMs != null ? esc(String(r.durationMs)) + ' ms' : ''
-      }</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
+      return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
+        formatDuration(r.durationMs),
+      )}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
     })
     .join('');
 

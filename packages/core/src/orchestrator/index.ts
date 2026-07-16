@@ -870,6 +870,19 @@ async function runPipeline(
       };
     }
 
+    // Drop any pre-registered scenario rows that never got a matching execution
+    // result (see deleteUnexecutedTests) so the Results tab's Total agrees with
+    // the Report's Total instead of counting phantom planned-but-never-ran rows.
+    try {
+      const removed = store.deleteUnexecutedTests(runId);
+      if (removed > 0) {
+        emit('execute', 'debug', `Dropped ${removed} pre-registered test row(s) that never executed.`);
+      }
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('deleteUnexecutedTests', err);
+    }
+
     // ---- 9. TRIAGE (best-effort) ----
     // classify() is the deterministic baseline for EVERY failure. For the first
     // few failures we additionally try AI analyze() with a short per-call timeout

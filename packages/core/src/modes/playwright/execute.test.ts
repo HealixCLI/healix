@@ -359,6 +359,58 @@ describe('parseReport — structural Tier B classification', () => {
   });
 });
 
+describe('parseReport — error text stays simple, not a wall of duplicates', () => {
+  it('picks a single clear error instead of concatenating result.error and every result.errors[] entry', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'click reveals greeting',
+              file: 'tests/tierA-public/click.spec.ts',
+              tests: [
+                {
+                  status: 'failed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'failed',
+                      duration: 11_235,
+                      // Playwright commonly repeats the same failure in both
+                      // `error` and `errors[]` (sometimes with a differing
+                      // captured call-log frame) — this used to concatenate
+                      // into 2-3x duplicated blocks in the report.
+                      error: {
+                        message: 'Test timeout of 60000ms exceeded.',
+                        stack:
+                          "Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole('button')\nat click.spec.ts:8:31",
+                      },
+                      errors: [
+                        {
+                          message: 'Test timeout of 60000ms exceeded.',
+                          stack:
+                            "Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole('button')\nat click.spec.ts:8:31",
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    const error = parsed.results[0]?.error ?? '';
+    // The message must appear exactly once, not two or three times back to back.
+    const occurrences = error.split('Test timeout of 60000ms exceeded.').length - 1;
+    expect(occurrences).toBe(1);
+    expect(error).toContain('Call log:');
+  });
+});
+
 describe('findAuthSetupOutcome', () => {
   it('detects a failed auth-setup by project name or file and captures its error', () => {
     const r = report([

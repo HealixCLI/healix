@@ -109,7 +109,17 @@ function makeRealisticFakeMode(
         const relPath = join('tests', item.tier, `${item.reqTag}.spec.ts`);
         const absPath = join(ctx.projectDir, relPath);
         await mkdir(dirname(absPath), { recursive: true });
-        const contents = `// spec for ${item.title} (${item.reqTag})\n`;
+        // One `test(...)` marker line per scenario — real generate.ts emits one
+        // test() per planned scenario, and execute() below counts these markers
+        // to decide how many results to return. Writing them into the actual
+        // file (rather than tracking scenario counts in a JS-side map) means a
+        // carried-forward spec (copied byte-for-byte by hydrateCarriedSpecs,
+        // read back from disk) still reports its true scenario count even
+        // though this mode's own generate() never ran for it.
+        const scenarioCount = Math.max(item.scenarios?.length ?? 0, 1);
+        const contents =
+          `// spec for ${item.title} (${item.reqTag})\n` +
+          Array.from({ length: scenarioCount }, (_, i) => `test('scenario ${i + 1}');\n`).join('');
         await writeFile(absPath, contents, 'utf-8');
         specs.push({
           path: absPath,
@@ -122,11 +132,18 @@ function makeRealisticFakeMode(
       return specs;
     },
     async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-      const results = specs.map((s) => ({
-        title: s.title,
-        status: (s.reqTag && failReqTags.has(s.reqTag) ? 'failed' : 'passed') as 'failed' | 'passed',
-        durationMs: 10,
-      }));
+      // Real Playwright discovers test files from disk and runs each physical
+      // file exactly once, regardless of how many bookkeeping entries the JS
+      // side has for it — hydrateCarriedSpecs deliberately pushes one
+      // GeneratedSpec per carried TEST ROW, so a 3-scenario carried spec can
+      // appear 3x here for the same file. Dedupe by path before counting
+      // scenarios, or a carried multi-scenario spec's results get multiplied.
+      const uniqueSpecs = [...new Map(specs.map((s) => [s.path, s])).values()];
+      const results = uniqueSpecs.flatMap((s) => {
+        const scenarioCount = Math.max((s.contents.match(/^test\(/gm) ?? []).length, 1);
+        const status = (s.reqTag && failReqTags.has(s.reqTag) ? 'failed' : 'passed') as 'failed' | 'passed';
+        return Array.from({ length: scenarioCount }, () => ({ title: s.title, status, durationMs: 10 }));
+      });
       return {
         passed: results.filter((r) => r.status === 'passed').length,
         failed: results.filter((r) => r.status === 'failed').length,

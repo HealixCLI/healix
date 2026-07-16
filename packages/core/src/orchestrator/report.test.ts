@@ -86,6 +86,27 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('Fix the missing aria-label on the submit button.');
   });
 
+  it('scales the Duration column ms -> s -> min -> hr instead of raw milliseconds', () => {
+    const outcome: ExecOutcome = {
+      passed: 4,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: 'sub-second', status: 'passed', durationMs: 500 },
+        { title: 'seconds', status: 'passed', durationMs: 11_235 },
+        { title: 'minutes', status: 'passed', durationMs: 1_432_300 },
+        { title: 'hours', status: 'passed', durationMs: 60 * 60_000 + 2 * 60_000 },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<td>500ms</td>');
+    expect(html).toContain('<td>11.2s</td>');
+    expect(html).toContain('<td>23m 52s</td>');
+    expect(html).toContain('<td>1h 2m</td>');
+  });
+
   it('shows a one-line error summary with the full call log tucked behind a details toggle', () => {
     const outcome: ExecOutcome = {
       passed: 0,

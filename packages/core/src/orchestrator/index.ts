@@ -1288,6 +1288,13 @@ export async function runPlanPhase(
     const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
     if (result.plan) {
       items.push(...result.plan.items);
+      emit('plan', 'info', `Batch ${i + 1}/${batches.length} generated ${result.plan.items.length} item(s).`, {
+        kind: 'plan-batch',
+        batchIndex: i,
+        totalBatches: batches.length,
+        items: result.plan.items,
+        status: 'ok',
+      });
     } else {
       failedBatches.push(`batch ${i + 1}/${batches.length}: ${result.reason}`);
       emit(
@@ -1295,6 +1302,14 @@ export async function runPlanPhase(
         'warn',
         `Batch ${i + 1}/${batches.length} produced no usable plan (${result.reason}); its units will be ` +
           'left for the coverage-feedback loop.',
+        {
+          kind: 'plan-batch',
+          batchIndex: i,
+          totalBatches: batches.length,
+          items: [],
+          status: 'failed',
+          reason: result.reason,
+        },
       );
     }
   }

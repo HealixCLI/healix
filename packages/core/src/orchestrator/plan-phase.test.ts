@@ -35,6 +35,21 @@ function noopEmit(): (phase: string, level: OrchestratorEvent['level'], message:
   return () => undefined;
 }
 
+type CapturedEmit = { phase: string; level: OrchestratorEvent['level']; message: string; data?: unknown };
+
+function capturingEmit(): {
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void;
+  events: CapturedEmit[];
+} {
+  const events: CapturedEmit[] = [];
+  return {
+    emit: (phase, level, message, data) => {
+      events.push({ phase, level, message, data });
+    },
+    events,
+  };
+}
+
 function fencedJson(value: unknown): string {
   return ['```json', JSON.stringify(value), '```'].join('\n');
 }
@@ -245,5 +260,115 @@ describe('runPlanPhase batching', () => {
     expect(plan.fallbackReason).toContain('batch 2');
     expect(plan.items.length).toBeGreaterThan(0);
     expect(plan.items.length).toBeLessThan(70);
+  }, 10_000);
+});
+
+describe('runPlanPhase batch progress events', () => {
+  function makeUnits(count: number): FunctionalityUnit[] {
+    return Array.from({ length: count }, (_, i) => ({
+      key: `route:/page-${i}`,
+      kind: 'route' as const,
+      label: `page: /page-${i}`,
+      file: `app/page-${i}/page.tsx`,
+    }));
+  }
+
+  function unitAwareProvider(): ProviderAdapter & { calls: number } {
+    const adapter = {
+      id: 'claude' as const,
+      label: 'Unit-aware Fake',
+      capabilities: ['plan' as const],
+      calls: 0,
+      async detect(): Promise<DetectResult> {
+        return { installed: true, binPath: '/fake/claude', version: '1.0.0' };
+      },
+      async health(): Promise<HealthResult> {
+        return {
+          provider: 'claude',
+          status: 'ready',
+          installed: true,
+          binPath: '/fake/claude',
+          version: '1.0.0',
+          authenticated: true,
+          model: 'fake',
+          latencyMs: 1,
+          detail: 'OK',
+        };
+      },
+      async plan(): Promise<PlanResult> {
+        return { provider: 'claude', ok: true, plan: fencedJson(SIMPLE_PLAN), raw: SIMPLE_PLAN, detail: 'OK' };
+      },
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        adapter.calls += 1;
+        if (opts?.mode !== 'plan') {
+          return { provider: 'claude', ok: true, text: 'n/a', raw: null, detail: 'OK' };
+        }
+        const keys = [...prompt.matchAll(/unitKey: "([^"]+)"/g)].map((m) => m[1]);
+        const body = {
+          summary: `Batch covering ${keys.length} unit(s).`,
+          items: keys.map((key) => ({
+            title: `Covers ${key}`,
+            tier: 'tierA-public',
+            intent: `Exercises ${key}.`,
+            unitKey: key,
+          })),
+        };
+        return { provider: 'claude', ok: true, text: fencedJson(body), raw: body, detail: 'OK' };
+      },
+    };
+    return adapter;
+  }
+
+  it('emits a kind:"plan-batch" event per successful batch, in order, each carrying only that batch\'s items', async () => {
+    const units = makeUnits(40);
+    const provider = unitAwareProvider();
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+    const { emit, events } = capturingEmit();
+
+    const plan = await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, emit, { provider }, repoIndex);
+
+    const batchEvents = events
+      .filter((e) => (e.data as { kind?: string } | undefined)?.kind === 'plan-batch')
+      .map((e) => e.data as { batchIndex: number; totalBatches: number; items: unknown[]; status: string });
+
+    expect(batchEvents.length).toBeGreaterThan(1);
+    batchEvents.forEach((e, idx) => {
+      expect(e.batchIndex).toBe(idx);
+      expect(e.status).toBe('ok');
+      expect(e.totalBatches).toBe(batchEvents.length);
+    });
+    // Every batch's emitted items add up to the final merged plan — no batch's
+    // items are double-counted or missing from the stream.
+    const totalStreamed = batchEvents.reduce((sum, e) => sum + e.items.length, 0);
+    expect(totalStreamed).toBe(plan.items.length);
+  }, 10_000);
+
+  it('emits a status:"failed" plan-batch event (with reason, zero items) for a batch that produced nothing', async () => {
+    const units = makeUnits(40);
+    const good = unitAwareProvider();
+    const provider: ProviderAdapter & { calls: number } = {
+      ...good,
+      calls: 0,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan' && prompt.includes('batch 2 of')) {
+          return { provider: 'claude', ok: false, text: '', raw: null, detail: 'batch 2 unavailable' };
+        }
+        return good.complete(prompt, opts);
+      },
+    };
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+    const { emit, events } = capturingEmit();
+
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, emit, { provider }, repoIndex);
+
+    const batchEvents = events
+      .filter((e) => (e.data as { kind?: string } | undefined)?.kind === 'plan-batch')
+      .map((e) => e.data as { batchIndex: number; items: unknown[]; status: string; reason?: string });
+
+    const failed = batchEvents.find((e) => e.status === 'failed');
+    expect(failed).toBeDefined();
+    expect(failed?.items).toHaveLength(0);
+    expect(failed?.reason).toBeTruthy();
+    expect(batchEvents.some((e) => e.status === 'ok')).toBe(true);
   }, 10_000);
 });

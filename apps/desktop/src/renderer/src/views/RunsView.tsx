@@ -25,6 +25,7 @@ const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
   starting: 'default',
   running: 'default',
+  'plan-streaming': 'default',
   'awaiting-approval': 'warn',
   done: 'ok',
   cancelled: 'muted',
@@ -35,6 +36,7 @@ const PHASE_LABEL: Record<RunPhase, string> = {
   idle: 'idle',
   starting: 'starting…',
   running: 'running',
+  'plan-streaming': 'generating plan…',
   'awaiting-approval': 'awaiting approval',
   done: 'done',
   cancelled: 'cancelled',
@@ -148,7 +150,10 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
   }, [selectedRunId]);
 
   const isActive =
-    engine.phase === 'starting' || engine.phase === 'running' || engine.phase === 'awaiting-approval';
+    engine.phase === 'starting' ||
+    engine.phase === 'running' ||
+    engine.phase === 'plan-streaming' ||
+    engine.phase === 'awaiting-approval';
 
   // Re-attach to a run that's still genuinely parked awaiting approval in the
   // main process — its approval promise only dies on app restart, not on
@@ -488,25 +493,33 @@ export function RunsView({ initialProjectId }: { initialProjectId?: string | nul
           <div className="h-px flex-1 bg-border" />
         </div>
 
-        {/* Plan gate: only while parked, AND only for the run currently being
-            shown — a rehydrated pending approval must not bleed into every
-            other history row's view (see showLiveSurface). */}
-        {showLiveSurface && engine.workingPlan && engine.phase === 'awaiting-approval' && (
-          <div className="mt-4 shrink-0">
-            <PlanGate
-              plan={engine.workingPlan}
-              decided={engine.planDecided}
-              revisingItemIds={engine.revisingItemIds}
-              reviseErrors={engine.reviseErrors}
-              onApproveItem={engine.approveItem}
-              onRejectItem={engine.rejectItem}
-              onEditItem={engine.editItem}
-              onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
-              onApproveAndContinue={() => void engine.approveAndContinue()}
-              onRejectAll={() => void engine.rejectAll()}
-            />
-          </div>
-        )}
+        {/* Plan gate: only while parked or still streaming in, AND only for the
+            run currently being shown — a rehydrated pending approval must not
+            bleed into every other history row's view (see showLiveSurface).
+            Mounted during 'plan-streaming' too so the reviewer can start
+            approving/editing items as batches land, though the overall
+            Approve/Reject actions stay locked (via `streaming`) until every
+            batch has arrived. */}
+        {showLiveSurface &&
+          engine.workingPlan &&
+          (engine.phase === 'awaiting-approval' || engine.phase === 'plan-streaming') && (
+            <div className="mt-4 shrink-0">
+              <PlanGate
+                plan={engine.workingPlan}
+                decided={engine.planDecided}
+                streaming={engine.phase === 'plan-streaming'}
+                batchProgress={engine.planBatchProgress}
+                revisingItemIds={engine.revisingItemIds}
+                reviseErrors={engine.reviseErrors}
+                onApproveItem={engine.approveItem}
+                onRejectItem={engine.rejectItem}
+                onEditItem={engine.editItem}
+                onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
+                onApproveAndContinue={() => void engine.approveAndContinue()}
+                onRejectAll={() => void engine.rejectAll()}
+              />
+            </div>
+          )}
 
         {/* Scoped the same way as the plan gate: only for the run currently
             being shown, so an error from one run doesn't linger while

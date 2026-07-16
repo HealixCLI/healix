@@ -11,7 +11,37 @@ import type {
 } from '@healix/core';
 import type { RunChannelMessage, StartRunArgs } from './ipc-types';
 
-export type RunPhase = 'idle' | 'starting' | 'running' | 'awaiting-approval' | 'done' | 'cancelled' | 'error';
+export type RunPhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'plan-streaming'
+  | 'awaiting-approval'
+  | 'done'
+  | 'cancelled'
+  | 'error';
+
+/** Data carried by a `kind: 'plan-batch'` OrchestratorEvent.data payload (see core's runPlanPhase). */
+interface PlanBatchEventData {
+  kind: 'plan-batch';
+  batchIndex: number;
+  totalBatches: number;
+  items: TestPlanItem[];
+  status: 'ok' | 'failed';
+  reason?: string;
+}
+
+function isPlanBatchEventData(data: unknown): data is PlanBatchEventData {
+  return typeof data === 'object' && data !== null && (data as { kind?: unknown }).kind === 'plan-batch';
+}
+
+export interface PlanBatchProgress {
+  batchIndex: number;
+  totalBatches: number;
+  receivedItems: number;
+  /** Human-readable notes for batches that failed outright (index-ordered, not deduped). */
+  failedNotes: string[];
+}
 
 /** Map a final run summary status onto the engine phase. */
 function settledPhase(status: RunSummary['status']): RunPhase {
@@ -43,6 +73,8 @@ export interface RunEngineState {
   revisingItemIds: Set<string>;
   /** itemId -> the last revise error for that item, if any. */
   reviseErrors: Record<string, string>;
+  /** Non-null while plan items are still streaming in batch-by-batch (phase 'plan-streaming'). */
+  planBatchProgress: PlanBatchProgress | null;
   summary: RunSummary | null;
   error: string | null;
   /**
@@ -94,6 +126,7 @@ const INITIAL: RunEngineState = {
   planDecided: false,
   revisingItemIds: new Set(),
   reviseErrors: {},
+  planBatchProgress: null,
   summary: null,
   error: null,
   hydrated: false,
@@ -122,6 +155,33 @@ function clonePlan(plan: TestPlan): TestPlan {
 
 function mapItem(plan: TestPlan, itemId: string, fn: (item: TestPlanItem) => TestPlanItem): TestPlan {
   return { ...plan, items: plan.items.map((it) => (it.id === itemId ? fn(it) : it)) };
+}
+
+/**
+ * Reconcile the final, authoritative plan with whatever working draft the
+ * reviewer already has (possibly built up from plan-batch streaming events).
+ * Items already present in the working draft keep their in-progress
+ * status/edits/revisions untouched; items only present in the final plan
+ * (no prior working-plan draft) are the exceptional case (unbatched plans,
+ * or none of that item's batch reached the UI in time) and get a fresh clone.
+ * Preserves working-draft item order, then appends any not-yet-seen items.
+ */
+function mergeFinalPlan(workingPlan: TestPlan | null, finalPlan: TestPlan): TestPlan {
+  const cloned = clonePlan(finalPlan);
+  if (!workingPlan) return cloned;
+  const finalById = new Map(cloned.items.map((it) => [it.id, it]));
+  const seen = new Set<string>();
+  const merged: TestPlanItem[] = [];
+  for (const draftItem of workingPlan.items) {
+    if (finalById.has(draftItem.id)) {
+      merged.push(draftItem);
+      seen.add(draftItem.id);
+    }
+  }
+  for (const item of cloned.items) {
+    if (!seen.has(item.id)) merged.push(item);
+  }
+  return { ...cloned, items: merged };
 }
 
 function snapshotOf(item: TestPlanItem): PlanItemSnapshot {
@@ -180,6 +240,33 @@ export function useRunEngine(): RunEngine {
         case 'run:event': {
           const e = msg.payload.event;
           pushLine(e.level, String(e.phase), e.message);
+          if (e.phase === 'plan' && isPlanBatchEventData(e.data)) {
+            const batch = e.data;
+            setState((prev) => {
+              const basePlan: TestPlan = prev.plan ?? { summary: '', items: [], planSource: 'ai' };
+              const baseWorking: TestPlan = prev.workingPlan ?? { summary: '', items: [], planSource: 'ai' };
+              const failedNotes =
+                batch.status === 'failed'
+                  ? [
+                      ...(prev.planBatchProgress?.failedNotes ?? []),
+                      `Batch ${batch.batchIndex + 1}/${batch.totalBatches} failed${batch.reason ? `: ${batch.reason}` : ''}.`,
+                    ]
+                  : (prev.planBatchProgress?.failedNotes ?? []);
+              const receivedItems = (prev.planBatchProgress?.receivedItems ?? 0) + batch.items.length;
+              return {
+                ...prev,
+                plan: { ...basePlan, items: [...basePlan.items, ...batch.items] },
+                workingPlan: { ...baseWorking, items: [...baseWorking.items, ...batch.items] },
+                phase: prev.phase === 'awaiting-approval' ? prev.phase : 'plan-streaming',
+                planBatchProgress: {
+                  batchIndex: batch.batchIndex,
+                  totalBatches: batch.totalBatches,
+                  receivedItems,
+                  failedNotes,
+                },
+              };
+            });
+          }
           break;
         }
         case 'run:plan': {
@@ -187,10 +274,17 @@ export function useRunEngine(): RunEngine {
           setState((prev) => ({
             ...prev,
             plan,
-            workingPlan: clonePlan(plan),
+            // Merge (not replace): preserve any per-item status/edits/revisions the
+            // reviewer already applied to items that streamed in via plan-batch
+            // events, keyed by id (stable from the moment a batch is parsed, see
+            // core's normalizeItem/nanoid — never reassigned across the merge).
+            // Items with no prior working-plan entry (non-batched plans, or any
+            // gap) are added fresh from the final plan.
+            workingPlan: mergeFinalPlan(prev.workingPlan, plan),
             planDecided: false,
             revisingItemIds: new Set(),
             reviseErrors: {},
+            planBatchProgress: null,
             phase: 'awaiting-approval',
           }));
           break;

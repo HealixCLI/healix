@@ -8,6 +8,7 @@ import { Label } from './ui/label';
 import { Select } from './ui/select';
 import { Textarea } from './ui/textarea';
 import { cn } from '../lib/utils';
+import type { PlanBatchProgress } from '../lib/run-engine';
 
 const TIER_OPTIONS: ReadonlyArray<{ value: Tier; label: string }> = [
   { value: 'tierA-public', label: 'Tier A — public' },
@@ -446,6 +447,8 @@ function PlanItemRow({
 export function PlanGate({
   plan,
   decided,
+  streaming = false,
+  batchProgress = null,
   revisingItemIds,
   reviseErrors,
   onApproveItem,
@@ -457,6 +460,10 @@ export function PlanGate({
 }: {
   plan: TestPlan;
   decided: boolean;
+  /** True while more batches are still being generated — locks the overall
+   *  Approve/Reject actions but leaves per-item review available. */
+  streaming?: boolean;
+  batchProgress?: PlanBatchProgress | null;
   revisingItemIds: Set<string>;
   reviseErrors: Record<string, string>;
   onApproveItem: (itemId: string) => void;
@@ -478,11 +485,32 @@ export function PlanGate({
     <div className="rounded-lg border border-accent/40 bg-accent/5 p-4">
       <div className="flex items-center justify-between">
         <div className="flex items-center gap-2">
-          <ShieldQuestion className="h-4 w-4 text-accent" />
-          <span className="text-sm font-semibold">Plan review required</span>
+          {streaming ? (
+            <Loader2 className="h-4 w-4 animate-spin text-accent" />
+          ) : (
+            <ShieldQuestion className="h-4 w-4 text-accent" />
+          )}
+          <span className="text-sm font-semibold">
+            {streaming ? 'Generating test plan…' : 'Plan review required'}
+          </span>
         </div>
         <Badge tone="default">{plan.items.length} spec {plan.items.length === 1 ? 'file' : 'files'}</Badge>
       </div>
+
+      {streaming && batchProgress && (
+        <p className="mt-1 text-xs text-muted">
+          Batch {batchProgress.batchIndex + 1}/{batchProgress.totalBatches} · {batchProgress.receivedItems} item
+          {batchProgress.receivedItems === 1 ? '' : 's'} so far — you can start reviewing below; new items keep
+          appearing as they're generated.
+        </p>
+      )}
+      {batchProgress && batchProgress.failedNotes.length > 0 && (
+        <div className="mt-2 rounded-md border border-warn/40 bg-warn/10 p-2 text-xs text-warn">
+          {batchProgress.failedNotes.map((note, i) => (
+            <p key={i}>{note}</p>
+          ))}
+        </div>
+      )}
 
       <p className="mt-2 text-sm text-muted">{plan.summary}</p>
 
@@ -504,13 +532,17 @@ export function PlanGate({
       </ol>
 
       <div className="mt-4 flex items-center justify-between gap-2">
-        <p className="text-xs text-muted">Unreviewed items will be approved as-is.</p>
+        <p className="text-xs text-muted">
+          {streaming
+            ? 'Waiting for remaining batches to finish generating before you can approve or reject all.'
+            : 'Unreviewed items will be approved as-is.'}
+        </p>
         <div className="flex items-center gap-2">
-          <Button variant="outline" onClick={onRejectAll} disabled={decided}>
+          <Button variant="outline" onClick={onRejectAll} disabled={decided || streaming}>
             <X className="h-4 w-4" />
             Reject All
           </Button>
-          <Button onClick={onApproveAndContinue} disabled={decided}>
+          <Button onClick={onApproveAndContinue} disabled={decided || streaming}>
             <Check className="h-4 w-4" />
             Approve &amp; Continue
           </Button>

@@ -121,9 +121,15 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push('      "unitKey": "the unitKey from the detected list above, or null",');
   lines.push('      "scenarios": [');
   lines.push('        { "kind": "positive", "description": "a happy-path case" },');
-  lines.push('        { "kind": "positive", "description": "another distinct happy-path case, if the feature has more than one" },');
-  lines.push('        { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
-  lines.push('        { "kind": "negative", "description": "another distinct negative case, if applicable" },');
+  lines.push(
+    '        { "kind": "positive", "description": "another distinct happy-path case, if the feature has more than one" },',
+  );
+  lines.push(
+    '        { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },',
+  );
+  lines.push(
+    '        { "kind": "negative", "description": "another distinct negative case, if applicable" },',
+  );
   lines.push('        { "kind": "edge", "description": "a boundary condition, if applicable" }');
   lines.push('      ]');
   lines.push('    }');
@@ -358,7 +364,10 @@ export function synthesizePlan(project: Project, scope: TestingScope = 'both'): 
       tier: 'tierA-public',
       intent: 'Confirm the application under test starts and serves its entry point.',
       scenarios: [
-        { kind: 'positive', description: 'Confirm the application under test starts and serves its entry point.' },
+        {
+          kind: 'positive',
+          description: 'Confirm the application under test starts and serves its entry point.',
+        },
       ],
     });
   }
@@ -437,7 +446,9 @@ export function buildReviseItemPrompt(
   lines.push('  "unitKey": "keep the current unitKey, or null",');
   lines.push('  "scenarios": [');
   lines.push('    { "kind": "positive", "description": "the happy-path case" },');
-  lines.push('    { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
+  lines.push(
+    '    { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },',
+  );
   lines.push('    { "kind": "edge", "description": "a boundary condition, if applicable" }');
   lines.push('  ]');
   lines.push('}');

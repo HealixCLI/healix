@@ -1,7 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import { buildReport, degradationNotes, renderReportHtml, type RunReport } from './report.js';
 import type { Project, Run } from '../storage/types.js';
-import type { TestPlan } from '../modes/types.js';
+import type { ExecOutcome, TestPlan } from '../modes/types.js';
 
 function makeRun(overrides: Partial<Run> = {}): Run {
   return {
@@ -48,7 +48,7 @@ describe('degradationNotes', () => {
       outcome: null,
       triage: [],
       generation: { requestedItems: 5, acceptedItems: 5 },
-      coverage: { ratio: 0.9, target: 0.8 },
+      coverage: { ratio: 0.9, target: 0.8, coveredCount: 9, totalCount: 10, uncovered: [] },
     });
     expect(degradationNotes(report)).toEqual([]);
   });
@@ -99,7 +99,7 @@ describe('degradationNotes', () => {
       plan: REAL_PLAN,
       outcome: null,
       triage: [],
-      coverage: { ratio: 0.62, target: 0.8 },
+      coverage: { ratio: 0.62, target: 0.8, coveredCount: 6, totalCount: 10, uncovered: [] },
     });
     const notes = degradationNotes(report);
     expect(notes.some((n) => n.includes('62%') && n.includes('80%'))).toBe(true);
@@ -112,7 +112,7 @@ describe('degradationNotes', () => {
       plan: REAL_PLAN,
       outcome: null,
       triage: [],
-      coverage: { ratio: 0.85, target: 0.8 },
+      coverage: { ratio: 0.85, target: 0.8, coveredCount: 17, totalCount: 20, uncovered: [] },
     });
     expect(degradationNotes(report)).toEqual([]);
   });
@@ -144,5 +144,199 @@ describe('renderReportHtml degradation banner', () => {
     expect(html).toContain('may be smaller than intended');
     expect(html).toContain('no ready provider');
     expect(html).toContain('3/10');
+  });
+});
+
+const run: Run = {
+  id: 'run_1',
+  projectId: 'prj_1',
+  status: 'failed',
+  provider: null,
+  mode: 'playwright',
+  startedAt: null,
+  finishedAt: null,
+  createdAt: new Date(0).toISOString(),
+  suiteMode: 'fresh',
+  baseRunId: null,
+};
+
+const project: Project = {
+  id: 'prj_1',
+  name: 'Demo',
+  mode: 'playwright',
+  baseUrl: 'https://app.example.test',
+  repoPath: null,
+  createdAt: new Date(0).toISOString(),
+  archivedAt: null,
+  testUsername: null,
+  testPassword: null,
+};
+
+const plan: TestPlan = { summary: 'One feature.', items: [] };
+
+describe('report — failure diagnostics, coverage, artifacts', () => {
+  it("surfaces a failed result's artifact basenames (not full local paths) alongside its error", () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          status: 'failed',
+          durationMs: 5,
+          error: 'expect(locator).toBeVisible() failed',
+          artifacts: [
+            'C:\\runs\\r1\\suite\\test-results\\foo\\trace.zip',
+            'C:\\runs\\r1\\suite\\test-results\\foo\\test-failed-1.png',
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('trace.zip');
+    expect(html).toContain('test-failed-1.png');
+    // The full local filesystem path must never leak into the report.
+    expect(html).not.toContain('C:\\runs\\r1');
+  });
+
+  it('renders a suggested fix from triage when the engine provides one', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: '[REQ:REQ-1] positive: fails', status: 'failed', durationMs: 5, error: 'boom' }],
+    };
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          error: 'boom',
+          triage: {
+            verdict: 'app_is_wrong',
+            confidence: 0.8,
+            rationale: 'Assertion failed on a real element.',
+            suggestedPatch: 'Fix the missing aria-label on the submit button.',
+          },
+        },
+      ],
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Suggested fix');
+    expect(html).toContain('Fix the missing aria-label on the submit button.');
+  });
+
+  it('scales the Duration column ms -> s -> min -> hr instead of raw milliseconds', () => {
+    const outcome: ExecOutcome = {
+      passed: 4,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: 'sub-second', status: 'passed', durationMs: 500 },
+        { title: 'seconds', status: 'passed', durationMs: 11_235 },
+        { title: 'minutes', status: 'passed', durationMs: 1_432_300 },
+        { title: 'hours', status: 'passed', durationMs: 60 * 60_000 + 2 * 60_000 },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<td>500ms</td>');
+    expect(html).toContain('<td>11.2s</td>');
+    expect(html).toContain('<td>23m 52s</td>');
+    expect(html).toContain('<td>1h 2m</td>');
+  });
+
+  it('shows a one-line error summary with the full call log tucked behind a details toggle', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          status: 'failed',
+          durationMs: 5,
+          error:
+            "Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole('button')\nat spec.ts:7:18",
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain(
+      '<div class="err-summary">Error: locator.click: Test timeout of 60000ms exceeded.</div>',
+    );
+    expect(html).toContain('<details><summary>Full details</summary>');
+    expect(html).toContain('Call log:');
+  });
+
+  it('inlines the matching triage verdict/rationale under a failed row instead of only in a separate table', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: '[REQ:REQ-1] positive: fails', status: 'failed', durationMs: 5, error: 'boom' }],
+    };
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          error: 'boom',
+          triage: { verdict: 'app_is_wrong', confidence: 0.9, rationale: 'Real defect.' },
+        },
+      ],
+    });
+    const html = renderReportHtml(report);
+    // Inline diagnosis appears once per matching row, inside the Results table's error cell.
+    expect(html).toContain('class="diagnosis"');
+    expect(html).toContain('App defect');
+    expect(html).toContain('90% confidence');
+    expect(html).toContain('Real defect.');
+  });
+
+  it('omits the coverage card/section entirely when coverage was never computed (e.g. reuse mode)', () => {
+    const report = buildReport({ run, project, plan, outcome: null, triage: [] });
+    expect(report.coverage).toBeNull();
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('>coverage<');
+    expect(html).not.toContain('<h2>Coverage</h2>');
+  });
+
+  it('surfaces the coverage ratio and lists uncovered functionality units when present', () => {
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome: null,
+      triage: [],
+      coverage: {
+        ratio: 0.5,
+        target: 0.8,
+        coveredCount: 1,
+        totalCount: 2,
+        uncovered: [
+          { key: 'route:/checkout', kind: 'route', label: 'GET /checkout', file: 'src/pages/checkout.tsx' },
+        ],
+      },
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<h2>Coverage</h2>');
+    expect(html).toContain('1/2 functionality unit(s) covered (50%)');
+    expect(html).toContain('GET /checkout');
+    expect(html).toContain('src/pages/checkout.tsx');
   });
 });

@@ -336,6 +336,26 @@ export class HealixStore {
     ).map(rowToResult);
   }
 
+  /**
+   * Remove test rows pre-registered for a scenario that never actually got an
+   * execution result — e.g. the plan called for 3 scenarios but generation
+   * only produced 2 `test()` blocks, or the coverage loop broke early after
+   * registering gap-fill rows but before executing them. Without this, those
+   * rows sit at their initial 'pending' status forever, so the Results tab's
+   * Total (which counts every `tests` row) ends up higher than the Report's
+   * Total (`outcome.results.length`, grounded in what actually ran) — the
+   * `tests` table and `outcome.results` must agree on "how many test cases".
+   * A row with zero result rows (any status, including a genuine 'pending'/
+   * skipped result) is unambiguously never-executed, so this only ever
+   * removes rows that would otherwise silently inflate the count.
+   */
+  deleteUnexecutedTests(runId: string): number {
+    const res = this.db
+      .prepare('DELETE FROM tests WHERE run_id = ? AND id NOT IN (SELECT test_id FROM results)')
+      .run(runId);
+    return Number(res.changes ?? 0);
+  }
+
   // ---- orchestrator events (resumable checkpoints) ----
   appendEvent(
     runId: string,

@@ -1,6 +1,7 @@
 import type { Project, Run } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** One triaged failure, attached to the report. */
 export interface ReportTriageEntry {
@@ -15,10 +16,17 @@ export interface GenerationStats {
   acceptedItems: number;
 }
 
-/** Final coverage-feedback-loop ratio vs. its target, when the loop ran. */
-export interface CoverageStats {
+/**
+ * Serializable snapshot of the coverage-feedback loop's final state (see
+ * orchestrator/coverage.ts's CoverageResult) — a plain object instead of a
+ * Set, so it survives JSON.stringify/report.json round-tripping intact.
+ */
+export interface ReportCoverageSummary {
   ratio: number;
   target: number;
+  coveredCount: number;
+  totalCount: number;
+  uncovered: FunctionalityUnit[];
 }
 
 /** Serializable run report written to reports/report.json. */
@@ -32,8 +40,8 @@ export interface RunReport {
   artifacts: string[];
   /** Item-level generation accounting across GENERATE and any gap-fill iterations. */
   generation?: GenerationStats;
-  /** Final coverage-feedback-loop result, or null when the loop didn't run. */
-  coverage?: CoverageStats | null;
+  /** Functionality-unit coverage reached by the coverage-feedback loop; null when it didn't run (e.g. reuse mode, or no functionality inventory). */
+  coverage: ReportCoverageSummary | null;
   generatedAt: string;
 }
 
@@ -45,7 +53,7 @@ export function buildReport(input: {
   triage: ReportTriageEntry[];
   artifacts?: string[];
   generation?: GenerationStats;
-  coverage?: CoverageStats | null;
+  coverage?: ReportCoverageSummary | null;
 }): RunReport {
   return {
     run: input.run,
@@ -99,9 +107,74 @@ export function degradationNotes(report: RunReport): string[] {
   return notes;
 }
 
+/** Last path segment, for display only — avoids printing a full local filesystem path into the report. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+/** Scales ms -> s -> "Xm Ys" -> "Xh Ym" so a slow scenario reads as "23m 52s" instead of a raw "1432300 ms". */
+function formatDuration(ms: number | null | undefined): string {
+  if (ms == null) return '';
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = ms / 1000;
+  // Round once, up front, so the sub-minute display and the minute/hour
+  // branch boundary agree (otherwise e.g. 59.96s would print "60.0s" while
+  // still taking the seconds-only branch instead of rolling over to "1m 0s").
+  const roundedSeconds = Math.round(totalSeconds);
+  if (roundedSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const totalMinutes = Math.floor(roundedSeconds / 60);
+  const seconds = roundedSeconds % 60;
+  if (totalMinutes < 60) return `${totalMinutes}m ${seconds}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
+}
+
+const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
+  app_is_wrong: 'App defect',
+  test_is_wrong: 'Test defect',
+  environment: 'Environment',
+  flaky: 'Flaky',
+  ambiguous: 'Ambiguous',
+};
+
+/**
+ * Split a raw Playwright error blob into a one-line summary (for the row
+ * itself) and the remaining call log / stack trace (tucked behind a
+ * <details> toggle) — a full multi-paragraph dump inline made the Results
+ * table unreadable at a glance.
+ */
+function splitErrorText(raw: string): { summary: string; rest: string } {
+  const lines = raw.split('\n');
+  const summary = (lines[0] ?? '').trim() || raw.trim();
+  const rest = lines.slice(1).join('\n').trim();
+  return { summary, rest };
+}
+
+function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
+  if (!error) return '';
+  const { summary, rest } = splitErrorText(error);
+  const detailsBlock = rest
+    ? `<details><summary>Full details</summary><pre>${esc(rest)}</pre></details>`
+    : '';
+  const triageBlock = triage
+    ? `<div class="diagnosis"><span class="tag verdict-${esc(triage.triage.verdict)}">${esc(
+        VERDICT_LABEL[triage.triage.verdict] ?? triage.triage.verdict,
+      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span>
+      <div>${esc(triage.triage.rationale)}</div>
+      ${
+        triage.triage.suggestedPatch
+          ? `<div><strong>Suggested fix:</strong> <code>${esc(triage.triage.suggestedPatch)}</code></div>`
+          : ''
+      }
+    </div>`
+    : '';
+  return `<div class="err-summary">${esc(summary)}</div>${triageBlock}${detailsBlock}`;
+}
+
 /** Render a self-contained, dependency-free HTML report. */
 export function renderReportHtml(report: RunReport): string {
-  const { run, project, plan, outcome, triage } = report;
+  const { run, project, plan, outcome, triage, coverage } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
@@ -133,13 +206,20 @@ export function renderReportHtml(report: RunReport): string {
     })
     .join('');
 
+  // Triage is keyed by title so a failed row can show its verdict/rationale
+  // inline instead of forcing readers to cross-reference a separate table.
+  const triageByTitle = new Map<string, ReportTriageEntry>(triage.map((t) => [t.title, t]));
+
   const resultRows = (outcome?.results ?? [])
-    .map(
-      (r) =>
-        `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${
-          r.durationMs != null ? esc(String(r.durationMs)) + ' ms' : ''
-        }</td><td>${esc(r.error ?? '')}</td></tr>`,
-    )
+    .map((r) => {
+      const artifactNote =
+        r.artifacts && r.artifacts.length > 0
+          ? `<div class="hist">${r.artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`
+          : '';
+      return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
+        formatDuration(r.durationMs),
+      )}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
+    })
     .join('');
 
   const triageRows = triage
@@ -147,9 +227,33 @@ export function renderReportHtml(report: RunReport): string {
       (t) =>
         `<tr><td>${esc(t.title)}</td><td>${esc(t.triage.verdict)}</td><td>${esc(
           (t.triage.confidence * 100).toFixed(0),
-        )}%</td><td>${esc(t.triage.rationale)}</td></tr>`,
+        )}%</td><td>${esc(t.triage.rationale)}${
+          t.triage.suggestedPatch
+            ? `<div class="hist"><strong>Suggested fix:</strong> <code>${esc(t.triage.suggestedPatch)}</code></div>`
+            : ''
+        }</td></tr>`,
     )
     .join('');
+
+  const coverageSection =
+    coverage != null
+      ? `<section>
+    <h2>Coverage</h2>
+    <p>${coverage.coveredCount}/${coverage.totalCount} functionality unit(s) covered (${Math.round(
+      coverage.ratio * 100,
+    )}%).</p>
+    ${
+      coverage.uncovered.length > 0
+        ? `<table>
+      <thead><tr><th>Uncovered unit</th><th>Kind</th><th>File</th></tr></thead>
+      <tbody>${coverage.uncovered
+        .map((u) => `<tr><td>${esc(u.label)}</td><td>${esc(u.kind)}</td><td>${esc(u.file)}</td></tr>`)
+        .join('')}</tbody>
+    </table>`
+        : ''
+    }
+  </section>`
+      : '';
 
   return `<!doctype html>
 <html lang="en">
@@ -176,10 +280,20 @@ export function renderReportHtml(report: RunReport): string {
     padding: 0 .35rem; border-radius: 4px; background: #8884; text-decoration: none; }
   .hist { font-size: .75rem; color: #888; margin-top: .15rem; text-decoration: none; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: .75rem; margin: .35rem 0 0; }
   section { margin-bottom: 1rem; }
   section.degraded { border: 1px solid #9a670066; background: #9a67000f; border-radius: 8px; padding: .25rem 1rem 1rem; }
   section.degraded h2 { color: #9a6700; }
   section.degraded ul { margin: 0; padding-left: 1.25rem; }
+  .err-summary { font-weight: 600; }
+  .diagnosis { margin-top: .35rem; font-size: .8rem; }
+  .diagnosis .hist { display: inline; }
+  .verdict-app_is_wrong { background: #cf222e30; }
+  .verdict-test_is_wrong { background: #9a670030; }
+  .verdict-environment { background: #9a670030; }
+  .verdict-flaky { background: #9a670030; }
+  .verdict-ambiguous { background: #88848430; }
+  details summary { cursor: pointer; font-size: .75rem; color: #888; }
 </style>
 </head>
 <body>
@@ -196,7 +310,14 @@ export function renderReportHtml(report: RunReport): string {
     <div class="card"><div class="n fail">${failed}</div><div>failed</div></div>
     <div class="card"><div class="n warn">${blocked}</div><div>blocked</div></div>
     <div class="card"><div class="n warn">${flaky}</div><div>flaky</div></div>
+    ${
+      coverage != null
+        ? `<div class="card"><div class="n">${Math.round(coverage.ratio * 100)}%</div><div>coverage</div></div>`
+        : ''
+    }
   </div>
+
+  ${coverageSection}
 
   <section>
     <h2>Plan</h2>

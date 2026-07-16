@@ -24,14 +24,18 @@ import { cn } from '../lib/utils';
 import {
   artifactLeaf,
   artifactUrl,
+  computeStageDurations,
+  computeTotalDurationMs,
   eventLevelColor,
   formatDuration,
+  formatStageBreakdown,
   formatTime,
   groupArtifacts,
   runStatusTone,
   slugMatches,
   testStatusTone,
 } from '../lib/run-format';
+import type { StageDuration } from '../lib/run-format';
 
 type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts';
 
@@ -72,6 +76,11 @@ export function RunDetailPanel({
     [rows, statusFilter],
   );
   const summary = useMemo(() => summarizeStatuses(rows), [rows]);
+  const totalTimeMs = useMemo(
+    () => (detail?.run ? computeTotalDurationMs(detail.run, detail.events) : null),
+    [detail?.run, detail?.events],
+  );
+  const stageDurations = useMemo(() => computeStageDurations(detail?.events ?? []), [detail?.events]);
 
   // Reset any active filter and tab when a different run is opened.
   useEffect(() => {
@@ -233,7 +242,13 @@ export function RunDetailPanel({
         )}
         {tab === 'results' && (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <TestSummary summary={summary} activeStatus={statusFilter} onSelect={selectStatus} />
+            <TestSummary
+              summary={summary}
+              activeStatus={statusFilter}
+              onSelect={selectStatus}
+              totalTimeMs={totalTimeMs}
+              stageDurations={stageDurations}
+            />
             <div className="min-h-0 flex-1 overflow-auto">
               <ResultsTable
                 rows={filteredRows}
@@ -347,16 +362,20 @@ function TestSummary({
   summary,
   activeStatus,
   onSelect,
+  totalTimeMs,
+  stageDurations,
 }: {
   summary: StatusCounts;
   activeStatus: TestStatus | 'all';
   onSelect: (status: TestStatus | 'all') => void;
+  totalTimeMs: number | null;
+  stageDurations: StageDuration[];
 }) {
   const total = STATUS_TILES.reduce((n, t) => n + summary[t.status], 0);
   const rate = total > 0 ? Math.round((summary.passed / total) * 100) : null;
 
   return (
-    <StatTileRow className="mt-3 sm:grid-cols-8">
+    <StatTileRow className="mt-3 sm:grid-cols-9">
       <StatTile
         label="Total"
         value={total}
@@ -376,6 +395,11 @@ function TestSummary({
       ))}
       {/* Non-interactive — a pass rate isn't a status you can filter Results by. */}
       <StatTile label="Rate" value={rate !== null ? `${rate}%` : '—'} />
+      <StatTile
+        label="Total time"
+        value={formatDuration(totalTimeMs)}
+        title={stageDurations.length > 0 ? formatStageBreakdown(stageDurations) : undefined}
+      />
     </StatTileRow>
   );
 }

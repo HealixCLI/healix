@@ -18,12 +18,15 @@ export function StatTile({
   tone = 'default',
   active = false,
   onClick,
+  title,
 }: {
   label: string;
   value: ReactNode;
   tone?: BadgeTone;
   active?: boolean;
   onClick?: () => void;
+  /** Native hover tooltip, e.g. a per-stage duration breakdown. */
+  title?: string;
 }) {
   const valueColor =
     tone === 'ok' ? 'text-ok' : tone === 'warn' ? 'text-warn' : tone === 'err' ? 'text-err' : 'text-fg';
@@ -39,10 +42,14 @@ export function StatTile({
     </>
   );
   if (!onClick) {
-    return <div className={classes}>{content}</div>;
+    return (
+      <div className={classes} title={title}>
+        {content}
+      </div>
+    );
   }
   return (
-    <button type="button" onClick={onClick} className={classes}>
+    <button type="button" onClick={onClick} className={classes} title={title}>
       {content}
     </button>
   );

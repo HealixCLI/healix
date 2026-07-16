@@ -1,6 +1,24 @@
 import { useEffect, useState, type ReactNode } from 'react';
-import type { PlanItemSnapshot, PlanItemStatus, PlanScenario, Tier, TestPlan, TestPlanItem } from '@healix/core';
-import { Check, ChevronDown, ChevronUp, Loader2, Pencil, Plus, Sparkles, ShieldQuestion, Trash2, X } from 'lucide-react';
+import type {
+  PlanItemSnapshot,
+  PlanItemStatus,
+  PlanScenario,
+  Tier,
+  TestPlan,
+  TestPlanItem,
+} from '@healix/core';
+import {
+  Check,
+  ChevronDown,
+  ChevronUp,
+  Loader2,
+  Pencil,
+  Plus,
+  Sparkles,
+  ShieldQuestion,
+  Trash2,
+  X,
+} from 'lucide-react';
 import { Button } from './ui/button';
 import { Badge, type BadgeTone } from './ui/badge';
 import { Input } from './ui/input';
@@ -498,7 +516,9 @@ export function PlanGate({
             {streaming ? 'Generating test plan…' : 'Plan review required'}
           </span>
         </div>
-        <Badge tone="default">{plan.items.length} spec {plan.items.length === 1 ? 'file' : 'files'}</Badge>
+        <Badge tone="default">
+          {plan.items.length} spec {plan.items.length === 1 ? 'file' : 'files'}
+        </Badge>
       </div>
 
       {streaming && batchProgress && (

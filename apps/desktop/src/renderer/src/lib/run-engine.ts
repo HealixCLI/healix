@@ -125,7 +125,7 @@ function mapItem(plan: TestPlan, itemId: string, fn: (item: TestPlanItem) => Tes
 }
 
 function snapshotOf(item: TestPlanItem): PlanItemSnapshot {
-  return { title: item.title, reqTag: item.reqTag, tier: item.tier, intent: item.intent };
+  return { title: item.title, reqTag: item.reqTag, tier: item.tier, intent: item.intent, scenarios: item.scenarios };
 }
 
 /**

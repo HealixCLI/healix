@@ -1,7 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../storage/types.js';
 import { tiersForScope } from '../modes/types.js';
-import { buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
+import { buildGapFillPlanPrompt, buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** Minimal black-box project fixture (baseUrl set so synthesize yields URL-flavoured items). */
 function makeProject(overrides: Partial<Project> = {}): Project {
@@ -133,6 +134,66 @@ describe('parsePlan', () => {
     expect(parsePlan(JSON.stringify({ summary: 'empty', items: [{ tier: 'tierA-public' }] }))).toBeNull();
     expect(parsePlan('')).toBeNull();
   });
+
+  it('parses a scenarios array with positive/negative/edge kinds and a unitKey', () => {
+    const text = JSON.stringify({
+      summary: 'Plan with scenarios.',
+      items: [
+        {
+          title: 'Checkout',
+          reqTag: 'REQ-010',
+          tier: 'tierA-public',
+          intent: 'Checkout flow works.',
+          unitKey: 'route:/checkout',
+          scenarios: [
+            { kind: 'positive', description: 'completes with valid card' },
+            { kind: 'negative', description: 'rejects an expired card' },
+            { kind: 'edge', description: 'handles a zero-total cart' },
+          ],
+        },
+      ],
+    });
+
+    const plan = parsePlan(text);
+    expect(plan?.items[0]?.unitKey).toBe('route:/checkout');
+    expect(plan?.items[0]?.scenarios).toEqual([
+      { kind: 'positive', description: 'completes with valid card' },
+      { kind: 'negative', description: 'rejects an expired card' },
+      { kind: 'edge', description: 'handles a zero-total cart' },
+    ]);
+  });
+
+  it('coerces an unknown scenario kind to positive and drops scenarios with no description', () => {
+    const text = JSON.stringify({
+      summary: 'Plan with a bogus scenario kind.',
+      items: [
+        {
+          title: 'Weird scenario',
+          tier: 'tierA-public',
+          intent: 'Should still parse.',
+          scenarios: [
+            { kind: 'catastrophic', description: 'treated as positive' },
+            { kind: 'negative', description: '' },
+          ],
+        },
+      ],
+    });
+
+    const plan = parsePlan(text);
+    expect(plan?.items[0]?.scenarios).toEqual([{ kind: 'positive', description: 'treated as positive' }]);
+  });
+
+  it('falls back to a single positive scenario derived from intent when scenarios is missing/malformed', () => {
+    const text = JSON.stringify({
+      summary: 'Plan with no scenarios field.',
+      items: [{ title: 'Legacy item', tier: 'tierA-public', intent: 'Still works without scenarios.' }],
+    });
+
+    const plan = parsePlan(text);
+    expect(plan?.items[0]?.scenarios).toEqual([
+      { kind: 'positive', description: 'Still works without scenarios.' },
+    ]);
+  });
 });
 
 describe('synthesizePlan', () => {
@@ -213,6 +274,53 @@ describe('buildPlanPrompt (repo context)', () => {
     expect(prompt).toContain('- src/file-079.ts');
     expect(prompt).not.toContain('src/file-080.ts');
     expect(prompt).toContain('... and 20 more file(s) not listed.');
+  });
+
+  it('does not cap scenario count at "3-8" — the old ceiling is gone', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test' });
+    expect(prompt).not.toContain('3-8');
+    expect(prompt).not.toMatch(/prefer\s+\d+-\d+/i);
+  });
+
+  it('lists detected functionality units and instructs one item per unit', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+      { key: 'endpoint:GET /health', kind: 'endpoint', label: 'GET /health', file: 'src/server.ts' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id },
+      { summary: 'Framework: next.', files: [], functionality: units },
+    );
+
+    expect(prompt).toContain('Detected routes/endpoints');
+    expect(prompt).toContain('[route] page: /checkout (unitKey: "route:/checkout")');
+    expect(prompt).toContain('[endpoint] GET /health (unitKey: "endpoint:GET /health")');
+    expect(prompt).toContain('one item per distinct route/endpoint');
+    expect(prompt).toContain('"unitKey"');
+  });
+});
+
+describe('buildGapFillPlanPrompt', () => {
+  it('scopes the prompt to only the given uncovered units and notes prior coverage', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const uncovered: FunctionalityUnit[] = [
+      { key: 'route:/settings', kind: 'route', label: 'page: /settings', file: 'app/settings/page.tsx' },
+    ];
+    const prompt = buildGapFillPlanPrompt(project, { projectId: project.id }, uncovered, {
+      summary: 'Framework: next.',
+      files: ['app/checkout/page.tsx', 'app/settings/page.tsx'],
+      functionality: [
+        { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+        ...uncovered,
+      ],
+    });
+
+    expect(prompt).toContain('already planned and tested other parts');
+    expect(prompt).toContain('route:/settings');
+    // Only the uncovered unit is listed, not the already-covered one.
+    expect(prompt).not.toContain('route:/checkout');
   });
 });
 

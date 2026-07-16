@@ -14,6 +14,7 @@ import type {
   TestMode,
   TestModeContext,
   TestPlan,
+  TestPlanItem,
 } from '../modes/types.js';
 import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
@@ -23,8 +24,16 @@ import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
-import { buildPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import { buildPlanPrompt, buildGapFillPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import { indexFunctionality } from '../target/functionality-index.js';
 import { diffAgainstBase } from './topup.js';
+import {
+  computeCoverage,
+  mergeExecOutcomes,
+  COVERAGE_MAX_ITERATIONS,
+  FRESH_COVERAGE_TARGET,
+  TOPUP_COVERAGE_TARGET,
+} from './coverage.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
@@ -239,6 +248,9 @@ async function runPipeline(
   let plan: TestPlan | null = null;
   let specs: GeneratedSpec[] = [];
   let outcome: ExecOutcome | null = null;
+  // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
+  // loop, which needs the same functionality inventory the initial plan was grounded on.
+  let repoIndex: PlanRepoContext | undefined;
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
   let artifactFiles: string[] = [];
@@ -287,7 +299,6 @@ async function runPipeline(
       // the model can see the repo's real structure (routes/pages/dirs), but
       // indexing must never block or break planning — any failure simply means
       // "plan without repo context".
-      let repoIndex: PlanRepoContext | undefined;
       if (project.repoPath) {
         try {
           const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
@@ -295,6 +306,19 @@ async function runPipeline(
           emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
         } catch (err) {
           emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+        }
+        try {
+          const functionality = await indexFunctionality(project.repoPath);
+          if (functionality.units.length > 0) {
+            repoIndex = { ...(repoIndex ?? { summary: '', files: [] }), functionality: functionality.units };
+            emit(
+              'plan',
+              'debug',
+              `Detected ${functionality.units.length} functionality unit(s) for plan grounding.`,
+            );
+          }
+        } catch (err) {
+          emit('plan', 'debug', `Functionality indexing failed (planning without route context): ${errMsg(err)}`);
         }
       }
 
@@ -620,6 +644,7 @@ async function runPipeline(
 
       let newSpecs: GeneratedSpec[] = [];
       let carriedSpecs: GeneratedSpec[] = [];
+      let newSpecItems: TestPlanItem[] = [];
       if (suiteMode === 'reuse') {
         emit(
           'generate',
@@ -636,24 +661,22 @@ async function runPipeline(
         );
         emit('generate', 'info', 'Generating specs.');
         newSpecs = await mode.generate(ctx, { ...planForGeneration, items: diff.toGenerate });
+        newSpecItems = diff.toGenerate;
         carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
       } else {
         emit('generate', 'info', 'Generating specs.');
         newSpecs = await mode.generate(ctx, planForGeneration);
+        newSpecItems = planForGeneration.items;
       }
 
       specs = [...newSpecs, ...carriedSpecs];
-      for (const spec of specs) {
-        const test = store.insertTest({
-          runId,
-          title: spec.title,
-          reqTag: spec.reqTag ?? null,
-          tier: (spec.tier ?? null) as Tier | null,
-          status: 'pending',
-          specPath: relative(ctx.projectDir, spec.path),
-        });
-        testIdByKey.set(stableKey(spec.reqTag, spec.title), test.id);
-      }
+      // Freshly generated specs register ONE test row per scenario the plan
+      // requested (see registerSpecRows) so Total/Passed/Failed/etc. reflect
+      // real test-case counts, matching the report — not spec-file counts.
+      // Carried-forward specs (copied bytes from a prior run, already at
+      // whatever granularity that run used) get a single row, as before.
+      for (const spec of newSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+      for (const spec of carriedSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
       emit('generate', 'info', `Generated ${specs.length} spec(s).`);
     } catch (err) {
       emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
@@ -715,6 +738,127 @@ async function runPipeline(
       emit('execute', 'warn', `Artifact collection failed (continuing): ${errMsg(err)}`, {
         stack: errStack(err),
       });
+    }
+
+    // ---- 8c. COVERAGE FEEDBACK LOOP (best-effort) ----
+    // Fresh/top-up runs bound their coverage to a MEASURED target instead of
+    // stopping after a single plan/generate/execute pass — the earlier "prefer
+    // 3-8 scenarios" cap meant the plan itself was the bottleneck no matter how
+    // much of the app's real surface area was detected. Each iteration here
+    // re-plans ONLY the still-uncovered functionality units (buildGapFillPlanPrompt),
+    // generates+executes just those items, and merges the results in. These
+    // fill-gap iterations are auto-approved (skip the human plan-approval gate)
+    // since they are strictly additive within the tiers/scope already approved
+    // in the initial plan — every iteration still emits a clear message so this
+    // is never silent about what it's adding or why it stopped.
+    if (checkCancelled()) return cancelRun('generate');
+    if (suiteMode === 'reuse' || !repoIndex?.functionality || repoIndex.functionality.length === 0) {
+      emit('generate', 'debug', 'Skipping coverage loop (reuse mode or no functionality inventory).');
+    } else {
+      const coverageTarget = suiteMode === 'topup' ? TOPUP_COVERAGE_TARGET : FRESH_COVERAGE_TARGET;
+      const units = repoIndex.functionality;
+      let coveredPlanItems = planForGeneration.items;
+      let iteration = 1;
+      let coverage = computeCoverage(units, coveredPlanItems, specs, outcome);
+      emit(
+        'generate',
+        'info',
+        `Coverage: ${Math.round(coverage.ratio * 100)}% (${coverage.coveredUnitKeys.size}/${units.length} unit(s)).`,
+      );
+
+      while (
+        coverage.ratio < coverageTarget &&
+        coverage.uncovered.length > 0 &&
+        iteration < COVERAGE_MAX_ITERATIONS &&
+        !checkCancelled()
+      ) {
+        iteration += 1;
+        emit(
+          'plan',
+          'info',
+          `Coverage ${Math.round(coverage.ratio * 100)}% below target ${Math.round(coverageTarget * 100)}%; ` +
+            `planning gap-fill iteration ${iteration}/${COVERAGE_MAX_ITERATIONS} for ${coverage.uncovered.length} uncovered unit(s).`,
+        );
+
+        const gapPrompt = buildGapFillPlanPrompt(project, opts, coverage.uncovered, repoIndex);
+        let gapPlan: TestPlan | null = null;
+        try {
+          const completion = await provider.complete(gapPrompt, {
+            mode: 'plan',
+            cwd: project.repoPath ?? undefined,
+            signal,
+          });
+          if (completion.ok && completion.text) {
+            gapPlan = parsePlan(completion.text, opts.testingScope ?? 'both');
+          } else {
+            emit('plan', 'warn', `Gap-fill planning returned no usable plan; stopping coverage loop.`);
+          }
+        } catch (err) {
+          emit('plan', 'warn', `Gap-fill planning failed (stopping coverage loop): ${errMsg(err)}`);
+        }
+        if (!gapPlan || gapPlan.items.length === 0) break;
+
+        const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
+        const gapItems = gapPlan.items.filter((it) => inScopeTiers.has(it.tier));
+        if (gapItems.length === 0) {
+          emit('plan', 'info', 'Gap-fill plan had no in-scope items; stopping coverage loop.');
+          break;
+        }
+        emit('plan', 'info', `Gap-fill plan: ${gapItems.length} item(s), auto-approved.`);
+
+        if (checkCancelled()) break;
+        let gapSpecs: GeneratedSpec[] = [];
+        try {
+          emit('generate', 'info', `Generating ${gapItems.length} gap-fill spec(s).`);
+          gapSpecs = await mode.generate(ctx, { summary: gapPlan.summary, items: gapItems });
+        } catch (err) {
+          emit('generate', 'warn', `Gap-fill generation failed (stopping coverage loop): ${errMsg(err)}`);
+          break;
+        }
+        if (gapSpecs.length === 0) {
+          emit('generate', 'info', 'Gap-fill generation produced no accepted specs; stopping coverage loop.');
+          break;
+        }
+        for (const spec of gapSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
+        specs = [...specs, ...gapSpecs];
+
+        if (checkCancelled()) break;
+        try {
+          emit('execute', 'info', `Executing ${gapSpecs.length} gap-fill spec(s).`);
+          const gapOutcome = await mode.execute(ctx, gapSpecs);
+          persistResults(store, runId, gapSpecs, gapOutcome, testIdByKey, noteStoreOk, noteStoreFailure);
+          outcome = mergeExecOutcomes(outcome, gapOutcome);
+        } catch (err) {
+          emit('execute', 'warn', `Gap-fill execution failed (stopping coverage loop): ${errMsg(err)}`);
+          break;
+        }
+
+        coveredPlanItems = [...coveredPlanItems, ...gapItems];
+        planForGeneration = { ...planForGeneration, items: coveredPlanItems };
+        plan = { ...plan, items: [...plan.items, ...gapItems] };
+
+        const prevCovered = coverage.coveredUnitKeys.size;
+        coverage = computeCoverage(units, coveredPlanItems, specs, outcome);
+        emit(
+          'generate',
+          'info',
+          `Coverage after iteration ${iteration}: ${Math.round(coverage.ratio * 100)}% (${coverage.coveredUnitKeys.size}/${units.length} unit(s)).`,
+        );
+        if (coverage.coveredUnitKeys.size <= prevCovered) {
+          emit('generate', 'info', 'No forward progress in coverage; stopping loop.');
+          break;
+        }
+      }
+
+      if (coverage.ratio < coverageTarget) {
+        emit(
+          'generate',
+          'warn',
+          `Coverage loop stopped at ${Math.round(coverage.ratio * 100)}% (target ${Math.round(coverageTarget * 100)}%) ` +
+            `after ${iteration} iteration(s) — see prior log lines for why it stopped short.`,
+        );
+      }
+      await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     }
 
     // ---- 9. TRIAGE (best-effort) ----
@@ -1007,10 +1151,66 @@ async function runPlanPhase(
 }
 
 /**
- * Persist execution results. The test rows were already inserted in GENERATE, so each
- * result is matched back to its spec by a stable key (reqTag preferred, else normalized
- * title) and we insert ONLY the result row. A result with no matching spec gets a single
- * fallback test row so it is still recorded exactly once.
+ * Insert `tests` rows for a batch of GENERATE-produced specs. A freshly generated
+ * spec (found in `items` by reqTag) gets ONE row per scenario the plan requested —
+ * so Total/Passed/Failed/etc. reflect real test-case counts, matching what the
+ * report already shows (outcome.results is scenario-level), not spec-file counts.
+ * A carried-forward spec (no matching item — copied bytes from a prior run,
+ * already at whatever granularity that run used) gets a single row, as before.
+ *
+ * Rows are keyed positionally (`${reqTag/title key}#${scenarioIndex}`) rather
+ * than by the model's own scenario title text, since that text isn't known
+ * until execution. persistResults matches results back to these rows by
+ * encounter order within the same reqTag — safe because generate.ts requires
+ * scenarios to be emitted as one test() each, in the same order they were
+ * planned, so Playwright's report preserves that order too.
+ */
+function registerSpecRows(
+  store: HealixStore,
+  runId: string,
+  projectDir: string,
+  spec: GeneratedSpec,
+  items: TestPlanItem[],
+  testIdByKey: Map<string, string>,
+): void {
+  const reqTag = (spec.reqTag ?? '').trim();
+  const item = reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined;
+  const specPath = relative(projectDir, spec.path);
+  const base = stableKey(spec.reqTag, spec.title);
+
+  if (!item || item.scenarios.length === 0) {
+    const test = store.insertTest({
+      runId,
+      title: spec.title,
+      reqTag: spec.reqTag ?? null,
+      tier: (spec.tier ?? null) as Tier | null,
+      status: 'pending',
+      specPath,
+    });
+    testIdByKey.set(base, test.id);
+    return;
+  }
+
+  item.scenarios.forEach((s, i) => {
+    const test = store.insertTest({
+      runId,
+      title: `${spec.title} — ${s.kind}: ${s.description}`,
+      reqTag: spec.reqTag ?? null,
+      tier: (spec.tier ?? null) as Tier | null,
+      status: 'pending',
+      specPath,
+    });
+    testIdByKey.set(`${base}#${i}`, test.id);
+  });
+}
+
+/**
+ * Persist execution results. Each spec's scenario results are matched back, IN
+ * ENCOUNTER ORDER, to the positionally-keyed rows registerSpecRows inserted for
+ * that reqTag — the first scenario result for a reqTag maps to `#0`, the second
+ * to `#1`, and so on. A result with no matching spec, or more results than
+ * scenarios were registered for (unexpected but not fatal), gets its own
+ * fallback row keyed by its own title so it's still recorded exactly once.
  */
 function persistResults(
   store: HealixStore,
@@ -1021,31 +1221,49 @@ function persistResults(
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
+  const scenarioIndexByReqTag = new Map<string, number>();
+
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
-    // to carry the "[REQ:<tag>]" marker (ensureReqTag). Recover the tag from the
-    // result title first — it keys directly onto the row inserted in GENERATE —
-    // and only fall back to normalized-title matching when no tag survived.
+    // to carry the "[REQ:<tag>]" marker on EVERY scenario test (see generate.ts's
+    // per-test tagging requirement). Recover the tag from the result title first —
+    // it keys directly onto the rows inserted in GENERATE — and only fall back to
+    // normalized-title matching when no tag survived.
     const tagFromTitle = extractReqTag(r.title);
     const matched = specs.find(
       (s) =>
         (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
         stableKey(undefined, s.title) === stableKey(undefined, r.title),
     );
-    const key = stableKey(tagFromTitle ?? matched?.reqTag, matched?.title ?? r.title);
-    let testId = testIdByKey.get(key);
-    if (!testId) {
-      // No spec matched this result — insert a single fallback test row to anchor it.
-      const fallback = store.insertTest({
-        runId,
-        title: r.title,
-        reqTag: matched?.reqTag ?? tagFromTitle,
-        tier: (matched?.tier ?? null) as Tier | null,
-        status: r.status as TestStatus,
-      });
-      testId = fallback.id;
-      testIdByKey.set(key, testId);
+    const base = matched ? stableKey(tagFromTitle ?? matched.reqTag, matched.title) : null;
+
+    let testId: string | undefined;
+    if (base) {
+      const reqTagKey = tagFromTitle ?? matched?.reqTag ?? base;
+      const scenarioIndex = scenarioIndexByReqTag.get(reqTagKey) ?? 0;
+      scenarioIndexByReqTag.set(reqTagKey, scenarioIndex + 1);
+      testId = testIdByKey.get(`${base}#${scenarioIndex}`) ?? (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
+      if (testId) store.updateTestTitle(testId, r.title);
     }
+    if (!testId) {
+      // No matching pre-registered row (no spec matched, or more results than
+      // scenarios were planned) — insert a fallback row, keyed by its own
+      // title so repeated overflow results don't collide with each other.
+      const fallbackKey = stableKey(tagFromTitle ?? matched?.reqTag, r.title);
+      testId = testIdByKey.get(fallbackKey);
+      if (!testId) {
+        const fallback = store.insertTest({
+          runId,
+          title: r.title,
+          reqTag: matched?.reqTag ?? tagFromTitle,
+          tier: (matched?.tier ?? null) as Tier | null,
+          status: r.status as TestStatus,
+        });
+        testId = fallback.id;
+        testIdByKey.set(fallbackKey, testId);
+      }
+    }
+
     try {
       store.insertResult({
         testId,
@@ -1054,13 +1272,20 @@ function persistResults(
         error: r.error ?? null,
         artifactsJson: r.artifacts && r.artifacts.length > 0 ? JSON.stringify(r.artifacts) : null,
       });
-      // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
-      // report command) would otherwise see every test as eternally 'pending'.
-      store.updateTestStatus(testId, r.status as TestStatus);
       noteStoreOk();
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
+    }
+    try {
+      // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
+      // report command) would otherwise see every test as eternally 'pending'.
+      // Each row now maps to exactly one scenario result (positionally or via
+      // the fallback path), so a direct update is correct — no aggregation needed.
+      store.updateTestStatus(testId, r.status as TestStatus);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('updateTestStatus', err);
     }
   }
 }

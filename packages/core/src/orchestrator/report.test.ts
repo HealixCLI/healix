@@ -31,7 +31,7 @@ const project: Project = {
 const plan: TestPlan = { summary: 'One feature.', items: [] };
 
 describe('report — failure diagnostics, coverage, artifacts', () => {
-  it('surfaces a failed result\'s artifact basenames (not full local paths) alongside its error', () => {
+  it("surfaces a failed result's artifact basenames (not full local paths) alongside its error", () => {
     const outcome: ExecOutcome = {
       passed: 0,
       failed: 1,
@@ -43,7 +43,10 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
           status: 'failed',
           durationMs: 5,
           error: 'expect(locator).toBeVisible() failed',
-          artifacts: ['C:\\runs\\r1\\suite\\test-results\\foo\\trace.zip', 'C:\\runs\\r1\\suite\\test-results\\foo\\test-failed-1.png'],
+          artifacts: [
+            'C:\\runs\\r1\\suite\\test-results\\foo\\trace.zip',
+            'C:\\runs\\r1\\suite\\test-results\\foo\\test-failed-1.png',
+          ],
         },
       ],
     };
@@ -119,13 +122,15 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
           status: 'failed',
           durationMs: 5,
           error:
-            'Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole(\'button\')\nat spec.ts:7:18',
+            "Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole('button')\nat spec.ts:7:18",
         },
       ],
     };
     const report = buildReport({ run, project, plan, outcome, triage: [] });
     const html = renderReportHtml(report);
-    expect(html).toContain('<div class="err-summary">Error: locator.click: Test timeout of 60000ms exceeded.</div>');
+    expect(html).toContain(
+      '<div class="err-summary">Error: locator.click: Test timeout of 60000ms exceeded.</div>',
+    );
     expect(html).toContain('<details><summary>Full details</summary>');
     expect(html).toContain('Call log:');
   });
@@ -178,7 +183,9 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         ratio: 0.5,
         coveredCount: 1,
         totalCount: 2,
-        uncovered: [{ key: 'route:/checkout', kind: 'route', label: 'GET /checkout', file: 'src/pages/checkout.tsx' }],
+        uncovered: [
+          { key: 'route:/checkout', kind: 'route', label: 'GET /checkout', file: 'src/pages/checkout.tsx' },
+        ],
       },
     });
     const html = renderReportHtml(report);

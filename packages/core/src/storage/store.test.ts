@@ -343,14 +343,38 @@ describe('deleteUnexecutedTests', () => {
     const project = s.createProject({ name: 'reconcile-project', baseUrl: 'https://reconcile.test' });
     const run = s.createRun(project.id);
 
-    const executed = s.insertTest({ runId: run.id, title: 'passed one', reqTag: 'REQ-1', tier: 'tierA-public', status: 'pending' });
-    s.insertResult({ testId: executed.id, status: 'passed', durationMs: 5, error: null, artifactsJson: null });
+    const executed = s.insertTest({
+      runId: run.id,
+      title: 'passed one',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'pending',
+    });
+    s.insertResult({
+      testId: executed.id,
+      status: 'passed',
+      durationMs: 5,
+      error: null,
+      artifactsJson: null,
+    });
 
-    const skipped = s.insertTest({ runId: run.id, title: 'skipped one', reqTag: 'REQ-2', tier: 'tierA-public', status: 'pending' });
+    const skipped = s.insertTest({
+      runId: run.id,
+      title: 'skipped one',
+      reqTag: 'REQ-2',
+      tier: 'tierA-public',
+      status: 'pending',
+    });
     // A genuinely executed-but-skipped scenario still gets a result row, whose
     // status can itself be 'pending' (see execute.ts's normalizeStatus) — this
     // must NOT be mistaken for an unexecuted row.
-    s.insertResult({ testId: skipped.id, status: 'pending', durationMs: null, error: null, artifactsJson: null });
+    s.insertResult({
+      testId: skipped.id,
+      status: 'pending',
+      durationMs: null,
+      error: null,
+      artifactsJson: null,
+    });
 
     const neverRan = s.insertTest({
       runId: run.id,
@@ -375,14 +399,20 @@ describe('deleteUnexecutedTests', () => {
     const s = await store();
     const project = s.createProject({ name: 'reconcile-clean', baseUrl: 'https://reconcile-clean.test' });
     const run = s.createRun(project.id);
-    const t = s.insertTest({ runId: run.id, title: 'ok', reqTag: 'REQ-1', tier: 'tierA-public', status: 'pending' });
+    const t = s.insertTest({
+      runId: run.id,
+      title: 'ok',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'pending',
+    });
     s.insertResult({ testId: t.id, status: 'passed', durationMs: 1, error: null, artifactsJson: null });
 
     expect(s.deleteUnexecutedTests(run.id)).toBe(0);
     expect(s.listTests(run.id)).toHaveLength(1);
   });
 
-  it('only reconciles the given run, leaving another run\'s unexecuted rows alone', async () => {
+  it("only reconciles the given run, leaving another run's unexecuted rows alone", async () => {
     const s = await store();
     const project = s.createProject({ name: 'reconcile-scoped', baseUrl: 'https://reconcile-scoped.test' });
     const runA = s.createRun(project.id);

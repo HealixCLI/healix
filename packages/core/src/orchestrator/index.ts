@@ -24,7 +24,13 @@ import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
-import { buildPlanPrompt, buildGapFillPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import {
+  buildPlanPrompt,
+  buildGapFillPlanPrompt,
+  parsePlan,
+  synthesizePlan,
+  type PlanRepoContext,
+} from './plan.js';
 import { indexFunctionality } from '../target/functionality-index.js';
 import { diffAgainstBase } from './topup.js';
 import {
@@ -34,7 +40,12 @@ import {
   FRESH_COVERAGE_TARGET,
   TOPUP_COVERAGE_TARGET,
 } from './coverage.js';
-import { buildReport, renderReportHtml, type ReportCoverageSummary, type ReportTriageEntry } from './report.js';
+import {
+  buildReport,
+  renderReportHtml,
+  type ReportCoverageSummary,
+  type ReportTriageEntry,
+} from './report.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
@@ -321,7 +332,11 @@ async function runPipeline(
             );
           }
         } catch (err) {
-          emit('plan', 'debug', `Functionality indexing failed (planning without route context): ${errMsg(err)}`);
+          emit(
+            'plan',
+            'debug',
+            `Functionality indexing failed (planning without route context): ${errMsg(err)}`,
+          );
         }
       }
 
@@ -678,7 +693,8 @@ async function runPipeline(
       // real test-case counts, matching the report — not spec-file counts.
       // Carried-forward specs (copied bytes from a prior run, already at
       // whatever granularity that run used) get a single row, as before.
-      for (const spec of newSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+      for (const spec of newSpecs)
+        registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
       for (const spec of carriedSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
       emit('generate', 'info', `Generated ${specs.length} spec(s).`);
     } catch (err) {
@@ -822,7 +838,8 @@ async function runPipeline(
           emit('generate', 'info', 'Gap-fill generation produced no accepted specs; stopping coverage loop.');
           break;
         }
-        for (const spec of gapSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
+        for (const spec of gapSpecs)
+          registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
         specs = [...specs, ...gapSpecs];
 
         if (checkCancelled()) break;
@@ -1291,7 +1308,9 @@ function persistResults(
       const reqTagKey = tagFromTitle ?? matched?.reqTag ?? base;
       const scenarioIndex = scenarioIndexByReqTag.get(reqTagKey) ?? 0;
       scenarioIndexByReqTag.set(reqTagKey, scenarioIndex + 1);
-      testId = testIdByKey.get(`${base}#${scenarioIndex}`) ?? (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
+      testId =
+        testIdByKey.get(`${base}#${scenarioIndex}`) ??
+        (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
       if (testId) store.updateTestTitle(testId, r.title);
     }
     if (!testId) {

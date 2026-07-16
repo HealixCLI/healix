@@ -60,7 +60,7 @@ describe('computeTotalDurationMs', () => {
     expect(computeTotalDurationMs({ startedAt: null, finishedAt: null }, [])).toBeNull();
   });
 
-  it('prefers the run\'s own startedAt/finishedAt when both are present', () => {
+  it("prefers the run's own startedAt/finishedAt when both are present", () => {
     const ms = computeTotalDurationMs(
       { startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:05:00.000Z' },
       [event('plan', '2026-01-01T00:00:00.000Z'), event('execute', '2026-01-01T00:04:00.000Z')],
@@ -77,10 +77,10 @@ describe('computeTotalDurationMs', () => {
   });
 
   it('falls back to the event span when only one of startedAt/finishedAt is present', () => {
-    const ms = computeTotalDurationMs(
-      { startedAt: '2026-01-01T00:00:00.000Z', finishedAt: null },
-      [event('plan', '2026-01-01T00:00:00.000Z'), event('execute', '2026-01-01T00:02:00.000Z')],
-    );
+    const ms = computeTotalDurationMs({ startedAt: '2026-01-01T00:00:00.000Z', finishedAt: null }, [
+      event('plan', '2026-01-01T00:00:00.000Z'),
+      event('execute', '2026-01-01T00:02:00.000Z'),
+    ]);
     expect(ms).toBe(2 * 60_000);
   });
 
@@ -92,7 +92,6 @@ describe('computeTotalDurationMs', () => {
     ]);
     expect(ms).toBe(5 * 60_000);
   });
-
 });
 
 describe('computeStageDurations', () => {
@@ -101,12 +100,15 @@ describe('computeStageDurations', () => {
   });
 
   it('returns an empty list when no event phase is a known stage', () => {
-    expect(computeStageDurations([event('launch', '2026-01-01T00:00:00.000Z'), event('done', '2026-01-01T00:01:00.000Z')])).toEqual(
-      [],
-    );
+    expect(
+      computeStageDurations([
+        event('launch', '2026-01-01T00:00:00.000Z'),
+        event('done', '2026-01-01T00:01:00.000Z'),
+      ]),
+    ).toEqual([]);
   });
 
-  it('derives each stage\'s duration from its first event to the next stage\'s first event', () => {
+  it("derives each stage's duration from its first event to the next stage's first event", () => {
     const stages = computeStageDurations([
       event('plan', '2026-01-01T00:00:00.000Z'),
       event('plan', '2026-01-01T00:00:30.000Z'),
@@ -120,7 +122,7 @@ describe('computeStageDurations', () => {
     ]);
   });
 
-  it('attributes the final known stage\'s duration up to the last event overall, not its own last event', () => {
+  it("attributes the final known stage's duration up to the last event overall, not its own last event", () => {
     const stages = computeStageDurations([
       event('execute', '2026-01-01T00:00:00.000Z'),
       event('execute', '2026-01-01T00:00:10.000Z'),
@@ -157,7 +159,7 @@ describe('formatStageBreakdown', () => {
     expect(formatStageBreakdown([])).toBe('');
   });
 
-  it('joins each stage\'s label and formatted duration on its own line', () => {
+  it("joins each stage's label and formatted duration on its own line", () => {
     const text = formatStageBreakdown([
       { phase: 'plan', label: 'Planning', ms: 1_432_300 },
       { phase: 'execute', label: 'Execution', ms: 500 },

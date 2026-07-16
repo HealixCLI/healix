@@ -166,7 +166,10 @@ export function computeStageDurations(events: AgentEvent[]): StageDuration[] {
 }
 
 /** Total run duration: prefers the run's own started/finished timestamps, falling back to the event span. */
-export function computeTotalDurationMs(run: Pick<Run, 'startedAt' | 'finishedAt'>, events: AgentEvent[]): number | null {
+export function computeTotalDurationMs(
+  run: Pick<Run, 'startedAt' | 'finishedAt'>,
+  events: AgentEvent[],
+): number | null {
   if (run.startedAt && run.finishedAt) {
     const start = new Date(run.startedAt).getTime();
     const end = new Date(run.finishedAt).getTime();

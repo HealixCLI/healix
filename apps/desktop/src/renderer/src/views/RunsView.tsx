@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ExplorationMode, Project, SuiteMode, TestingScope } from '@healix/core';
+import type { Project, SuiteMode, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, ListPlus, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
@@ -19,7 +19,7 @@ import { useRunDetail } from '../lib/use-run-detail';
 import { useLastSuccessfulRun } from '../lib/use-last-successful-run';
 import { useLiveFrame } from '../lib/use-live-frame';
 import { cn } from '../lib/utils';
-import { formatCreatedAt } from '../lib/run-format';
+import { formatCreatedAt, isTerminalRun } from '../lib/run-format';
 import { SUITE_MODES, TESTING_SCOPES, type RunEngine, type RunPhase } from '../lib/run-engine';
 import type { RunQueue } from '../lib/run-queue';
 
@@ -233,6 +233,21 @@ export function RunsView({
     const id = setInterval(() => void refreshRuns(), 3000);
     return () => clearInterval(id);
   }, [isActive, refreshRuns]);
+
+  // useRunDetail fetches its tests/results/report snapshot only once per
+  // selectedRunId and otherwise only refetches once the run fully settles
+  // (see the SETTLED_PHASES effect above) — so watching a still-in-progress
+  // run's Results tab showed a stale, smaller test count than the report.html
+  // file (re-read fresh from disk every time it's opened) as the run kept
+  // adding rows in the background. Poll the same detail while the SELECTED
+  // run itself is non-terminal, regardless of whether it's the one the local
+  // engine is driving (e.g. re-opening a run started in a previous session).
+  const selectedRunStatus = detail?.run?.status ?? null;
+  useEffect(() => {
+    if (!selectedRunId || !selectedRunStatus || isTerminalRun(selectedRunStatus)) return;
+    const id = setInterval(() => void reloadDetail(), 3000);
+    return () => clearInterval(id);
+  }, [selectedRunId, selectedRunStatus, reloadDetail]);
 
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === projectId) ?? null,

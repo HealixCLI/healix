@@ -562,7 +562,7 @@ async function runPipeline(
           'launch',
           'error',
           `[launch] Target app could not be started${launchError ? `: ${errMsg(launchError)}` : ''}. ` +
-          'Fix the start command (healix scan <repo>), start the app yourself and register the project with --url, or check the error above.',
+            'Fix the start command (healix scan <repo>), start the app yourself and register the project with --url, or check the error above.',
           { stack: errStack(launchError ?? undefined) },
         );
         setStatus('error', { finishedAt: nowIso() });
@@ -830,7 +830,7 @@ async function runPipeline(
           'plan',
           'info',
           `Coverage ${Math.round(coverage.ratio * 100)}% below target ${Math.round(coverageTarget * 100)}%; ` +
-          `planning gap-fill iteration ${iteration}/${COVERAGE_MAX_ITERATIONS} for ${coverage.uncovered.length} uncovered unit(s).`,
+            `planning gap-fill iteration ${iteration}/${COVERAGE_MAX_ITERATIONS} for ${coverage.uncovered.length} uncovered unit(s).`,
         );
 
         const gapPrompt = buildGapFillPlanPrompt(project, opts, coverage.uncovered, repoIndex);
@@ -910,7 +910,7 @@ async function runPipeline(
           'generate',
           'warn',
           `Coverage loop stopped at ${Math.round(coverage.ratio * 100)}% (target ${Math.round(coverageTarget * 100)}%) ` +
-          `after ${iteration} iteration(s) — see prior log lines for why it stopped short.`,
+            `after ${iteration} iteration(s) — see prior log lines for why it stopped short.`,
         );
       }
       await writeJson(join(runDir, 'plan', 'plan.json'), plan);
@@ -1021,7 +1021,7 @@ async function runPipeline(
         'report',
         'warn',
         `Generated ${generationStats.acceptedItems}/${generationStats.requestedItems} planned spec(s); ` +
-        `${dropped} dropped after failed generation attempts (see generate-phase logs above for reasons).`,
+          `${dropped} dropped after failed generation attempts (see generate-phase logs above for reasons).`,
       );
     }
     emit('report', 'info', 'Writing report.');
@@ -1231,7 +1231,11 @@ export async function attemptPlanCompletion(
         // well-formed prompt.
         const retryable = parsed.failureReason === 'truncated';
         const reason = `unparseable plan response (${parsed.failureReason ?? 'unknown'})`;
-        emit('plan', 'warn', `Could not parse plan JSON from "${p.id}" (${parsed.failureReason ?? 'unknown'}).`);
+        emit(
+          'plan',
+          'warn',
+          `Could not parse plan JSON from "${p.id}" (${parsed.failureReason ?? 'unknown'}).`,
+        );
         return { plan: null, retryable, reason };
       }
       // ok:false is a provider-level failure → eligible for one fallback retry.
@@ -1332,20 +1336,25 @@ export async function runPlanPhase(
     const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
     if (result.plan) {
       items.push(...result.plan.items);
-      emit('plan', 'info', `Batch ${i + 1}/${batches.length} generated ${result.plan.items.length} item(s).`, {
-        kind: 'plan-batch',
-        batchIndex: i,
-        totalBatches: batches.length,
-        items: result.plan.items,
-        status: 'ok',
-      });
+      emit(
+        'plan',
+        'info',
+        `Batch ${i + 1}/${batches.length} generated ${result.plan.items.length} item(s).`,
+        {
+          kind: 'plan-batch',
+          batchIndex: i,
+          totalBatches: batches.length,
+          items: result.plan.items,
+          status: 'ok',
+        },
+      );
     } else {
       failedBatches.push(`batch ${i + 1}/${batches.length}: ${result.reason}`);
       emit(
         'plan',
         'warn',
         `Batch ${i + 1}/${batches.length} produced no usable plan (${result.reason}); its units will be ` +
-        'left for the coverage-feedback loop.',
+          'left for the coverage-feedback loop.',
         {
           kind: 'plan-batch',
           batchIndex: i,
@@ -1373,7 +1382,9 @@ export async function runPlanPhase(
     items,
     planSource: 'ai',
     ...(failedBatches.length > 0
-      ? { fallbackReason: `${failedBatches.length}/${batches.length} batch(es) failed: ${failedBatches.join('; ')}` }
+      ? {
+          fallbackReason: `${failedBatches.length}/${batches.length} batch(es) failed: ${failedBatches.join('; ')}`,
+        }
       : {}),
   };
 }

@@ -35,7 +35,9 @@ function makeProject(): Project {
 
 const REAL_PLAN: TestPlan = {
   summary: 'A real plan.',
-  items: [{ id: 'pli_1', title: 'Home loads', tier: 'tierA-public', intent: 'Landing renders.', scenarios: [] }],
+  items: [
+    { id: 'pli_1', title: 'Home loads', tier: 'tierA-public', intent: 'Landing renders.', scenarios: [] },
+  ],
   planSource: 'ai',
 };
 

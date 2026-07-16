@@ -450,7 +450,10 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // usedPaths set, so each accepted spec persists to a unique file on disk
   // even when several items are generated at once.
   const tasks = items.map((item, i) => async () => {
-    emit(ctx, `Dispatched ${i + 1}/${items.length}: Generating "${item.title}"`, { id: item.id, tier: item.tier });
+    emit(ctx, `Dispatched ${i + 1}/${items.length}: Generating "${item.title}"`, {
+      id: item.id,
+      tier: item.tier,
+    });
     const outcome = await generateOne(ctx, item, usedPaths);
     completed += 1;
     emit(ctx, `Progress: ${completed}/${items.length} done`, { completed, total: items.length });

@@ -262,7 +262,9 @@ describe('parsePlanWithDiagnostics', () => {
 
   it('parsePlan stays a thin wrapper returning only the plan (or null)', () => {
     expect(parsePlan('no json here')).toBeNull();
-    expect(parsePlan(JSON.stringify({ items: [{ title: 'X', tier: 'tierA-public', intent: 'x' }] }))).not.toBeNull();
+    expect(
+      parsePlan(JSON.stringify({ items: [{ title: 'X', tier: 'tierA-public', intent: 'x' }] })),
+    ).not.toBeNull();
   });
 });
 
@@ -275,7 +277,10 @@ describe('buildBatchPlanPrompt', () => {
     const prompt = buildBatchPlanPrompt(project, { projectId: project.id }, batchUnits, 2, 5, {
       summary: 'Framework: next.',
       files: [],
-      functionality: [{ key: 'route:/other', kind: 'route', label: 'page: /other', file: 'app/other/page.tsx' }, ...batchUnits],
+      functionality: [
+        { key: 'route:/other', kind: 'route', label: 'page: /other', file: 'app/other/page.tsx' },
+        ...batchUnits,
+      ],
     });
 
     expect(prompt).toContain('batch 2 of 5');

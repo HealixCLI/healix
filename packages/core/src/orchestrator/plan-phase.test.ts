@@ -3,7 +3,14 @@ import { runPlanPhase, attemptPlanCompletion } from './index.js';
 import type { OrchestratorEvent } from './types.js';
 import type { PlanRepoContext } from './plan.js';
 import type { Project } from '../storage/types.js';
-import type { CompleteOptions, CompletionResult, DetectResult, HealthResult, PlanResult, ProviderAdapter } from '../providers/types.js';
+import type {
+  CompleteOptions,
+  CompletionResult,
+  DetectResult,
+  HealthResult,
+  PlanResult,
+  ProviderAdapter,
+} from '../providers/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 // ---------------------------------------------------------------------------
@@ -31,7 +38,12 @@ function makeProject(overrides: Partial<Project> = {}): Project {
   };
 }
 
-function noopEmit(): (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void {
+function noopEmit(): (
+  phase: string,
+  level: OrchestratorEvent['level'],
+  message: string,
+  data?: unknown,
+) => void {
   return () => undefined;
 }
 
@@ -99,13 +111,9 @@ const SIMPLE_PLAN = {
 describe('runPlanPhase resilience', () => {
   it('a transient failure that succeeds on the same-provider retry produces a real AI plan, not a fallback', async () => {
     const provider = makeFlakyProvider(1, SIMPLE_PLAN);
-    const plan = await runPlanPhase(
+    const plan = await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
       provider,
-      makeProject(),
-      { projectId: 'prj_test' },
-      noopEmit(),
-      { provider },
-    );
+    });
     expect(plan.planSource).toBe('ai');
     expect(plan.fallbackReason).toBeUndefined();
     expect(plan.items.map((it) => it.title)).toEqual(['Home loads']);
@@ -169,7 +177,13 @@ describe('runPlanPhase batching', () => {
         };
       },
       async plan(): Promise<PlanResult> {
-        return { provider: 'claude', ok: true, plan: fencedJson(SIMPLE_PLAN), raw: SIMPLE_PLAN, detail: 'OK' };
+        return {
+          provider: 'claude',
+          ok: true,
+          plan: fencedJson(SIMPLE_PLAN),
+          raw: SIMPLE_PLAN,
+          detail: 'OK',
+        };
       },
       async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
         adapter.calls += 1;
@@ -296,7 +310,13 @@ describe('runPlanPhase batch progress events', () => {
         };
       },
       async plan(): Promise<PlanResult> {
-        return { provider: 'claude', ok: true, plan: fencedJson(SIMPLE_PLAN), raw: SIMPLE_PLAN, detail: 'OK' };
+        return {
+          provider: 'claude',
+          ok: true,
+          plan: fencedJson(SIMPLE_PLAN),
+          raw: SIMPLE_PLAN,
+          detail: 'OK',
+        };
       },
       async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
         adapter.calls += 1;
@@ -325,7 +345,14 @@ describe('runPlanPhase batch progress events', () => {
     const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
     const { emit, events } = capturingEmit();
 
-    const plan = await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, emit, { provider }, repoIndex);
+    const plan = await runPlanPhase(
+      provider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      emit,
+      { provider },
+      repoIndex,
+    );
 
     const batchEvents = events
       .filter((e) => (e.data as { kind?: string } | undefined)?.kind === 'plan-batch')

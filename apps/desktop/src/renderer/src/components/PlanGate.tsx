@@ -523,9 +523,10 @@ export function PlanGate({
 
       {streaming && batchProgress && (
         <p className="mt-1 text-xs text-muted">
-          Batch {batchProgress.batchIndex + 1}/{batchProgress.totalBatches} · {batchProgress.receivedItems} item
-          {batchProgress.receivedItems === 1 ? '' : 's'} so far — you can start reviewing below; new items keep
-          appearing as they're generated.
+          Batch {batchProgress.batchIndex + 1}/{batchProgress.totalBatches} · {batchProgress.receivedItems}{' '}
+          item
+          {batchProgress.receivedItems === 1 ? '' : 's'} so far — you can start reviewing below; new items
+          keep appearing as they're generated.
         </p>
       )}
       {batchProgress && batchProgress.failedNotes.length > 0 && (

@@ -114,7 +114,8 @@ export function asRunReport(value: unknown): RunReportShape | null {
   const plan = v.plan && typeof v.plan === 'object' ? (v.plan as Record<string, unknown>) : undefined;
   const generation =
     v.generation && typeof v.generation === 'object' ? (v.generation as Record<string, unknown>) : undefined;
-  const coverage = v.coverage && typeof v.coverage === 'object' ? (v.coverage as Record<string, unknown>) : undefined;
+  const coverage =
+    v.coverage && typeof v.coverage === 'object' ? (v.coverage as Record<string, unknown>) : undefined;
   return {
     triage,
     generatedAt: typeof v.generatedAt === 'string' ? v.generatedAt : undefined,
@@ -124,7 +125,9 @@ export function asRunReport(value: unknown): RunReportShape | null {
         : undefined,
     fallbackReason: plan && typeof plan.fallbackReason === 'string' ? plan.fallbackReason : undefined,
     generation:
-      generation && typeof generation.requestedItems === 'number' && typeof generation.acceptedItems === 'number'
+      generation &&
+      typeof generation.requestedItems === 'number' &&
+      typeof generation.acceptedItems === 'number'
         ? { requestedItems: generation.requestedItems, acceptedItems: generation.acceptedItems }
         : undefined,
     coverage:

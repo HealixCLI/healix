@@ -103,6 +103,22 @@ export interface TestPlan {
   summary: string;
   items: TestPlanItem[];
   raw?: unknown;
+  /**
+   * How this plan's items were obtained. 'ai' when the model's own plan
+   * completion(s) parsed successfully (even if some batches degraded — see
+   * fallbackReason); 'fallback' when every attempt failed and the plan is
+   * synthesizePlan()'s minimal hardcoded smoke plan; 'reuse' when suiteMode
+   * 'reuse' replayed a prior run's suite with no AI planning at all.
+   * Undefined for legacy/synthetic plans predating this field (e.g. tests).
+   */
+  planSource?: 'ai' | 'fallback' | 'reuse';
+  /**
+   * Present whenever planning degraded in some way — either the whole plan
+   * is a fallback (planSource: 'fallback') or an otherwise-successful
+   * batched plan (planSource: 'ai') had one or more batches fail outright.
+   * Human-readable, meant for the report/UI, not machine parsing.
+   */
+  fallbackReason?: string;
 }
 
 /** True unless the item was explicitly rejected during per-item plan review. */

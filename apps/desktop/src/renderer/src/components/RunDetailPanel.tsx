@@ -19,19 +19,23 @@ import { TestCaseHistoryDrawer } from './TestCaseHistoryDrawer';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
 import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
-import { asRunReport } from '../lib/ipc-types';
+import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
 import { cn } from '../lib/utils';
 import {
   artifactLeaf,
   artifactUrl,
+  computeStageDurations,
+  computeTotalDurationMs,
   eventLevelColor,
   formatDuration,
+  formatStageBreakdown,
   formatTime,
   groupArtifacts,
   runStatusTone,
   slugMatches,
   testStatusTone,
 } from '../lib/run-format';
+import type { StageDuration } from '../lib/run-format';
 
 type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts';
 
@@ -62,6 +66,7 @@ export function RunDetailPanel({
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
   const triage = report?.triage ?? [];
+  const degradationNotes = useMemo(() => reportDegradationNotes(report), [report]);
 
   // Join results to their test rows so the table can show title / REQ / tier.
   const rows = useMemo(() => joinResults(detail?.tests ?? [], detail?.results ?? []), [detail]);
@@ -71,6 +76,11 @@ export function RunDetailPanel({
     [rows, statusFilter],
   );
   const summary = useMemo(() => summarizeStatuses(rows), [rows]);
+  const totalTimeMs = useMemo(
+    () => (detail?.run ? computeTotalDurationMs(detail.run, detail.events) : null),
+    [detail?.run, detail?.events],
+  );
+  const stageDurations = useMemo(() => computeStageDurations(detail?.events ?? []), [detail?.events]);
 
   // Reset any active filter and tab when a different run is opened.
   useEffect(() => {
@@ -201,6 +211,17 @@ export function RunDetailPanel({
 
       {note && <p className="mt-2 break-all text-xs text-muted">{note}</p>}
 
+      {degradationNotes.length > 0 && (
+        <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">⚠ This run's suite may be smaller than intended</p>
+          <ul className="mt-1 list-disc pl-4">
+            {degradationNotes.map((n, i) => (
+              <li key={i}>{n}</li>
+            ))}
+          </ul>
+        </div>
+      )}
+
       <div className="mt-3">
         <Tabs
           items={TABS}
@@ -221,7 +242,13 @@ export function RunDetailPanel({
         )}
         {tab === 'results' && (
           <div className="flex min-h-0 flex-1 flex-col gap-3">
-            <TestSummary summary={summary} activeStatus={statusFilter} onSelect={selectStatus} />
+            <TestSummary
+              summary={summary}
+              activeStatus={statusFilter}
+              onSelect={selectStatus}
+              totalTimeMs={totalTimeMs}
+              stageDurations={stageDurations}
+            />
             <div className="min-h-0 flex-1 overflow-auto">
               <ResultsTable
                 rows={filteredRows}
@@ -335,16 +362,20 @@ function TestSummary({
   summary,
   activeStatus,
   onSelect,
+  totalTimeMs,
+  stageDurations,
 }: {
   summary: StatusCounts;
   activeStatus: TestStatus | 'all';
   onSelect: (status: TestStatus | 'all') => void;
+  totalTimeMs: number | null;
+  stageDurations: StageDuration[];
 }) {
   const total = STATUS_TILES.reduce((n, t) => n + summary[t.status], 0);
   const rate = total > 0 ? Math.round((summary.passed / total) * 100) : null;
 
   return (
-    <StatTileRow className="mt-3 sm:grid-cols-8">
+    <StatTileRow className="mt-3 sm:grid-cols-9">
       <StatTile
         label="Total"
         value={total}
@@ -364,6 +395,11 @@ function TestSummary({
       ))}
       {/* Non-interactive — a pass rate isn't a status you can filter Results by. */}
       <StatTile label="Rate" value={rate !== null ? `${rate}%` : '—'} />
+      <StatTile
+        label="Total time"
+        value={formatDuration(totalTimeMs)}
+        title={stageDurations.length > 0 ? formatStageBreakdown(stageDurations) : undefined}
+      />
     </StatTileRow>
   );
 }

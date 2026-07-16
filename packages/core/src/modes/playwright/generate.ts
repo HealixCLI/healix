@@ -225,7 +225,8 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
-  const scenarios = item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
+  const scenarios =
+    item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
 
   const tierGuidance =
@@ -432,10 +433,7 @@ const GEN_CONCURRENCY = 3;
  * Run up to `concurrency` promises at a time from `tasks`. Returns results in
  * the same order as `tasks` regardless of completion order.
  */
-async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-): Promise<T[]> {
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   let nextIndex = 0;
 
@@ -475,7 +473,10 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // usedPaths set, so each accepted spec persists to a unique file on disk
   // even when several items are generated at once.
   const tasks = items.map((item, i) => async () => {
-    emit(ctx, `[${i + 1}/${items.length}] Generating "${item.title}"`, { id: item.id, tier: item.tier });
+    emit(ctx, `Dispatched ${i + 1}/${items.length}: Generating "${item.title}"`, {
+      id: item.id,
+      tier: item.tier,
+    });
     const outcome = await generateOne(ctx, item, usedPaths);
     completed += 1;
     emit(ctx, `Progress: ${completed}/${items.length} done`, { completed, total: items.length });

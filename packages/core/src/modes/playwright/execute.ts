@@ -533,13 +533,26 @@ async function readSetupMeta(projectDir: string): Promise<boolean | null> {
   return null;
 }
 
+/**
+ * `result.error` and `result.errors[]` usually describe the SAME failure —
+ * Playwright's `errors` array typically repeats `error` verbatim, or with
+ * only a slightly different captured call-log frame — so concatenating them
+ * used to print near-duplicate "Test timeout of 60000ms exceeded." blocks
+ * two or three times in a row. Show a single, clearest error (the richest
+ * field of the first candidate) instead of joining every entry; a wall of
+ * repeated call logs is noise, not diagnosis.
+ */
 function errorText(result: PwResult | undefined): string {
   if (!result) return '';
-  const parts: string[] = [];
-  if (result.error)
-    parts.push(result.error.message ?? '', result.error.stack ?? '', result.error.value ?? '');
-  for (const e of result.errors ?? []) parts.push(e.message ?? '', e.stack ?? '', e.value ?? '');
-  return stripAnsi(parts.filter(Boolean).join('\n')).trim();
+  const candidates: PwError[] = [];
+  if (result.error) candidates.push(result.error);
+  for (const e of result.errors ?? []) candidates.push(e);
+
+  for (const err of candidates) {
+    const text = stripAnsi(err.stack || err.message || err.value || '').trim();
+    if (text) return text;
+  }
+  return '';
 }
 
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {

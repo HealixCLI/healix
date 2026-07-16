@@ -133,6 +133,16 @@ describe('parseTriageReply — confidence clamping', () => {
   });
 });
 
+describe('buildTriagePrompt — suggestedPatch guidance covers both verdicts', () => {
+  it('asks for an app-side fix recommendation for app_is_wrong, not just a test-code snippet for test_is_wrong', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom' });
+    expect(prompt).toContain('test_is_wrong: a corrected test code snippet');
+    expect(prompt).toContain('app_is_wrong: a concise, actionable recommendation for the engineering');
+    expect(prompt).toContain('do NOT');
+    expect(prompt).toContain('fabricate file paths, line numbers, or code you have not been shown');
+  });
+});
+
 describe('buildTriagePrompt — untrusted-data fencing (prompt injection)', () => {
   const OPEN = '<<<UNTRUSTED_TEST_OUTPUT';
   const CLOSE = 'UNTRUSTED_TEST_OUTPUT>>>';

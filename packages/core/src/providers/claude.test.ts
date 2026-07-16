@@ -210,4 +210,32 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     for (const a of args) expect(a).not.toContain(prompt);
     expect(callOpts?.input).toBe(prompt);
   });
+
+  it('defaults to a 300s timeout when no timeoutMs override is given', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    await provider.complete('prompt');
+    const [, , callOpts] = runCliMock.mock.calls[0]!;
+    expect(callOpts?.timeoutMs).toBe(300_000);
+  });
+
+  it('honours an explicit timeoutMs override instead of the default', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    await provider.complete('prompt', { timeoutMs: 42_000 });
+    const [, , callOpts] = runCliMock.mock.calls[0]!;
+    expect(callOpts?.timeoutMs).toBe(42_000);
+  });
 });

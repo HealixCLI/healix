@@ -132,7 +132,12 @@ function extractNextRoutes(rel: string): FunctionalityUnit[] {
 
   if (/^pages\/api\//.test(rel)) {
     const routePath = toNextPagesRoutePath(rel);
-    units.push({ key: `endpoint:${routePath}`, kind: 'endpoint', label: `api route: ${routePath}`, file: rel });
+    units.push({
+      key: `endpoint:${routePath}`,
+      kind: 'endpoint',
+      label: `api route: ${routePath}`,
+      file: rel,
+    });
   }
 
   if (/^app\//.test(rel) && /\/page\.(tsx|jsx|ts|js)$/.test(rel)) {
@@ -142,7 +147,12 @@ function extractNextRoutes(rel: string): FunctionalityUnit[] {
 
   if (/^app\//.test(rel) && /\/route\.(ts|js)$/.test(rel)) {
     const routePath = toNextAppRoutePath(rel, 'route');
-    units.push({ key: `endpoint:${routePath}`, kind: 'endpoint', label: `api route: ${routePath}`, file: rel });
+    units.push({
+      key: `endpoint:${routePath}`,
+      kind: 'endpoint',
+      label: `api route: ${routePath}`,
+      file: rel,
+    });
   }
 
   return units;
@@ -155,9 +165,7 @@ function toNextPagesRoutePath(rel: string): string {
 }
 
 function toNextAppRoutePath(rel: string, leaf: 'page' | 'route'): string {
-  let p = rel
-    .replace(/^app\//, '/')
-    .replace(new RegExp(`/${leaf}\\.(tsx|jsx|ts|js)$`), '');
+  let p = rel.replace(/^app\//, '/').replace(new RegExp(`/${leaf}\\.(tsx|jsx|ts|js)$`), '');
   // Strip Next.js route groups like (marketing).
   p = p
     .split('/')
@@ -187,8 +195,7 @@ function extractReactRouterRoutes(rel: string, source: string): FunctionalityUni
 /** Express/Fastify/Koa: app.get/post/... and router.get/post/... registrations. */
 function extractServerRoutes(rel: string, source: string): FunctionalityUnit[] {
   const units: FunctionalityUnit[] = [];
-  const re =
-    /\b(?:app|router|server)\s*\.\s*(get|post|put|patch|delete|options)\s*\(\s*(["'`])([^"'`]*)\2/gi;
+  const re = /\b(?:app|router|server)\s*\.\s*(get|post|put|patch|delete|options)\s*\(\s*(["'`])([^"'`]*)\2/gi;
   for (const m of source.matchAll(re)) {
     const method = m[1].toUpperCase();
     const routePath = m[3];
@@ -217,15 +224,7 @@ function extractExportedHandlers(rel: string, source: string): FunctionalityUnit
   return units;
 }
 
-const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set([
-  'react',
-  'cra',
-  'vite',
-  'vue',
-  'svelte',
-  'angular',
-  'remix',
-]);
+const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set(['react', 'cra', 'vite', 'vue', 'svelte', 'angular', 'remix']);
 const SERVER_FRAMEWORKS = new Set(['express', 'fastify', 'koa', 'nest']);
 
 /**

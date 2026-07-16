@@ -1,16 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ExplorationMode, Project, SuiteMode, TestingScope } from '@healix/core';
-import {
-  ChevronDown,
-  ChevronUp,
-  Loader2,
-  ListPlus,
-  Pause,
-  Play,
-  Plus,
-  Square,
-  X,
-} from 'lucide-react';
+import type { Project, SuiteMode, TestingScope } from '@healix/core';
+import { ChevronDown, ChevronUp, Loader2, ListPlus, Pause, Play, Plus, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
@@ -29,7 +19,7 @@ import { useRunDetail } from '../lib/use-run-detail';
 import { useLastSuccessfulRun } from '../lib/use-last-successful-run';
 import { useLiveFrame } from '../lib/use-live-frame';
 import { cn } from '../lib/utils';
-import { formatCreatedAt } from '../lib/run-format';
+import { formatCreatedAt, isTerminalRun } from '../lib/run-format';
 import { SUITE_MODES, TESTING_SCOPES, type RunEngine, type RunPhase } from '../lib/run-engine';
 import type { RunQueue } from '../lib/run-queue';
 
@@ -37,6 +27,7 @@ const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
   starting: 'default',
   running: 'default',
+  'plan-streaming': 'default',
   'awaiting-approval': 'warn',
   paused: 'warn',
   done: 'ok',
@@ -48,6 +39,7 @@ const PHASE_LABEL: Record<RunPhase, string> = {
   idle: 'idle',
   starting: 'starting…',
   running: 'running',
+  'plan-streaming': 'generating plan…',
   'awaiting-approval': 'awaiting approval',
   paused: 'paused',
   done: 'done',
@@ -183,7 +175,10 @@ export function RunsView({
   }, [selectedRunId]);
 
   const isActive =
-    engine.phase === 'starting' || engine.phase === 'running' || engine.phase === 'awaiting-approval';
+    engine.phase === 'starting' ||
+    engine.phase === 'running' ||
+    engine.phase === 'plan-streaming' ||
+    engine.phase === 'awaiting-approval';
 
   // Re-attach to a run that's still genuinely parked awaiting approval in the
   // main process — its approval promise only dies on app restart, not on
@@ -265,6 +260,21 @@ export function RunsView({
     return () => clearInterval(id);
   }, [isActive, refreshRuns]);
 
+  // useRunDetail fetches its tests/results/report snapshot only once per
+  // selectedRunId and otherwise only refetches once the run fully settles
+  // (see the SETTLED_PHASES effect above) — so watching a still-in-progress
+  // run's Results tab showed a stale, smaller test count than the report.html
+  // file (re-read fresh from disk every time it's opened) as the run kept
+  // adding rows in the background. Poll the same detail while the SELECTED
+  // run itself is non-terminal, regardless of whether it's the one the local
+  // engine is driving (e.g. re-opening a run started in a previous session).
+  const selectedRunStatus = detail?.run?.status ?? null;
+  useEffect(() => {
+    if (!selectedRunId || !selectedRunStatus || isTerminalRun(selectedRunStatus)) return;
+    const id = setInterval(() => void reloadDetail(), 3000);
+    return () => clearInterval(id);
+  }, [selectedRunId, selectedRunStatus, reloadDetail]);
+
   const selectedProject = useMemo(
     () => projects.find((p) => p.id === projectId) ?? null,
     [projects, projectId],
@@ -341,18 +351,26 @@ export function RunsView({
   };
 
   // The live surface is shown ONLY for the run the engine is actually tracking
-  // (live-this-session or rehydrated) — selecting a DIFFERENT row in history
-  // always shows THAT run's own fetched detail instead, even while a run is
-  // actively executing in the background. This is what lets the user freely
-  // browse other runs/projects while the active run keeps going untouched:
-  // navigating between runs only ever fetches the data for the one selected.
+  // (live-this-session or rehydrated) AND only while it's still non-terminal.
+  // Selecting a DIFFERENT row in history always shows THAT run's own fetched
+  // detail instead, even while a run is actively executing in the background.
+  // This is what lets the user freely browse other runs/projects while the
+  // active run keeps going untouched: navigating between runs only ever
+  // fetches the data for the one selected.
+  //
+  // The `isActive` gate matters even for the CURRENTLY selected run: once it
+  // settles (SETTLED_PHASES effect above refreshes history + reloads detail),
+  // engine.runId keeps pointing at it and selectedRunId was set to the same
+  // id — without this gate the view would stay on the bare live Console
+  // forever, never showing RunDetailPanel's Report/Reveal suite/Export suite
+  // controls until the user clicked "New run" or picked a different history row.
   //
   // Before the engine has a real runId yet (the brief 'starting' window right
   // after clicking Start/Queue, before run:started arrives), fall back to
   // "was nothing else explicitly selected" so the just-started run's own
   // transient state is still shown rather than a blank/unrelated panel.
   const showLiveSurface =
-    engine.runId != null ? selectedRunId === engine.runId : isActive && selectedRunId == null;
+    engine.runId != null ? selectedRunId === engine.runId && isActive : isActive && selectedRunId == null;
 
   return (
     <div className="flex h-full min-h-0">
@@ -583,25 +601,33 @@ export function RunsView({
           <div className="h-px flex-1 bg-border" />
         </div>
 
-        {/* Plan gate: only while parked, AND only for the run currently being
-            shown — a rehydrated pending approval must not bleed into every
-            other history row's view (see showLiveSurface). */}
-        {showLiveSurface && engine.workingPlan && engine.phase === 'awaiting-approval' && (
-          <div className="mt-4 shrink-0">
-            <PlanGate
-              plan={engine.workingPlan}
-              decided={engine.planDecided}
-              revisingItemIds={engine.revisingItemIds}
-              reviseErrors={engine.reviseErrors}
-              onApproveItem={engine.approveItem}
-              onRejectItem={engine.rejectItem}
-              onEditItem={engine.editItem}
-              onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
-              onApproveAndContinue={() => void engine.approveAndContinue()}
-              onRejectAll={() => void engine.rejectAll()}
-            />
-          </div>
-        )}
+        {/* Plan gate: only while parked or still streaming in, AND only for the
+            run currently being shown — a rehydrated pending approval must not
+            bleed into every other history row's view (see showLiveSurface).
+            Mounted during 'plan-streaming' too so the reviewer can start
+            approving/editing items as batches land, though the overall
+            Approve/Reject actions stay locked (via `streaming`) until every
+            batch has arrived. */}
+        {showLiveSurface &&
+          engine.workingPlan &&
+          (engine.phase === 'awaiting-approval' || engine.phase === 'plan-streaming') && (
+            <div className="mt-4 shrink-0">
+              <PlanGate
+                plan={engine.workingPlan}
+                decided={engine.planDecided}
+                streaming={engine.phase === 'plan-streaming'}
+                batchProgress={engine.planBatchProgress}
+                revisingItemIds={engine.revisingItemIds}
+                reviseErrors={engine.reviseErrors}
+                onApproveItem={engine.approveItem}
+                onRejectItem={engine.rejectItem}
+                onEditItem={engine.editItem}
+                onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
+                onApproveAndContinue={() => void engine.approveAndContinue()}
+                onRejectAll={() => void engine.rejectAll()}
+              />
+            </div>
+          )}
 
         {/* Scoped the same way as the plan gate: only for the run currently
             being shown, so an error from one run doesn't linger while

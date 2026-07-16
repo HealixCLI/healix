@@ -44,6 +44,9 @@ import {
   type PlanRepoContext,
 } from './plan.js';
 import { indexFunctionality, type FunctionalityUnit } from '../target/functionality-index.js';
+import { indexSource } from '../target/source-index.js';
+import { persistSourceContext } from '../target/context-store.js';
+import type { SourceContext } from '../target/source-context.js';
 import { diffAgainstBase } from './topup.js';
 import {
   computeCoverage,
@@ -390,6 +393,11 @@ async function runPipeline(
   // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
   // loop, which needs the same functionality inventory the initial plan was grounded on.
   let repoIndex: PlanRepoContext | undefined;
+  // Full white-box static-analysis result (routes/endpoints + forms/auth-patterns/selector
+  // hints), set alongside repoIndex during PLAN. repoIndex.functionality is a projection of
+  // sourceContext.units for backward compatibility; sourceContext itself is what GENERATE and
+  // TRIAGE consume for their own grounding (see modes/types.ts's TestModeContext.sourceContext).
+  let sourceContext: SourceContext | undefined;
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
   let artifactFiles: string[] = [];
@@ -563,18 +571,19 @@ async function runPipeline(
             emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
           }
           try {
-            const functionality = await indexFunctionality(project.repoPath);
-            if (functionality.units.length > 0) {
+            sourceContext = await indexSource(project.repoPath);
+            if (sourceContext.units.length > 0) {
               repoIndex = {
                 ...(repoIndex ?? { summary: '', files: [] }),
-                functionality: functionality.units,
+                functionality: sourceContext.units,
               };
               emit(
                 'plan',
                 'debug',
-                `Detected ${functionality.units.length} functionality unit(s) for plan grounding.`,
+                `Detected ${sourceContext.units.length} functionality unit(s) for plan grounding.`,
               );
             }
+            persistSourceContext(project.repoPath, sourceContext);
           } catch (err) {
             emit(
               'plan',

@@ -41,7 +41,14 @@ function libraryFor(spec: string): string | null {
 export function extractAuthPatternsAst(rel: string, source: string): AuthPatternInfo | null {
   const ast: File | null = parseModule(source, rel);
   if (!ast) return null;
+  return extractAuthPatternsFromAst(rel, ast);
+}
 
+/**
+ * Same as extractAuthPatternsAst, but takes an already-parsed AST — for callers (source-index.ts)
+ * that parse each file once and share the AST across every AST-based extractor.
+ */
+export function extractAuthPatternsFromAst(rel: string, ast: File): AuthPatternInfo {
   const libraries = new Set<string>();
   const routeGuards = new Set<string>();
 

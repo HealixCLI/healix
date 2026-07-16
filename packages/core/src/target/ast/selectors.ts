@@ -22,7 +22,14 @@ const SELECTOR_ATTRS = new Set<SelectorAttribute>(['data-testid', 'data-test', '
 export function extractSelectorHintsAst(rel: string, source: string): SelectorHint[] | null {
   const ast: File | null = parseModule(source, rel);
   if (!ast) return null;
+  return extractSelectorHintsFromAst(rel, ast);
+}
 
+/**
+ * Same as extractSelectorHintsAst, but takes an already-parsed AST — for callers (source-index.ts)
+ * that parse each file once and share the AST across every AST-based extractor.
+ */
+export function extractSelectorHintsFromAst(rel: string, ast: File): SelectorHint[] {
   const hints: SelectorHint[] = [];
 
   traverse(ast, {

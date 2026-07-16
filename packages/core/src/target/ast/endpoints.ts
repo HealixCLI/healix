@@ -79,16 +79,11 @@ function collectRouterVarNames(ast: File): Set<string> {
 }
 
 /**
- * Extract everything one file contributes toward the Express/Fastify/Koa endpoint graph:
- * local `X.METHOD(path, ...)` registrations, `X.use(mountPath, subRouter)` mounts, whether this
- * file exports a router (`module.exports = router` / `export default router`), and its
- * require/import specifier map (for resolving mount targets to files in a second pass). Returns
- * null on parse failure so callers fall back to the regex-based extractServerRoutes for that file.
+ * Same as extractExpressRouterInfo, but takes an already-parsed AST — for callers (source-index.ts)
+ * that parse each file once and share the AST across every AST-based extractor instead of having
+ * each one re-parse the same file from source.
  */
-export function extractExpressRouterInfo(source: string, filename: string): FileRouterInfo | null {
-  const ast = parseModule(source, filename);
-  if (!ast) return null;
-
+export function extractExpressRouterInfoFromAst(ast: File): FileRouterInfo {
   const routerVarNames = collectRouterVarNames(ast);
   const localEndpoints: LocalEndpoint[] = [];
   const mounts: MountCandidate[] = [];
@@ -171,6 +166,19 @@ export function extractExpressRouterInfo(source: string, filename: string): File
   return { localEndpoints, mounts, exportsRouterVar, importedFrom };
 }
 
+/**
+ * Extract everything one file contributes toward the Express/Fastify/Koa endpoint graph:
+ * local `X.METHOD(path, ...)` registrations, `X.use(mountPath, subRouter)` mounts, whether this
+ * file exports a router (`module.exports = router` / `export default router`), and its
+ * require/import specifier map (for resolving mount targets to files in a second pass). Returns
+ * null on parse failure so callers fall back to the regex-based extractServerRoutes for that file.
+ */
+export function extractExpressRouterInfo(source: string, filename: string): FileRouterInfo | null {
+  const ast = parseModule(source, filename);
+  if (!ast) return null;
+  return extractExpressRouterInfoFromAst(ast);
+}
+
 /** Join a mount prefix and a route suffix into one normalized path, collapsing the `/` + `/` root case. */
 function joinPath(prefix: string, suffix: string): string {
   const p = prefix.replace(/\/+$/, '');
@@ -200,21 +208,18 @@ function unit(method: string, routePath: string, file: string): FunctionalityUni
 }
 
 /**
- * Compose per-file Express/Fastify/Koa router info (see extractExpressRouterInfo) into a final
- * endpoint inventory, resolving `app.use('/mount', subRouter)` across files back to the router
- * module's own local `router.METHOD(...)` registrations — e.g. app.js's
+ * Compose already-extracted per-file Express/Fastify/Koa router info (see
+ * extractExpressRouterInfoFromAst) into a final endpoint inventory, resolving
+ * `app.use('/mount', subRouter)` across files back to the router module's own local
+ * `router.METHOD(...)` registrations — e.g. app.js's
  * `app.use('/api/users', require('./routes/userRoutes'))` plus userRoutes.js's
  * `router.get('/:id', ...)` composes to `GET /api/users/:id`. A router file never reached by any
- * mount still surfaces its endpoints unprefixed rather than being silently dropped.
+ * mount still surfaces its endpoints unprefixed rather than being silently dropped. Split out from
+ * resolveExpressEndpoints so source-index.ts can reuse ASTs it already parsed for other
+ * extractors instead of re-parsing every file again here.
  */
-export function resolveExpressEndpoints(files: Array<{ rel: string; source: string }>): FunctionalityUnit[] {
-  const allRelPaths = new Set(files.map((f) => f.rel));
-  const perFile = new Map<string, FileRouterInfo>();
-
-  for (const f of files) {
-    const info = extractExpressRouterInfo(f.source, f.rel);
-    if (info) perFile.set(f.rel, info);
-  }
+export function resolveExpressEndpointsFromInfo(perFile: Map<string, FileRouterInfo>): FunctionalityUnit[] {
+  const allRelPaths = new Set(perFile.keys());
 
   // fileRel -> mount prefixes that resolve to it, from every OTHER file's mount calls.
   const prefixesForFile = new Map<string, string[]>();
@@ -241,4 +246,18 @@ export function resolveExpressEndpoints(files: Array<{ rel: string; source: stri
     }
   }
   return units;
+}
+
+/**
+ * Convenience wrapper over resolveExpressEndpointsFromInfo for callers that only have raw source
+ * text (e.g. tests) — parses each file once via extractExpressRouterInfo, skipping any file that
+ * fails to parse (same as that function's own null-on-parse-failure contract).
+ */
+export function resolveExpressEndpoints(files: Array<{ rel: string; source: string }>): FunctionalityUnit[] {
+  const perFile = new Map<string, FileRouterInfo>();
+  for (const f of files) {
+    const info = extractExpressRouterInfo(f.source, f.rel);
+    if (info) perFile.set(f.rel, info);
+  }
+  return resolveExpressEndpointsFromInfo(perFile);
 }

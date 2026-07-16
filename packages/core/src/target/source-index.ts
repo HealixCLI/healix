@@ -1,4 +1,5 @@
 import path from 'node:path';
+import type { File } from '@babel/types';
 import { detect } from './detector.js';
 import {
   extractExportedHandlers,
@@ -11,11 +12,12 @@ import {
   walkSourceFiles,
   type FunctionalityUnit,
 } from './functionality-index.js';
-import { extractReactRouterRoutesAst } from './ast/routes.js';
-import { extractExpressRouterInfo, resolveExpressEndpoints } from './ast/endpoints.js';
-import { extractFormsAst, type FormInfo } from './ast/forms.js';
-import { extractAuthPatternsAst, type AuthPatternInfo } from './ast/auth-patterns.js';
-import { extractSelectorHintsAst, type SelectorHint } from './ast/selectors.js';
+import { parseModule } from './ast/parse.js';
+import { extractReactRouterRoutesFromAst } from './ast/routes.js';
+import { extractExpressRouterInfoFromAst, resolveExpressEndpointsFromInfo, type FileRouterInfo } from './ast/endpoints.js';
+import { extractFormsFromAst, type FormInfo } from './ast/forms.js';
+import { extractAuthPatternsFromAst, type AuthPatternInfo } from './ast/auth-patterns.js';
+import { extractSelectorHintsFromAst, type SelectorHint } from './ast/selectors.js';
 import { extractMultiLangEndpoints } from './ast/multilang.js';
 import { findSpecFiles, parseOpenApiSpec, parsePostmanCollection } from './spec-parser.js';
 import type { SourceContext } from './source-context.js';
@@ -32,6 +34,12 @@ const JS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
  * override a code-derived unit sharing the same key). This is the composed replacement for
  * functionality-index.ts's regex-only indexFunctionality — see that file's indexFunctionality,
  * which now delegates here for backward compatibility with existing callers.
+ *
+ * Each JS/TS file is parsed to an AST at most ONCE (see `parseModule` below) and that single AST
+ * is shared across routes/express/forms/auth/selectors extraction — an earlier version called
+ * each extractor's own source-parsing wrapper independently, re-parsing the same file up to five
+ * times, which measurably slowed a real orchestrator run down (surfaced by a test regression
+ * during Item E1's wiring, not a hypothetical concern).
  */
 export async function indexSource(repoPath: string, opts?: { maxUnits?: number }): Promise<SourceContext> {
   const root = path.resolve(repoPath);
@@ -56,49 +64,45 @@ export async function indexSource(repoPath: string, opts?: { maxUnits?: number }
   const forms: FormInfo[] = [];
   const authPatterns: AuthPatternInfo[] = [];
   const selectorHints: SelectorHint[] = [];
+  const expressInfoByFile = new Map<string, FileRouterInfo>();
 
   const jsFiles = files.filter((f) => JS_EXTENSIONS.has(path.extname(f.rel).toLowerCase()));
 
-  if (isServer || framework === null) {
-    // Cross-file mount resolution needs every file's source up front (see ast/endpoints.ts).
-    const withSource = jsFiles
-      .map((f) => ({ rel: f.rel, source: readSafe(f.abs) }))
-      .filter((f) => f.source.length > 0);
-    codeUnits.push(...resolveExpressEndpoints(withSource));
-
-    // Regex fallback ONLY for files resolveExpressEndpoints's AST pass couldn't parse — running
-    // it unconditionally would duplicate every successfully mount-resolved endpoint under its
-    // own unprefixed (and therefore wrong) key, since the two extractors produce different key
-    // strings for the same route.
-    for (const f of withSource) {
-      if (extractExpressRouterInfo(f.source, f.rel) === null) {
-        codeUnits.push(...extractServerRoutes(f.rel, f.source));
-      }
-    }
-  }
-
   for (const f of jsFiles) {
-    if (isNext) codeUnits.push(...extractNextRoutes(f.rel));
-
     const source = readSafe(f.abs);
     if (!source) continue;
 
+    if (isNext) codeUnits.push(...extractNextRoutes(f.rel));
+
+    // Parsed once, shared across every AST-based extractor below; null on parse failure lets
+    // each concern fall back independently (route/express extractors have a regex fallback,
+    // forms/auth-patterns/selector-hints do not and simply skip the file).
+    const ast: File | null = parseModule(source, f.rel);
+
     if (wantsRouter || framework === null) {
-      const astRoutes = extractReactRouterRoutesAst(f.rel, source);
-      codeUnits.push(...(astRoutes ?? extractReactRouterRoutes(f.rel, source)));
+      codeUnits.push(...(ast ? extractReactRouterRoutesFromAst(f.rel, ast) : extractReactRouterRoutes(f.rel, source)));
     }
+
+    if (isServer || framework === null) {
+      if (ast) {
+        expressInfoByFile.set(f.rel, extractExpressRouterInfoFromAst(ast));
+      } else {
+        codeUnits.push(...extractServerRoutes(f.rel, source));
+      }
+    }
+
     codeUnits.push(...extractExportedHandlers(f.rel, source));
 
-    const formInfo = extractFormsAst(f.rel, source);
-    if (formInfo) forms.push(...formInfo);
-
-    const authInfo = extractAuthPatternsAst(f.rel, source);
-    if (authInfo && (authInfo.libraries.length > 0 || authInfo.routeGuards.length > 0)) {
-      authPatterns.push(authInfo);
+    if (ast) {
+      forms.push(...extractFormsFromAst(f.rel, ast));
+      const authInfo = extractAuthPatternsFromAst(f.rel, ast);
+      if (authInfo.libraries.length > 0 || authInfo.routeGuards.length > 0) authPatterns.push(authInfo);
+      selectorHints.push(...extractSelectorHintsFromAst(f.rel, ast));
     }
+  }
 
-    const hints = extractSelectorHintsAst(f.rel, source);
-    if (hints) selectorHints.push(...hints);
+  if (isServer || framework === null) {
+    codeUnits.push(...resolveExpressEndpointsFromInfo(expressInfoByFile));
   }
 
   for (const f of files) {

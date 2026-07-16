@@ -95,7 +95,14 @@ function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number
 export function extractFormsAst(rel: string, source: string): FormInfo[] | null {
   const ast: File | null = parseModule(source, rel);
   if (!ast) return null;
+  return extractFormsFromAst(rel, ast);
+}
 
+/**
+ * Same as extractFormsAst, but takes an already-parsed AST — for callers (source-index.ts) that
+ * parse each file once and share the AST across every AST-based extractor.
+ */
+export function extractFormsFromAst(rel: string, ast: File): FormInfo[] {
   const forms: FormInfo[] = [];
 
   traverse(ast, {

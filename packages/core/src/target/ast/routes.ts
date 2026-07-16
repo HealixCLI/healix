@@ -66,7 +66,14 @@ function walkRouterFactoryCall(call: CallExpression, rel: string, out: Functiona
 export function extractReactRouterRoutesAst(rel: string, source: string): FunctionalityUnit[] | null {
   const ast: File | null = parseModule(source, rel);
   if (!ast) return null;
+  return extractReactRouterRoutesFromAst(rel, ast);
+}
 
+/**
+ * Same as extractReactRouterRoutesAst, but takes an already-parsed AST — for callers
+ * (source-index.ts) that parse each file once and share the AST across every AST-based extractor.
+ */
+export function extractReactRouterRoutesFromAst(rel: string, ast: File): FunctionalityUnit[] {
   const out: FunctionalityUnit[] = [];
   traverse(ast, {
     JSXOpeningElement(path) {

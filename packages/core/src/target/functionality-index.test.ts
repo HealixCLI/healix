@@ -77,11 +77,15 @@ describe('indexFunctionality', () => {
 
   it('extracts React Router route paths when no server framework is detected', async () => {
     const dir = makeRepo();
-    write(dir, 'package.json', JSON.stringify({ dependencies: { react: '^18.0.0', 'react-router-dom': '^6.0.0' } }));
+    write(
+      dir,
+      'package.json',
+      JSON.stringify({ dependencies: { react: '^18.0.0', 'react-router-dom': '^6.0.0' } }),
+    );
     write(
       dir,
       'src/App.tsx',
-      "function App() {\n  return <Routes><Route path=\"/settings\" element={<Settings />} /></Routes>;\n}\n",
+      'function App() {\n  return <Routes><Route path="/settings" element={<Settings />} /></Routes>;\n}\n',
     );
 
     const index = await indexFunctionality(dir);
@@ -93,7 +97,10 @@ describe('indexFunctionality', () => {
   it('dedupes repeated units and respects the maxUnits cap with a truncated flag', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({ dependencies: { express: '^4.0.0' } }));
-    const lines = Array.from({ length: 10 }, (_, i) => `app.get('/r${i}', (req, res) => res.send('ok'));`).join('\n');
+    const lines = Array.from(
+      { length: 10 },
+      (_, i) => `app.get('/r${i}', (req, res) => res.send('ok'));`,
+    ).join('\n');
     write(dir, 'src/server.ts', `const app = express();\n${lines}\n`);
 
     const index = await indexFunctionality(dir, { maxUnits: 5 });

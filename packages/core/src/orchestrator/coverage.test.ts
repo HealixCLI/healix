@@ -50,7 +50,10 @@ describe('computeCoverage', () => {
       item({ id: 'i1', reqTag: 'REQ-1', unitKey: 'route:/' }),
       item({ id: 'i2', reqTag: 'REQ-2', unitKey: 'route:/checkout' }),
     ];
-    const specs = [spec({ title: '[REQ:REQ-1] Home', reqTag: 'REQ-1' }), spec({ title: '[REQ:REQ-2] Checkout', reqTag: 'REQ-2' })];
+    const specs = [
+      spec({ title: '[REQ:REQ-1] Home', reqTag: 'REQ-1' }),
+      spec({ title: '[REQ:REQ-2] Checkout', reqTag: 'REQ-2' }),
+    ];
     const exec = outcome([
       { title: '[REQ:REQ-1] positive: loads', status: 'passed' },
       { title: '[REQ:REQ-2] positive: completes', status: 'failed' },

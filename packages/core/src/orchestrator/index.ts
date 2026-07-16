@@ -1,19 +1,22 @@
-import { mkdir, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
+import { dirname, join, relative } from 'node:path';
 import { projectsDir } from '../env/app-data.js';
 import { getStore, type HealixStore } from '../storage/store.js';
-import type { Project, Run, RunStatus, TestStatus, Tier } from '../storage/types.js';
+import type { Project, Run, RunStatus, SuiteMode, TestCase, TestStatus, Tier } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
 import { getTestMode } from '../modes/registry.js';
 import type {
   ExecOutcome,
+  ExplorationMode,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
   TestModeContext,
   TestPlan,
+  TestPlanItem,
 } from '../modes/types.js';
+import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { runCli } from '../exec/run-cli.js';
@@ -21,7 +24,16 @@ import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
-import { buildPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import { buildPlanPrompt, buildGapFillPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import { indexFunctionality } from '../target/functionality-index.js';
+import { diffAgainstBase } from './topup.js';
+import {
+  computeCoverage,
+  mergeExecOutcomes,
+  COVERAGE_MAX_ITERATIONS,
+  FRESH_COVERAGE_TARGET,
+  TOPUP_COVERAGE_TARGET,
+} from './coverage.js';
 import { buildReport, renderReportHtml, type ReportTriageEntry } from './report.js';
 import type {
   Orchestrator,
@@ -29,6 +41,7 @@ import type {
   OrchestratorHooks,
   OrchestratorOverrides,
   OrchestratorPhase,
+  PlanApprovalResult,
   RunOptions,
   RunSummary,
 } from './types.js';
@@ -90,7 +103,45 @@ async function runPipeline(
     return { runId: '', status: 'error' };
   }
 
-  const run = store.createRun(project.id, { provider: opts.provider ?? null, mode: project.mode });
+  // Top-up/reuse: resolve the base run BEFORE creating this run's own row —
+  // a missing base is a precondition failure, same category as "project not
+  // found" above, so it must never silently fall back to 'fresh'.
+  const suiteMode: SuiteMode = opts.suiteMode ?? 'fresh';
+  let baseRun: Run | null = null;
+  if (suiteMode === 'topup' || suiteMode === 'reuse') {
+    baseRun = opts.baseRunId ? store.getRun(opts.baseRunId) : store.getLastSuccessfulRun(project.id);
+    // An explicitly-pinned baseRunId isn't status-filtered by the store lookup
+    // above (unlike the auto-resolved path) — reject 'error'/'cancelled' pins
+    // here too, so a caller can't top-up/reuse from a run that never produced
+    // a real verdict or was aborted mid-way.
+    if (baseRun && (baseRun.status === 'error' || baseRun.status === 'cancelled')) {
+      baseRun = null;
+    }
+    if (!baseRun) {
+      hooks?.onEvent?.({
+        phase: 'plan',
+        level: 'error',
+        message: `No previous completed run to ${suiteMode} from for project "${project.name}" — run Fresh first.`,
+      });
+      return { runId: '', status: 'error' };
+    }
+  }
+  // Every base-run test with a known spec file — the only thing that gates
+  // carrying a test forward is having a physical file to copy, not its
+  // previous status.
+  const baseTestsWithSpec: TestCase[] = baseRun ? store.listTests(baseRun.id).filter((t) => t.specPath) : [];
+  // TOP-UP only carries forward proven-good (passing) tests — a failing/
+  // blocked test is left for the fresh exploration to decide whether it's
+  // still worth testing (and, if so, regenerate) rather than silently
+  // re-including a known-bad test unchanged.
+  const basePassingTests: TestCase[] = baseTestsWithSpec.filter((t) => t.status === 'passed');
+
+  const run = store.createRun(project.id, {
+    provider: opts.provider ?? null,
+    mode: project.mode,
+    suiteMode,
+    baseRunId: baseRun?.id ?? null,
+  });
   const runId = run.id;
   // Surface the canonical runId immediately so callers (e.g. the desktop app)
   // correlate events/approval to THIS run instead of pre-creating a duplicate.
@@ -197,6 +248,9 @@ async function runPipeline(
   let plan: TestPlan | null = null;
   let specs: GeneratedSpec[] = [];
   let outcome: ExecOutcome | null = null;
+  // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
+  // loop, which needs the same functionality inventory the initial plan was grounded on.
+  let repoIndex: PlanRepoContext | undefined;
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
   let artifactFiles: string[] = [];
@@ -229,31 +283,67 @@ async function runPipeline(
     // functions) so the plan phase can reuse its repo indexer for grounding.
     const target = makeTarget();
 
-    // Best-effort repo grounding: a white-box plan is dramatically better when
-    // the model can see the repo's real structure (routes/pages/dirs), but
-    // indexing must never block or break planning — any failure simply means
-    // "plan without repo context".
-    let repoIndex: PlanRepoContext | undefined;
-    if (project.repoPath) {
-      try {
-        const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
-        repoIndex = { summary: idx.summary, files: idx.files };
-        emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
-      } catch (err) {
-        emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+    if (suiteMode === 'reuse') {
+      // Reuse never plans/generates via AI — it re-executes the base run's
+      // ENTIRE suite as-is (every test with a known spec file, regardless of
+      // its previous status — a run that reruns only last time's winners
+      // isn't actually "the suite as-is"). Still synthesize a concrete,
+      // cancellable plan (zero AI cost) so the APPROVE gate shows something.
+      plan = {
+        summary: `Reusing ${baseTestsWithSpec.length} test(s) from run ${baseRun!.id} — no generation.`,
+        items: [],
+      };
+      emit('plan', 'info', 'Skipping AI planning (reuse mode).');
+    } else {
+      // Best-effort repo grounding: a white-box plan is dramatically better when
+      // the model can see the repo's real structure (routes/pages/dirs), but
+      // indexing must never block or break planning — any failure simply means
+      // "plan without repo context".
+      if (project.repoPath) {
+        try {
+          const idx = await target.indexRepo(project.repoPath, { maxFiles: 200 });
+          repoIndex = { summary: idx.summary, files: idx.files };
+          emit('plan', 'debug', `Indexed repo for plan grounding (${idx.files.length} file(s)).`);
+        } catch (err) {
+          emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
+        }
+        try {
+          const functionality = await indexFunctionality(project.repoPath);
+          if (functionality.units.length > 0) {
+            repoIndex = { ...(repoIndex ?? { summary: '', files: [] }), functionality: functionality.units };
+            emit(
+              'plan',
+              'debug',
+              `Detected ${functionality.units.length} functionality unit(s) for plan grounding.`,
+            );
+          }
+        } catch (err) {
+          emit('plan', 'debug', `Functionality indexing failed (planning without route context): ${errMsg(err)}`);
+        }
       }
-    }
 
-    plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+      plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+      // Enforce the testing-scope boundary as a backstop: plan.ts already asks
+      // the model for (and normalizes tiers to) only in-scope tiers, but this
+      // is the hard guarantee — filtered here, before approval/persistence, so
+      // the approval gate, plan.json, and the report all consistently reflect
+      // only what will actually be generated and executed.
+      const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
+      plan = { ...plan, items: plan.items.filter((it) => inScopeTiers.has(it.tier)) };
+    }
     await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     emit('plan', 'info', `Plan ready: ${plan.items.length} item(s).`, { summary: plan.summary });
     setStatus('awaiting-approval');
 
     // ---- 4. APPROVE ----
     if (checkCancelled()) return cancelRun('approve');
+    // What GENERATE actually receives: the full audited plan (all items,
+    // whatever their status) filtered to non-rejected items. Identical to
+    // `plan` itself when there's no approval gate (auto-approve / no hook).
+    let planForGeneration: TestPlan = plan;
     if (!opts.autoApprove && hooks?.onPlan) {
       emit('approve', 'info', 'Awaiting plan approval.');
-      let approved = false;
+      let result: PlanApprovalResult = { decision: 'cancel' };
       try {
         // Race the (potentially indefinite) human approval gate against abort:
         // a run cancelled while parked at the gate must resolve 'cancelled',
@@ -263,17 +353,48 @@ async function runPipeline(
         if (gate === ABORTED) {
           return cancelRun('approve', 'Run cancelled while awaiting approval.');
         }
-        approved = gate;
+        result = gate;
       } catch (err) {
         emit('approve', 'warn', `Approval gate threw: ${errMsg(err)}`, { stack: errStack(err) });
-        approved = false;
+        result = { decision: 'cancel' };
       }
-      if (!approved) {
+      if (result.decision === 'cancel') {
         emit('approve', 'info', 'Plan rejected; cancelling run.');
         setStatus('cancelled', { finishedAt: nowIso() });
         return { runId, status: 'cancelled' };
       }
-      emit('approve', 'info', 'Plan approved.');
+      // Finalize: per-item review is opt-in, so any item the reviewer left
+      // without a final decision — undefined/'pending' (never touched), or
+      // 'revised' (regenerated by AI but not explicitly re-approved) —
+      // defaults to 'approved' here, at the trust boundary rather than in a
+      // particular caller's UI, so every caller (desktop, CLI, tests) gets
+      // the same guarantee.
+      const finalizedItems = result.plan.items.map((it) =>
+        it.status === undefined || it.status === 'pending' || it.status === 'revised'
+          ? { ...it, status: 'approved' as const }
+          : it,
+      );
+      plan = { ...result.plan, items: finalizedItems };
+      // Overwrite the pre-approval draft with the finalized, fully-audited
+      // plan (statuses + edit/revision history) — this becomes the
+      // authoritative "what was actually run" version that plan.json,
+      // runs:detail, and the report all read from here on.
+      await writeJson(join(runDir, 'plan', 'plan.json'), plan);
+      const includedItems = plan.items.filter(isPlanItemIncluded);
+      if (includedItems.length === 0) {
+        // Every item was rejected — a deliberate empty plan, not a pipeline
+        // failure, so this reads as a cancellation rather than falling into
+        // the "verified nothing" error path further down.
+        emit('approve', 'info', 'All plan items were rejected; cancelling run.');
+        setStatus('cancelled', { finishedAt: nowIso() });
+        return { runId, status: 'cancelled' };
+      }
+      planForGeneration = { ...plan, items: includedItems };
+      emit(
+        'approve',
+        'info',
+        `Plan approved: ${includedItems.length} of ${plan.items.length} item(s) proceeding.`,
+      );
     } else {
       emit('approve', 'info', opts.autoApprove ? 'Auto-approved.' : 'No approval gate; proceeding.');
     }
@@ -417,10 +538,13 @@ async function runPipeline(
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
       baseUrl: effectiveBaseUrl,
+      testUsername: project.testUsername,
+      testPassword: project.testPassword,
       provider,
       target,
       browser,
-      explorationMode: opts.explorationMode ?? 'codegen',
+      explorationMode: opts.explorationMode ?? deriveExplorationMode(project),
+      testingScope: opts.testingScope ?? 'both',
       emit: ctxEmit,
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
@@ -434,21 +558,46 @@ async function runPipeline(
     // snapshot grounds GENERATE in real selectors either way. Codegen mode
     // used to skip this entirely, so its specs guessed routes/locators blind —
     // the dominant source of test_is_wrong failures. Frame mirroring (the live
-    // browser view in the desktop app) stays a computer-use-only feature.
+    // browser view in the desktop app) mirrors whenever a live URL exists too,
+    // not just for computer-use — a codegen project still drives a real
+    // browser here and during EXECUTE, so there's a real frame to show either way.
     if (checkCancelled()) return cancelRun('explore');
-    if (effectiveBaseUrl) {
+    if (suiteMode === 'reuse') {
+      // No new specs are ever generated in reuse mode, so there is nothing for
+      // a DOM snapshot to ground — skip the live browser pass entirely.
+      emit('explore', 'debug', 'Skipping exploration (reuse mode).');
+    } else if (effectiveBaseUrl) {
       setStatus('exploring');
       emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
       // Live frame mirroring is best-effort and must never abort the run; the
       // subscription + browser teardown both happen in this phase's finally.
       let unsubFrames: (() => void) | null = null;
+      // Resolves the moment a frame is actually delivered to hooks.onFrame —
+      // used below to hold teardown open just long enough for the mirror's
+      // in-flight capture to land. Without this, a real screenshot capture
+      // (genuinely tens to hundreds of ms against a real browser) can still
+      // be in flight when this phase's own work (goto + one DOM snapshot)
+      // finishes first; unsubscribing/stopping the browser at that point
+      // silently drops the frame before it's ever delivered.
+      let firstFrame: Promise<void> | null = null;
       try {
         await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
         await browser.goto(effectiveBaseUrl);
         // Subscribe AFTER start/goto so the UI only mirrors the live page.
-        if (hooks?.onFrame && ctx.explorationMode === 'computer-use') {
+        if (hooks?.onFrame) {
           try {
-            unsubFrames = browser.onFrame(hooks.onFrame);
+            let resolveFirstFrame: () => void = () => undefined;
+            firstFrame = new Promise((resolve) => {
+              resolveFirstFrame = resolve;
+            });
+            let delivered = false;
+            unsubFrames = browser.onFrame((png) => {
+              hooks?.onFrame?.(png);
+              if (!delivered) {
+                delivered = true;
+                resolveFirstFrame();
+              }
+            });
           } catch (err) {
             emit('explore', 'debug', `Frame subscription failed (continuing): ${errMsg(err)}`);
           }
@@ -462,6 +611,13 @@ async function runPipeline(
           url: snap.url,
           interactiveElements: snap.interactiveElements.length,
         });
+        // Bounded best-effort wait: give the mirror a brief window to deliver
+        // its first frame if it hasn't already, so short explorations still
+        // get one before the browser tears down. Never blocks the run for
+        // more than this cap.
+        if (firstFrame) {
+          await Promise.race([firstFrame, delay(600)]);
+        }
       } catch (err) {
         emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
       } finally {
@@ -485,18 +641,42 @@ async function runPipeline(
     emit('generate', 'info', 'Scaffolding suite.');
     try {
       await mode.scaffold(ctx);
-      emit('generate', 'info', 'Generating specs.');
-      specs = await mode.generate(ctx, plan);
-      for (const spec of specs) {
-        const test = store.insertTest({
-          runId,
-          title: spec.title,
-          reqTag: spec.reqTag ?? null,
-          tier: (spec.tier ?? null) as Tier | null,
-          status: 'pending',
-        });
-        testIdByKey.set(stableKey(spec.reqTag, spec.title), test.id);
+
+      let newSpecs: GeneratedSpec[] = [];
+      let carriedSpecs: GeneratedSpec[] = [];
+      let newSpecItems: TestPlanItem[] = [];
+      if (suiteMode === 'reuse') {
+        emit(
+          'generate',
+          'info',
+          `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
+        );
+        carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
+      } else if (suiteMode === 'topup') {
+        const diff = diffAgainstBase(planForGeneration.items, basePassingTests);
+        emit(
+          'generate',
+          'info',
+          `Top-up: ${diff.toGenerate.length} new/missing spec(s), ${diff.carried.length} carried forward from run ${baseRun!.id}.`,
+        );
+        emit('generate', 'info', 'Generating specs.');
+        newSpecs = await mode.generate(ctx, { ...planForGeneration, items: diff.toGenerate });
+        newSpecItems = diff.toGenerate;
+        carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
+      } else {
+        emit('generate', 'info', 'Generating specs.');
+        newSpecs = await mode.generate(ctx, planForGeneration);
+        newSpecItems = planForGeneration.items;
       }
+
+      specs = [...newSpecs, ...carriedSpecs];
+      // Freshly generated specs register ONE test row per scenario the plan
+      // requested (see registerSpecRows) so Total/Passed/Failed/etc. reflect
+      // real test-case counts, matching the report — not spec-file counts.
+      // Carried-forward specs (copied bytes from a prior run, already at
+      // whatever granularity that run used) get a single row, as before.
+      for (const spec of newSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+      for (const spec of carriedSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
       emit('generate', 'info', `Generated ${specs.length} spec(s).`);
     } catch (err) {
       emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
@@ -558,6 +738,127 @@ async function runPipeline(
       emit('execute', 'warn', `Artifact collection failed (continuing): ${errMsg(err)}`, {
         stack: errStack(err),
       });
+    }
+
+    // ---- 8c. COVERAGE FEEDBACK LOOP (best-effort) ----
+    // Fresh/top-up runs bound their coverage to a MEASURED target instead of
+    // stopping after a single plan/generate/execute pass — the earlier "prefer
+    // 3-8 scenarios" cap meant the plan itself was the bottleneck no matter how
+    // much of the app's real surface area was detected. Each iteration here
+    // re-plans ONLY the still-uncovered functionality units (buildGapFillPlanPrompt),
+    // generates+executes just those items, and merges the results in. These
+    // fill-gap iterations are auto-approved (skip the human plan-approval gate)
+    // since they are strictly additive within the tiers/scope already approved
+    // in the initial plan — every iteration still emits a clear message so this
+    // is never silent about what it's adding or why it stopped.
+    if (checkCancelled()) return cancelRun('generate');
+    if (suiteMode === 'reuse' || !repoIndex?.functionality || repoIndex.functionality.length === 0) {
+      emit('generate', 'debug', 'Skipping coverage loop (reuse mode or no functionality inventory).');
+    } else {
+      const coverageTarget = suiteMode === 'topup' ? TOPUP_COVERAGE_TARGET : FRESH_COVERAGE_TARGET;
+      const units = repoIndex.functionality;
+      let coveredPlanItems = planForGeneration.items;
+      let iteration = 1;
+      let coverage = computeCoverage(units, coveredPlanItems, specs, outcome);
+      emit(
+        'generate',
+        'info',
+        `Coverage: ${Math.round(coverage.ratio * 100)}% (${coverage.coveredUnitKeys.size}/${units.length} unit(s)).`,
+      );
+
+      while (
+        coverage.ratio < coverageTarget &&
+        coverage.uncovered.length > 0 &&
+        iteration < COVERAGE_MAX_ITERATIONS &&
+        !checkCancelled()
+      ) {
+        iteration += 1;
+        emit(
+          'plan',
+          'info',
+          `Coverage ${Math.round(coverage.ratio * 100)}% below target ${Math.round(coverageTarget * 100)}%; ` +
+            `planning gap-fill iteration ${iteration}/${COVERAGE_MAX_ITERATIONS} for ${coverage.uncovered.length} uncovered unit(s).`,
+        );
+
+        const gapPrompt = buildGapFillPlanPrompt(project, opts, coverage.uncovered, repoIndex);
+        let gapPlan: TestPlan | null = null;
+        try {
+          const completion = await provider.complete(gapPrompt, {
+            mode: 'plan',
+            cwd: project.repoPath ?? undefined,
+            signal,
+          });
+          if (completion.ok && completion.text) {
+            gapPlan = parsePlan(completion.text, opts.testingScope ?? 'both');
+          } else {
+            emit('plan', 'warn', `Gap-fill planning returned no usable plan; stopping coverage loop.`);
+          }
+        } catch (err) {
+          emit('plan', 'warn', `Gap-fill planning failed (stopping coverage loop): ${errMsg(err)}`);
+        }
+        if (!gapPlan || gapPlan.items.length === 0) break;
+
+        const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
+        const gapItems = gapPlan.items.filter((it) => inScopeTiers.has(it.tier));
+        if (gapItems.length === 0) {
+          emit('plan', 'info', 'Gap-fill plan had no in-scope items; stopping coverage loop.');
+          break;
+        }
+        emit('plan', 'info', `Gap-fill plan: ${gapItems.length} item(s), auto-approved.`);
+
+        if (checkCancelled()) break;
+        let gapSpecs: GeneratedSpec[] = [];
+        try {
+          emit('generate', 'info', `Generating ${gapItems.length} gap-fill spec(s).`);
+          gapSpecs = await mode.generate(ctx, { summary: gapPlan.summary, items: gapItems });
+        } catch (err) {
+          emit('generate', 'warn', `Gap-fill generation failed (stopping coverage loop): ${errMsg(err)}`);
+          break;
+        }
+        if (gapSpecs.length === 0) {
+          emit('generate', 'info', 'Gap-fill generation produced no accepted specs; stopping coverage loop.');
+          break;
+        }
+        for (const spec of gapSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
+        specs = [...specs, ...gapSpecs];
+
+        if (checkCancelled()) break;
+        try {
+          emit('execute', 'info', `Executing ${gapSpecs.length} gap-fill spec(s).`);
+          const gapOutcome = await mode.execute(ctx, gapSpecs);
+          persistResults(store, runId, gapSpecs, gapOutcome, testIdByKey, noteStoreOk, noteStoreFailure);
+          outcome = mergeExecOutcomes(outcome, gapOutcome);
+        } catch (err) {
+          emit('execute', 'warn', `Gap-fill execution failed (stopping coverage loop): ${errMsg(err)}`);
+          break;
+        }
+
+        coveredPlanItems = [...coveredPlanItems, ...gapItems];
+        planForGeneration = { ...planForGeneration, items: coveredPlanItems };
+        plan = { ...plan, items: [...plan.items, ...gapItems] };
+
+        const prevCovered = coverage.coveredUnitKeys.size;
+        coverage = computeCoverage(units, coveredPlanItems, specs, outcome);
+        emit(
+          'generate',
+          'info',
+          `Coverage after iteration ${iteration}: ${Math.round(coverage.ratio * 100)}% (${coverage.coveredUnitKeys.size}/${units.length} unit(s)).`,
+        );
+        if (coverage.coveredUnitKeys.size <= prevCovered) {
+          emit('generate', 'info', 'No forward progress in coverage; stopping loop.');
+          break;
+        }
+      }
+
+      if (coverage.ratio < coverageTarget) {
+        emit(
+          'generate',
+          'warn',
+          `Coverage loop stopped at ${Math.round(coverage.ratio * 100)}% (target ${Math.round(coverageTarget * 100)}%) ` +
+            `after ${iteration} iteration(s) — see prior log lines for why it stopped short.`,
+        );
+      }
+      await writeJson(join(runDir, 'plan', 'plan.json'), plan);
     }
 
     // ---- 9. TRIAGE (best-effort) ----
@@ -740,7 +1041,7 @@ async function runPipeline(
  *   use it; otherwise fall back to the first OTHER ready provider for 'plan' (emitting a
  *   warn). Returns undefined only when no provider is ready at all.
  */
-async function resolveProvider(
+export async function resolveProvider(
   id: RunOptions['provider'],
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
 ): Promise<ProviderAdapter | undefined> {
@@ -812,7 +1113,7 @@ async function runPlanPhase(
         signal: opts.signal,
       });
       if (completion.ok && completion.text) {
-        const parsed = parsePlan(completion.text);
+        const parsed = parsePlan(completion.text, opts.testingScope ?? 'both');
         if (parsed) return { plan: parsed };
         // ok but unparseable — not a provider fault, so don't retry on a different provider.
         emit('plan', 'warn', 'Could not parse plan JSON; synthesizing fallback.');
@@ -846,14 +1147,70 @@ async function runPlanPhase(
   }
 
   emit('plan', 'warn', 'Synthesizing fallback plan.');
-  return synthesizePlan(project);
+  return synthesizePlan(project, opts.testingScope ?? 'both');
 }
 
 /**
- * Persist execution results. The test rows were already inserted in GENERATE, so each
- * result is matched back to its spec by a stable key (reqTag preferred, else normalized
- * title) and we insert ONLY the result row. A result with no matching spec gets a single
- * fallback test row so it is still recorded exactly once.
+ * Insert `tests` rows for a batch of GENERATE-produced specs. A freshly generated
+ * spec (found in `items` by reqTag) gets ONE row per scenario the plan requested —
+ * so Total/Passed/Failed/etc. reflect real test-case counts, matching what the
+ * report already shows (outcome.results is scenario-level), not spec-file counts.
+ * A carried-forward spec (no matching item — copied bytes from a prior run,
+ * already at whatever granularity that run used) gets a single row, as before.
+ *
+ * Rows are keyed positionally (`${reqTag/title key}#${scenarioIndex}`) rather
+ * than by the model's own scenario title text, since that text isn't known
+ * until execution. persistResults matches results back to these rows by
+ * encounter order within the same reqTag — safe because generate.ts requires
+ * scenarios to be emitted as one test() each, in the same order they were
+ * planned, so Playwright's report preserves that order too.
+ */
+function registerSpecRows(
+  store: HealixStore,
+  runId: string,
+  projectDir: string,
+  spec: GeneratedSpec,
+  items: TestPlanItem[],
+  testIdByKey: Map<string, string>,
+): void {
+  const reqTag = (spec.reqTag ?? '').trim();
+  const item = reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined;
+  const specPath = relative(projectDir, spec.path);
+  const base = stableKey(spec.reqTag, spec.title);
+
+  if (!item || item.scenarios.length === 0) {
+    const test = store.insertTest({
+      runId,
+      title: spec.title,
+      reqTag: spec.reqTag ?? null,
+      tier: (spec.tier ?? null) as Tier | null,
+      status: 'pending',
+      specPath,
+    });
+    testIdByKey.set(base, test.id);
+    return;
+  }
+
+  item.scenarios.forEach((s, i) => {
+    const test = store.insertTest({
+      runId,
+      title: `${spec.title} — ${s.kind}: ${s.description}`,
+      reqTag: spec.reqTag ?? null,
+      tier: (spec.tier ?? null) as Tier | null,
+      status: 'pending',
+      specPath,
+    });
+    testIdByKey.set(`${base}#${i}`, test.id);
+  });
+}
+
+/**
+ * Persist execution results. Each spec's scenario results are matched back, IN
+ * ENCOUNTER ORDER, to the positionally-keyed rows registerSpecRows inserted for
+ * that reqTag — the first scenario result for a reqTag maps to `#0`, the second
+ * to `#1`, and so on. A result with no matching spec, or more results than
+ * scenarios were registered for (unexpected but not fatal), gets its own
+ * fallback row keyed by its own title so it's still recorded exactly once.
  */
 function persistResults(
   store: HealixStore,
@@ -864,31 +1221,49 @@ function persistResults(
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
+  const scenarioIndexByReqTag = new Map<string, number>();
+
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
-    // to carry the "[REQ:<tag>]" marker (ensureReqTag). Recover the tag from the
-    // result title first — it keys directly onto the row inserted in GENERATE —
-    // and only fall back to normalized-title matching when no tag survived.
+    // to carry the "[REQ:<tag>]" marker on EVERY scenario test (see generate.ts's
+    // per-test tagging requirement). Recover the tag from the result title first —
+    // it keys directly onto the rows inserted in GENERATE — and only fall back to
+    // normalized-title matching when no tag survived.
     const tagFromTitle = extractReqTag(r.title);
     const matched = specs.find(
       (s) =>
         (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
         stableKey(undefined, s.title) === stableKey(undefined, r.title),
     );
-    const key = stableKey(tagFromTitle ?? matched?.reqTag, matched?.title ?? r.title);
-    let testId = testIdByKey.get(key);
-    if (!testId) {
-      // No spec matched this result — insert a single fallback test row to anchor it.
-      const fallback = store.insertTest({
-        runId,
-        title: r.title,
-        reqTag: matched?.reqTag ?? tagFromTitle,
-        tier: (matched?.tier ?? null) as Tier | null,
-        status: r.status as TestStatus,
-      });
-      testId = fallback.id;
-      testIdByKey.set(key, testId);
+    const base = matched ? stableKey(tagFromTitle ?? matched.reqTag, matched.title) : null;
+
+    let testId: string | undefined;
+    if (base) {
+      const reqTagKey = tagFromTitle ?? matched?.reqTag ?? base;
+      const scenarioIndex = scenarioIndexByReqTag.get(reqTagKey) ?? 0;
+      scenarioIndexByReqTag.set(reqTagKey, scenarioIndex + 1);
+      testId = testIdByKey.get(`${base}#${scenarioIndex}`) ?? (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
+      if (testId) store.updateTestTitle(testId, r.title);
     }
+    if (!testId) {
+      // No matching pre-registered row (no spec matched, or more results than
+      // scenarios were planned) — insert a fallback row, keyed by its own
+      // title so repeated overflow results don't collide with each other.
+      const fallbackKey = stableKey(tagFromTitle ?? matched?.reqTag, r.title);
+      testId = testIdByKey.get(fallbackKey);
+      if (!testId) {
+        const fallback = store.insertTest({
+          runId,
+          title: r.title,
+          reqTag: matched?.reqTag ?? tagFromTitle,
+          tier: (matched?.tier ?? null) as Tier | null,
+          status: r.status as TestStatus,
+        });
+        testId = fallback.id;
+        testIdByKey.set(fallbackKey, testId);
+      }
+    }
+
     try {
       store.insertResult({
         testId,
@@ -897,18 +1272,39 @@ function persistResults(
         error: r.error ?? null,
         artifactsJson: r.artifacts && r.artifacts.length > 0 ? JSON.stringify(r.artifacts) : null,
       });
-      // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
-      // report command) would otherwise see every test as eternally 'pending'.
-      store.updateTestStatus(testId, r.status as TestStatus);
       noteStoreOk();
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
     }
+    try {
+      // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
+      // report command) would otherwise see every test as eternally 'pending'.
+      // Each row now maps to exactly one scenario result (positionally or via
+      // the fallback path), so a direct update is correct — no aggregation needed.
+      store.updateTestStatus(testId, r.status as TestStatus);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('updateTestStatus', err);
+    }
   }
 }
 
 /** Pull the "[REQ:<tag>]" marker out of an executed test's title, if present. */
+/**
+ * Pick the exploration mechanism from how the project is actually configured:
+ * a repo path means white-box source is available, so Codegen can read and
+ * generate real specs from it (repo path wins when both are set); a base-URL-
+ * only project has no source to read, so Computer-use (live exploration) is
+ * the only mode that makes sense. No longer a user choice (see RunOptions.
+ * explorationMode, which still allows an explicit override for tests/CLI).
+ */
+function deriveExplorationMode(project: Project): ExplorationMode {
+  if (project.repoPath) return 'codegen';
+  if (project.baseUrl) return 'computer-use';
+  return 'codegen';
+}
+
 function extractReqTag(title: string): string | null {
   const m = title.match(/\[REQ:([^\]]+)\]/i);
   const tag = m?.[1]?.trim();
@@ -920,6 +1316,52 @@ function stableKey(reqTag: string | null | undefined, title: string): string {
   const tag = reqTag?.trim();
   if (tag && tag.length > 0) return `req:${tag}`;
   return `title:${title.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+}
+
+/**
+ * Copy each carried-forward test's spec file from the base run's own suite dir
+ * into THIS run's suite dir (ctx.projectDir), and reconstruct a GeneratedSpec
+ * for it so it flows through EXECUTE/persistResults exactly like a freshly
+ * AI-generated one. A test with no on-disk file left (missing/moved since the
+ * base run) is skipped rather than failing the whole run — it simply won't be
+ * part of this run's suite, and a subsequent Fresh/Top-up run can regenerate it.
+ */
+async function hydrateCarriedSpecs(
+  ctx: TestModeContext,
+  projectId: string,
+  baseRunId: string,
+  tests: TestCase[],
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<GeneratedSpec[]> {
+  const baseSuiteDir = join(projectsDir(), projectId, 'runs', baseRunId, 'suite');
+  const specs: GeneratedSpec[] = [];
+  for (const t of tests) {
+    if (!t.specPath) continue;
+    const srcAbs = join(baseSuiteDir, t.specPath);
+    const destAbs = join(ctx.projectDir, t.specPath);
+    try {
+      await mkdir(dirname(destAbs), { recursive: true });
+      await copyFile(srcAbs, destAbs);
+      const contents = await readFile(destAbs, 'utf-8');
+      specs.push({
+        path: destAbs,
+        title: t.title,
+        reqTag: t.reqTag ?? undefined,
+        tier: (t.tier ?? 'tierA-public') as Tier,
+        contents,
+      });
+    } catch (err) {
+      emit(
+        'generate',
+        'warn',
+        `Could not carry forward "${t.title}" (spec file unavailable): ${errMsg(err)}`,
+        {
+          specPath: t.specPath,
+        },
+      );
+    }
+  }
+  return specs;
 }
 
 /** Build + write report.json and report.html. Returns the report path (best-effort). */
@@ -1046,6 +1488,10 @@ export function looksLikeMissingDeps(message: string): boolean {
   return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|command not found|not recognized as an internal|ENOENT|node_modules/i.test(
     message,
   );
+}
+
+function delay(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function errMsg(err: unknown): string {

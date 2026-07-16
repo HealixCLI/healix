@@ -1,6 +1,13 @@
 import type { ProviderAdapter, ProviderId } from '../providers/types.js';
-import type { ModeId, RunStatus } from '../storage/types.js';
-import type { ExecOutcome, ExplorationMode, SuiteBundle, TestMode, TestPlan } from '../modes/types.js';
+import type { ModeId, RunStatus, SuiteMode } from '../storage/types.js';
+import type {
+  ExecOutcome,
+  ExplorationMode,
+  SuiteBundle,
+  TestingScope,
+  TestMode,
+  TestPlan,
+} from '../modes/types.js';
 import type { TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { HealixStore } from '../storage/store.js';
@@ -19,11 +26,37 @@ export type OrchestratorPhase =
 export interface RunOptions {
   projectId: string;
   provider?: ProviderId;
+  /**
+   * Which tiers to plan/generate/execute. The user-facing control — replaces
+   * choosing ExplorationMode directly. Defaults to 'both' (all tiers, current
+   * behavior) when omitted.
+   */
+  testingScope?: TestingScope;
+  /**
+   * How to explore/ground generation (white-box repo reading vs. black-box
+   * live browser). No longer a user choice: when omitted, the orchestrator
+   * derives it from the project's repoPath/baseUrl. Still overridable
+   * explicitly (tests, CLI) for callers that want to force one.
+   */
   explorationMode?: ExplorationMode;
   /** Skip the human approval gate (e.g. CI). */
   autoApprove?: boolean;
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
+  /**
+   * Suite lifecycle strategy: 'fresh' regenerates everything (default, current
+   * behavior, byte-identical when omitted); 'topup' plans as normal but skips
+   * AI-generating any item that matches (by reqTag, else normalized title) a
+   * still-passing test from the base run, copying that test's spec file forward
+   * instead; 'reuse' skips planning/generation entirely and re-executes the base
+   * run's passing tests as-is.
+   */
+  suiteMode?: SuiteMode;
+  /**
+   * Pin top-up/reuse to a specific prior run instead of auto-resolving to the
+   * project's most recent 'passed' run.
+   */
+  baseRunId?: string;
   /**
    * Cooperative cancellation. When aborted, the run stops at the next phase
    * boundary (and in-flight provider/suite work is killed), the run row is
@@ -39,8 +72,15 @@ export interface OrchestratorEvent {
   data?: unknown;
 }
 
-/** Returns true to approve the proposed plan, false to abort. */
-export type ApprovalGate = (plan: TestPlan) => Promise<boolean>;
+/**
+ * The finalized outcome of per-item plan review: 'proceed' carries the plan
+ * as the reviewer left it (items may be approved/rejected/edited/revised —
+ * see TestPlanItem.status), 'cancel' aborts the run entirely.
+ */
+export type PlanApprovalResult = { decision: 'proceed'; plan: TestPlan } | { decision: 'cancel' };
+
+/** Presents the proposed plan to a human reviewer and returns their finalized decision. */
+export type ApprovalGate = (plan: TestPlan) => Promise<PlanApprovalResult>;
 
 export interface OrchestratorHooks {
   onEvent?: (e: OrchestratorEvent) => void;

@@ -2,7 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
-import type { GeneratedSpec, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
+import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import { TIERS, tierLabel } from './templates.js';
 
 const GEN_TIMEOUT_MS = 180_000;
@@ -128,6 +128,14 @@ function looksLikePlaywrightSpec(source: string): boolean {
   return /@playwright\/test/.test(source) && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
 }
 
+/** Matches bare `test(...)` and `test.only/skip/fixme(...)` calls — deliberately excludes `test.describe(...)`. */
+const TEST_CASE_RE = /\btest(?:\.(?:only|skip|fixme))?\s*\(/g;
+
+/** Count actual test-case blocks in a spec (not the enclosing describe block). */
+function countTestCases(source: string): number {
+  return [...source.matchAll(TEST_CASE_RE)].length;
+}
+
 /** Ensure the generated title carries the [REQ:...] tag for traceability. */
 function ensureReqTag(source: string, reqTag: string | undefined): string {
   if (!reqTag) return source;
@@ -143,6 +151,23 @@ function ensureReqTag(source: string, reqTag: string | undefined): string {
 /** Retry note when the previous attempt produced a spec without an assertion. */
 const RETRY_NOTE_NO_EXPECT =
   'Your previous output was rejected because it contained no expect(...) assertion. You MUST include at least one concrete expect(...) assertion that verifies real behaviour.';
+
+/** Retry note when the previous attempt didn't include a test() case for every requested scenario. */
+function retryNoteMissingScenarios(expected: number, actual: number): string {
+  return `Your previous output was rejected because it had ${actual} test case(s) but ${expected} scenario(s) were requested. Output exactly one test(...) per scenario listed below, in the same order.`;
+}
+
+/** Retry note when individual test() titles are missing the [REQ:tag] marker (only the describe had it). */
+function retryNoteMissingPerTestTag(reqTag: string): string {
+  return `Your previous output was rejected because "[REQ:${reqTag}]" only appeared on the describe block, not on every individual test(...) title. EVERY test(...) title must start with "[REQ:${reqTag}]" — this is required for coverage tracking.`;
+}
+
+/** Count occurrences of the "[REQ:<tag>]" marker in the source (used to confirm it's on every test, not just the describe). */
+function countReqTagOccurrences(source: string, reqTag: string): number {
+  const escaped = reqTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const re = new RegExp(`\\[REQ:${escaped}\\]`, 'g');
+  return [...source.matchAll(re)].length;
+}
 
 /** Retry note when the previous attempt used forbidden APIs (deny-list gate). */
 function retryNoteForbidden(violations: string[]): string {
@@ -184,11 +209,18 @@ Interactive elements observed${where} during exploration — PREFER these real s
 ${lines.join('\n')}${more}`;
 }
 
+/** Render a plan item's scenarios as a numbered list for the generation prompt. */
+function formatScenarios(scenarios: PlanScenario[]): string {
+  return scenarios.map((s, i) => `${i + 1}. [${s.kind}] ${s.description}`).join('\n');
+}
+
 function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
+  const scenarios = item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
+  const scenarioList = formatScenarios(scenarios);
 
   const tierGuidance =
     tier === 'tierC-api'
@@ -197,20 +229,28 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
         ? 'This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.'
         : 'This is a public flow requiring no authentication.';
 
-  return `You are generating ONE Playwright test spec file in TypeScript.
+  return `You are generating ONE Playwright test spec file in TypeScript covering ONE feature with
+multiple test cases (positive/negative/edge), not just a single check.
 
 Output ONLY the TypeScript source for the spec. No markdown, no code fences, no explanation.
 
 Requirements:
 - Begin with: import { test, expect } from '@playwright/test';
-- The test (or test.describe) title MUST start with "[REQ:${reqTag}]".
+- Wrap all cases in: test.describe('[REQ:${reqTag}] ${item.title}', () => { ... });
+- Output exactly one test(...) per scenario listed below, IN THE SAME ORDER.
+- EVERY test(...) title MUST itself start with "[REQ:${reqTag}]" too (not just the describe title),
+  followed by its scenario kind, e.g. test('[REQ:${reqTag}] positive: succeeds with valid input', ...).
+  This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
-- Include AT LEAST ONE concrete expect(...) assertion.
+- Every test(...) MUST include at least one concrete expect(...) assertion.
 - Be self-contained and runnable; do not import local helpers.
 - ${tierGuidance}${strictNote}${inventory}
 
-Test intent: ${item.intent}
-Test title hint: ${item.title}
+Scenarios to cover, one test(...) each, in this order:
+${scenarioList}
+
+Feature: ${item.title}
+Feature intent: ${item.intent}
 Tier: ${tierLabel(tier)}`;
 }
 
@@ -297,6 +337,34 @@ async function generateOne(
       continue;
     }
 
+    const expectedScenarios = item.scenarios.length || 1;
+    const actualTestCases = countTestCases(source);
+    if (actualTestCases < expectedScenarios) {
+      // Same retry-once-then-skip treatment: a spec covering fewer cases than
+      // requested isn't the positive/negative/edge bundle the plan asked for.
+      emit(
+        ctx,
+        `Output for "${item.title}" had ${actualTestCases}/${expectedScenarios} scenario(s) (attempt ${attempt + 1}); retrying`,
+      );
+      retryNote = retryNoteMissingScenarios(expectedScenarios, actualTestCases);
+      lastReason = `only ${actualTestCases}/${expectedScenarios} scenario(s) covered after retry`;
+      continue;
+    }
+
+    const reqTagOccurrences = countReqTagOccurrences(source, reqTag);
+    if (reqTagOccurrences < expectedScenarios) {
+      // The tag must be on every individual test(...) title, not just the
+      // describe block, so results/coverage-tracking can match each scenario
+      // result back to this item (see orchestrator/index.ts persistResults).
+      emit(
+        ctx,
+        `Output for "${item.title}" only tagged ${reqTagOccurrences}/${expectedScenarios} test(s) with [REQ:${reqTag}] (attempt ${attempt + 1}); retrying`,
+      );
+      retryNote = retryNoteMissingPerTestTag(reqTag);
+      lastReason = `[REQ:${reqTag}] missing from individual test titles after retry`;
+      continue;
+    }
+
     // Deny-list gate: same retry-once-then-skip treatment as the zero-expect
     // case, but the stricter note lists the concrete violations so the retry
     // can actually fix them.
@@ -334,26 +402,66 @@ async function generateOne(
   return { spec: null, reason: lastReason, violations: lastViolations };
 }
 
+/** Number of plan items generated concurrently. */
+const GEN_CONCURRENCY = 3;
+
+/**
+ * Run up to `concurrency` promises at a time from `tasks`. Returns results in
+ * the same order as `tasks` regardless of completion order.
+ */
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+): Promise<T[]> {
+  const results: T[] = new Array(tasks.length);
+  let nextIndex = 0;
+
+  async function worker(): Promise<void> {
+    while (nextIndex < tasks.length) {
+      const i = nextIndex++;
+      results[i] = await tasks[i]();
+    }
+  }
+
+  const workers = Array.from({ length: Math.min(concurrency, tasks.length) }, worker);
+  await Promise.all(workers);
+  return results;
+}
+
 /**
  * For each plan item, ask the provider (read-only) for a single Playwright
  * spec, validate it (must look like a spec, contain >=1 expect, and pass the
  * forbidden-API gate), retry once stricter on failure, write it to
  * tests/<tier>/<slug>.spec.ts, and return the accepted specs.
+ *
+ * Runs up to GEN_CONCURRENCY items in parallel to increase throughput on
+ * plans with many items; per-item order doesn't matter since each spec is
+ * independent, but path de-dup (usedPaths) still guarantees unique files.
  */
 export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
   const items = plan.items ?? [];
-  emit(ctx, `Generating ${items.length} spec(s)`, { count: items.length });
+  emit(ctx, `Generating ${items.length} spec(s) (up to ${GEN_CONCURRENCY} in parallel)`, {
+    count: items.length,
+  });
 
   const specs: GeneratedSpec[] = [];
   const usedPaths = new Set<string>();
+  let completed = 0;
 
-  for (let i = 0; i < items.length; i += 1) {
-    const item = items[i];
+  // Path de-dup happens inside generateOne (before writeFile) via the shared
+  // usedPaths set, so each accepted spec persists to a unique file on disk
+  // even when several items are generated at once.
+  const tasks = items.map((item, i) => async () => {
     emit(ctx, `[${i + 1}/${items.length}] Generating "${item.title}"`, { id: item.id, tier: item.tier });
+    const outcome = await generateOne(ctx, item, usedPaths);
+    completed += 1;
+    emit(ctx, `Progress: ${completed}/${items.length} done`, { completed, total: items.length });
+    return { item, ...outcome };
+  });
 
-    // Path de-dup happens inside generateOne (before writeFile) via usedPaths,
-    // so each accepted spec persists to a unique file on disk.
-    const { spec, reason, violations } = await generateOne(ctx, item, usedPaths);
+  const outcomes = await runWithConcurrency(tasks, GEN_CONCURRENCY);
+
+  for (const { item, spec, reason, violations } of outcomes) {
     if (!spec) {
       // Include the violation list so the UI/logs show WHAT was forbidden,
       // not just that the spec was skipped.

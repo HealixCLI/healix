@@ -173,6 +173,10 @@ export function registerRuns(program: Command): void {
       console.log(`    ${pc.dim('created')}   ${run.createdAt}`);
       console.log(`    ${pc.dim('started')}   ${run.startedAt ?? pc.dim('—')}`);
       console.log(`    ${pc.dim('finished')}  ${run.finishedAt ?? pc.dim('—')}`);
+      if (run.suiteMode) {
+        const based = run.baseRunId ? ` (based on ${run.baseRunId})` : '';
+        console.log(`    ${pc.dim('suite')}     ${pc.cyan(run.suiteMode)}${pc.dim(based)}`);
+      }
 
       // ---- results table (results joined with test metadata) ----
       const tests = store.listTests(runId);

@@ -32,10 +32,19 @@ const api = {
     mode?: string;
     repoPath?: string | null;
     baseUrl?: string | null;
+    testUsername?: string | null;
+    testPassword?: string | null;
   }) => ipcRenderer.invoke('projects:create', input),
   updateProject: (
     id: string,
-    input: { name: string; mode?: string; repoPath?: string | null; baseUrl?: string | null },
+    input: {
+      name: string;
+      mode?: string;
+      repoPath?: string | null;
+      baseUrl?: string | null;
+      testUsername?: string | null;
+      testPassword?: string | null;
+    },
   ) => ipcRenderer.invoke('projects:update', { id, ...input }),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),
   archiveProject: (id: string, archived: boolean) => ipcRenderer.invoke('projects:archive', { id, archived }),
@@ -43,15 +52,27 @@ const api = {
   // runs
   startRun: (args: {
     projectId: string;
-    mode?: string;
+    testingScope?: string;
     provider?: string;
     autoApprove?: boolean;
     prd?: string;
+    suiteMode?: string;
+    baseRunId?: string;
   }) => ipcRenderer.invoke('run:start', args),
-  approveRun: (runId: string, ok: boolean) => ipcRenderer.invoke('run:approve', { runId, ok }),
+  approveRun: (runId: string, decision: { decision: 'cancel' } | { decision: 'proceed'; plan: unknown }) =>
+    ipcRenderer.invoke('run:approve', { runId, ...decision }),
   cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
+  lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),
+  suiteDiff: (runId: string) => ipcRenderer.invoke('runs:suiteDiff', { runId }),
+  caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
+    ipcRenderer.invoke('runs:caseHistory', { projectId, ...key }),
+  projectMetrics: (projectId: string) => ipcRenderer.invoke('runs:projectMetrics', { projectId }),
+
+  // per-item plan revision (AI-regenerates one item from human feedback)
+  reviseItem: (args: { projectId: string; item: unknown; suggestion: string }) =>
+    ipcRenderer.invoke('plan:reviseItem', args),
 
   // export / shell
   exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>

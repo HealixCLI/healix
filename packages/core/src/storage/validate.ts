@@ -30,6 +30,8 @@ export interface NormalizedNewProject {
   mode: ModeId;
   repoPath: string | null;
   baseUrl: string | null;
+  testUsername: string | null;
+  testPassword: string | null;
 }
 
 export type NewProjectValidation = { ok: true; value: NormalizedNewProject } | { ok: false; error: string };
@@ -57,6 +59,8 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
 
   const repoPath = (input.repoPath ?? '').trim() || null;
   const baseUrl = (input.baseUrl ?? '').trim() || null;
+  const testUsername = (input.testUsername ?? '').trim() || null;
+  const testPassword = (input.testPassword ?? '').trim() || null;
 
   if (!repoPath && !baseUrl) {
     return {
@@ -87,6 +91,6 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
 
   return {
     ok: true,
-    value: { name, mode: input.mode ?? 'playwright', repoPath, baseUrl },
+    value: { name, mode: input.mode ?? 'playwright', repoPath, baseUrl, testUsername, testPassword },
   };
 }

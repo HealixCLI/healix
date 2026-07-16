@@ -2,20 +2,26 @@
 import type {
   DoctorReport,
   HealthResult,
+  PlanApprovalResult,
   Project,
   NewProject,
   ProviderId,
   Run,
   RunSummary,
   SuiteBundle,
+  TestPlanItem,
 } from '@healix/core';
 import type {
   PickPrdFileResult,
   ProviderLoginResult,
   ProviderSummary,
+  ReviseItemResult,
   RunDetail,
   StartRunArgs,
   RunChannelMessage,
+  SuiteDiffSummary,
+  TestCaseHistory,
+  ProjectMetrics,
 } from './lib/ipc-types';
 
 export interface HealixBridge {
@@ -29,8 +35,15 @@ export interface HealixBridge {
   archiveProject: (id: string, archived: boolean) => Promise<{ ok: true }>;
 
   startRun: (args: StartRunArgs) => Promise<RunSummary>;
-  approveRun: (runId: string, ok: boolean) => Promise<{ settled: boolean }>;
+  approveRun: (runId: string, decision: PlanApprovalResult) => Promise<{ settled: boolean }>;
   cancelRun: (runId: string) => Promise<{ cancelled: boolean }>;
+
+  // ---- per-item plan revision ----
+  reviseItem: (args: {
+    projectId: string;
+    item: TestPlanItem;
+    suggestion: string;
+  }) => Promise<ReviseItemResult>;
 
   exportSuite: (args: {
     suiteDir: string;
@@ -51,6 +64,10 @@ export interface HealixBridge {
   // ---- run history ----
   listRuns: (projectId?: string) => Promise<Run[]>;
   runDetail: (runId: string) => Promise<RunDetail>;
+  lastSuccessfulRun: (projectId: string) => Promise<Run | null>;
+  suiteDiff: (runId: string) => Promise<SuiteDiffSummary | null>;
+  caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) => Promise<TestCaseHistory>;
+  projectMetrics: (projectId: string) => Promise<ProjectMetrics | null>;
 
   onRunEvent: (cb: (msg: RunChannelMessage) => void) => () => void;
 }

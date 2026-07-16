@@ -123,9 +123,11 @@ describe('shapeRunShow', () => {
       startedAt: '2026-07-01T00:00:00.000Z',
       finishedAt: '2026-07-01T00:01:00.000Z',
       createdAt: '2026-07-01T00:00:00.000Z',
+      suiteMode: null,
+      baseRunId: null,
     };
     const tests: TestCase[] = [
-      { id: 't1', runId: 'r1', title: 'login', reqTag: null, tier: null, status: 'passed' },
+      { id: 't1', runId: 'r1', title: 'login', reqTag: null, tier: null, status: 'passed', specPath: null },
     ];
     const results: TestResult[] = [
       { id: 'res1', testId: 't1', status: 'passed', durationMs: 12, error: null, artifactsJson: null },

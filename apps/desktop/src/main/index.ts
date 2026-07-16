@@ -27,13 +27,19 @@ import {
   deleteProjectAssets,
   isGitRemoteUrl,
   cloneRepo,
+  computeIdentityKey,
+  resolveProvider,
+  reviseItem,
   type NewProject,
   type Project,
-  type ExplorationMode,
+  type TestingScope,
   type ProviderId,
   type TestPlan,
+  type TestPlanItem,
+  type PlanApprovalResult,
   type RunSummary,
   type Run,
+  type SuiteMode,
   type TestCase,
   type TestResult,
   type AgentEvent,
@@ -182,6 +188,8 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
     mode: input.mode ?? 'playwright',
     repoPath,
     baseUrl: normalizeOptional(input.baseUrl),
+    testUsername: normalizeOptional(input.testUsername),
+    testPassword: normalizeOptional(input.testPassword),
   });
 });
 
@@ -196,6 +204,8 @@ ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProjec
     mode: input.mode ?? 'playwright',
     repoPath: normalizeOptional(input.repoPath),
     baseUrl: normalizeOptional(input.baseUrl),
+    testUsername: normalizeOptional(input.testUsername),
+    testPassword: normalizeOptional(input.testPassword),
   });
 });
 
@@ -228,7 +238,7 @@ ipcMain.handle(
 // ---- Run lifecycle (orchestrator with streamed events + correlated approval gate) ----
 
 interface PendingApproval {
-  resolve: (ok: boolean) => void;
+  resolve: (result: PlanApprovalResult) => void;
 }
 
 /** runId -> resolver for the in-flight approval gate awaiting a renderer reply. */
@@ -242,21 +252,27 @@ const pendingApprovals = new Map<string, PendingApproval>();
 const activeRuns = new Map<string, AbortController>();
 
 /** Resolve a parked approval gate. Returns true when a gate was actually waiting. */
-function settleApproval(runId: string, ok: boolean): boolean {
+function settleApproval(runId: string, result: PlanApprovalResult): boolean {
   const pending = pendingApprovals.get(runId);
   if (!pending) return false;
   pendingApprovals.delete(runId);
-  pending.resolve(ok);
+  pending.resolve(result);
   return true;
 }
 
 export interface StartRunArgs {
   projectId: string;
-  /** Maps to the orchestrator's exploration mode (codegen | computer-use). */
-  mode?: ExplorationMode;
+  /** What to test — drives tier selection; the underlying exploration
+   * mechanism (codegen vs. computer-use) is derived internally from the
+   * project's config. */
+  testingScope?: TestingScope;
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;
+  /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
+  suiteMode?: SuiteMode;
+  /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
+  baseRunId?: string;
 }
 
 ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs): Promise<RunSummary> => {
@@ -289,9 +305,11 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
       {
         projectId: args.projectId,
         provider: args.provider,
-        explorationMode: args.mode,
+        testingScope: args.testingScope,
         autoApprove: args.autoApprove ?? false,
         prd: args.prd,
+        suiteMode: args.suiteMode,
+        baseRunId: args.baseRunId,
         signal: controller.signal,
       },
       {
@@ -308,7 +326,8 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
         onPlan: (plan: TestPlan) => {
           if (runId) safeSend(sender, 'run:plan', { runId, plan });
           // Auto-approve short-circuits the human gate.
-          if (args.autoApprove || !runId) return Promise.resolve(true);
+          if (args.autoApprove || !runId)
+            return Promise.resolve<PlanApprovalResult>({ decision: 'proceed', plan });
           return waitForApproval(runId, sender);
         },
         // Live browser mirroring for computer-use runs. Throttling (~2fps) and
@@ -330,7 +349,7 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
     .finally(() => {
       // Never leak a parked gate or a stale controller, however the run ended.
       if (runId) {
-        settleApproval(runId, false);
+        settleApproval(runId, { decision: 'cancel' });
         activeRuns.delete(runId);
       }
     });
@@ -367,15 +386,17 @@ async function forceSettleOrphanedRun(
 
 ipcMain.handle(
   'run:approve',
-  async (_e, payload: { runId: string; ok: boolean }): Promise<{ settled: boolean }> => {
+  async (_e, payload: { runId: string } & PlanApprovalResult): Promise<{ settled: boolean }> => {
     if (!payload?.runId) return { settled: false };
-    const settled = settleApproval(payload.runId, payload.ok === true);
+    const result: PlanApprovalResult =
+      payload.decision === 'proceed' ? { decision: 'proceed', plan: payload.plan } : { decision: 'cancel' };
+    const settled = settleApproval(payload.runId, result);
     if (!settled) {
-      // Rejecting is a deliberate cancellation either way; approving a run
-      // that can no longer actually resume never runs, which is an error.
-      // Wording matches exactly what a live orchestrator logs for the same
-      // decisions (packages/core/src/orchestrator/index.ts).
-      await (payload.ok
+      // Rejecting/cancelling is a deliberate cancellation either way;
+      // approving a run that can no longer actually resume never runs, which
+      // is an error. Wording matches exactly what a live orchestrator logs
+      // for the same decisions (packages/core/src/orchestrator/index.ts).
+      await (result.decision === 'proceed'
         ? forceSettleOrphanedRun(
             payload.runId,
             'error',
@@ -392,7 +413,7 @@ ipcMain.handle('run:cancel', async (_e, payload: { runId: string }): Promise<{ c
   if (!runId) return { cancelled: false };
   // A parked approval gate would hold the orchestrator before it ever checks
   // the abort signal, so cancelling also rejects any pending plan approval.
-  settleApproval(runId, false);
+  settleApproval(runId, { decision: 'cancel' });
   const controller = activeRuns.get(runId);
   if (!controller) {
     // Nothing live to abort — same orphaned-run situation as above. The user
@@ -404,6 +425,35 @@ ipcMain.handle('run:cancel', async (_e, payload: { runId: string }): Promise<{ c
   controller.abort();
   return { cancelled: true };
 });
+
+/** Swallows the level param so resolveProvider's emit callback has somewhere harmless to go. */
+function noopEmit(_phase: string, _level: 'debug' | 'info' | 'warn' | 'error', _message: string): void {
+  /* no-op: revise-item is a one-off call, not worth a Timeline entry */
+}
+
+/**
+ * Revise a single plan item with AI-incorporated human feedback, while the
+ * run stays parked at the approval gate. Stateless beyond looking up the
+ * project — no coupling to activeRuns/pendingApprovals, since this happens
+ * independently of (and possibly concurrently with) the gate's own lifecycle.
+ */
+ipcMain.handle(
+  'plan:reviseItem',
+  async (
+    _e,
+    payload: { projectId: string; item: TestPlanItem; suggestion: string },
+  ): Promise<{ ok: true; item: TestPlanItem } | { ok: false; detail: string }> => {
+    if (!payload?.projectId || !payload.item || !payload.suggestion?.trim()) {
+      return { ok: false, detail: 'projectId, item, and a non-empty suggestion are required.' };
+    }
+    const store = await requireStore();
+    const project = store.getProject(payload.projectId);
+    if (!project) return { ok: false, detail: `Project not found: ${payload.projectId}` };
+    const provider = await resolveProvider(undefined, noopEmit);
+    if (!provider) return { ok: false, detail: 'No ready provider available for revising this item.' };
+    return reviseItem(provider, project, { projectId: payload.projectId }, payload.item, payload.suggestion);
+  },
+);
 
 // ---- Suite export ----
 
@@ -671,6 +721,190 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan };
 });
 
+/** Most recent fully-passed run for a project — drives the Suite Mode toggle's enable/disable state. */
+ipcMain.handle('runs:lastSuccessful', async (_e, payload: { projectId: string }): Promise<Run | null> => {
+  const store = await getStore();
+  if (!store || !payload?.projectId) return null;
+  try {
+    return store.getLastSuccessfulRun(payload.projectId);
+  } catch {
+    return null;
+  }
+});
+
+export interface SuiteDiffSummary {
+  runId: string;
+  baseRunId: string | null;
+  addedCount: number;
+  carriedCount: number;
+  removedCount: number;
+  totalCount: number;
+}
+
+/** Added/carried/removed test counts for one run vs. the run it topped-up/reused from, computed on read. */
+ipcMain.handle('runs:suiteDiff', async (_e, payload: { runId: string }): Promise<SuiteDiffSummary | null> => {
+  const store = await getStore();
+  if (!store || !payload?.runId) return null;
+  const run = store.getRun(payload.runId);
+  if (!run) return null;
+
+  const tests = store.listTests(run.id);
+  const totalCount = tests.length;
+  if (!run.baseRunId) {
+    return {
+      runId: run.id,
+      baseRunId: null,
+      addedCount: totalCount,
+      carriedCount: 0,
+      removedCount: 0,
+      totalCount,
+    };
+  }
+
+  const baseTests = store.listTests(run.baseRunId);
+  const baseKeys = new Set(baseTests.map((t) => computeIdentityKey(t.reqTag, t.title)));
+  const thisKeys = new Set(tests.map((t) => computeIdentityKey(t.reqTag, t.title)));
+
+  let addedCount = 0;
+  let carriedCount = 0;
+  for (const t of tests) {
+    if (baseKeys.has(computeIdentityKey(t.reqTag, t.title))) carriedCount += 1;
+    else addedCount += 1;
+  }
+  let removedCount = 0;
+  for (const key of baseKeys) {
+    if (!thisKeys.has(key)) removedCount += 1;
+  }
+
+  return { runId: run.id, baseRunId: run.baseRunId, addedCount, carriedCount, removedCount, totalCount };
+});
+
+export interface TestCaseHistoryEntry {
+  runId: string;
+  runCreatedAt: string;
+  suiteMode: SuiteMode | null;
+  status: TestCase['status'];
+  durationMs: number | null;
+  specPath: string | null;
+}
+
+export interface TestCaseHistory {
+  identityKey: string;
+  currentTitle: string;
+  reqTag: string | null;
+  runHistory: TestCaseHistoryEntry[];
+}
+
+/**
+ * One test's lineage + pass/fail history: walks the base_run_id chain
+ * backward from the project's most recent run, matching a test by identity
+ * key (reqTag, else normalized title) at each link. The chain only extends as
+ * far back as an unbroken top-up/reuse lineage permits — a 'fresh' run has no
+ * base_run_id, so history naturally stops there.
+ */
+ipcMain.handle(
+  'runs:caseHistory',
+  async (_e, payload: { projectId: string; reqTag?: string; title?: string }): Promise<TestCaseHistory> => {
+    const empty: TestCaseHistory = { identityKey: '', currentTitle: '', reqTag: null, runHistory: [] };
+    if (!payload?.projectId || (!payload.reqTag && !payload.title)) return empty;
+    const store = await getStore();
+    if (!store) return empty;
+
+    const targetKey = computeIdentityKey(payload.reqTag ?? null, payload.title ?? '');
+    const runs = store.listRuns(payload.projectId); // newest-first
+    if (runs.length === 0) return empty;
+
+    const byId = new Map(runs.map((r) => [r.id, r]));
+    const chain: Run[] = [];
+    let current: Run | undefined = runs[0];
+    const seen = new Set<string>();
+    while (current && !seen.has(current.id)) {
+      seen.add(current.id);
+      chain.push(current);
+      current = current.baseRunId ? byId.get(current.baseRunId) : undefined;
+    }
+
+    const runHistory: TestCaseHistoryEntry[] = [];
+    let currentTitle = '';
+    let reqTag: string | null = null;
+    for (const run of chain) {
+      const tests = store.listTests(run.id);
+      const match = tests.find((t) => computeIdentityKey(t.reqTag, t.title) === targetKey);
+      if (!match) continue;
+      if (!currentTitle) {
+        currentTitle = match.title;
+        reqTag = match.reqTag;
+      }
+      const result = store.listResults(run.id).find((r) => r.testId === match.id);
+      runHistory.push({
+        runId: run.id,
+        runCreatedAt: run.createdAt,
+        suiteMode: run.suiteMode,
+        status: match.status,
+        durationMs: result?.durationMs ?? null,
+        specPath: match.specPath,
+      });
+    }
+
+    return { identityKey: targetKey, currentTitle, reqTag, runHistory };
+  },
+);
+
+const METRICS_TREND_LIMIT = 20;
+
+export interface ProjectMetrics {
+  totalRuns: number;
+  lastRunAt: string | null;
+  /** Test count of the project's most recent run (any status), i.e. the current suite size. */
+  latestRunTestCount: number;
+  /** 0..1 over the trend window below; null when no results exist yet. */
+  passRate: number | null;
+  /** Oldest → newest, capped to the most recent METRICS_TREND_LIMIT runs. */
+  failureTrend: Array<{
+    runId: string;
+    runCreatedAt: string;
+    passed: number;
+    failed: number;
+    blocked: number;
+    total: number;
+  }>;
+}
+
+/** Project-level metrics for the dashboard Overview tab — pure aggregation over existing tables, no new schema. */
+ipcMain.handle(
+  'runs:projectMetrics',
+  async (_e, payload: { projectId: string }): Promise<ProjectMetrics | null> => {
+    const store = await getStore();
+    if (!store || !payload?.projectId) return null;
+
+    const runs = store.listRuns(payload.projectId); // newest-first
+    const totalRuns = runs.length;
+    const lastRunAt = runs[0]?.createdAt ?? null;
+    const latestRunTestCount = runs[0] ? store.listTests(runs[0].id).length : 0;
+
+    const failureTrend = runs
+      .slice(0, METRICS_TREND_LIMIT)
+      .map((run) => {
+        const results = store.listResults(run.id);
+        return {
+          runId: run.id,
+          runCreatedAt: run.createdAt,
+          passed: results.filter((r) => r.status === 'passed').length,
+          failed: results.filter((r) => r.status === 'failed').length,
+          blocked: results.filter((r) => r.status === 'blocked').length,
+          total: results.length,
+        };
+      })
+      .reverse();
+
+    const totalResults = failureTrend.reduce((n, t) => n + t.total, 0);
+    const totalPassed = failureTrend.reduce((n, t) => n + t.passed, 0);
+    const passRate = totalResults > 0 ? totalPassed / totalResults : null;
+
+    return { totalRuns, lastRunAt, latestRunTestCount, passRate, failureTrend };
+  },
+);
+
 // ---- helpers ----
 
 /** Parse a JSON file if it exists; return null on any error (missing/malformed). */
@@ -748,23 +982,23 @@ function normalizeOptional(v: string | null | undefined): string | null {
 }
 
 /** Park the orchestrator until the renderer replies via 'run:approve'. */
-function waitForApproval(runId: string, sender: WebContents): Promise<boolean> {
-  return new Promise<boolean>((resolve) => {
+function waitForApproval(runId: string, sender: WebContents): Promise<PlanApprovalResult> {
+  return new Promise<PlanApprovalResult>((resolve) => {
     // If a stale gate somehow exists for this id, reject it first.
-    settleApproval(runId, false);
+    settleApproval(runId, { decision: 'cancel' });
 
     // If the window is torn down while we wait, fail closed.
     const onDestroyed = (): void => {
-      settleApproval(runId, false);
+      settleApproval(runId, { decision: 'cancel' });
     };
 
     // Wrap resolve so settling the gate (approve, reject, or destroy) also
     // detaches the 'destroyed' listener. Without this, a normally-approved run
     // leaves a dead listener on the long-lived window every time — after enough
     // runs Node emits MaxListenersExceededWarning and each closure leaks.
-    const settle = (ok: boolean): void => {
+    const settle = (result: PlanApprovalResult): void => {
       sender.removeListener('destroyed', onDestroyed);
-      resolve(ok);
+      resolve(result);
     };
 
     pendingApprovals.set(runId, { resolve: settle });

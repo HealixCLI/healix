@@ -14,6 +14,10 @@ export interface Project {
   createdAt: string;
   /** Soft-archive timestamp; null = active. Archived projects keep all data. */
   archivedAt: string | null;
+  /** Login identifier (username or email) for authenticated (tierB) test flows. */
+  testUsername: string | null;
+  /** Password paired with testUsername. Stored locally, same as repoPath/baseUrl — never sent to the AI provider. */
+  testPassword: string | null;
 }
 
 export type RunStatus =
@@ -32,6 +36,9 @@ export type RunStatus =
   | 'error'
   | 'cancelled';
 
+/** How a run's suite was produced: fully regenerated, topped-up from a prior run, or re-executed as-is. */
+export type SuiteMode = 'fresh' | 'topup' | 'reuse';
+
 export interface Run {
   id: string;
   projectId: string;
@@ -41,6 +48,10 @@ export interface Run {
   startedAt: string | null;
   finishedAt: string | null;
   createdAt: string;
+  /** Null for runs predating this feature. */
+  suiteMode: SuiteMode | null;
+  /** The prior run this one topped-up/reused from, if any. */
+  baseRunId: string | null;
 }
 
 export type Tier = 'tierA-public' | 'tierB-auth' | 'tierC-api' | (string & {});
@@ -53,6 +64,8 @@ export interface TestCase {
   reqTag: string | null;
   tier: Tier | null;
   status: TestStatus | null;
+  /** Relative path of this test's generated spec file within its own run's suite dir (e.g. 'tests/tierA-public/login.spec.ts'). Null for legacy rows. */
+  specPath: string | null;
 }
 
 export interface TestResult {
@@ -81,4 +94,6 @@ export interface NewProject {
   mode?: ModeId;
   repoPath?: string | null;
   baseUrl?: string | null;
+  testUsername?: string | null;
+  testPassword?: string | null;
 }

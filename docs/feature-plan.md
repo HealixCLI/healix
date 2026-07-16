@@ -117,6 +117,8 @@ Healix CLI  ───┘   (orchestrator)  Router └─ Codex CLI (plan mode)  
 
 `<app-data>` = `~/Library/Application Support` (macOS), `%APPDATA%` (Windows), `$XDG_DATA_HOME` (Linux).
 
+A run's `suite/` folder above is still per-run and disposable, but a `topup`/`reuse` run's folder is now seeded by copying still-passing spec files forward from a prior run (`runs.base_run_id`) rather than always generating from zero — see [ADR-0018](./adr/0018-persistent-topup-suites.md).
+
 ---
 
 ## 7. Milestones

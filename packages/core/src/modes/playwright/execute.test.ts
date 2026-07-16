@@ -18,7 +18,14 @@ vi.mock('node:child_process', async (importOriginal) => {
 
 import { spawn } from 'node:child_process';
 import type { GeneratedSpec, TestModeContext } from '../types.js';
-import { execute, suiteEnv, parseReport, findAuthSetupOutcome, type AuthSignals } from './execute.js';
+import {
+  execute,
+  suiteEnv,
+  parseReport,
+  findAuthSetupOutcome,
+  playwrightProjectArgs,
+  type AuthSignals,
+} from './execute.js';
 
 function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
   return {
@@ -104,6 +111,55 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     const env = suiteEnv(makeCtx());
     // Original casing is preserved; the match itself is case-insensitive.
     expect(env.Path ?? env.PATH).toBeDefined();
+  });
+
+  it('injects HEALIX_TIERB_EMAIL/PASSWORD and a /login default from baseUrl when both credentials are set', () => {
+    const env = suiteEnv(
+      makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user@test.com', testPassword: 'hunter2' }),
+    );
+    expect(env.HEALIX_TIERB_EMAIL).toBe('user@test.com');
+    expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
+  });
+
+  it('injects neither credential var when only one of username/password is set (fixture requires both)', () => {
+    const withOnlyUsername = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user' }));
+    expect(withOnlyUsername.HEALIX_TIERB_EMAIL).toBeUndefined();
+    expect(withOnlyUsername.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+
+    const withOnlyPassword = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testPassword: 'hunter2' }));
+    expect(withOnlyPassword.HEALIX_TIERB_PASSWORD).toBeUndefined();
+    expect(withOnlyPassword.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+  });
+
+  it('does not inject a login URL when credentials are set but no baseUrl is configured', () => {
+    const env = suiteEnv(makeCtx({ testUsername: 'user', testPassword: 'hunter2' }));
+    expect(env.HEALIX_TIERB_EMAIL).toBe('user');
+    expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+  });
+});
+
+describe('playwrightProjectArgs — testing-scope --project restriction', () => {
+  it('adds no --project flags for "both" (runs every Playwright project)', () => {
+    expect(playwrightProjectArgs('both')).toEqual([]);
+  });
+
+  it('adds no --project flags when scope is undefined (current default behavior)', () => {
+    expect(playwrightProjectArgs(undefined)).toEqual([]);
+  });
+
+  it('restricts to tierA-public and tierB-auth for frontend', () => {
+    expect(playwrightProjectArgs('frontend')).toEqual([
+      '--project',
+      'tierA-public',
+      '--project',
+      'tierB-auth',
+    ]);
+  });
+
+  it('restricts to tierC-api for backend', () => {
+    expect(playwrightProjectArgs('backend')).toEqual(['--project', 'tierC-api']);
   });
 });
 
@@ -236,6 +292,23 @@ describe('parseReport — structural Tier B classification', () => {
     expect(parsed.blocked).toBe(2);
     // the setup's own row stays an honest failure
     expect(byTitle['authenticate']?.status).toBe('failed');
+  });
+
+  it('excludes a PASSING auth-setup spec from results entirely (no phantom test row)', () => {
+    // Regression: a passing auth-setup used to appear in `results` as a normal
+    // "test" that can never be matched back to a generated spec — inflating
+    // the total and, downstream, poisoning top-up/reuse's "which tests passed"
+    // accounting with an uncarryable phantom row every Tier B run.
+    const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: true };
+    const r = report([
+      { title: 'authenticate', file: 'fixtures/auth.setup.ts', projectName: 'auth-setup', status: 'passed' },
+      { title: 'dashboard greeting', projectName: 'tierB-auth', status: 'passed' },
+    ]);
+    const parsed = parseReport(r, auth);
+    expect(parsed.results.map((x) => x.title)).toEqual(['dashboard greeting']);
+    expect(parsed.results.some((x) => x.title === 'authenticate')).toBe(false);
+    // Only the real test counts toward the headline — the setup phantom does not.
+    expect(parsed.passed).toBe(1);
   });
 
   it('marks Tier B failures BLOCKED when the setup ran without credentials (anonymous session)', () => {

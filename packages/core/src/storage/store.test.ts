@@ -199,6 +199,32 @@ describe('updateProject', () => {
     expect(s.getProject(project.id)).toMatchObject({ name: 'Renamed', repoPath: '/Users/me/code/renamed' });
   });
 
+  it('persists and round-trips test credentials through create, get, and update', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'Auth Project',
+      baseUrl: 'https://auth.test',
+      testUsername: 'tester@auth.test',
+      testPassword: 'hunter2',
+    });
+    expect(project.testUsername).toBe('tester@auth.test');
+    expect(project.testPassword).toBe('hunter2');
+    expect(s.getProject(project.id)).toMatchObject({
+      testUsername: 'tester@auth.test',
+      testPassword: 'hunter2',
+    });
+
+    const cleared = s.updateProject(project.id, {
+      name: 'Auth Project',
+      baseUrl: 'https://auth.test',
+      testUsername: null,
+      testPassword: null,
+    });
+    expect(cleared.testUsername).toBeNull();
+    expect(cleared.testPassword).toBeNull();
+    expect(s.getProject(project.id)).toMatchObject({ testUsername: null, testPassword: null });
+  });
+
   it('throws and persists nothing when the edit would violate the invariant', async () => {
     const s = await store();
     const project = s.createProject({ name: 'Original', baseUrl: 'https://original.test' });
@@ -213,6 +239,58 @@ describe('updateProject', () => {
     expect(() => s.updateProject('prj_does_not_exist', { name: 'X', baseUrl: 'https://x.test' })).toThrow(
       /not found/i,
     );
+  });
+});
+
+describe('duplicate project names', () => {
+  it('blocks creating a second active project with the same name', async () => {
+    const s = await store();
+    s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+
+    expect(() => s.createProject({ name: 'Acme', baseUrl: 'https://acme2.test' })).toThrow(/already exists/i);
+    // Rejected create must not have persisted a second row.
+    expect(s.listProjects()).toHaveLength(1);
+  });
+
+  it('matches names case-insensitively', async () => {
+    const s = await store();
+    s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+
+    expect(() => s.createProject({ name: 'ACME', baseUrl: 'https://acme2.test' })).toThrow(/already exists/i);
+    expect(() => s.createProject({ name: '  acme  ', baseUrl: 'https://acme3.test' })).toThrow(
+      /already exists/i,
+    );
+  });
+
+  it('allows reusing the name of an archived project', async () => {
+    const s = await store();
+    const original = s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+    s.setProjectArchived(original.id, true);
+
+    const recreated = s.createProject({ name: 'Acme', baseUrl: 'https://acme2.test' });
+    expect(recreated.id).not.toBe(original.id);
+    expect(s.listProjects().filter((p) => !p.archivedAt)).toHaveLength(1);
+  });
+
+  it('blocks renaming a project to collide with another active project', async () => {
+    const s = await store();
+    s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+    const other = s.createProject({ name: 'Beta', baseUrl: 'https://beta.test' });
+
+    expect(() => s.updateProject(other.id, { name: 'Acme', baseUrl: 'https://beta.test' })).toThrow(
+      /already exists/i,
+    );
+    // Rejected rename must not have touched the row.
+    expect(s.getProject(other.id)).toMatchObject({ name: 'Beta' });
+  });
+
+  it('allows updating a project without changing its own name (no self-collision)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'Acme', baseUrl: 'https://acme.test' });
+
+    const updated = s.updateProject(project.id, { name: 'Acme', baseUrl: 'https://acme-v2.test' });
+    expect(updated.name).toBe('Acme');
+    expect(updated.baseUrl).toBe('https://acme-v2.test');
   });
 });
 
@@ -256,6 +334,98 @@ describe('deleteRun cascade', () => {
     expect(await countRows('tests')).toBe(N);
     expect(await countRows('results')).toBe(N);
     expect(await countRows('agent_events')).toBe(N);
+  });
+});
+
+describe('top-up suite lineage', () => {
+  it('round-trips suiteMode/baseRunId on runs and specPath on tests', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'lineage-project', baseUrl: 'https://lineage.test' });
+
+    const baseRun = s.createRun(project.id, { provider: null, mode: 'playwright' });
+    expect(baseRun.suiteMode).toBeNull();
+    expect(baseRun.baseRunId).toBeNull();
+
+    const topupRun = s.createRun(project.id, { suiteMode: 'topup', baseRunId: baseRun.id });
+    expect(topupRun.suiteMode).toBe('topup');
+    expect(topupRun.baseRunId).toBe(baseRun.id);
+    expect(s.getRun(topupRun.id)).toMatchObject({ suiteMode: 'topup', baseRunId: baseRun.id });
+
+    const test = s.insertTest({
+      runId: topupRun.id,
+      title: 'Login with valid credentials',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'passed',
+      specPath: 'tests/tierA-public/login.spec.ts',
+    });
+    expect(test.specPath).toBe('tests/tierA-public/login.spec.ts');
+    expect(s.listTests(topupRun.id)).toMatchObject([{ specPath: 'tests/tierA-public/login.spec.ts' }]);
+  });
+
+  it('defaults specPath to null when omitted (legacy-row shape)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'legacy-project', baseUrl: 'https://legacy.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'legacy test',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+    expect(test.specPath).toBeNull();
+    expect(s.listTests(run.id)).toMatchObject([{ specPath: null }]);
+  });
+});
+
+describe('getLastSuccessfulRun', () => {
+  it('returns null when the project has no runs at all', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'no-runs', baseUrl: 'https://no-runs.test' });
+    expect(s.getLastSuccessfulRun(project.id)).toBeNull();
+  });
+
+  it('returns null when every run is error or cancelled (never produced a real verdict)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'never-completed', baseUrl: 'https://never-completed.test' });
+    const errored = s.createRun(project.id);
+    s.updateRunStatus(errored.id, 'error', { finishedAt: new Date().toISOString() });
+    const cancelled = s.createRun(project.id);
+    s.updateRunStatus(cancelled.id, 'cancelled', { finishedAt: new Date().toISOString() });
+    expect(s.getLastSuccessfulRun(project.id)).toBeNull();
+  });
+
+  it('counts a failed or blocked run as eligible — not just a fully-passed one', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'partial-failures', baseUrl: 'https://partial-failures.test' });
+    const run = s.createRun(project.id);
+    s.updateRunStatus(run.id, 'failed', { finishedAt: new Date().toISOString() });
+    const last = s.getLastSuccessfulRun(project.id);
+    expect(last?.id).toBe(run.id);
+    expect(last?.status).toBe('failed');
+  });
+
+  it('picks the most recent eligible run, ignoring later error/cancelled runs and other projects', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'mixed-history', baseUrl: 'https://mixed-history.test' });
+    const other = s.createProject({ name: 'other-project', baseUrl: 'https://other-project.test' });
+
+    const firstPassed = s.createRun(project.id);
+    s.updateRunStatus(firstPassed.id, 'passed', { finishedAt: new Date().toISOString() });
+
+    const secondFailed = s.createRun(project.id);
+    s.updateRunStatus(secondFailed.id, 'failed', { finishedAt: new Date().toISOString() });
+
+    const laterCancelled = s.createRun(project.id);
+    s.updateRunStatus(laterCancelled.id, 'cancelled', { finishedAt: new Date().toISOString() });
+
+    const otherProjectPassed = s.createRun(other.id);
+    s.updateRunStatus(otherProjectPassed.id, 'passed', { finishedAt: new Date().toISOString() });
+
+    const last = s.getLastSuccessfulRun(project.id);
+    expect(last?.id).toBe(secondFailed.id);
+    expect(last?.status).toBe('failed');
   });
 });
 

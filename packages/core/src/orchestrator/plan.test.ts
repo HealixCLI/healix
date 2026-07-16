@@ -1,6 +1,8 @@
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../storage/types.js';
-import { buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
+import { tiersForScope } from '../modes/types.js';
+import { buildGapFillPlanPrompt, buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** Minimal black-box project fixture (baseUrl set so synthesize yields URL-flavoured items). */
 function makeProject(overrides: Partial<Project> = {}): Project {
@@ -12,6 +14,8 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     baseUrl: 'https://example.test',
     createdAt: '2026-01-01T00:00:00.000Z',
     archivedAt: null,
+    testUsername: null,
+    testPassword: null,
     ...overrides,
   };
 }
@@ -62,7 +66,7 @@ describe('parsePlan', () => {
     expect(plan?.items[0]?.reqTag).toBeUndefined();
   });
 
-  it('clamps an unknown/hallucinated tier to tierA-public', () => {
+  it('clamps an unknown/hallucinated tier to tierA-public (default "both" scope)', () => {
     const text = [
       '```json',
       JSON.stringify({
@@ -75,6 +79,42 @@ describe('parsePlan', () => {
     const plan = parsePlan(text);
     expect(plan).not.toBeNull();
     expect(plan?.items[0]?.tier).toBe('tierA-public');
+  });
+
+  it('clamps to the first in-scope tier for a restricted scope, not tierA-public unconditionally', () => {
+    const text = JSON.stringify({
+      summary: 'Backend-only plan with a bogus tier.',
+      items: [{ title: 'Weird tier', tier: 'tierZ-quantum', intent: 'Should clamp within scope.' }],
+    });
+
+    const plan = parsePlan(text, 'backend');
+    expect(plan?.items[0]?.tier).toBe('tierC-api');
+  });
+
+  it('preserves a recognized-but-out-of-scope tier as-is (the orchestrator filters it, not this)', () => {
+    // A real tier name that's outside the requested scope must NOT be
+    // coerced into scope here — the orchestrator applies the actual scope
+    // boundary as a filter right after planning, and that filter needs the
+    // item's real tier to drop it correctly. Clamping it here would make
+    // every item look "in scope" by the time the filter runs, defeating it.
+    const text = JSON.stringify({
+      summary: 'Frontend-only plan with an out-of-scope API item.',
+      items: [{ title: 'API check', tier: 'tierC-api', intent: 'A real (but out-of-scope) tier.' }],
+    });
+
+    const plan = parsePlan(text, 'frontend');
+    expect(plan?.items[0]?.tier).toBe('tierC-api');
+    expect(tiersForScope('frontend')).not.toContain(plan?.items[0]?.tier);
+  });
+
+  it('keeps an in-scope tier as-is', () => {
+    const text = JSON.stringify({
+      summary: 'Backend-only plan.',
+      items: [{ title: 'API check', tier: 'tierC-api', intent: 'A real API test.' }],
+    });
+
+    const plan = parsePlan(text, 'backend');
+    expect(plan?.items[0]?.tier).toBe('tierC-api');
   });
 
   it('falls back to a default summary when summary is missing', () => {
@@ -93,6 +133,66 @@ describe('parsePlan', () => {
     // Valid JSON but zero usable items (no titles) is also unusable.
     expect(parsePlan(JSON.stringify({ summary: 'empty', items: [{ tier: 'tierA-public' }] }))).toBeNull();
     expect(parsePlan('')).toBeNull();
+  });
+
+  it('parses a scenarios array with positive/negative/edge kinds and a unitKey', () => {
+    const text = JSON.stringify({
+      summary: 'Plan with scenarios.',
+      items: [
+        {
+          title: 'Checkout',
+          reqTag: 'REQ-010',
+          tier: 'tierA-public',
+          intent: 'Checkout flow works.',
+          unitKey: 'route:/checkout',
+          scenarios: [
+            { kind: 'positive', description: 'completes with valid card' },
+            { kind: 'negative', description: 'rejects an expired card' },
+            { kind: 'edge', description: 'handles a zero-total cart' },
+          ],
+        },
+      ],
+    });
+
+    const plan = parsePlan(text);
+    expect(plan?.items[0]?.unitKey).toBe('route:/checkout');
+    expect(plan?.items[0]?.scenarios).toEqual([
+      { kind: 'positive', description: 'completes with valid card' },
+      { kind: 'negative', description: 'rejects an expired card' },
+      { kind: 'edge', description: 'handles a zero-total cart' },
+    ]);
+  });
+
+  it('coerces an unknown scenario kind to positive and drops scenarios with no description', () => {
+    const text = JSON.stringify({
+      summary: 'Plan with a bogus scenario kind.',
+      items: [
+        {
+          title: 'Weird scenario',
+          tier: 'tierA-public',
+          intent: 'Should still parse.',
+          scenarios: [
+            { kind: 'catastrophic', description: 'treated as positive' },
+            { kind: 'negative', description: '' },
+          ],
+        },
+      ],
+    });
+
+    const plan = parsePlan(text);
+    expect(plan?.items[0]?.scenarios).toEqual([{ kind: 'positive', description: 'treated as positive' }]);
+  });
+
+  it('falls back to a single positive scenario derived from intent when scenarios is missing/malformed', () => {
+    const text = JSON.stringify({
+      summary: 'Plan with no scenarios field.',
+      items: [{ title: 'Legacy item', tier: 'tierA-public', intent: 'Still works without scenarios.' }],
+    });
+
+    const plan = parsePlan(text);
+    expect(plan?.items[0]?.scenarios).toEqual([
+      { kind: 'positive', description: 'Still works without scenarios.' },
+    ]);
   });
 });
 
@@ -117,6 +217,19 @@ describe('synthesizePlan', () => {
     const plan = synthesizePlan(makeProject({ baseUrl: null }));
     expect(plan.items).toHaveLength(1);
     expect(plan.items[0]?.tier).toBe('tierA-public');
+  });
+
+  it('falls back to a tierC-api item for a backend-only scope instead of tierA-public', () => {
+    // A tierA-public fallback would be filtered out entirely by the caller's
+    // scope filter, leaving an empty plan — must synthesize something in scope.
+    const plan = synthesizePlan(makeProject(), 'backend');
+    expect(plan.items.length).toBeGreaterThan(0);
+    for (const item of plan.items) expect(item.tier).toBe('tierC-api');
+  });
+
+  it('keeps the tierA-public fallback for frontend and both scopes', () => {
+    expect(synthesizePlan(makeProject(), 'frontend').items[0]?.tier).toBe('tierA-public');
+    expect(synthesizePlan(makeProject(), 'both').items[0]?.tier).toBe('tierA-public');
   });
 });
 
@@ -161,5 +274,90 @@ describe('buildPlanPrompt (repo context)', () => {
     expect(prompt).toContain('- src/file-079.ts');
     expect(prompt).not.toContain('src/file-080.ts');
     expect(prompt).toContain('... and 20 more file(s) not listed.');
+  });
+
+  it('does not cap scenario count at "3-8" — the old ceiling is gone', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test' });
+    expect(prompt).not.toContain('3-8');
+    expect(prompt).not.toMatch(/prefer\s+\d+-\d+/i);
+  });
+
+  it('lists detected functionality units and instructs one item per unit', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+      { key: 'endpoint:GET /health', kind: 'endpoint', label: 'GET /health', file: 'src/server.ts' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id },
+      { summary: 'Framework: next.', files: [], functionality: units },
+    );
+
+    expect(prompt).toContain('Detected routes/endpoints');
+    expect(prompt).toContain('[route] page: /checkout (unitKey: "route:/checkout")');
+    expect(prompt).toContain('[endpoint] GET /health (unitKey: "endpoint:GET /health")');
+    expect(prompt).toContain('one item per distinct route/endpoint');
+    expect(prompt).toContain('"unitKey"');
+  });
+});
+
+describe('buildGapFillPlanPrompt', () => {
+  it('scopes the prompt to only the given uncovered units and notes prior coverage', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const uncovered: FunctionalityUnit[] = [
+      { key: 'route:/settings', kind: 'route', label: 'page: /settings', file: 'app/settings/page.tsx' },
+    ];
+    const prompt = buildGapFillPlanPrompt(project, { projectId: project.id }, uncovered, {
+      summary: 'Framework: next.',
+      files: ['app/checkout/page.tsx', 'app/settings/page.tsx'],
+      functionality: [
+        { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+        ...uncovered,
+      ],
+    });
+
+    expect(prompt).toContain('already planned and tested other parts');
+    expect(prompt).toContain('route:/settings');
+    // Only the uncovered unit is listed, not the already-covered one.
+    expect(prompt).not.toContain('route:/checkout');
+  });
+});
+
+describe('buildPlanPrompt (testing scope)', () => {
+  it('defaults to "both" and lists all three tiers when no scope is given', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test' });
+    expect(prompt).toContain('"tierA-public" | "tierB-auth" | "tierC-api"');
+    expect(prompt).toContain('tierA-public for unauthenticated flows');
+    expect(prompt).toContain('tierB-auth for authenticated flows');
+    expect(prompt).toContain('tierC-api for API-level checks');
+  });
+
+  it('restricts the tier enum and guidance to frontend tiers only', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test', testingScope: 'frontend' });
+    expect(prompt).toContain('"tierA-public" | "tierB-auth"');
+    expect(prompt).not.toContain('tierC-api');
+    expect(prompt).toContain('tierA-public for unauthenticated flows');
+    expect(prompt).toContain('tierB-auth for authenticated flows');
+  });
+
+  it('restricts the tier enum and guidance to tierC-api only for backend', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test', testingScope: 'backend' });
+    expect(prompt).toContain('"tierC-api"');
+    expect(prompt).not.toContain('tierA-public');
+    expect(prompt).not.toContain('tierB-auth');
+    expect(prompt).toContain('tierC-api for API-level checks');
+  });
+
+  it('names the selected scope in the prompt', () => {
+    expect(buildPlanPrompt(makeProject(), { projectId: 'p', testingScope: 'frontend' })).toContain(
+      'Testing scope: Frontend testing',
+    );
+    expect(buildPlanPrompt(makeProject(), { projectId: 'p', testingScope: 'backend' })).toContain(
+      'Testing scope: Backend testing',
+    );
+    expect(buildPlanPrompt(makeProject(), { projectId: 'p', testingScope: 'both' })).toContain(
+      'Testing scope: Frontend + backend testing',
+    );
   });
 });

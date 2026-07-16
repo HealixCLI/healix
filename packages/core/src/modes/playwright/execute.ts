@@ -3,7 +3,8 @@ import { access, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { TestStatus } from '../../storage/types.js';
-import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestModeContext } from '../types.js';
+import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestingScope, TestModeContext } from '../types.js';
+import { tiersForScope } from '../types.js';
 
 const EXEC_TIMEOUT_MS = 30 * 60_000; // generous: full suite across three tiers
 const INSTALL_TIMEOUT_MS = 300_000; // generous: npm install for the scaffolded suite
@@ -68,8 +69,15 @@ const SUITE_ENV_ALLOWLIST = new Set(
  * credentials, tokens) to whatever code the model generated — one
  * `process.env` read plus one fetch() inside a spec exfiltrates them all.
  * Only what node/npm/Playwright genuinely need to run is passed through,
- * plus every HEALIX_* var (our own config, by definition non-secret) and the
- * HEALIX_BASE_URL injection the scaffolded playwright.config reads.
+ * plus every HEALIX_* var already in the host env (our own config, by
+ * default non-secret) and the HEALIX_BASE_URL / HEALIX_TIERB_* injections
+ * below, which the scaffolded playwright.config / fixtures/auth.setup.ts
+ * (see templates.ts) read. The test credentials ARE secrets — unlike the
+ * rest of this allowlist they're deliberately exposed to the spec process
+ * because the user configured them on the project for exactly this: logging
+ * the generated Tier B tests in. They are never sent to the AI provider (see
+ * generate.ts, which only ever tells the model to assume storageState, never
+ * references the literal values).
  */
 export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
   const env: NodeJS.ProcessEnv = {};
@@ -79,7 +87,30 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     }
   }
   if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
+  if (ctx.testUsername && ctx.testPassword) {
+    env.HEALIX_TIERB_EMAIL = ctx.testUsername;
+    env.HEALIX_TIERB_PASSWORD = ctx.testPassword;
+    // The auth fixture requires all three of email/password/loginUrl to
+    // attempt a real login (see authSetupContents() in templates.ts) — absent
+    // a dedicated "login URL" field on the project, default to the common
+    // `/login` convention relative to the configured base URL.
+    if (ctx.baseUrl) env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+  }
   return env;
+}
+
+/**
+ * Playwright --project flags restricting execution to the tiers in scope.
+ * Omitted entirely for 'both' (or when scope is unset) so Playwright runs
+ * every project — current default behavior. tierB-auth's `auth-setup`
+ * dependency (see playwrightConfigContents in templates.ts) runs
+ * automatically whenever tierB-auth is selected, even though it's never
+ * listed here explicitly — that's Playwright's own dependency semantics for
+ * `--project`, not something this needs to reproduce.
+ */
+export function playwrightProjectArgs(scope: TestingScope | undefined): string[] {
+  if (!scope || scope === 'both') return [];
+  return tiersForScope(scope).flatMap((tier) => ['--project', tier]);
 }
 
 interface RawCommand {
@@ -111,7 +142,7 @@ function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
     // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
-    const args = ['playwright', 'test'];
+    const args = ['playwright', 'test', ...playwrightProjectArgs(ctx.testingScope)];
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -529,9 +560,20 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let blocked = 0;
   let flaky = 0;
 
-  const processSpec = (spec: PwSpec, suiteTitle: string): void => {
+  const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
     if (tests.length === 0) return;
+    // The auth-setup project's own fixture "test" (fixtures/auth.setup.ts) is
+    // Healix-internal plumbing, not a user-facing test case. A PASSING setup
+    // is uninteresting and must never appear in the report/results or get
+    // persisted as a test row — it can never be matched back to a generated
+    // spec, which used to inflate the total and silently poison future
+    // top-up/reuse's "which tests passed" accounting with an uncarryable
+    // phantom "passed" row every Tier B run. A FAILING setup, however, is
+    // kept — it's the reason Tier B got blocked and must stay visible for
+    // diagnosis (see the AuthSignals classification below), so the isAuthSetup
+    // check happens after `worst` is known, not as an early return here.
+    const isSetupSpec = tests.every((t) => isAuthSetup(t.projectName, spec.file ?? suiteFile));
     const title = stripAnsi(spec.title ?? suiteTitle ?? 'Unnamed test').trim();
 
     let worst: TestStatus = 'pending';
@@ -587,6 +629,10 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       worst = 'flaky';
     }
 
+    // Suppress only a passing (uninteresting) setup phantom; a failed one
+    // stays visible below since it's the actual root cause of a blocked Tier B.
+    if (isSetupSpec && worst !== 'failed') return;
+
     const item: ExecResultItem = {
       title,
       status: worst,
@@ -618,7 +664,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
 
   const walk = (suite: PwSuite, parentTitle: string): void => {
     const suiteTitle = parentTitle ? `${parentTitle} > ${suite.title ?? ''}` : (suite.title ?? '');
-    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle);
+    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle, suite.file);
     for (const child of suite.suites ?? []) walk(child, suiteTitle);
   };
 

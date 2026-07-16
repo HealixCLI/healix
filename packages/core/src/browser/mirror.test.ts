@@ -32,19 +32,23 @@ describe('FrameMirror', () => {
     vi.useRealTimers();
   });
 
-  it('captures JPEG frames (quality 70) and delivers them to subscribers', async () => {
+  it('captures a frame immediately on subscribe, then again every ~500ms', async () => {
     const page = makeFakePage();
     const mirror = new FrameMirror(() => asPage(page));
     const frames: Buffer[] = [];
     const unsubscribe = mirror.subscribe((f) => frames.push(f));
 
-    await vi.advanceTimersByTimeAsync(500);
-
+    // Immediate capture: a short-lived subscription (e.g. a single EXPLORE
+    // snapshot) must not end before any frame is delivered.
+    await vi.advanceTimersByTimeAsync(0);
     // The live mirror must stream JPEG, not PNG — PNG frames are several times
     // larger and every frame is base64'd over IPC to the renderer.
     expect(page.screenshot).toHaveBeenCalledWith({ type: 'jpeg', quality: 70 });
     expect(frames).toHaveLength(1);
     expect(frames[0].toString()).toBe('jpeg-bytes');
+
+    await vi.advanceTimersByTimeAsync(500);
+    expect(frames).toHaveLength(2);
 
     unsubscribe();
     mirror.dispose();

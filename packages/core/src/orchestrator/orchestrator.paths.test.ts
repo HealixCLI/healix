@@ -5,7 +5,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createOrchestrator } from './index.js';
-import type { OrchestratorEvent } from './types.js';
+import type { OrchestratorEvent, PlanApprovalResult } from './types.js';
 import type { RunReport } from './report.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import { projectsDir } from '../env/app-data.js';
@@ -279,6 +279,113 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(done?.message).toContain('passed');
   });
 
+  it('MULTI-SCENARIO: one spec file with N scenario tests persists N test rows, not one', async () => {
+    // A single plan item with 3 scenarios (positive/negative/edge) generates ONE
+    // spec file containing 3 test() cases — Results/Total counts must reflect
+    // the 3 real test cases, not collapse to 1 row per spec file.
+    const multiScenarioPlan = {
+      summary: 'One feature, three scenarios.',
+      items: [
+        {
+          title: 'Checkout',
+          reqTag: 'REQ-100',
+          tier: 'tierA-public',
+          intent: 'Checkout flow works.',
+          scenarios: [
+            { kind: 'positive', description: 'completes with a valid card' },
+            { kind: 'negative', description: 'rejects an expired card' },
+            { kind: 'edge', description: 'handles a zero-total cart' },
+          ],
+        },
+      ],
+    };
+    const multiScenarioProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return {
+            provider: 'claude',
+            ok: true,
+            text: ['```json', JSON.stringify(multiScenarioPlan), '```'].join('\n'),
+            raw: multiScenarioPlan,
+            detail: 'OK',
+          };
+        }
+        return { provider: 'claude', ok: true, text: 'unused', raw: null, detail: 'OK' };
+      },
+    };
+
+    const checkoutSpec: GeneratedSpec = {
+      path: 'tests/checkout.spec.ts',
+      title: '[REQ:REQ-100] Checkout',
+      reqTag: 'REQ-100',
+      tier: 'tierA-public',
+      contents: '// checkout spec with 3 test() blocks',
+    };
+    const multiScenarioOutcome: ExecOutcome = {
+      passed: 2,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: '[REQ:REQ-100] positive: completes with a valid card', status: 'passed', durationMs: 10 },
+        { title: '[REQ:REQ-100] negative: rejects an expired card', status: 'failed', durationMs: 11 },
+        { title: '[REQ:REQ-100] edge: handles a zero-total cart', status: 'passed', durationMs: 12 },
+      ],
+    };
+    const multiScenarioMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(): Promise<GeneratedSpec[]> {
+        return [{ ...checkoutSpec }];
+      },
+      async execute(): Promise<ExecOutcome> {
+        return { ...multiScenarioOutcome, results: multiScenarioOutcome.results.map((r) => ({ ...r })) };
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'suite', files: [] };
+      },
+    };
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Multi Scenario Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const orchestrator = createOrchestrator({
+      provider: multiScenarioProvider,
+      getMode: () => multiScenarioMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    expect(summary.status).toBe('failed');
+    expect(summary.outcome?.passed).toBe(2);
+    expect(summary.outcome?.failed).toBe(1);
+
+    // One spec file, three scenarios → three distinct test rows, each carrying
+    // its own real scenario title and status — not one row per spec file.
+    const tests = store.listTests(summary.runId);
+    expect(tests).toHaveLength(3);
+    const statusByTitle = Object.fromEntries(tests.map((t) => [t.title, t.status]));
+    expect(statusByTitle['[REQ:REQ-100] positive: completes with a valid card']).toBe('passed');
+    expect(statusByTitle['[REQ:REQ-100] negative: rejects an expired card']).toBe('failed');
+    expect(statusByTitle['[REQ:REQ-100] edge: handles a zero-total cart']).toBe('passed');
+    expect(tests.every((t) => t.reqTag === 'REQ-100')).toBe(true);
+
+    // One result row per scenario, matched to its own test row (no collisions).
+    const results = store.listResults(summary.runId);
+    expect(results).toHaveLength(3);
+    expect(new Set(results.map((r) => r.testId)).size).toBe(3);
+  });
+
   it('APPROVAL-GATE reject: onPlan returning false cancels the run before execute', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
@@ -314,9 +421,9 @@ describe('orchestrator paths (offline DI seam)', () => {
     });
 
     let onPlanCalls = 0;
-    const onPlan = async (_plan: TestPlan): Promise<boolean> => {
+    const onPlan = async (_plan: TestPlan): Promise<PlanApprovalResult> => {
       onPlanCalls += 1;
-      return false;
+      return { decision: 'cancel' };
     };
 
     const summary = await orchestrator.run(
@@ -345,6 +452,46 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(phases).not.toContain('execute');
     const rejected = events.find((e) => e.phase === 'approve' && /reject/i.test(e.message));
     expect(rejected).toBeDefined();
+  });
+
+  it('TESTING SCOPE: filters plan.items to the selected scope before the approval gate sees it', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Scope Filter Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // CANNED_PLAN carries one tierA-public item and one tierB-auth item — no
+    // tierC-api item at all — so a 'backend' scope must filter it down to
+    // zero items, and a 'frontend' scope must keep both.
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const seenPlans: TestPlan[] = [];
+    const onPlan = async (plan: TestPlan): Promise<PlanApprovalResult> => {
+      seenPlans.push(plan);
+      return { decision: 'cancel' }; // reject — we only care what the gate was shown, not execution.
+    };
+
+    await orchestrator.run(
+      { projectId: project.id, autoApprove: false, testingScope: 'backend' },
+      { onPlan },
+    );
+    await orchestrator.run(
+      { projectId: project.id, autoApprove: false, testingScope: 'frontend' },
+      { onPlan },
+    );
+
+    expect(seenPlans).toHaveLength(2);
+    const [backendPlan, frontendPlan] = seenPlans;
+    expect(backendPlan.items).toHaveLength(0);
+    expect(frontendPlan.items).toHaveLength(2);
+    expect(frontendPlan.items.map((it) => it.tier).sort()).toEqual(['tierA-public', 'tierB-auth']);
   });
 
   it('PROVIDER FALLBACK: a ProviderRouter selects a ready fallback when the preferred provider is unhealthy', async () => {
@@ -528,6 +675,54 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(subscribedAfterStartAndGoto).toBe(true);
     expect(unsubscribeCalled).toBe(true);
     expect(stopCalled).toBe(true);
+  });
+
+  it('LIVE FRAMES: codegen exploration with a live URL mirrors frames too (not computer-use-only)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Codegen With URL Demo',
+      mode: 'playwright',
+      repoPath: process.cwd(),
+      baseUrl: 'https://app.example.test',
+    });
+
+    const framingBrowser: BrowserSurface = {
+      async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
+      async goto(_url: string): Promise<void> {},
+      async screenshot(): Promise<Buffer> {
+        return Buffer.alloc(0);
+      },
+      async snapshot(): Promise<DomSnapshot> {
+        return { url: 'https://app.example.test', title: 'Home', interactiveElements: [] };
+      },
+      async click(_selector: string): Promise<void> {},
+      async clickAt(_point: Point): Promise<void> {},
+      async type(_selector: string, _text: string): Promise<void> {},
+      async pressKey(_key: string): Promise<void> {},
+      onFrame(cb: (png: Buffer) => void): () => void {
+        cb(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
+        return () => {};
+      },
+      async stop(): Promise<void> {},
+    };
+
+    const frames: Buffer[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => framingBrowser,
+    });
+
+    // No explorationMode override: deriveExplorationMode resolves 'codegen'
+    // here because the project has a repoPath. Frame mirroring must still fire.
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onFrame: (png) => frames.push(png) },
+    );
+
+    expect(['passed', 'failed']).toContain(summary.status);
+    expect(frames.length).toBeGreaterThanOrEqual(1);
   });
 
   it('FALSE-GREEN GUARD: a run that generates zero specs settles as error, not passed', async () => {

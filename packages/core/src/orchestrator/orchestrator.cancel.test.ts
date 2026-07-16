@@ -4,7 +4,7 @@ import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createOrchestrator } from './index.js';
-import type { OrchestratorEvent } from './types.js';
+import type { OrchestratorEvent, PlanApprovalResult } from './types.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import type {
   CompleteOptions,
@@ -273,9 +273,9 @@ describe('orchestrator cancellation (offline DI seam)', () => {
     const entered = new Promise<void>((resolve) => {
       gateEntered = resolve;
     });
-    const onPlan = (_plan: TestPlan): Promise<boolean> => {
+    const onPlan = (_plan: TestPlan): Promise<PlanApprovalResult> => {
       gateEntered();
-      return new Promise<boolean>(() => {
+      return new Promise<PlanApprovalResult>(() => {
         /* intentionally pending forever */
       });
     };

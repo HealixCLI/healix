@@ -1,7 +1,18 @@
 import { useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { NewProject, Project } from '@healix/core';
-import { Archive, ArchiveRestore, FolderGit2, Globe, Pencil, Plus, Trash2 } from 'lucide-react';
+import {
+  Archive,
+  ArchiveRestore,
+  Eye,
+  EyeOff,
+  FolderGit2,
+  Globe,
+  LayoutDashboard,
+  Pencil,
+  Plus,
+  Trash2,
+} from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge } from '../components/ui/badge';
@@ -21,7 +32,13 @@ type FormState =
   | { kind: 'edit'; project: Project }
   | { kind: 'view'; project: Project };
 
-export function ProjectsView({ onRunProject }: { onRunProject?: (project: Project) => void }) {
+export function ProjectsView({
+  onRunProject,
+  onOpenDashboard,
+}: {
+  onRunProject?: (project: Project) => void;
+  onOpenDashboard?: (project: Project) => void;
+}) {
   const { projects, loading, error, create, update, remove, archive } = useProjects();
   const [formState, setFormState] = useState<FormState>({ kind: 'closed' });
 
@@ -51,12 +68,15 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
         <p className="mt-4 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">{error}</p>
       )}
 
-      {formState.kind === 'create' && <ProjectForm onSubmit={create} onDone={closeForm} />}
+      {formState.kind === 'create' && (
+        <ProjectForm onSubmit={create} onDone={closeForm} existingActiveProjects={active} />
+      )}
       {formState.kind === 'edit' && (
         <ProjectForm
           project={formState.project}
           onSubmit={(input) => update(formState.project.id, input)}
           onDone={closeForm}
+          existingActiveProjects={active}
         />
       )}
       {formState.kind === 'view' && (
@@ -86,6 +106,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
             onDelete={() => void remove(p.id)}
             onArchive={() => void archive(p.id, true)}
             onRun={onRunProject ? () => onRunProject(p) : undefined}
+            onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(p) : undefined}
           />
         ))}
       </section>
@@ -106,6 +127,7 @@ export function ProjectsView({ onRunProject }: { onRunProject?: (project: Projec
                 onEdit={() => setFormState({ kind: 'edit', project: p })}
                 onDelete={() => void remove(p.id)}
                 onUnarchive={() => void archive(p.id, false)}
+                onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(p) : undefined}
               />
             ))}
           </div>
@@ -133,6 +155,7 @@ function ProjectRow({
   onArchive,
   onUnarchive,
   onRun,
+  onOpenDashboard,
 }: {
   project: Project;
   onView: () => void;
@@ -141,6 +164,7 @@ function ProjectRow({
   onArchive?: () => void;
   onUnarchive?: () => void;
   onRun?: () => void;
+  onOpenDashboard?: () => void;
 }) {
   const isArchived = Boolean(project.archivedAt);
   return (
@@ -175,6 +199,17 @@ function ProjectRow({
           </div>
         </button>
         <div className="flex shrink-0 items-center gap-1">
+          {onOpenDashboard && (
+            <Button
+              size="icon"
+              variant="ghost"
+              onClick={onOpenDashboard}
+              aria-label="Open project dashboard"
+              title="Open project dashboard"
+            >
+              <LayoutDashboard className="h-4 w-4" />
+            </Button>
+          )}
           {onRun && (
             <Button size="sm" variant="outline" onClick={onRun}>
               Run
@@ -284,18 +319,24 @@ function ProjectForm({
   onEdit,
   onDone,
   readOnly = false,
+  existingActiveProjects = [],
 }: {
   project?: Project;
   onSubmit?: (input: NewProject) => Promise<Project | null>;
   onEdit?: () => void;
   onDone: () => void;
   readOnly?: boolean;
+  /** Active (non-archived) projects, for inline duplicate-name feedback. */
+  existingActiveProjects?: Project[];
 }) {
   const isEdit = project !== undefined && !readOnly;
   const [name, setName] = useState(project?.name ?? '');
   const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
   const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
   const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
+  const [testUsername, setTestUsername] = useState(project?.testUsername ?? '');
+  const [testPassword, setTestPassword] = useState(project?.testPassword ?? '');
+  const [showTestPassword, setShowTestPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
 
   // Same rules as core validateNewProject: a project needs a name, at least one
@@ -303,7 +344,15 @@ function ProjectForm({
   const trimmedName = name.trim();
   const hasTarget = repoPath.trim().length > 0 || baseUrl.trim().length > 0;
   const baseUrlInvalid = baseUrl.trim().length > 0 && !isValidBaseUrl(baseUrl);
-  const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !submitting;
+  // Mirrors HealixStore's case-insensitive, active-projects-only duplicate
+  // guard — excludes the project being edited itself, so resubmitting an
+  // unchanged name never false-positives.
+  const nameTaken =
+    trimmedName.length > 0 &&
+    existingActiveProjects.some(
+      (p) => p.id !== project?.id && p.name.trim().toLowerCase() === trimmedName.toLowerCase(),
+    );
+  const canSubmit = trimmedName.length > 0 && hasTarget && !baseUrlInvalid && !nameTaken && !submitting;
   const repoIsUrl = isGitRemoteUrl(repoPath);
 
   const submit = async (e: FormEvent): Promise<void> => {
@@ -315,6 +364,8 @@ function ProjectForm({
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
+      testUsername: testUsername.trim() || null,
+      testPassword: testPassword.trim() || null,
     });
     setSubmitting(false);
     if (saved) {
@@ -322,6 +373,8 @@ function ProjectForm({
         setName('');
         setRepoPath('');
         setBaseUrl('');
+        setTestUsername('');
+        setTestPassword('');
       }
       onDone();
     }
@@ -344,7 +397,11 @@ function ProjectForm({
               autoFocus={!readOnly}
               required
               disabled={readOnly}
+              aria-invalid={nameTaken}
             />
+            {!readOnly && nameTaken && (
+              <p className="mt-1 text-xs text-err">A project named "{trimmedName}" already exists.</p>
+            )}
           </Field>
           <Field label="Repo path or git URL (white-box)">
             <Input
@@ -379,6 +436,41 @@ function ProjectForm({
             >
               <option value="playwright">playwright</option>
             </Select>
+          </Field>
+          <div className="sm:col-span-2">
+            <h3 className="mb-1.5 text-sm font-semibold text-fg">Test credentials</h3>
+          </div>
+          <Field label="Test username / email">
+            <Input
+              value={testUsername}
+              onChange={(e) => setTestUsername(e.target.value)}
+              placeholder="you@example.com or a test username"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+          <Field label="Test password">
+            <div className="relative">
+              <Input
+                type={showTestPassword ? 'text' : 'password'}
+                value={testPassword}
+                onChange={(e) => setTestPassword(e.target.value)}
+                placeholder="Password for the credential above"
+                className="pr-9 font-mono"
+                autoComplete="new-password"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                onClick={() => setShowTestPassword((v) => !v)}
+                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+                aria-label={showTestPassword ? 'Hide test password' : 'Show test password'}
+                aria-pressed={showTestPassword}
+                tabIndex={-1}
+              >
+                {showTestPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
           </Field>
           {readOnly ? (
             <div className="flex items-center justify-end gap-2 sm:col-span-2">

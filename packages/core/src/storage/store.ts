@@ -9,6 +9,7 @@ import type {
   Project,
   Run,
   RunStatus,
+  SuiteMode,
   TestCase,
   TestResult,
   TestStatus,
@@ -28,7 +29,8 @@ export class HealixStore {
     // single source of truth for the invariant; the UI mirrors it for feedback.
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
-    const { name, mode, repoPath, baseUrl } = validation.value;
+    const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
+    this.assertNameAvailable(name);
     const project: Project = {
       id: `prj_${nanoid(10)}`,
       name,
@@ -37,31 +39,60 @@ export class HealixStore {
       baseUrl,
       createdAt: new Date().toISOString(),
       archivedAt: null,
+      testUsername,
+      testPassword,
     };
     this.db
       .prepare(
-        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at, test_username, test_password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(project.id, project.name, project.mode, project.repoPath, project.baseUrl, project.createdAt);
+      .run(
+        project.id,
+        project.name,
+        project.mode,
+        project.repoPath,
+        project.baseUrl,
+        project.createdAt,
+        project.testUsername,
+        project.testPassword,
+      );
     return project;
   }
 
   /**
-   * Update a project's editable fields (name, mode, repoPath, baseUrl). Runs the
-   * same validation as createProject — it is edited via the identical form, so
-   * the identical invariant (name required, at least one of repo/URL, a valid
-   * base URL) must hold. Throws if the project does not exist.
+   * Update a project's editable fields (name, mode, repoPath, baseUrl, test
+   * credentials). Runs the same validation as createProject — it is edited via
+   * the identical form, so the identical invariant (name required, at least one
+   * of repo/URL, a valid base URL) must hold. Throws if the project does not exist.
    */
   updateProject(id: string, input: NewProject): Project {
     const existing = this.getProject(id);
     if (!existing) throw new Error(`Project not found: ${id}`);
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
-    const { name, mode, repoPath, baseUrl } = validation.value;
+    const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
+    this.assertNameAvailable(name, id);
     this.db
-      .prepare('UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ? WHERE id = ?')
-      .run(name, mode, repoPath, baseUrl, id);
-    return { ...existing, name, mode, repoPath, baseUrl };
+      .prepare(
+        'UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ?, test_username = ?, test_password = ? WHERE id = ?',
+      )
+      .run(name, mode, repoPath, baseUrl, testUsername, testPassword, id);
+    return { ...existing, name, mode, repoPath, baseUrl, testUsername, testPassword };
+  }
+
+  /**
+   * Block duplicate project creation/renaming: names collide case-
+   * insensitively (so "Acme" and "acme" can't coexist and confuse the Project
+   * picker), scoped to ACTIVE projects only — an archived project's name is
+   * free to reuse, since archiving is Healix's own "this is effectively gone"
+   * signal. `excludeId` lets updateProject rename a project without it
+   * colliding with itself.
+   */
+  private assertNameAvailable(name: string, excludeId = ''): void {
+    const clash = this.db
+      .prepare('SELECT id FROM projects WHERE lower(name) = lower(?) AND archived_at IS NULL AND id != ?')
+      .get(name, excludeId) as { id: string } | undefined;
+    if (clash) throw new Error(`A project named "${name}" already exists.`);
   }
 
   /** Soft-archive (or restore) a project. Archived projects keep all runs and assets. */
@@ -117,7 +148,15 @@ export class HealixStore {
   }
 
   // ---- runs ----
-  createRun(projectId: string, opts: { provider?: string | null; mode?: string | null } = {}): Run {
+  createRun(
+    projectId: string,
+    opts: {
+      provider?: string | null;
+      mode?: string | null;
+      suiteMode?: SuiteMode | null;
+      baseRunId?: string | null;
+    } = {},
+  ): Run {
     const run: Run = {
       id: `run_${nanoid(10)}`,
       projectId,
@@ -127,10 +166,12 @@ export class HealixStore {
       startedAt: null,
       finishedAt: null,
       createdAt: new Date().toISOString(),
+      suiteMode: opts.suiteMode ?? null,
+      baseRunId: opts.baseRunId ?? null,
     };
     this.db
       .prepare(
-        'INSERT INTO runs (id, project_id, status, provider, mode, started_at, finished_at, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO runs (id, project_id, status, provider, mode, started_at, finished_at, created_at, suite_mode, base_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         run.id,
@@ -141,8 +182,30 @@ export class HealixStore {
         run.startedAt,
         run.finishedAt,
         run.createdAt,
+        run.suiteMode,
+        run.baseRunId,
       );
     return run;
+  }
+
+  /**
+   * Most recent run for a project that actually executed and is eligible as a
+   * top-up/reuse base — 'passed', 'failed', or 'blocked' (it produced a real
+   * verdict over real tests), but NOT 'error' (verified nothing — no runnable
+   * specs) or 'cancelled' (aborted mid-run, unreliable). Deliberately NOT
+   * restricted to 'passed' only: a run with some failures still has plenty of
+   * passing tests worth carrying forward — that's the whole point of top-up.
+   */
+  getLastSuccessfulRun(projectId: string): Run | null {
+    const row = this.db
+      .prepare(
+        // rowid tiebreaker: same reasoning as listEvents — several runs can share
+        // the same millisecond created_at, so insertion order must break ties.
+        `SELECT * FROM runs WHERE project_id = ? AND status IN ('passed', 'failed', 'blocked')
+         ORDER BY created_at DESC, rowid DESC LIMIT 1`,
+      )
+      .get(projectId) as Record<string, unknown> | undefined;
+    return row ? rowToRun(row) : null;
   }
 
   /**
@@ -225,17 +288,27 @@ export class HealixStore {
   }
 
   // ---- tests + results ----
-  insertTest(test: Omit<TestCase, 'id'> & { id?: string }): TestCase {
-    const full: TestCase = { ...test, id: test.id ?? `tst_${nanoid(10)}` };
+  insertTest(test: Omit<TestCase, 'id' | 'specPath'> & { id?: string; specPath?: string | null }): TestCase {
+    const full: TestCase = { ...test, id: test.id ?? `tst_${nanoid(10)}`, specPath: test.specPath ?? null };
     this.db
-      .prepare('INSERT INTO tests (id, run_id, title, req_tag, tier, status) VALUES (?, ?, ?, ?, ?, ?)')
-      .run(full.id, full.runId, full.title, full.reqTag, full.tier, full.status);
+      .prepare(
+        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(full.id, full.runId, full.title, full.reqTag, full.tier, full.status, full.specPath);
     return full;
   }
 
   /** Reflect an execution outcome back onto the test row (inserted as 'pending' in GENERATE). */
   updateTestStatus(id: string, status: TestStatus): void {
     this.db.prepare('UPDATE tests SET status = ? WHERE id = ?').run(status, id);
+  }
+
+  /**
+   * Replace a test row's placeholder title (synthesized at GENERATE time, before the
+   * model's actual scenario test title was known) with its real executed title.
+   */
+  updateTestTitle(id: string, title: string): void {
+    this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
   }
 
   insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
@@ -338,6 +411,8 @@ function rowToProject(r: Record<string, unknown>): Project {
     baseUrl: s(r.base_url),
     createdAt: String(r.created_at),
     archivedAt: s(r.archived_at),
+    testUsername: s(r.test_username),
+    testPassword: s(r.test_password),
   };
 }
 
@@ -351,6 +426,8 @@ function rowToRun(r: Record<string, unknown>): Run {
     startedAt: s(r.started_at),
     finishedAt: s(r.finished_at),
     createdAt: String(r.created_at),
+    suiteMode: s(r.suite_mode) as Run['suiteMode'],
+    baseRunId: s(r.base_run_id),
   };
 }
 
@@ -362,6 +439,7 @@ function rowToTest(r: Record<string, unknown>): TestCase {
     reqTag: s(r.req_tag),
     tier: s(r.tier),
     status: s(r.status) as TestCase['status'],
+    specPath: s(r.spec_path),
   };
 }
 

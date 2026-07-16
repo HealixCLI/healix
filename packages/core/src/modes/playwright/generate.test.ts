@@ -300,6 +300,7 @@ function makeExploration(
       budgetExhausted: false,
       redirectLoopsDetected: [],
       shellCollapsed: false,
+      degenerateRedirectsSkipped: [],
       authAttempted: false,
       authVerified: false,
     },

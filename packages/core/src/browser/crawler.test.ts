@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { crawl, crawlWithAuth } from './crawler.js';
+import { crawl, crawlWithAuth, reconcileStaticRoutePaths } from './crawler.js';
 import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, InteractiveElement, Point } from './types.js';
 
 interface FakePage {
@@ -81,6 +81,42 @@ describe('crawl()', () => {
     expect(result.budgetExhausted).toBe(false);
     expect(result.shellCollapsed).toBe(false);
     expect(result.redirectLoopsDetected).toEqual([]);
+  });
+
+  it('skips (does not record) a runaway redirect that recursively appends a segment to itself', async () => {
+    // Observed live against a real hash-routed SPA: navigating directly to an
+    // unrecognized path triggers an unmatched-route fallback that keeps
+    // re-appending "/home" to the hash, producing an ever-growing URL that
+    // never repeats a prior one (so redirectLoopsDetected's A<->B check
+    // never fires) but is obviously not a real route.
+    const runaway = `https://a.test/#/${Array(8).fill('home').join('/')}`;
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/unknown-route': { elements: [] },
+        [runaway]: { elements: [] },
+      },
+      redirects: { 'https://a.test/unknown-route': runaway },
+    });
+
+    const result = await crawl(browser, 'https://a.test/unknown-route');
+
+    expect(result.routes).toEqual([]);
+    expect(result.visitedCount).toBe(0);
+    // Recorded (not silently dropped) so callers can surface it as a breadcrumb.
+    expect(result.degenerateRedirectsSkipped).toEqual(['https://a.test/unknown-route']);
+  });
+
+  it('does not flag a URL with only a few repeated segments as degenerate', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/#/home/home/home': { elements: [button('ok')] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/#/home/home/home');
+    expect(result.degenerateRedirectsSkipped).toEqual([]);
+
+    expect(result.routes).toHaveLength(1);
   });
 
   it('follows same-origin links and visits each linked page once', async () => {
@@ -335,5 +371,40 @@ describe('crawlWithAuth()', () => {
     expect(result.authVerified).toBe(false);
     expect(result.authReason).toMatch(/password field/i);
     expect(result.routes.every((r) => r.role === 'anonymous')).toBe(true);
+  });
+});
+
+describe('reconcileStaticRoutePaths()', () => {
+  it('joins plain paths unchanged for a non-hash-routed app', () => {
+    const out = reconcileStaticRoutePaths(['/checkout', '/about'], { hashRouted: false }, 'https://a.test/');
+    expect(out).toEqual(['https://a.test/checkout', 'https://a.test/about']);
+  });
+
+  it('joins paths behind the detected hash/region prefix for a hash-routed app', () => {
+    const out = reconcileStaticRoutePaths(
+      ['/checkout'],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+    expect(out).toEqual(['https://a.test/#/SK/checkout']);
+  });
+
+  it('falls back to a bare "#" prefix when hash-routed but no invariant prefix was detected', () => {
+    const out = reconcileStaticRoutePaths(['/checkout'], { hashRouted: true }, 'https://a.test/');
+    expect(out).toEqual(['https://a.test/#/checkout']);
+  });
+
+  it('drops paths with a dynamic segment (:id, [id], or *) instead of guessing a value', () => {
+    const out = reconcileStaticRoutePaths(
+      ['/users/:id', '/posts/[slug]', '/files/*', '/checkout'],
+      { hashRouted: false },
+      'https://a.test/',
+    );
+    expect(out).toEqual(['https://a.test/checkout']);
+  });
+
+  it('skips a path that fails to resolve against a malformed base URL rather than throwing', () => {
+    expect(() => reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).not.toThrow();
+    expect(reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).toEqual([]);
   });
 });

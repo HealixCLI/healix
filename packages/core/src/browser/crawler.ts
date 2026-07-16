@@ -21,6 +21,8 @@ export interface CrawlResult {
   redirectLoopsDetected: string[];
   /** True when most visited routes render near-identical DOM (a single-shell SPA). */
   shellCollapsed: boolean;
+  /** Requested URLs whose resolution was skipped as a runaway/degenerate redirect — see isDegenerateUrl. Likely an app-side routing defect, not a Healix bug; never a confirmed triage verdict. */
+  degenerateRedirectsSkipped: string[];
 }
 
 export interface CrawlOptions {
@@ -95,6 +97,40 @@ function hasPasswordField(snapshot: DomSnapshot): boolean {
   return snapshot.interactiveElements.some((el) => el.inputType === 'password');
 }
 
+const DEGENERATE_URL_MAX_LENGTH = 2000;
+/** More than this many identical consecutive path/hash segments is a runaway redirect, not a real route. */
+const DEGENERATE_REPEAT_SEGMENT_THRESHOLD = 4;
+
+/**
+ * True for a resolved URL that's almost certainly a runaway app-side
+ * redirect rather than a real route — observed live against a real
+ * hash-routed SPA whose unmatched-route fallback recursively re-appends a
+ * segment to itself (e.g. `.../home/home/home/home/...`) when navigated
+ * directly to an unrecognized path. `redirectLoopsDetected` only catches an
+ * exact two-node A<->B ping-pong; a monotonically-growing chain like this
+ * never repeats a prior URL, so it needs its own guard. Recording the
+ * eventual (huge) URL as a "discovered route" would be pure garbage.
+ */
+function isDegenerateUrl(url: string): boolean {
+  if (url.length > DEGENERATE_URL_MAX_LENGTH) return true;
+  let resolved: URL;
+  try {
+    resolved = new URL(url);
+  } catch {
+    return false;
+  }
+  const segments = [
+    ...resolved.pathname.split('/').filter(Boolean),
+    ...resolved.hash.replace(/^#\/?/, '').split('/').filter(Boolean),
+  ];
+  let runLength = 1;
+  for (let i = 1; i < segments.length; i += 1) {
+    runLength = segments[i] === segments[i - 1] ? runLength + 1 : 1;
+    if (runLength > DEGENERATE_REPEAT_SEGMENT_THRESHOLD) return true;
+  }
+  return false;
+}
+
 /**
  * BFS crawl over same-origin routes reachable from `baseUrl`, replacing the
  * old single `goto`+`snapshot` EXPLORE pass. Bounded by `maxRoutes` and
@@ -123,6 +159,7 @@ export async function crawl(
   // redirect ping-pong (A -> B, then B -> A) without following it forever.
   const redirectTargetOf = new Map<string, string>();
   const redirectLoopsDetected: string[] = [];
+  const degenerateRedirectsSkipped: string[] = [];
   const fingerprintCounts = new Map<string, number>();
   const routes: CrawledRoute[] = [];
   let budgetExhausted = false;
@@ -149,6 +186,16 @@ export async function crawl(
     }
 
     const resolvedUrl = normalizeUrl(snapshot.url || requestedUrl);
+
+    if (isDegenerateUrl(resolvedUrl)) {
+      // Runaway app-side redirect (e.g. an unmatched-route fallback that
+      // recursively appends itself) — skip like a dead link, never record it.
+      // Recorded (not just silently dropped) so callers can surface it as a
+      // breadcrumb — likely an app-side routing defect, though crawl() has no
+      // way to confirm that, so this is never a triage verdict.
+      degenerateRedirectsSkipped.push(requestedUrl);
+      continue;
+    }
 
     if (resolvedUrl !== requestedUrl) {
       if (redirectTargetOf.get(resolvedUrl) === requestedUrl) {
@@ -196,6 +243,7 @@ export async function crawl(
     budgetExhausted,
     redirectLoopsDetected,
     shellCollapsed,
+    degenerateRedirectsSkipped,
   };
 }
 
@@ -262,6 +310,7 @@ export async function crawlWithAuth(
     budgetExhausted: anonymous.budgetExhausted || authCrawl.budgetExhausted,
     redirectLoopsDetected: [...anonymous.redirectLoopsDetected, ...authCrawl.redirectLoopsDetected],
     shellCollapsed: anonymous.shellCollapsed || authCrawl.shellCollapsed,
+    degenerateRedirectsSkipped: [...anonymous.degenerateRedirectsSkipped, ...authCrawl.degenerateRedirectsSkipped],
     authAttempted: true,
     authVerified: true,
   };
@@ -366,4 +415,29 @@ export function scoreLoginCandidates(
   }
 
   return candidates;
+}
+
+const DYNAMIC_SEGMENT_RE = /[:[*]/;
+
+/**
+ * Resolves static-analysis route paths (e.g. from functionality-index.ts)
+ * into crawlable URLs, reconciled against the detected hash/region prefix —
+ * the same join scoreLoginCandidates already uses for its common-path
+ * fallback, since a raw static path like "/checkout" is wrong on a
+ * hash+region-routed app (needs "#/SK/checkout"). Paths with a dynamic
+ * segment (":id", "[id]", "*") are dropped: there's no real value to crawl
+ * them with, and guessing one produces noise, not signal.
+ */
+export function reconcileStaticRoutePaths(paths: string[], routing: RoutePrefixInfo, baseUrl: string): string[] {
+  const out: string[] = [];
+  for (const path of paths) {
+    if (DYNAMIC_SEGMENT_RE.test(path)) continue;
+    const relative = routing.hashRouted ? `${routing.invariantPrefix ?? '#'}${path}` : path;
+    try {
+      out.push(new URL(relative, baseUrl).toString());
+    } catch {
+      // Malformed path — skip rather than throw.
+    }
+  }
+  return out;
 }

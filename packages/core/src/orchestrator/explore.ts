@@ -1,6 +1,9 @@
 import {
+  crawl,
   crawlWithAuth,
   detectRoutePrefix,
+  normalizeUrl,
+  reconcileStaticRoutePaths,
   scoreLoginCandidates,
   type CrawlOptions,
   type CrawlWithAuthResult,
@@ -14,9 +17,15 @@ export interface ExploreInput {
   baseUrl: string;
   credentials?: { username: string; password: string };
   crawlOptions?: CrawlOptions;
+  /** Static-analysis route paths (e.g. functionality-index.ts units) to seed as a follow-up crawl once the hash/region prefix is known — see reconcileStaticRoutePaths. */
+  staticRoutePaths?: string[];
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void;
   onFrame?: (png: Buffer) => void;
 }
+
+/** Bounds for the small follow-up crawl seeded from static-analysis routes. */
+const STATIC_SEED_MAX_ROUTES = 15;
+const STATIC_SEED_BUDGET_MS = 20_000;
 
 /** Bounded best-effort wait for the frame mirror's first capture before teardown. */
 const FIRST_FRAME_WAIT_MS = 600;
@@ -85,12 +94,54 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       }
     }
 
-    const crawlResult = await crawlWithAuth(browser, baseUrl, {
+    let crawlResult = await crawlWithAuth(browser, baseUrl, {
       ...input.crawlOptions,
       credentials: input.credentials,
     });
 
     const routing = detectRoutePrefix(baseUrl, crawlResult.routes);
+
+    if (input.staticRoutePaths && input.staticRoutePaths.length > 0) {
+      try {
+        const reconciled = reconcileStaticRoutePaths(input.staticRoutePaths, routing, baseUrl);
+        const alreadyVisited = new Set(crawlResult.routes.map((r) => normalizeUrl(r.url)));
+        const unvisited = reconciled.filter((url) => !alreadyVisited.has(normalizeUrl(url)));
+        if (unvisited.length > 0) {
+          const [firstSeed, ...restSeeds] = unvisited;
+          const staticCrawl = await crawl(browser, firstSeed, {
+            seedRoutes: restSeeds,
+            maxRoutes: STATIC_SEED_MAX_ROUTES,
+            wallClockBudgetMs: STATIC_SEED_BUDGET_MS,
+          });
+          // Reuses whatever session state crawlWithAuth left the browser in
+          // (its last action was on the authenticated session if login succeeded).
+          const role: 'anonymous' | 'authenticated' = crawlResult.authVerified ? 'authenticated' : 'anonymous';
+          const staticRoutes = staticCrawl.routes.map((r) => ({ ...r, role }));
+          crawlResult = {
+            ...crawlResult,
+            routes: [...crawlResult.routes, ...staticRoutes],
+            visitedCount: crawlResult.visitedCount + staticRoutes.length,
+            budgetExhausted: crawlResult.budgetExhausted || staticCrawl.budgetExhausted,
+            redirectLoopsDetected: [...crawlResult.redirectLoopsDetected, ...staticCrawl.redirectLoopsDetected],
+            shellCollapsed: crawlResult.shellCollapsed || staticCrawl.shellCollapsed,
+            degenerateRedirectsSkipped: [
+              ...crawlResult.degenerateRedirectsSkipped,
+              ...staticCrawl.degenerateRedirectsSkipped,
+            ],
+          };
+          if (staticRoutes.length > 0) {
+            emit(
+              'explore',
+              'debug',
+              `Static-analysis route seeding found ${staticRoutes.length} additional route(s) not reachable by link-following.`,
+            );
+          }
+        }
+      } catch (err) {
+        emit('explore', 'debug', `Static route seeding failed (continuing): ${errMsg(err)}`);
+      }
+    }
+
     const loginCandidates = scoreLoginCandidates(crawlResult.routes, routing, baseUrl);
     const quality = assessExplorationUsefulness(crawlResult);
 
@@ -117,6 +168,18 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
         'explore',
         'warn',
         `Credentials present but authenticated crawl could not be verified: ${crawlResult.authReason ?? 'unknown reason'}. Continuing with anonymous routes only.`,
+      );
+    }
+
+    if (crawlResult.degenerateRedirectsSkipped.length > 0) {
+      // Not a triage verdict — crawl() can't tell an app-side routing defect
+      // apart from us having probed a nonsense URL. Surfaced as a breadcrumb
+      // for a human to investigate, never blocks the run.
+      emit(
+        'explore',
+        'warn',
+        `Detected ${crawlResult.degenerateRedirectsSkipped.length} runaway redirect(s) while crawling; skipped as likely app-side routing defect(s).`,
+        { skipped: crawlResult.degenerateRedirectsSkipped },
       );
     }
 

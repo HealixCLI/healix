@@ -20,6 +20,7 @@ function makeFakeBrowser(config: {
   onClickGoTo?: Record<string, string>;
   frameOnSubscribe?: boolean;
   throwOnGoto?: Set<string>;
+  redirects?: Record<string, string>;
 }): BrowserSurface & { started: boolean; stopped: boolean; gotoCalls: string[] } {
   let currentUrl = '';
   const state = { started: false, stopped: false, gotoCalls: [] as string[] };
@@ -41,7 +42,7 @@ function makeFakeBrowser(config: {
       if (config.throwOnGoto?.has(url)) {
         throw new Error(`fake nav failure for ${url}`);
       }
-      currentUrl = url;
+      currentUrl = config.redirects?.[url] ?? url;
     },
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
@@ -102,6 +103,7 @@ describe('assessExplorationUsefulness()', () => {
       budgetExhausted: false,
       redirectLoopsDetected: [],
       shellCollapsed: false,
+      degenerateRedirectsSkipped: [],
       authAttempted: false,
       authVerified: false,
       ...overrides,
@@ -277,5 +279,96 @@ describe('runExplorePhase()', () => {
       (e) => e.phase === 'explore' && e.level === 'warn' && /could not be verified/i.test(e.message),
     );
     expect(warn).toBeDefined();
+  });
+
+  describe('staticRoutePaths (static-analysis route seeding)', () => {
+    it('reaches a route only reachable via a static path, not linked from any crawled page', async () => {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/': { elements: [link('https://a.test/#/SK/home')] },
+          'https://a.test/#/SK/home': { elements: [heading('Home')] },
+          // Not linked from home or anywhere else — only discoverable via the static path.
+          'https://a.test/#/SK/admin': { elements: [heading('Admin')] },
+        },
+      });
+      const { emit } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        staticRoutePaths: ['/admin'],
+        emit,
+      });
+
+      const adminRoute = artifact.crawl.routes.find((r) => r.url === 'https://a.test/#/SK/admin');
+      expect(adminRoute).toBeDefined();
+      expect(adminRoute?.role).toBe('anonymous');
+    });
+
+    it('silently skips a static path that fails to resolve, without failing the run', async () => {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/': { elements: [] },
+        },
+        throwOnGoto: new Set(['https://a.test/nonexistent']),
+      });
+      const { emit } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        staticRoutePaths: ['/nonexistent'],
+        emit,
+      });
+
+      expect(artifact.crawl.routes.some((r) => r.url === 'https://a.test/nonexistent')).toBe(false);
+      expect(artifact.crawl.routes.some((r) => r.url === 'https://a.test/')).toBe(true);
+    });
+
+    it('does not run a redundant follow-up crawl when every static path was already visited', async () => {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/': { elements: [link('https://a.test/about')] },
+          'https://a.test/about': { elements: [heading('About')] },
+        },
+      });
+      const { emit, events } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        staticRoutePaths: ['/about'],
+        emit,
+      });
+
+      expect(artifact.crawl.routes.filter((r) => r.url === 'https://a.test/about')).toHaveLength(1);
+      expect(events.some((e) => /static-analysis route seeding found/i.test(e.message))).toBe(false);
+    });
+
+    it('emits a warn breadcrumb (not a triage verdict) when a static seed resolves to a runaway redirect', async () => {
+      const runaway = `https://a.test/#/${Array(8).fill('home').join('/')}`;
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/': { elements: [] },
+          [runaway]: { elements: [] },
+        },
+        redirects: { 'https://a.test/broken': runaway },
+      });
+      const { emit, events } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        staticRoutePaths: ['/broken'],
+        emit,
+      });
+
+      expect(artifact.crawl.degenerateRedirectsSkipped).toEqual(['https://a.test/broken']);
+      const warn = events.find(
+        (e) => e.phase === 'explore' && e.level === 'warn' && /runaway redirect/i.test(e.message),
+      );
+      expect(warn).toBeDefined();
+      expect(warn?.data).toEqual({ skipped: ['https://a.test/broken'] });
+    });
   });
 });

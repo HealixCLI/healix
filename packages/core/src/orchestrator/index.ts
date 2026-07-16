@@ -852,6 +852,22 @@ async function runPipeline(
       if (reachable) {
         setStatus('exploring');
         emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
+        // White-box only: feed functionality-index.ts's already-extracted static
+        // routes as extra crawl seeds, so routes with no visible in-app link
+        // (admin pages, wizard steps, deep settings) still get explored. Mirrors
+        // the identical independent best-effort indexing already done for PLAN
+        // (see indexFunctionality above) — cheap regex scan, never blocks EXPLORE.
+        let staticRoutePaths: string[] | undefined;
+        if (project.repoPath) {
+          try {
+            const functionality = await indexFunctionality(project.repoPath);
+            staticRoutePaths = functionality.units
+              .filter((u) => u.kind === 'route')
+              .map((u) => u.key.replace(/^route:/, ''));
+          } catch (err) {
+            emit('explore', 'debug', `Static route indexing failed (continuing): ${errMsg(err)}`);
+          }
+        }
         try {
           const exploration = await runExplorePhase({
             browser,
@@ -860,6 +876,7 @@ async function runPipeline(
               ctx.testUsername && ctx.testPassword
                 ? { username: ctx.testUsername, password: ctx.testPassword }
                 : undefined,
+            staticRoutePaths,
             emit,
             onFrame: hooks?.onFrame,
           });

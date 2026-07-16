@@ -185,6 +185,16 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(calls[0].opts?.readOnly).toBe(true);
   });
 
+  it('emits a per-item "Dispatched i/n" event distinct from the batch "Progress" event', async () => {
+    const ctx = makeCtx(makeProvider([CLEAN_SPEC], calls));
+
+    await generate(ctx, PLAN);
+
+    const dispatched = events.find((e) => e.message.includes('Dispatched'));
+    expect(dispatched?.message).toBe(`Dispatched 1/1: Generating "${PLAN.items[0].title}"`);
+    expect(events.some((e) => e.message === 'Progress: 1/1 done')).toBe(true);
+  });
+
   it('forwards ctx.signal into the provider completion', async () => {
     const controller = new AbortController();
     const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), signal: controller.signal };

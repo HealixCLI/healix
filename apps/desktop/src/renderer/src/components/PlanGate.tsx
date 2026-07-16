@@ -401,6 +401,7 @@ function PlanItemRow({
             variant="outline"
             size="icon"
             aria-label="Approve item"
+            title="Approve item"
             disabled={decided || revising}
             onClick={onApprove}
           >
@@ -410,6 +411,7 @@ function PlanItemRow({
             variant="outline"
             size="icon"
             aria-label="Reject item"
+            title="Reject item"
             disabled={decided || revising}
             onClick={onReject}
           >
@@ -419,6 +421,7 @@ function PlanItemRow({
             variant="outline"
             size="icon"
             aria-label="Edit item"
+            title="Edit item"
             disabled={decided || revising}
             onClick={onEdit}
           >
@@ -428,6 +431,7 @@ function PlanItemRow({
             variant="outline"
             size="icon"
             aria-label="Revise item with AI"
+            title="Revise item with AI"
             disabled={decided || revising}
             onClick={onRevise}
           >

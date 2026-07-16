@@ -1276,12 +1276,12 @@ function safeSend(sender: WebContents, channel: string, payload: unknown): void 
  *    through to failOrphanedRuns()'s 6-HOUR age buffer, which reads as
  *    "auto-resume is broken" to anyone testing this within the same hour).
  *
- * Runs one at a time via resumeRun's own activeRuns gate — a second call
- * simply won't find `activeRuns` empty and this loop doesn't wait between
- * iterations, so in practice only the first auto-resumable run starts
- * immediately; the rest are picked up by startNextQueued's drain once it
- * settles (queued exactly like any other pending request would be, since
- * resumeRun re-registers under activeRuns exactly like a fresh run).
+ * Runs strictly one at a time: each resumeRun() call is awaited fully before
+ * the next one starts, so at most one auto-resume (and therefore at most one
+ * orchestrator pipeline / Playwright invocation) is ever active from this
+ * pass. Any run:start request that arrives mid-batch correctly queues itself
+ * behind whichever resume is currently active (see run:start's activeRuns
+ * gate) and is drained once, after the whole batch settles.
  */
 async function reconcileRunsOnBoot(): Promise<void> {
   const store = await getStore();
@@ -1317,16 +1317,25 @@ async function reconcileRunsOnBoot(): Promise<void> {
     );
   }
 
+  // Resumed strictly one at a time: resumeRun() registers into `activeRuns`
+  // as soon as it starts, and every other run-starting path in this file
+  // enforces "one run executes at a time" (see run:start's activeRuns.size
+  // gate) because every run shares the single live-browser mirror surface and
+  // fixed local ports. Firing all of these concurrently would violate that
+  // invariant.
   for (const run of toResume) {
     console.log(`[healix] auto-resuming run ${run.id} (paused: ${run.pauseReason ?? 'unknown'}).`);
-    void resumeRun(run.id, (channel, payload) => broadcastAll(channel, payload))
-      .catch((err: unknown) => {
-        console.error(`[healix] auto-resume of run ${run.id} failed:`, err);
-      })
-      .finally(() => {
-        void startNextQueued();
-      });
+    try {
+      await resumeRun(run.id, (channel, payload) => broadcastAll(channel, payload));
+    } catch (err) {
+      console.error(`[healix] auto-resume of run ${run.id} failed:`, err);
+    }
   }
+  // Drain any run:start requests that queued (behind activeRuns) while the
+  // above was resuming — exactly once, after the whole batch, not per
+  // iteration: draining mid-loop could let a queued run start concurrently
+  // with the NEXT boot-time resume, reintroducing the same bug in a new spot.
+  if (toResume.length > 0) void startNextQueued();
 
   // Fallback janitor for anything the pass above didn't touch (e.g. storage
   // was briefly unavailable) — still age-buffered (default 6h) so it never

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { ExplorationMode, Project, SuiteMode, TestingScope } from '@healix/core';
+import type { Project, SuiteMode, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, ListPlus, Play, Plus, RotateCcw, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';

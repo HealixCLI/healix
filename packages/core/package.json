@@ -22,12 +22,16 @@
     "dev": "tsc -p tsconfig.json --watch"
   },
   "dependencies": {
+    "@babel/parser": "^7.26.3",
+    "@babel/traverse": "^7.26.4",
+    "@babel/types": "^7.26.3",
     "archiver": "^7.0.1",
     "nanoid": "^5.0.9",
     "playwright": "^1.49.1"
   },
   "devDependencies": {
     "@types/archiver": "^6.0.3",
+    "@types/babel__traverse": "^7.20.6",
     "@types/node": "^24.0.0",
     "typescript": "^5.7.2"
   }

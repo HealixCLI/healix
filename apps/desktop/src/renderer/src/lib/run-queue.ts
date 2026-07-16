@@ -5,6 +5,9 @@ export interface RunQueue {
   queue: QueuedRunSummary[];
   /** Remove a not-yet-started request from the queue. No-op if it already started or was already removed. */
   remove: (queueEntryId: string) => Promise<void>;
+  /** Message from the most recent queued run that failed to start, until dismissed. */
+  error: string | null;
+  clearError: () => void;
 }
 
 /**
@@ -15,6 +18,7 @@ export interface RunQueue {
  */
 export function useRunQueue(): RunQueue {
   const [queue, setQueue] = useState<QueuedRunSummary[]>([]);
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
     let cancelled = false;
@@ -29,6 +33,7 @@ export function useRunQueue(): RunQueue {
 
     const unsubscribe = window.healix.onRunEvent((msg: RunChannelMessage) => {
       if (msg.channel === 'queue:updated') setQueue(msg.payload.queue);
+      if (msg.channel === 'queue:failed') setError(msg.payload.message);
     });
     return () => {
       cancelled = true;
@@ -36,11 +41,21 @@ export function useRunQueue(): RunQueue {
     };
   }, []);
 
+  // Auto-dismiss after a few seconds — still manually dismissable (clearError)
+  // in the meantime, same as the other error banners in this view.
+  useEffect(() => {
+    if (!error) return;
+    const id = setTimeout(() => setError(null), 8000);
+    return () => clearTimeout(id);
+  }, [error]);
+
   const remove = useCallback(async (queueEntryId: string): Promise<void> => {
     await window.healix.queueRemove(queueEntryId);
     // The main process broadcasts queue:updated on every mutation; no need to
     // optimistically update local state here.
   }, []);
 
-  return { queue, remove };
+  const clearError = useCallback((): void => setError(null), []);
+
+  return { queue, remove, error, clearError };
 }

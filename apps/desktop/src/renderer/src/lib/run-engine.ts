@@ -223,7 +223,7 @@ export function useRunEngine(): RunEngine {
 
   useEffect(() => {
     const unsubscribe = window.healix.onRunEvent((msg: RunChannelMessage) => {
-      if (msg.channel === 'queue:updated') return; // handled by useRunQueue, not this engine.
+      if (msg.channel === 'queue:updated' || msg.channel === 'queue:failed') return; // handled by useRunQueue, not this engine.
 
       // run:started always wins, even over a DIFFERENT previously-tracked run:
       // this is exactly how a queued request announces "it's my turn now" —

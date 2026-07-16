@@ -212,7 +212,36 @@ ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProjec
 ipcMain.handle('projects:delete', async (_e, id: string): Promise<{ ok: true; assetsRemoved: boolean }> => {
   const store = await requireStore();
   if (!id) throw new Error('Project id is required.');
+
+  // Cancel any run of this project that's actively executing right now —
+  // must happen BEFORE store.deleteProject, which cascade-deletes the run
+  // row this looks up. Without this, the engine watching that run would sit
+  // on "running" (button stuck on "Queue run") forever: the orchestrator has
+  // no idea its project just vanished, so run:done would never arrive to
+  // settle it. Mirrors run:cancel's own settleApproval + abort sequence.
+  for (const [runId, controller] of activeRuns) {
+    if (store.getRun(runId)?.projectId !== id) continue;
+    broadcastAll('run:event', {
+      runId,
+      event: { phase: 'error', level: 'error', message: "This run's project was deleted — cancelling." },
+    });
+    settleApproval(runId, { decision: 'cancel' });
+    controller.abort();
+  }
+
   store.deleteProject(id);
+
+  // Drop any of this project's requests still waiting in the run queue —
+  // otherwise they'd sit there until their turn, then fail once dequeued
+  // (still handled gracefully, but there's no reason to let a doomed request
+  // occupy a queue slot when we already know it can never run).
+  const remaining = runQueue.filter((q) => q.projectId !== id);
+  if (remaining.length !== runQueue.length) {
+    runQueue.length = 0;
+    runQueue.push(...remaining);
+    broadcastAll('queue:updated', { queue: serializeQueue() });
+  }
+
   // Remove the project's on-disk assets (runs, suites, screenshots, videos).
   // Best-effort: the DB rows are already gone; a disk failure should not
   // resurrect the project, only be reported.
@@ -392,8 +421,22 @@ async function startNextQueued(): Promise<void> {
   const next = runQueue.shift();
   if (!next) return;
   broadcastAll('queue:updated', { queue: serializeQueue() });
-  await executeRun(next.args, next.sender);
-  void startNextQueued();
+  try {
+    await executeRun(next.args, next.sender);
+  } catch (err) {
+    // executeRun already turns orchestrator failures into a resolved 'error'
+    // summary internally — this only catches something failing before that
+    // safety net (e.g. createOrchestrator() throwing synchronously). Without
+    // this, one bad queued run would reject here and the recursive call below
+    // would never run, silently stranding every request still waiting behind it.
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[healix] queued run for "${next.projectName}" failed to start:`, err);
+    broadcastAll('queue:failed', {
+      message: `Queued run for "${next.projectName}" failed to start: ${message}`,
+    });
+  } finally {
+    void startNextQueued();
+  }
 }
 
 ipcMain.handle(

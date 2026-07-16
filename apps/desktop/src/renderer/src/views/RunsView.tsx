@@ -85,6 +85,10 @@ export function RunsView({
   };
   // True from the moment the user clicks Cancel until run:done settles the run.
   const [cancelling, setCancelling] = useState(false);
+  // Set when the most recent "Queue run" click itself failed (e.g. the
+  // project was deleted in another window) — distinct from engine.error,
+  // which is scoped to the run the engine is actively tracking, not this button.
+  const [queueError, setQueueError] = useState<string | null>(null);
   // Session-only: resets to expanded on next launch.
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   // Collapsing "Start a run" frees most of the column for the report/timeline
@@ -240,13 +244,23 @@ export function RunsView({
   // drives a real browser during EXPLORE and EXECUTE.
   const showLiveBrowserPanel = !!selectedProject?.baseUrl && testingScope !== 'backend';
 
+  // Auto-dismiss after a few seconds — still manually dismissable in the meantime.
+  useEffect(() => {
+    if (!queueError) return;
+    const id = setTimeout(() => setQueueError(null), 8000);
+    return () => clearTimeout(id);
+  }, [queueError]);
+
   const startOrQueue = (): void => {
     if (!projectId) return;
     const args = { projectId, testingScope, suiteMode, prd: prd.trim() || undefined };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
       // active — this never silently supersedes the run currently on screen.
-      void engine.queueRun(args);
+      setQueueError(null);
+      void engine.queueRun(args).catch((err) => {
+        setQueueError(err instanceof Error ? err.message : String(err));
+      });
       return;
     }
     // Showing live run UI rather than a historical detail.
@@ -492,10 +506,26 @@ export function RunsView({
           )}
         </Card>
 
+        {queueError && (
+          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+            <p>{queueError}</p>
+            <button
+              type="button"
+              onClick={() => setQueueError(null)}
+              aria-label="Dismiss"
+              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
         <RunQueuePanel
           queue={queue.queue}
           projectsById={projectsById}
           onRemove={(id) => void queue.remove(id)}
+          error={queue.error}
+          onDismissError={queue.clearError}
         />
 
         {/* Collapse toggle: centered chevron on a divider. Collapsing "Start a

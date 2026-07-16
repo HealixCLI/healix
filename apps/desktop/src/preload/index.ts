@@ -13,7 +13,9 @@ export type RunChannelMessage =
   // Live browser mirror frame (JPEG, base64) for computer-use runs.
   | { channel: 'run:frame'; payload: { runId: string; frameBase64: string } }
   // Broadcast to every window whenever the pending-run queue changes.
-  | { channel: 'queue:updated'; payload: { queue: unknown[] } };
+  | { channel: 'queue:updated'; payload: { queue: unknown[] } }
+  // Broadcast to every window when a queued run fails to start (before it ever got its own runId).
+  | { channel: 'queue:failed'; payload: { message: string } };
 
 const RUN_CHANNELS = [
   'run:started',
@@ -22,6 +24,7 @@ const RUN_CHANNELS = [
   'run:done',
   'run:frame',
   'queue:updated',
+  'queue:failed',
 ] as const;
 
 const api = {

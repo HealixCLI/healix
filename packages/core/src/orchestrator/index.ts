@@ -27,11 +27,13 @@ import type { TriageInput } from '../triage/types.js';
 import {
   buildPlanPrompt,
   buildGapFillPlanPrompt,
+  buildBatchPlanPrompt,
   parsePlan,
+  parsePlanWithDiagnostics,
   synthesizePlan,
   type PlanRepoContext,
 } from './plan.js';
-import { indexFunctionality } from '../target/functionality-index.js';
+import { indexFunctionality, type FunctionalityUnit } from '../target/functionality-index.js';
 import { diffAgainstBase } from './topup.js';
 import {
   computeCoverage,
@@ -65,6 +67,22 @@ const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
 const TRIAGE_AI_LIMIT = 3;
 /** Consecutive best-effort store-write failures before we warn that persistence is down. */
 const STORE_FAILURE_WARN_THRESHOLD = 3;
+/** Small delay before a same-provider plan retry — cheap insurance against a one-off CLI hiccup/timeout. */
+const PLAN_SAME_PROVIDER_RETRY_DELAY_MS = 2_000;
+/**
+ * Units per batched planning call — keeps each individual completion's expected
+ * JSON response small enough to avoid output-length truncation (see
+ * PlanParseFailureReason 'truncated' in plan.ts). A repo with more detected
+ * functionality units than this is planned across multiple smaller calls
+ * instead of one monolithic request covering everything at once.
+ *
+ * Kept conservative (well under what "no truncation" alone would require)
+ * because unit count understates real response size: each unit's plan item
+ * also carries an uncapped scenarios array (positive/negative/edge), so a
+ * batch of richly-scenario'd units can produce a much larger response than
+ * the same batch size with one scenario per unit.
+ */
+const PLAN_BATCH_UNIT_SIZE = 15;
 
 /**
  * Run state machine for the Healix orchestrator. Every phase transition is
@@ -274,6 +292,17 @@ async function runPipeline(
   let effectiveBaseUrl: string | null = project.baseUrl;
   // White-box launch handle, stopped in the run's cleanup regardless of outcome.
   let launchHandle: { stop(): Promise<void> } | null = null;
+  // Item-level generation accounting across GENERATE and every coverage-loop
+  // gap-fill iteration: how many plan items asked for a spec vs. how many
+  // actually got one (the rest were silently dropped after failed generation
+  // attempts — see generate.ts's per-item retry-then-skip). Surfaced in the
+  // report so a suite that came out smaller than planned is visible instead
+  // of looking identical to a suite that genuinely only needed that many.
+  const generationStats = { requestedItems: 0, acceptedItems: 0 };
+  const trackGeneration = (requested: number, accepted: number): void => {
+    generationStats.requestedItems += requested;
+    generationStats.acceptedItems += accepted;
+  };
 
   try {
     // ---- 3. PLAN ----
@@ -306,6 +335,7 @@ async function runPipeline(
       plan = {
         summary: `Reusing ${baseTestsWithSpec.length} test(s) from run ${baseRun!.id} — no generation.`,
         items: [],
+        planSource: 'reuse',
       };
       emit('plan', 'info', 'Skipping AI planning (reuse mode).');
     } else {
@@ -680,11 +710,13 @@ async function runPipeline(
         emit('generate', 'info', 'Generating specs.');
         newSpecs = await mode.generate(ctx, { ...planForGeneration, items: diff.toGenerate });
         newSpecItems = diff.toGenerate;
+        trackGeneration(diff.toGenerate.length, newSpecs.length);
         carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
       } else {
         emit('generate', 'info', 'Generating specs.');
         newSpecs = await mode.generate(ctx, planForGeneration);
         newSpecItems = planForGeneration.items;
+        trackGeneration(planForGeneration.items.length, newSpecs.length);
       }
 
       specs = [...newSpecs, ...carriedSpecs];
@@ -711,6 +743,7 @@ async function runPipeline(
         artifactFiles,
         noteStoreOk,
         noteStoreFailure,
+        { generationStats, coverage: coverageSummary },
       );
       return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
@@ -742,6 +775,7 @@ async function runPipeline(
         artifactFiles,
         noteStoreOk,
         noteStoreFailure,
+        { generationStats, coverage: coverageSummary },
       );
       return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
@@ -830,6 +864,7 @@ async function runPipeline(
         try {
           emit('generate', 'info', `Generating ${gapItems.length} gap-fill spec(s).`);
           gapSpecs = await mode.generate(ctx, { summary: gapPlan.summary, items: gapItems });
+          trackGeneration(gapItems.length, gapSpecs.length);
         } catch (err) {
           emit('generate', 'warn', `Gap-fill generation failed (stopping coverage loop): ${errMsg(err)}`);
           break;
@@ -881,6 +916,7 @@ async function runPipeline(
       await writeJson(join(runDir, 'plan', 'plan.json'), plan);
       coverageSummary = {
         ratio: coverage.ratio,
+        target: coverageTarget,
         coveredCount: coverage.coveredUnitKeys.size,
         totalCount: units.length,
         uncovered: coverage.uncovered,
@@ -979,6 +1015,15 @@ async function runPipeline(
     // ---- 10. REPORT ----
     if (checkCancelled()) return cancelRun('report');
     setStatus('reporting');
+    if (generationStats.requestedItems > generationStats.acceptedItems) {
+      const dropped = generationStats.requestedItems - generationStats.acceptedItems;
+      emit(
+        'report',
+        'warn',
+        `Generated ${generationStats.acceptedItems}/${generationStats.requestedItems} planned spec(s); ` +
+          `${dropped} dropped after failed generation attempts (see generate-phase logs above for reasons).`,
+      );
+    }
     emit('report', 'info', 'Writing report.');
     const reportPath = (
       await finalizeReport(
@@ -992,7 +1037,7 @@ async function runPipeline(
         artifactFiles,
         noteStoreOk,
         noteStoreFailure,
-        coverageSummary,
+        { generationStats, coverage: coverageSummary },
       )
     ).reportPath;
 
@@ -1069,7 +1114,7 @@ async function runPipeline(
           artifactFiles,
           noteStoreOk,
           noteStoreFailure,
-          coverageSummary,
+          { generationStats, coverage: coverageSummary },
         )
       ).reportPath;
     } catch {
@@ -1138,28 +1183,32 @@ export async function resolveProvider(
 }
 
 /**
- * Run the model to obtain a plan, falling back to a synthesized plan on any failure.
+ * Attempt to get an AI-authored plan for the given (already-built) prompt:
+ * one attempt with `provider`, one same-provider retry on ANY failure (cheap
+ * insurance against a one-off CLI hiccup/timeout — the only retry available
+ * at all when no second provider is configured), and — only for failures
+ * classified retryable (a provider-level fault, or a truncated JSON response;
+ * see PlanParseFailureReason) — one attempt with a different ready provider.
  *
- * Provider-level fallback: if the primary provider's complete() throws or returns
- * ok:false AND a different ready provider exists, we retry the completion ONCE with
- * that fallback provider before giving up to the synthesized plan. The fallback is
- * skipped when a provider was injected via overrides (it is trusted as-is and there is
- * no router to consult).
+ * Returns null (never synthesizePlan()) once every attempt is exhausted, so
+ * the caller decides what "nothing came back" means for its scope: a single
+ * unscoped plan falls back to the smoke plan, while one failed batch within a
+ * larger plan (see runPlanPhase) just contributes zero items for that batch.
  */
-async function runPlanPhase(
+/** Exported for tests — see the doc-comment above for behavior. */
+export async function attemptPlanCompletion(
   provider: ProviderAdapter,
+  prompt: string,
   project: Project,
   opts: RunOptions,
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
   overrides?: OrchestratorOverrides,
-  repoIndex?: PlanRepoContext,
-): Promise<TestPlan> {
-  const prompt = buildPlanPrompt(project, opts, repoIndex);
+): Promise<{ plan: TestPlan } | { plan: null; reason: string }> {
   // Attempt a single completion with one provider; classifies the outcome so the
   // caller can decide whether to retry with a fallback.
   const attempt = async (
     p: ProviderAdapter,
-  ): Promise<{ plan: TestPlan } | { plan: null; retryable: boolean }> => {
+  ): Promise<{ plan: TestPlan } | { plan: null; retryable: boolean; reason: string }> => {
     try {
       const completion = await p.complete(prompt, {
         mode: 'plan',
@@ -1170,28 +1219,51 @@ async function runPlanPhase(
         signal: opts.signal,
       });
       if (completion.ok && completion.text) {
-        const parsed = parsePlan(completion.text, opts.testingScope ?? 'both');
-        if (parsed) return { plan: parsed };
-        // ok but unparseable — not a provider fault, so don't retry on a different provider.
-        emit('plan', 'warn', 'Could not parse plan JSON; synthesizing fallback.');
-        return { plan: null, retryable: false };
+        const parsed = parsePlanWithDiagnostics(completion.text, opts.testingScope ?? 'both');
+        if (parsed.plan) return { plan: parsed.plan };
+        // A truncated response (output cut off before the JSON object closed —
+        // the likely cause when a large functionality inventory pushes the
+        // model past its response-length limit) is transient: the identical
+        // request may well complete on a retry, so it's treated the same as a
+        // provider-level fault. Malformed-but-complete JSON or an empty
+        // response is NOT retried against a different provider — a different
+        // provider is unlikely to parse any differently against the same
+        // well-formed prompt.
+        const retryable = parsed.failureReason === 'truncated';
+        const reason = `unparseable plan response (${parsed.failureReason ?? 'unknown'})`;
+        emit(
+          'plan',
+          'warn',
+          `Could not parse plan JSON from "${p.id}" (${parsed.failureReason ?? 'unknown'}).`,
+        );
+        return { plan: null, retryable, reason };
       }
       // ok:false is a provider-level failure → eligible for one fallback retry.
       emit('plan', 'warn', `Provider "${p.id}" returned no usable plan (${completion.detail}).`);
-      return { plan: null, retryable: true };
+      return { plan: null, retryable: true, reason: completion.detail || 'provider returned no usable plan' };
     } catch (err) {
       // A thrown completion is a provider-level failure → eligible for one fallback retry.
       emit('plan', 'warn', `Planning provider "${p.id}" threw: ${errMsg(err)}.`, { stack: errStack(err) });
-      return { plan: null, retryable: true };
+      return { plan: null, retryable: true, reason: errMsg(err) };
     }
   };
 
-  const first = await attempt(provider);
-  if (first.plan) return first.plan;
+  let last = await attempt(provider);
+  if (last.plan) return last;
 
-  // One-time provider fallback: only when the failure was provider-level (retryable),
-  // a real router is in play (no injected override), and a DIFFERENT ready provider exists.
-  if (first.retryable && !overrides?.provider) {
+  // Same-provider retry: a one-off CLI hiccup/timeout/truncated response is
+  // often transient, and with a single-provider setup the fallback-provider
+  // step below is otherwise a no-op — cheap insurance before giving up.
+  emit('plan', 'info', `Retrying plan with the same provider "${provider.id}" after: ${last.reason}`);
+  await delay(PLAN_SAME_PROVIDER_RETRY_DELAY_MS);
+  const retried = await attempt(provider);
+  if (retried.plan) return retried;
+  last = retried;
+
+  // One-time provider fallback: only when the failure was classified retryable
+  // (provider-level fault, or a truncated response), a real router is in play
+  // (no injected override), and a DIFFERENT ready provider exists.
+  if (last.retryable && !overrides?.provider) {
     const fallback = await new ProviderRouter().firstReady('plan', { exclude: provider.id });
     if (fallback) {
       emit('plan', 'warn', `Retrying plan with fallback provider "${fallback.id}".`, {
@@ -1199,12 +1271,122 @@ async function runPlanPhase(
         fallback: fallback.id,
       });
       const second = await attempt(fallback);
-      if (second.plan) return second.plan;
+      if (second.plan) return second;
+      last = second;
     }
   }
 
-  emit('plan', 'warn', 'Synthesizing fallback plan.');
-  return synthesizePlan(project, opts.testingScope ?? 'both');
+  return { plan: null, reason: last.reason };
+}
+
+/**
+ * Run the model to obtain a plan, falling back to a synthesized smoke plan
+ * only once every attempt (including retries — see attemptPlanCompletion) is
+ * exhausted.
+ *
+ * A large functionality inventory is planned across multiple smaller batches
+ * (see PLAN_BATCH_UNIT_SIZE) instead of one monolithic request — asking the
+ * model for a single unbounded JSON response covering the entire app's
+ * surface is what makes output-length truncation likely in the first place.
+ * A batch that fails outright contributes zero items (NOT its own smoke
+ * fallback, which wouldn't make sense scoped to a handful of known units) —
+ * its units simply stay uncovered for the coverage-feedback loop to pick up
+ * afterward. Only a total wipeout (no batch produced anything at all) falls
+ * back to synthesizePlan().
+ */
+export async function runPlanPhase(
+  provider: ProviderAdapter,
+  project: Project,
+  opts: RunOptions,
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+  overrides?: OrchestratorOverrides,
+  repoIndex?: PlanRepoContext,
+): Promise<TestPlan> {
+  const units = repoIndex?.functionality ?? [];
+
+  if (units.length <= PLAN_BATCH_UNIT_SIZE) {
+    const prompt = buildPlanPrompt(project, opts, repoIndex);
+    const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
+    if (result.plan) return { ...result.plan, planSource: 'ai' };
+    emit('plan', 'warn', `Synthesizing fallback plan (reason: ${result.reason}).`);
+    return {
+      ...synthesizePlan(project, opts.testingScope ?? 'both'),
+      planSource: 'fallback',
+      fallbackReason: result.reason,
+    };
+  }
+
+  const batches: FunctionalityUnit[][] = [];
+  for (let i = 0; i < units.length; i += PLAN_BATCH_UNIT_SIZE) {
+    batches.push(units.slice(i, i + PLAN_BATCH_UNIT_SIZE));
+  }
+  emit(
+    'plan',
+    'info',
+    `Planning ${units.length} unit(s) across ${batches.length} batch(es) of up to ${PLAN_BATCH_UNIT_SIZE}.`,
+  );
+
+  const items: TestPlanItem[] = [];
+  const failedBatches: string[] = [];
+
+  for (let i = 0; i < batches.length; i++) {
+    if (opts.signal?.aborted) break;
+    const prompt = buildBatchPlanPrompt(project, opts, batches[i]!, i + 1, batches.length, repoIndex);
+    emit('plan', 'info', `Planning batch ${i + 1}/${batches.length} (${batches[i]!.length} unit(s)).`);
+    const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
+    if (result.plan) {
+      items.push(...result.plan.items);
+      emit(
+        'plan',
+        'info',
+        `Batch ${i + 1}/${batches.length} generated ${result.plan.items.length} item(s).`,
+        {
+          kind: 'plan-batch',
+          batchIndex: i,
+          totalBatches: batches.length,
+          items: result.plan.items,
+          status: 'ok',
+        },
+      );
+    } else {
+      failedBatches.push(`batch ${i + 1}/${batches.length}: ${result.reason}`);
+      emit(
+        'plan',
+        'warn',
+        `Batch ${i + 1}/${batches.length} produced no usable plan (${result.reason}); its units will be ` +
+          'left for the coverage-feedback loop.',
+        {
+          kind: 'plan-batch',
+          batchIndex: i,
+          totalBatches: batches.length,
+          items: [],
+          status: 'failed',
+          reason: result.reason,
+        },
+      );
+    }
+  }
+
+  if (items.length === 0) {
+    const reason = failedBatches.length > 0 ? failedBatches.join('; ') : 'no batch produced any items';
+    emit('plan', 'warn', `Synthesizing fallback plan (reason: ${reason}).`);
+    return {
+      ...synthesizePlan(project, opts.testingScope ?? 'both'),
+      planSource: 'fallback',
+      fallbackReason: reason,
+    };
+  }
+
+  return {
+    summary: `Planned ${items.length} item(s) across ${batches.length} batch(es) covering ${units.length} detected unit(s).`,
+    items,
+    planSource: 'ai',
+    ...(failedBatches.length > 0
+      ? {
+          fallbackReason: `${failedBatches.length}/${batches.length} batch(es) failed: ${failedBatches.join('; ')}`,
+        }
+      : {}),
+  };
 }
 
 /**
@@ -1444,7 +1626,10 @@ async function finalizeReport(
   artifacts: string[],
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
-  coverage: ReportCoverageSummary | null = null,
+  degradation?: {
+    generationStats?: { requestedItems: number; acceptedItems: number };
+    coverage?: ReportCoverageSummary | null;
+  },
 ): Promise<{ reportPath: string | undefined }> {
   const effectivePlan: TestPlan = plan ?? { summary: 'No plan generated.', items: [] };
   const report = buildReport({
@@ -1454,7 +1639,8 @@ async function finalizeReport(
     outcome,
     triage,
     artifacts,
-    coverage,
+    generation: degradation?.generationStats,
+    coverage: degradation?.coverage ?? null,
   });
   const reportPath = join(runDir, 'reports', 'report.json');
   try {

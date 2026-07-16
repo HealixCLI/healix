@@ -8,6 +8,10 @@ export interface TriageInput {
   specSource?: string;
   reqTag?: string;
   tracePath?: string;
+  /** Relative path of the source-context unit (see target/source-index.ts) the failing test's plan item mapped to, when known. */
+  sourceFile?: string;
+  /** That file's content (or a leading slice of it) — first-party repo code, cited normally rather than fenced as untrusted. */
+  sourceExcerpt?: string;
 }
 
 export interface TriageResult {

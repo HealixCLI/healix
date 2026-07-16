@@ -215,3 +215,47 @@ describe('buildTriagePrompt — untrusted-data fencing (prompt injection)', () =
     expect(prompt).not.toContain('--- TRACE PATH (untrusted) ---');
   });
 });
+
+describe('buildTriagePrompt — matched source-context file citation', () => {
+  const OPEN = '<<<UNTRUSTED_TEST_OUTPUT';
+  const CLOSE = 'UNTRUSTED_TEST_OUTPUT>>>';
+
+  it('cites the matched source file and its excerpt, NOT inside the untrusted fence', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      sourceFile: 'routes/userRoutes.js',
+      sourceExcerpt: "router.get('/:id', getUserById);",
+    });
+    expect(prompt).toContain('--- MATCHED SOURCE FILE: routes/userRoutes.js ---');
+    expect(prompt).toContain("router.get('/:id', getUserById);");
+
+    // Cited normally (first-party code), unlike the error/trace blocks above.
+    const sourceIdx = prompt.indexOf("router.get('/:id', getUserById);");
+    const openIdx = prompt.lastIndexOf(OPEN, sourceIdx);
+    const closeIdx = prompt.indexOf(CLOSE, openIdx === -1 ? 0 : openIdx);
+    expect(openIdx === -1 || sourceIdx > closeIdx).toBe(true);
+  });
+
+  it('omits the source-file block entirely when no sourceFile is provided', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom' });
+    expect(prompt).not.toContain('MATCHED SOURCE FILE');
+  });
+
+  it('truncates an oversized source excerpt', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      sourceFile: 'big.ts',
+      sourceExcerpt: 'x'.repeat(4_000),
+    });
+    expect(prompt).toContain('… [truncated, 1000 more chars]');
+    expect(prompt).not.toContain('x'.repeat(3_001));
+  });
+
+  it('shows a placeholder when sourceFile is present but sourceExcerpt is not (read failed)', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom', sourceFile: 'routes/userRoutes.js' });
+    expect(prompt).toContain('--- MATCHED SOURCE FILE: routes/userRoutes.js ---');
+    expect(prompt).toContain('(file content unavailable)');
+  });
+});

@@ -1325,6 +1325,15 @@ async function runPipeline(
           // but never threaded through before, so triage only ever "knew" a
           // trace existed by chance, never which file.
           const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+          // Recover the plan item this spec was generated from, to find the source-context unit
+          // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
+          // candidates below, since most failures never reach that stage.
+          const planItem = planForGeneration.items.find(
+            (it) => (spec?.reqTag && it.reqTag === spec.reqTag) || it.title === r.title,
+          );
+          const unit = planItem?.unitKey
+            ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
+            : undefined;
           const input: TriageInput = {
             title: r.title,
             error: r.error ?? '',
@@ -1338,7 +1347,7 @@ async function runPipeline(
           } catch (err) {
             emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
           }
-          return { r, input, triage };
+          return { r, input, triage, unit };
         });
 
         // Best-effort AI enrichment for the first N failures, run CONCURRENTLY
@@ -1348,6 +1357,17 @@ async function runPipeline(
         const aiCandidates = baseline.filter((b) => b.triage !== null).slice(0, TRIAGE_AI_LIMIT);
         await Promise.all(
           aiCandidates.map(async (b) => {
+            // Read the matched source-context unit's file lazily — only AI-enriched candidates
+            // need it (classify()'s deterministic rules never look at source), so most failures
+            // never pay this read.
+            if (b.unit && project.repoPath) {
+              try {
+                const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
+                b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
+              } catch (err) {
+                emit('triage', 'debug', `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`);
+              }
+            }
             const controller = new AbortController();
             try {
               const enriched = await withTimeoutAbort(

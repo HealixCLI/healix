@@ -145,6 +145,18 @@ export interface GeneratedSpec {
   contents: string;
 }
 
+export interface QuarantinedSpec {
+  spec: GeneratedSpec;
+  reason: string;
+}
+
+/** Result of a mode's pre-execution parse-check gate — see modes/playwright/validate.ts. */
+export interface ValidationResult {
+  ok: GeneratedSpec[];
+  repaired: GeneratedSpec[];
+  quarantined: QuarantinedSpec[];
+}
+
 export interface ExecResultItem {
   title: string;
   status: TestStatus;
@@ -194,6 +206,8 @@ export interface TestMode {
   readonly id: ModeId;
   scaffold(ctx: TestModeContext): Promise<void>;
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
+  /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
+  validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
   execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: Tier }): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;

@@ -941,6 +941,30 @@ async function runPipeline(
           trackGeneration(planForGeneration.items.length, newSpecs.length);
         }
 
+        // Pre-execution validation gate: generate.ts's regex/string gates
+        // never parse the TypeScript, so a spec with a genuine syntax defect
+        // (unclosed string, dropped brace) can still sail through — catch
+        // that HERE, before any row is registered or execute() ever sees the
+        // file, rather than as a raw exception mid-suite (see
+        // modes/playwright/validate.ts). Modes without a validate() are
+        // treated as always-valid.
+        const validation = mode.validate
+          ? await mode.validate(ctx, [...newSpecs, ...carriedSpecs])
+          : { ok: [...newSpecs, ...carriedSpecs], repaired: [], quarantined: [] };
+        if (validation.quarantined.length > 0) {
+          emit(
+            'generate',
+            'warn',
+            `${validation.quarantined.length} spec(s) quarantined after failing to parse (one repair attempt each).`,
+            { quarantined: validation.quarantined.map((q) => ({ title: q.spec.title, reason: q.reason })) },
+          );
+        }
+        const validatedByPath = new Map([...validation.ok, ...validation.repaired].map((s) => [s.path, s]));
+        newSpecs = newSpecs.flatMap((s) => (validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : []));
+        carriedSpecs = carriedSpecs.flatMap((s) =>
+          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+        );
+
         specs = [...newSpecs, ...carriedSpecs];
         // Freshly generated specs register ONE test row per scenario the plan
         // requested (see registerSpecRows) so Total/Passed/Failed/etc. reflect

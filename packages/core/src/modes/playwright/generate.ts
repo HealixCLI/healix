@@ -130,7 +130,7 @@ export function findForbiddenApis(source: string): string[] {
   return [...violations];
 }
 
-function looksLikePlaywrightSpec(source: string): boolean {
+export function looksLikePlaywrightSpec(source: string): boolean {
   return /@playwright\/test/.test(source) && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
 }
 

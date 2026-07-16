@@ -275,8 +275,14 @@ interface CmdResult {
   aborted: boolean;
 }
 
-/** Run a one-off command (npm install / browser install) in the suite dir. */
-function runCommand(
+/**
+ * Run a one-off command (npm install / browser install / `playwright test
+ * --list` parse-check) in the suite dir, with the same allowlisted env as
+ * runPlaywright() — see SUITE_ENV_ALLOWLIST. Exported for validate.ts's
+ * pre-execution spec parse-check, which must never hand generated specs a
+ * broader env than the run they're eventually executed in.
+ */
+export function runCommand(
   ctx: TestModeContext,
   command: string,
   args: string[],

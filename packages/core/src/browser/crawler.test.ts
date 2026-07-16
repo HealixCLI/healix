@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { crawl } from './crawler.js';
+import { crawl, crawlWithAuth } from './crawler.js';
 import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, InteractiveElement, Point } from './types.js';
 
 interface FakePage {
@@ -11,13 +11,15 @@ interface FakePage {
  * A fake BrowserSurface driven purely by a URL->page map, keyed by the final
  * (post-redirect) URL. `redirects` maps a requested URL to the URL goto()
  * actually lands on, mirroring how a real page's `page.url()` can differ from
- * what was requested.
+ * what was requested. `onClickGoTo` maps a source URL to a destination URL,
+ * simulating a login form's submit button navigating on success.
  */
 function makeFakeBrowser(config: {
   pages: Record<string, FakePage>;
   redirects?: Record<string, string>;
   throwFor?: Set<string>;
   delayMs?: number;
+  onClickGoTo?: Record<string, string>;
 }): BrowserSurface {
   let currentUrl = '';
   return {
@@ -41,7 +43,10 @@ function makeFakeBrowser(config: {
       }
       return { url: currentUrl, title: page.title ?? currentUrl, interactiveElements: page.elements };
     },
-    async click(_selector: string): Promise<void> {},
+    async click(_selector: string): Promise<void> {
+      const next = config.onClickGoTo?.[currentUrl];
+      if (next) currentUrl = next;
+    },
     async clickAt(_point: Point): Promise<void> {},
     async type(_selector: string, _text: string): Promise<void> {},
     async pressKey(_key: string): Promise<void> {},
@@ -243,5 +248,92 @@ describe('crawl()', () => {
     const result = await crawl(browser, 'https://a.test/');
 
     expect(result.visitedCount).toBe(1);
+  });
+});
+
+const EMAIL_FIELD: InteractiveElement = { role: 'textbox', name: 'Email', selector: '#email', inputType: 'email' };
+const PASSWORD_FIELD: InteractiveElement = {
+  role: 'textbox',
+  name: 'Password',
+  selector: '#password',
+  inputType: 'password',
+};
+const SUBMIT_BUTTON: InteractiveElement = { role: 'button', name: 'Sign in', selector: '#submit' };
+
+describe('crawlWithAuth()', () => {
+  it('returns anonymous-only routes and skips auth when no credentials are supplied', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/login')] },
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+      },
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/');
+
+    expect(result.authAttempted).toBe(false);
+    expect(result.authVerified).toBe(false);
+    expect(result.routes.every((r) => r.role === 'anonymous')).toBe(true);
+  });
+
+  it('degrades to anonymous-only (with a reason) when no password-bearing route is found', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [] },
+      },
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/', {
+      credentials: { username: 'user@a.test', password: 'pw' },
+    });
+
+    expect(result.authAttempted).toBe(false);
+    expect(result.authReason).toMatch(/no password-bearing route/i);
+  });
+
+  it('attempts login on the discovered candidate and crawls authenticated routes on success', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/login')] },
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/dashboard': {
+          elements: [link('https://a.test/dashboard/settings'), { role: 'heading', name: 'Dashboard', selector: 'h1' }],
+        },
+        'https://a.test/dashboard/settings': { elements: [{ role: 'heading', name: 'Settings', selector: 'h1' }] },
+      },
+      onClickGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/', {
+      credentials: { username: 'user@a.test', password: 'correct-pw' },
+    });
+
+    expect(result.authAttempted).toBe(true);
+    expect(result.authVerified).toBe(true);
+
+    const anonymousUrls = result.routes.filter((r) => r.role === 'anonymous').map((r) => r.url);
+    expect(anonymousUrls.sort()).toEqual(['https://a.test/', 'https://a.test/login']);
+
+    const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
+    expect(authUrls.sort()).toEqual(['https://a.test/dashboard', 'https://a.test/dashboard/settings']);
+  });
+
+  it('degrades to anonymous-only when login cannot be verified (wrong credentials)', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/login')] },
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+      },
+      // No onClickGoTo entry: submitting leaves the session on /login.
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/', {
+      credentials: { username: 'user@a.test', password: 'wrong-pw' },
+    });
+
+    expect(result.authAttempted).toBe(true);
+    expect(result.authVerified).toBe(false);
+    expect(result.authReason).toMatch(/password field/i);
+    expect(result.routes.every((r) => r.role === 'anonymous')).toBe(true);
   });
 });

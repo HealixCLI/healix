@@ -1,3 +1,4 @@
+import { attemptLogin } from './login.js';
 import type { BrowserSurface, DomSnapshot } from './types.js';
 
 export interface CrawledRoute {
@@ -7,6 +8,8 @@ export interface CrawledRoute {
   /** BFS distance from the seed URL(s); 0 for the entry route(s). */
   depth: number;
   hasPasswordField: boolean;
+  /** Whether this route was reached before or after a verified login. */
+  role: 'anonymous' | 'authenticated';
 }
 
 export interface CrawlResult {
@@ -42,7 +45,7 @@ interface QueueItem {
 }
 
 /** Strip a trailing slash from the path (but keep a bare "/") while preserving hash/query. */
-function normalizeUrl(url: string): string {
+export function normalizeUrl(url: string): string {
   try {
     const u = new URL(url);
     if (u.pathname.length > 1 && u.pathname.endsWith('/')) {
@@ -168,6 +171,7 @@ export async function crawl(
       snapshot,
       depth: item.depth,
       hasPasswordField: hasPasswordField(snapshot),
+      role: 'anonymous',
     });
 
     // A fingerprint that keeps repeating is a shell page rendering nothing
@@ -192,5 +196,73 @@ export async function crawl(
     budgetExhausted,
     redirectLoopsDetected,
     shellCollapsed,
+  };
+}
+
+export interface CrawlWithAuthOptions extends CrawlOptions {
+  credentials?: { username: string; password: string };
+}
+
+export interface CrawlWithAuthResult extends CrawlResult {
+  /** Whether a login candidate was found and a login was actually attempted. */
+  authAttempted: boolean;
+  /** Whether the login was verified to have actually left the login page. */
+  authVerified: boolean;
+  /** Set whenever auth wasn't attempted or wasn't verified — never blocks the crawl. */
+  authReason?: string;
+}
+
+/**
+ * Anonymous-only routes can never reach pages gated behind login, which are
+ * exactly the pages Tier B generation needs grounded. Runs the anonymous
+ * `crawl()` first (also how a login candidate route is found — any visited
+ * route with a password field), then, only if credentials are supplied and a
+ * candidate was found, attempts a verified login and crawls again from the
+ * post-login landing page. A failed or unverifiable login degrades to the
+ * anonymous-only result plus a reason — it never blocks or throws.
+ */
+export async function crawlWithAuth(
+  browser: BrowserSurface,
+  baseUrl: string,
+  opts: CrawlWithAuthOptions = {},
+): Promise<CrawlWithAuthResult> {
+  const anonymous = await crawl(browser, baseUrl, opts);
+
+  const creds = opts.credentials;
+  if (!creds || !creds.username || !creds.password) {
+    return { ...anonymous, authAttempted: false, authVerified: false };
+  }
+
+  const candidate = anonymous.routes.find((r) => r.hasPasswordField);
+  if (!candidate) {
+    return {
+      ...anonymous,
+      authAttempted: false,
+      authVerified: false,
+      authReason: 'no password-bearing route found during anonymous crawl',
+    };
+  }
+
+  const attempt = await attemptLogin(browser, candidate.url, creds.username, creds.password);
+  if (!attempt.ok) {
+    return {
+      ...anonymous,
+      authAttempted: true,
+      authVerified: false,
+      authReason: attempt.reason,
+    };
+  }
+
+  const authCrawl = await crawl(browser, attempt.landingUrl ?? candidate.url, opts);
+  const authenticatedRoutes = authCrawl.routes.map((r) => ({ ...r, role: 'authenticated' as const }));
+
+  return {
+    routes: [...anonymous.routes, ...authenticatedRoutes],
+    visitedCount: anonymous.visitedCount + authenticatedRoutes.length,
+    budgetExhausted: anonymous.budgetExhausted || authCrawl.budgetExhausted,
+    redirectLoopsDetected: [...anonymous.redirectLoopsDetected, ...authCrawl.redirectLoopsDetected],
+    shellCollapsed: anonymous.shellCollapsed || authCrawl.shellCollapsed,
+    authAttempted: true,
+    authVerified: true,
   };
 }

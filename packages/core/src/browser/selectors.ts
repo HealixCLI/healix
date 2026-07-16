@@ -241,10 +241,13 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         continue;
       }
       seen.add(el);
+      const tag = el.tagName.toLowerCase();
       out.push({
         role: roleFor(el),
         name: accessibleName(el),
         selector: selectorFor(el),
+        href: tag === 'a' ? (el.getAttribute('href') ?? undefined) : undefined,
+        inputType: tag === 'input' ? (el.getAttribute('type') ?? 'text').toLowerCase() : undefined,
       });
     }
 

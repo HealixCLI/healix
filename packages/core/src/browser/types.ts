@@ -13,6 +13,10 @@ export interface InteractiveElement {
   role: string;
   name: string;
   selector: string;
+  /** Raw `href` attribute for `<a>` elements — same-origin links a crawler can follow. */
+  href?: string;
+  /** Raw `type` attribute for `<input>` elements — lets callers spot password fields. */
+  inputType?: string;
 }
 
 export interface DomSnapshot {

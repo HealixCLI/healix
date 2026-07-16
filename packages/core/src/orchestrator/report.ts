@@ -9,6 +9,18 @@ export interface ReportTriageEntry {
   triage: TriageResult;
 }
 
+/** How many planned items actually got a generated spec vs. were silently dropped. */
+export interface GenerationStats {
+  requestedItems: number;
+  acceptedItems: number;
+}
+
+/** Final coverage-feedback-loop ratio vs. its target, when the loop ran. */
+export interface CoverageStats {
+  ratio: number;
+  target: number;
+}
+
 /** Serializable run report written to reports/report.json. */
 export interface RunReport {
   run: Run;
@@ -18,6 +30,10 @@ export interface RunReport {
   triage: ReportTriageEntry[];
   /** Artifact files collected from the mode after execution (relative paths). */
   artifacts: string[];
+  /** Item-level generation accounting across GENERATE and any gap-fill iterations. */
+  generation?: GenerationStats;
+  /** Final coverage-feedback-loop result, or null when the loop didn't run. */
+  coverage?: CoverageStats | null;
   generatedAt: string;
 }
 
@@ -28,6 +44,8 @@ export function buildReport(input: {
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
   artifacts?: string[];
+  generation?: GenerationStats;
+  coverage?: CoverageStats | null;
 }): RunReport {
   return {
     run: input.run,
@@ -36,8 +54,49 @@ export function buildReport(input: {
     outcome: input.outcome,
     triage: input.triage,
     artifacts: input.artifacts ?? [],
+    generation: input.generation,
+    coverage: input.coverage ?? null,
     generatedAt: new Date().toISOString(),
   };
+}
+
+/**
+ * Human-readable degradation notes for this report, or an empty array when
+ * nothing degraded. Covers three independent silent-failure paths that used
+ * to look identical to a normal, fully-AI-authored run:
+ *   1. planSource === 'fallback' — every planning attempt failed and this is
+ *      synthesizePlan()'s minimal hardcoded smoke plan.
+ *   2. plan.fallbackReason present with planSource still 'ai' — a batched
+ *      plan where some (not all) batches failed; the rest is real AI content.
+ *   3. generation.acceptedItems < requestedItems — items were planned but
+ *      silently dropped after failed generation attempts.
+ *   4. coverage.ratio < coverage.target — the coverage-feedback loop stopped
+ *      short of its target.
+ */
+export function degradationNotes(report: RunReport): string[] {
+  const notes: string[] = [];
+  if (report.plan.planSource === 'fallback') {
+    notes.push(
+      `AI planning failed; this run used a minimal fallback plan instead of a full AI-generated one` +
+        (report.plan.fallbackReason ? ` (reason: ${report.plan.fallbackReason}).` : '.'),
+    );
+  } else if (report.plan.fallbackReason) {
+    notes.push(`Part of the plan could not be AI-generated (${report.plan.fallbackReason}).`);
+  }
+  const gen = report.generation;
+  if (gen && gen.acceptedItems < gen.requestedItems) {
+    const dropped = gen.requestedItems - gen.acceptedItems;
+    notes.push(
+      `Generated ${gen.acceptedItems}/${gen.requestedItems} planned spec(s); ${dropped} dropped after failed generation attempts.`,
+    );
+  }
+  const cov = report.coverage;
+  if (cov && cov.ratio < cov.target) {
+    notes.push(
+      `Coverage-feedback loop stopped at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%).`,
+    );
+  }
+  return notes;
 }
 
 /** Render a self-contained, dependency-free HTML report. */
@@ -48,6 +107,14 @@ export function renderReportHtml(report: RunReport): string {
   const failed = outcome?.failed ?? 0;
   const blocked = outcome?.blocked ?? 0;
   const flaky = outcome?.flaky ?? 0;
+  const notes = degradationNotes(report);
+  const degradationBanner =
+    notes.length > 0
+      ? `<section class="degraded">
+    <h2>⚠ This run's suite may be smaller than intended</h2>
+    <ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>
+  </section>`
+      : '';
 
   const planRows = plan.items
     .map((it) => {
@@ -110,6 +177,9 @@ export function renderReportHtml(report: RunReport): string {
   .hist { font-size: .75rem; color: #888; margin-top: .15rem; text-decoration: none; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
   section { margin-bottom: 1rem; }
+  section.degraded { border: 1px solid #9a670066; background: #9a67000f; border-radius: 8px; padding: .25rem 1rem 1rem; }
+  section.degraded h2 { color: #9a6700; }
+  section.degraded ul { margin: 0; padding-left: 1.25rem; }
 </style>
 </head>
 <body>
@@ -117,6 +187,8 @@ export function renderReportHtml(report: RunReport): string {
   <div class="sub">${esc(project.name)} &middot; run <code>${esc(run.id)}</code> &middot; status <strong>${esc(
     run.status,
   )}</strong></div>
+
+  ${degradationBanner}
 
   <div class="cards">
     <div class="card"><div class="n">${total}</div><div>total</div></div>

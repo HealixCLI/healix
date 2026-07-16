@@ -90,6 +90,11 @@ export interface ReportTriageEntryShape {
 export interface RunReportShape {
   triage?: ReportTriageEntryShape[];
   generatedAt?: string;
+  /** Mirrors TestPlan.planSource/fallbackReason — see @healix/core's TestPlan. */
+  planSource?: 'ai' | 'fallback' | 'reuse';
+  fallbackReason?: string;
+  generation?: { requestedItems: number; acceptedItems: number };
+  coverage?: { ratio: number; target: number } | null;
 }
 
 /** Best-effort narrowing of the opaque report.json payload. Returns null when unusable. */
@@ -106,10 +111,60 @@ export function asRunReport(value: unknown): RunReportShape | null {
           typeof (t as Record<string, unknown>).triage === 'object',
       ) as ReportTriageEntryShape[])
     : undefined;
+  const plan = v.plan && typeof v.plan === 'object' ? (v.plan as Record<string, unknown>) : undefined;
+  const generation =
+    v.generation && typeof v.generation === 'object' ? (v.generation as Record<string, unknown>) : undefined;
+  const coverage = v.coverage && typeof v.coverage === 'object' ? (v.coverage as Record<string, unknown>) : undefined;
   return {
     triage,
     generatedAt: typeof v.generatedAt === 'string' ? v.generatedAt : undefined,
+    planSource:
+      plan && (plan.planSource === 'ai' || plan.planSource === 'fallback' || plan.planSource === 'reuse')
+        ? plan.planSource
+        : undefined,
+    fallbackReason: plan && typeof plan.fallbackReason === 'string' ? plan.fallbackReason : undefined,
+    generation:
+      generation && typeof generation.requestedItems === 'number' && typeof generation.acceptedItems === 'number'
+        ? { requestedItems: generation.requestedItems, acceptedItems: generation.acceptedItems }
+        : undefined,
+    coverage:
+      coverage && typeof coverage.ratio === 'number' && typeof coverage.target === 'number'
+        ? { ratio: coverage.ratio, target: coverage.target }
+        : null,
   };
+}
+
+/**
+ * Human-readable degradation notes for a parsed report, or an empty array
+ * when nothing degraded — presentation-only mirror of @healix/core's
+ * report.ts degradationNotes(), kept in sync manually since the renderer
+ * only has the narrowed RunReportShape, not the full core RunReport type.
+ */
+export function reportDegradationNotes(report: RunReportShape | null): string[] {
+  if (!report) return [];
+  const notes: string[] = [];
+  if (report.planSource === 'fallback') {
+    notes.push(
+      `AI planning failed; this run used a minimal fallback plan instead of a full AI-generated one` +
+        (report.fallbackReason ? ` (reason: ${report.fallbackReason}).` : '.'),
+    );
+  } else if (report.fallbackReason) {
+    notes.push(`Part of the plan could not be AI-generated (${report.fallbackReason}).`);
+  }
+  const gen = report.generation;
+  if (gen && gen.acceptedItems < gen.requestedItems) {
+    const dropped = gen.requestedItems - gen.acceptedItems;
+    notes.push(
+      `Generated ${gen.acceptedItems}/${gen.requestedItems} planned spec(s); ${dropped} dropped after failed generation attempts.`,
+    );
+  }
+  const cov = report.coverage;
+  if (cov && cov.ratio < cov.target) {
+    notes.push(
+      `Coverage-feedback loop stopped at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%).`,
+    );
+  }
+  return notes;
 }
 
 /** Added/carried/removed test counts for one run vs. the run it topped-up/reused from. */

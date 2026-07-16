@@ -19,7 +19,7 @@ import { TestCaseHistoryDrawer } from './TestCaseHistoryDrawer';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
 import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
-import { asRunReport } from '../lib/ipc-types';
+import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
 import { cn } from '../lib/utils';
 import {
   artifactLeaf,
@@ -62,6 +62,7 @@ export function RunDetailPanel({
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
   const triage = report?.triage ?? [];
+  const degradationNotes = useMemo(() => reportDegradationNotes(report), [report]);
 
   // Join results to their test rows so the table can show title / REQ / tier.
   const rows = useMemo(() => joinResults(detail?.tests ?? [], detail?.results ?? []), [detail]);
@@ -200,6 +201,17 @@ export function RunDetailPanel({
       </div>
 
       {note && <p className="mt-2 break-all text-xs text-muted">{note}</p>}
+
+      {degradationNotes.length > 0 && (
+        <div className="mt-2 rounded-md border border-amber-500/40 bg-amber-500/10 px-3 py-2 text-xs text-amber-700 dark:text-amber-400">
+          <p className="font-medium">⚠ This run's suite may be smaller than intended</p>
+          <ul className="mt-1 list-disc pl-4">
+            {degradationNotes.map((n, i) => (
+              <li key={i}>{n}</li>
+            ))}
+          </ul>
+        </div>
+      )}
 
       <div className="mt-3">
         <Tabs

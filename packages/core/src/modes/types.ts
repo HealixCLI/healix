@@ -1,6 +1,6 @@
 import type { ProviderAdapter } from '../providers/types.js';
 import type { TargetAdapter } from '../target/types.js';
-import type { BrowserSurface, DomSnapshot } from '../browser/types.js';
+import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
 
@@ -182,9 +182,7 @@ export interface TestModeContext {
   explorationMode?: ExplorationMode;
   /** Which tiers this run is in scope for; drives generation and execution. */
   testingScope?: TestingScope;
-  /** DOM snapshot captured during computer-use exploration; grounds generation. */
-  snapshot?: DomSnapshot;
-  /** Multi-page/multi-role EXPLORE crawl artifact; the richer replacement for `snapshot`. */
+  /** Multi-page/multi-role EXPLORE crawl artifact; grounds generation. */
   exploration?: ExplorationArtifact;
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */

@@ -186,33 +186,65 @@ const MAX_SNAPSHOT_ELEMENTS = 40;
 const MAX_ELEMENT_NAME_LEN = 80;
 
 /**
- * Render the interactive-element inventory captured during computer-use
- * exploration (ctx.snapshot) as a compact list, so generation targets REAL
- * selectors instead of guessing. Returns '' when there is nothing to add:
- *   - no snapshot (no live URL to explore, or exploration failed) or no elements observed;
+ * Render the interactive-element inventory captured during the multi-page
+ * EXPLORE crawl (ctx.exploration) as a compact list, so generation targets
+ * REAL selectors instead of guessing. Returns '' when there is nothing to
+ * add:
+ *   - no exploration artifact (no live URL to explore, or exploration failed) or no elements observed;
  *   - an API tier (tierC-api), which must not drive a browser page at all.
- * The list is capped at MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so
- * a huge page can't blow up the prompt (and the omission isn't silent).
+ * Elements from every crawled route are included (not just the entry page),
+ * each tagged with its route URL and role so a tierB-auth item knows which
+ * elements require the authenticated session. Tier-aware ordering surfaces
+ * the most relevant role first: authenticated routes for tierB-auth items,
+ * anonymous routes otherwise. The combined list is capped at
+ * MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so a huge crawl can't
+ * blow up the prompt (and the omission isn't silent).
  */
 function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
   if (tier === 'tierC-api') return '';
-  const elements = ctx.snapshot?.interactiveElements ?? [];
-  if (elements.length === 0) return '';
+  const routes = ctx.exploration?.crawl.routes ?? [];
+  if (routes.length === 0) return '';
 
-  const shown = elements.slice(0, MAX_SNAPSHOT_ELEMENTS);
-  const lines = shown.map((el) => {
-    const name =
-      el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
-    return `- ${el.role} "${name}" -> ${el.selector}`;
-  });
-  const omitted = elements.length - shown.length;
+  const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
+  const ordered = [...routes].sort((a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole));
+
+  const lines: string[] = [];
+  let totalCount = 0;
+  for (const route of ordered) {
+    for (const el of route.snapshot.interactiveElements) {
+      totalCount += 1;
+      if (lines.length >= MAX_SNAPSHOT_ELEMENTS) continue;
+      const name =
+        el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
+      lines.push(`- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}`);
+    }
+  }
+  if (lines.length === 0) return '';
+
+  const omitted = totalCount - lines.length;
   const more = omitted > 0 ? `\n(+${omitted} more not shown)` : '';
-  const where = ctx.snapshot?.url ? ` on ${ctx.snapshot.url}` : '';
 
   return `
 
-Interactive elements observed${where} during exploration — PREFER these real selectors over guessing:
+Interactive elements observed during exploration across ${ordered.length} route(s) — PREFER these real selectors over guessing. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies):
 ${lines.join('\n')}${more}`;
+}
+
+/**
+ * Hash-routed SPAs (React Router HashRouter etc.) often gate content behind
+ * an invariant locale/region segment (e.g. "#/SK") observed via the app's own
+ * redirect during EXPLORE (see browser/crawler.ts detectRoutePrefix). Without
+ * this, generated specs default to a plain path-based page.goto() that never
+ * reaches the real route. Returns '' for non-hash apps or when no routing
+ * info was captured.
+ */
+function formatRoutingGuidance(ctx: TestModeContext): string {
+  const routing = ctx.exploration?.routing;
+  if (!routing?.hashRouted) return '';
+  const prefixNote = routing.invariantPrefix ? ` with an observed invariant prefix "${routing.invariantPrefix}"` : '';
+  return `
+
+This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
 }
 
 /** Render a plan item's scenarios as a numbered list for the generation prompt. */
@@ -225,6 +257,7 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
+  const routingGuidance = formatRoutingGuidance(ctx);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
@@ -251,7 +284,7 @@ Requirements:
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
 - Be self-contained and runnable; do not import local helpers.
-- ${tierGuidance}${strictNote}${inventory}
+- ${tierGuidance}${strictNote}${inventory}${routingGuidance}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}

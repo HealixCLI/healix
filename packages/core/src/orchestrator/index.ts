@@ -864,10 +864,6 @@ async function runPipeline(
             onFrame: hooks?.onFrame,
           });
           ctx.exploration = exploration;
-          // Backward-compat for the one remaining reader of the old
-          // single-page shape (generate.ts's formatSnapshotInventory) until
-          // it's updated to consume the richer crawl artifact directly.
-          ctx.snapshot = exploration.crawl.routes[0]?.snapshot;
         } catch (err) {
           emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
         }

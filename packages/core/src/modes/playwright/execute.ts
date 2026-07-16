@@ -91,10 +91,17 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     env.HEALIX_TIERB_EMAIL = ctx.testUsername;
     env.HEALIX_TIERB_PASSWORD = ctx.testPassword;
     // The auth fixture requires all three of email/password/loginUrl to
-    // attempt a real login (see authSetupContents() in templates.ts) — absent
-    // a dedicated "login URL" field on the project, default to the common
-    // `/login` convention relative to the configured base URL.
-    if (ctx.baseUrl) env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    // attempt a real login (see authSetupContents() in templates.ts). Prefer
+    // EXPLORE's discovered/scored login candidate (hash- and region-prefix
+    // aware — see browser/crawler.ts scoreLoginCandidates) over the naive
+    // `/login` path join, which 404s or falls back to the app's default
+    // route on a HashRouter + region-prefixed app (the RCA's Branch 2).
+    const discovered = ctx.exploration?.loginCandidates?.[0]?.url;
+    if (discovered) {
+      env.HEALIX_TIERB_LOGIN_URL = discovered;
+    } else if (ctx.baseUrl) {
+      env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    }
   }
   return env;
 }

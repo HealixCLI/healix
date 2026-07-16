@@ -39,6 +39,8 @@ import {
   type PlanApprovalResult,
   type RunSummary,
   type Run,
+  type PauseReason,
+  readCheckpoint,
   type SuiteMode,
   type TestCase,
   type TestResult,
@@ -413,6 +415,55 @@ async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunS
 }
 
 /**
+ * Continue a paused run from its last checkpoint (see @healix/core's
+ * orchestrator/checkpoint.ts) — a manual pause, or an automatic one from a
+ * network/credits interruption. Shares executeRun's event/frame wiring, but
+ * `send` is a callback instead of a fixed WebContents: boot-time auto-resume
+ * has no single renderer to target yet, so it passes broadcastAll, while the
+ * run:resume IPC handler passes a sender-scoped safeSend.
+ *
+ * A resumed run re-registers under activeRuns exactly like a fresh one (a
+ * paused run's controller was already deleted when it paused — see
+ * executeRun's finally), so the "one run at a time" gate and the queue both
+ * treat it identically to a brand-new run.
+ */
+async function resumeRun(runId: string, send: (channel: string, payload: unknown) => void): Promise<RunSummary> {
+  const controller = new AbortController();
+  activeRuns.set(runId, controller);
+
+  const store = await requireStore();
+  const run = store.getRun(runId);
+  // Reuses 'run:started' (not a distinct channel) — the renderer's handler
+  // already does exactly what a resume needs: reset its live view to
+  // 'running' for this runId. See run-engine.ts's onRunEvent switch.
+  send('run:started', { runId, projectId: run?.projectId ?? 'unknown' });
+
+  const orchestrator = createOrchestrator();
+  const summary = await orchestrator
+    .resume(
+      runId,
+      {
+        onEvent: (e) => send('run:event', { runId, event: e }),
+        onFrame: (frame: Buffer) => send('run:frame', { runId, frameBase64: frame.toString('base64') }),
+      },
+      controller.signal,
+    )
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      send('run:event', { runId, event: { phase: 'error', level: 'error', message } });
+      const failed: RunSummary = { runId, status: 'error' };
+      return failed;
+    })
+    .finally(() => {
+      settleApproval(runId, { decision: 'cancel' });
+      activeRuns.delete(runId);
+    });
+
+  send('run:done', { runId, summary });
+  return summary;
+}
+
+/**
  * Pop the next queued request (if any) and run it, chaining onward to the one
  * after that once IT settles — this is what makes the queue actually drain
  * itself, one at a time, without any renderer involvement.
@@ -569,6 +620,51 @@ ipcMain.handle('run:cancel', async (_e, payload: { runId: string }): Promise<{ c
   controller.abort();
   return { cancelled: true };
 });
+
+ipcMain.handle('run:pause', async (_e, payload: { runId: string }): Promise<{ paused: boolean }> => {
+  const runId = payload?.runId;
+  if (!runId) return { paused: false };
+  // A parked approval gate would hold the orchestrator before it ever checks
+  // the abort signal — same reasoning as run:cancel.
+  settleApproval(runId, { decision: 'cancel' });
+  const controller = activeRuns.get(runId);
+  if (!controller) return { paused: false };
+  // The reason string IS the signal: the orchestrator's isPauseRequested()
+  // checks `signal.reason === 'pause'` to distinguish this from a plain cancel.
+  controller.abort('pause');
+  return { paused: true };
+});
+
+ipcMain.handle(
+  'run:resume',
+  async (
+    event,
+    payload: { runId: string },
+  ): Promise<{ resumed: true; summary: RunSummary } | { resumed: false; reason: string }> => {
+    const runId = payload?.runId;
+    if (!runId) return { resumed: false, reason: 'A runId is required.' };
+
+    const store = await requireStore();
+    const run = store.getRun(runId);
+    if (!run) return { resumed: false, reason: `No run found with id ${runId}.` };
+    if (run.status !== 'paused') {
+      return { resumed: false, reason: `Run is ${run.status}, not paused.` };
+    }
+    // Same "one run executes at a time" gate run:start enforces — resuming
+    // doesn't get to cut in front of whatever is currently live.
+    if (activeRuns.size > 0) {
+      return { resumed: false, reason: 'Another run is currently active. Try again once it finishes.' };
+    }
+
+    // Mirrors run:start: block on the full run (the renderer already gets live
+    // progress via the run:started/run:event/run:done push channels), then
+    // let the queue advance once this one truly settles.
+    const sender = event.sender;
+    const summary = await resumeRun(runId, (channel, msg) => safeSend(sender, channel, msg));
+    void startNextQueued();
+    return { resumed: true, summary };
+  },
+);
 
 /** Swallows the level param so resolveProvider's emit callback has somewhere harmless to go. */
 function noopEmit(_phase: string, _level: 'debug' | 'info' | 'warn' | 'error', _message: string): void {
@@ -1156,20 +1252,95 @@ function safeSend(sender: WebContents, channel: string, payload: unknown): void 
   sender.send(channel, payload);
 }
 
+/**
+ * Boot-time reconciliation: fully automatic, no confirmation prompt (a paused
+ * run just quietly picks back up). Three cases, in order:
+ *
+ * 1. Runs already cleanly 'paused' for a non-manual reason (network/credits —
+ *    see HealixStore.listAutoResumableRuns()) from a PRIOR session: resume
+ *    each directly. A 'manual' pause is never touched here — the user must
+ *    resume it themselves.
+ * 2. Runs still showing an in-flight status (planning/generating/…) with a
+ *    checkpoint surviving on disk — the process driving them is gone
+ *    (crash/quit) before it could mark them 'paused' itself, but there IS
+ *    something to pick back up: claim the row as 'paused'/'crashed' and
+ *    resume it.
+ * 3. Runs still in-flight with NO checkpoint — e.g. the app was closed mid
+ *    PLAN, before GENERATE ever got a chance to write one. There is nothing
+ *    to resume from (redoing PLAN from scratch is just... starting over), so
+ *    unlike case 2 this fails the row immediately instead of leaving it
+ *    stuck showing a live-looking status indefinitely (previously this fell
+ *    through to failOrphanedRuns()'s 6-HOUR age buffer, which reads as
+ *    "auto-resume is broken" to anyone testing this within the same hour).
+ *
+ * Runs one at a time via resumeRun's own activeRuns gate — a second call
+ * simply won't find `activeRuns` empty and this loop doesn't wait between
+ * iterations, so in practice only the first auto-resumable run starts
+ * immediately; the rest are picked up by startNextQueued's drain once it
+ * settles (queued exactly like any other pending request would be, since
+ * resumeRun re-registers under activeRuns exactly like a fresh run).
+ */
+async function reconcileRunsOnBoot(): Promise<void> {
+  const store = await getStore();
+  if (!store) return;
+
+  const toResume: Run[] = [...store.listAutoResumableRuns()];
+  let failedNow = 0;
+  for (const run of store.listInFlightRuns()) {
+    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
+    const checkpoint = await readCheckpoint(runDir);
+    if (!checkpoint) {
+      store.updateRunStatus(run.id, 'error', { finishedAt: new Date().toISOString() });
+      try {
+        store.appendEvent(
+          run.id,
+          'done',
+          'Run interrupted (app closed or crashed) before any checkpoint existed — nothing to resume from.',
+          { level: 'error' },
+        );
+      } catch {
+        /* best-effort */
+      }
+      failedNow += 1;
+      continue;
+    }
+    const pauseReason: PauseReason = 'crashed';
+    store.updateRunStatus(run.id, 'paused', { pauseReason, finishedAt: new Date().toISOString() });
+    toResume.push({ ...run, status: 'paused', pauseReason });
+  }
+  if (failedNow > 0) {
+    console.log(`[healix] boot: marked ${failedNow} uncheckpointed in-flight run(s) as error (nothing to resume from).`);
+  }
+
+  for (const run of toResume) {
+    console.log(`[healix] auto-resuming run ${run.id} (paused: ${run.pauseReason ?? 'unknown'}).`);
+    void resumeRun(run.id, (channel, payload) => broadcastAll(channel, payload))
+      .catch((err: unknown) => {
+        console.error(`[healix] auto-resume of run ${run.id} failed:`, err);
+      })
+      .finally(() => {
+        void startNextQueued();
+      });
+  }
+
+  // Fallback janitor for anything the pass above didn't touch (e.g. storage
+  // was briefly unavailable) — still age-buffered (default 6h) so it never
+  // reaps a run genuinely still in flight in another process (e.g. the CLI).
+  try {
+    const reaped = store.failOrphanedRuns();
+    if (reaped > 0) console.log(`[healix] janitor: marked ${reaped} orphaned run(s) as error`);
+  } catch {
+    /* best-effort */
+  }
+}
+
 app.whenReady().then(() => {
   registerArtifactProtocol();
-  // Orphaned-run janitor: runs left in non-terminal states by a crashed or
-  // quit session would otherwise look "running" forever in the history rail
-  // (a real one sat in 'planning' for a week). Best-effort and fire-and-forget
-  // so a missing/broken store never blocks window creation.
-  void (async () => {
-    try {
-      const reaped = (await getStore())?.failOrphanedRuns() ?? 0;
-      if (reaped > 0) console.log(`[healix] janitor: marked ${reaped} orphaned run(s) as error`);
-    } catch {
-      /* storage unavailable — nothing to reap */
-    }
-  })();
+  // Best-effort and fire-and-forget so a missing/broken store never blocks
+  // window creation.
+  void reconcileRunsOnBoot().catch(() => {
+    /* storage unavailable — nothing to reconcile */
+  });
   applyDevDockIcon();
   createWindow();
   app.on('activate', () => {

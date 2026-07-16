@@ -11,12 +11,21 @@ import type {
 } from '@healix/core';
 import type { RunChannelMessage, StartRunArgs } from './ipc-types';
 
-export type RunPhase = 'idle' | 'starting' | 'running' | 'awaiting-approval' | 'done' | 'cancelled' | 'error';
+export type RunPhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'awaiting-approval'
+  | 'paused'
+  | 'done'
+  | 'cancelled'
+  | 'error';
 
-/** Map a final run summary status onto the engine phase. */
+/** Map a final run summary status onto the engine phase. 'paused' is NOT terminal — see RunPhase's own doc. */
 function settledPhase(status: RunSummary['status']): RunPhase {
   if (status === 'error') return 'error';
   if (status === 'cancelled') return 'cancelled';
+  if (status === 'paused') return 'paused';
   return 'done';
 }
 
@@ -74,6 +83,13 @@ export interface RunEngine extends RunEngineState {
   rejectAll: () => Promise<void>;
   /** Request cancellation of the active run; run:done ('cancelled') confirms. */
   cancel: () => Promise<void>;
+  /** Request a manual pause of the active run; run:done ('paused') confirms. */
+  pause: () => Promise<void>;
+  /**
+   * Resume a specific paused run (from a history row, not necessarily the
+   * run this engine was last tracking) and adopt it as the live run.
+   */
+  resume: (runId: string) => Promise<void>;
   reset: () => void;
   /**
    * Re-attach to a run that is still genuinely parked awaiting approval in the
@@ -210,7 +226,12 @@ export function useRunEngine(): RunEngine {
         ...INITIAL,
         runId: active.runId,
         lines,
-        phase: detail.run.status === 'awaiting-approval' ? 'awaiting-approval' : 'running',
+        phase:
+          detail.run.status === 'awaiting-approval'
+            ? 'awaiting-approval'
+            : detail.run.status === 'paused'
+              ? 'paused'
+              : 'running',
         plan: detail.plan,
         workingPlan: detail.plan ? clonePlan(detail.plan) : null,
         hydrated: true,
@@ -494,12 +515,25 @@ export function useRunEngine(): RunEngine {
   const cancel = useCallback(async (): Promise<void> => {
     const runId = activeRunId.current;
     if (!runId) return;
+    // A paused run never has a live controller to abort (it was already
+    // released back when it paused — see main/index.ts's activeRuns
+    // bookkeeping), so cancelling one ALWAYS takes the "nothing live, force-
+    // settle" path below. That's the normal, expected outcome here, not an
+    // anomaly — captured before the call so the response below can tell the
+    // two cases apart.
+    const wasPaused = stateRef.current.phase === 'paused';
     // Cancellation is asynchronous and cooperative: the main process aborts the
     // orchestrator, which winds down at the next phase boundary. We do NOT flip
     // the phase here — the authoritative 'cancelled' arrives via run:done.
     try {
       const result = await window.healix.cancelRun(runId);
       if (!result.cancelled) {
+        if (wasPaused) {
+          // Expected path for a paused run — force-settled to 'cancelled' by
+          // design, not because anything was orphaned. No error banner.
+          setState((prev) => ({ ...prev, phase: 'cancelled', hydrated: false }));
+          return;
+        }
         // Nothing was actually running on the backend for this runId — most
         // likely orphaned by an app restart since it started (same class of
         // gap as approveAndContinue/rejectAll's !settled case). run:done will
@@ -519,6 +553,55 @@ export function useRunEngine(): RunEngine {
       }
     } catch {
       // The run may have already settled; run:done tells the real story.
+    }
+  }, []);
+
+  const pause = useCallback(async (): Promise<void> => {
+    const runId = activeRunId.current;
+    if (!runId) return;
+    // Same cooperative shape as cancel(): we do NOT flip the phase here — the
+    // authoritative 'paused' status arrives via run:done once the orchestrator
+    // actually winds down at its next checkpoint boundary.
+    try {
+      const result = await window.healix.pauseRun(runId);
+      if (!result.paused) {
+        // Nothing live to pause (already settled, or an app-restart orphan).
+        // run:done will already have told the real story, or never arrives —
+        // either way there's nothing further to force here (unlike cancel,
+        // which has an explicit "mark it cancelled" fallback: a run that's
+        // gone is simply not pausable, so leaving it alone is correct).
+      }
+    } catch {
+      /* the run may have already settled; run:done tells the real story */
+    }
+  }, []);
+
+  const resume = useCallback(async (runId: string): Promise<void> => {
+    // Adopt this run as the live one immediately, mirroring start(): resuming
+    // makes a paused history row live again, so its console/plan/summary
+    // should reset just like a freshly-started run rather than carry over
+    // whatever this engine was last showing.
+    lineSeq.current = 0;
+    activeRunId.current = runId;
+    setState({ ...INITIAL, runId, phase: 'starting' });
+    try {
+      // Note: resumeRun resolves only when the run finishes (or pauses again);
+      // live updates flow through onRunEvent same as start().
+      const result = await window.healix.resumeRun(runId);
+      if (!result.resumed) {
+        setState((prev) => ({ ...prev, phase: 'error', error: result.reason }));
+        return;
+      }
+      const summary = result.summary;
+      setState((prev) => ({
+        ...prev,
+        summary,
+        // run:done may have already set phase; keep error sticky.
+        phase: prev.phase === 'error' ? 'error' : settledPhase(summary.status),
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setState((prev) => ({ ...prev, phase: 'error', error: message }));
     }
   }, []);
 
@@ -556,6 +639,8 @@ export function useRunEngine(): RunEngine {
     approveAndContinue,
     rejectAll,
     cancel,
+    pause,
+    resume,
     reset,
     hydrate,
     clearError,

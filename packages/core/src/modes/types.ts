@@ -167,7 +167,23 @@ export interface TestMode {
   readonly id: ModeId;
   scaffold(ctx: TestModeContext): Promise<void>;
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
-  execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
+  execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: Tier }): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;
+}
+
+/**
+ * Thrown by a mode's generate() ONLY when every requested item failed at the
+ * provider-communication level — never once got far enough to validate model
+ * output. Shared across modes (not Playwright-specific) so the orchestrator
+ * can catch it without depending on any one mode's implementation. See
+ * orchestrator/checkpoint.ts's classifyTransientFailure for what happens next:
+ * this is the signal to checkpoint+pause instead of hard-erroring on what
+ * would otherwise look like "verified nothing."
+ */
+export class ProviderUnavailableError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = 'ProviderUnavailableError';
+  }
 }

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { access, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { TestStatus } from '../../storage/types.js';
+import type { Tier, TestStatus } from '../../storage/types.js';
 import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestingScope, TestModeContext } from '../types.js';
 import { tiersForScope } from '../types.js';
 
@@ -124,7 +124,7 @@ interface RawCommand {
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
-function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
+function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
     // Cancelled before we even spawned — return immediately; nothing to kill.
     if (ctx.signal?.aborted) {
@@ -142,7 +142,10 @@ function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
     // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
-    const args = ['playwright', 'test', ...playwrightProjectArgs(ctx.testingScope)];
+    // onlyTier (resume's per-tier batching — see execute()'s opts) restricts
+    // to exactly that one tier, overriding the scope-wide project selection.
+    const projectArgs = onlyTier ? ['--project', onlyTier] : playwrightProjectArgs(ctx.testingScope);
+    const args = ['playwright', 'test', ...projectArgs];
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -736,8 +739,17 @@ function abortedOutcome(exitCode: number | null = null): ExecOutcome {
  * aborted outcome (raw.aborted) is returned so callers can distinguish
  * "cancelled" from "ran and everything failed".
  */
-export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-  emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
+export async function execute(
+  ctx: TestModeContext,
+  specs: GeneratedSpec[],
+  opts?: { onlyTier?: Tier },
+): Promise<ExecOutcome> {
+  const onlyTier = opts?.onlyTier;
+  emit(
+    ctx,
+    `Executing ${specs.length} spec(s) via Playwright${onlyTier ? ` (${onlyTier} only)` : ''}`,
+    { count: specs.length, onlyTier },
+  );
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');
@@ -754,7 +766,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
-  let cmd = await runPlaywright(ctx);
+  let cmd = await runPlaywright(ctx, onlyTier);
 
   // Cancelled during (or right before) the run: partial results are
   // meaningless and would mislabel interrupted tests as failures — discard
@@ -776,7 +788,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
-    cmd = await runPlaywright(ctx);
+    cmd = await runPlaywright(ctx, onlyTier);
 
     // The retry run can be cancelled too (as can the install before it).
     if (cmd.aborted || ctx.signal?.aborted) {

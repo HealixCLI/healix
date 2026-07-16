@@ -124,6 +124,12 @@ const CANNED_OUTCOME: ExecOutcome = {
 };
 
 /** TestMode whose every phase returns canned, side-effect-free data. */
+// Tier-aware: the orchestrator invokes execute() once per in-scope tier
+// rather than once for the whole suite, so a result whose title matches one
+// of THIS call's specs belongs to this tier; anything matching no generated
+// spec at all is delivered once, on the first call, so it isn't dropped.
+let fakeModeExecuteCallCount = 0;
+const fakeModeAllGeneratedTitles = new Set(CANNED_SPECS.map((s) => s.title));
 const fakeMode: TestMode = {
   id: 'playwright',
   async scaffold(_ctx: TestModeContext): Promise<void> {
@@ -132,8 +138,21 @@ const fakeMode: TestMode = {
   async generate(_ctx: TestModeContext, _plan: TestPlan): Promise<GeneratedSpec[]> {
     return CANNED_SPECS.map((s) => ({ ...s }));
   },
-  async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
-    return { ...CANNED_OUTCOME, results: CANNED_OUTCOME.results.map((r) => ({ ...r })) };
+  async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+    fakeModeExecuteCallCount += 1;
+    const specTitles = new Set(specs.map((s) => s.title));
+    const results = CANNED_OUTCOME.results
+      .filter(
+        (r) => specTitles.has(r.title) || (fakeModeExecuteCallCount === 1 && !fakeModeAllGeneratedTitles.has(r.title)),
+      )
+      .map((r) => ({ ...r }));
+    return {
+      passed: results.filter((r) => r.status === 'passed').length,
+      failed: results.filter((r) => r.status === 'failed').length,
+      blocked: results.filter((r) => r.status === 'blocked').length,
+      flaky: results.filter((r) => r.status === 'flaky').length,
+      results,
+    };
   },
   async collectArtifacts(_ctx: TestModeContext): Promise<{ dir: string; files: string[] }> {
     return { dir: 'artifacts', files: ['test-results/x.png'] };

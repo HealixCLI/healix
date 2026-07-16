@@ -2,6 +2,7 @@ import { existsSync } from 'node:fs';
 import type { Command } from 'commander';
 import pc from 'picocolors';
 import {
+  createOrchestrator,
   getStore,
   projectsDir,
   type AgentEvent,
@@ -10,7 +11,8 @@ import {
   type TestCase,
   type TestStatus,
 } from '@healix/core';
-import { isTerminalRunStatus, reportPathFor, shapeRunShow } from '../lib/helpers.js';
+import { isTerminalRunStatus, reportPathFor, runExitCode, shapeRunShow } from '../lib/helpers.js';
+import { printSummary, streamEvent } from './run.js';
 
 /** Print a friendly hint when the local SQLite store is unavailable. */
 function storeUnavailable(): void {
@@ -277,6 +279,58 @@ export function registerRuns(program: Command): void {
       console.log(pc.green(`  ✔ Run ${pc.bold(runId)} marked as cancelled (was ${run.status}).`));
       console.log(pc.dim('    Note: this updates the stored status only; it cannot stop a live process.'));
       console.log('');
+    });
+
+  /**
+   * Resume a paused run from its last checkpoint (see orchestrator/checkpoint.ts):
+   * a manual pause, or an automatic one from a network/credits interruption.
+   * Skips re-planning and re-generating already-accepted specs; re-executes
+   * only the tier(s) that hadn't finished when the run paused.
+   */
+  cmd
+    .command('resume <runId>')
+    .description('Resume a paused run from its last checkpoint')
+    .action(async (runId: string) => {
+      const store = await getStore();
+      if (!store) {
+        storeUnavailable();
+        process.exitCode = 1;
+        return;
+      }
+
+      const run = store.getRun(runId);
+      if (!run) {
+        console.log('');
+        console.log(pc.red(`  ✖ No run found with id ${pc.bold(runId)}.`));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+      if (run.status !== 'paused') {
+        console.log('');
+        console.log(pc.yellow(`  ⚠ Run ${pc.bold(runId)} is ${run.status}, not paused — nothing to resume.`));
+        console.log('');
+        process.exitCode = 1;
+        return;
+      }
+
+      const orchestrator = createOrchestrator();
+      console.log('');
+      console.log(
+        `  ${pc.bold('Resuming run')} ${pc.dim(runId)} ${pc.dim(`(paused: ${run.pauseReason ?? 'unknown'})`)}`,
+      );
+      console.log('');
+
+      try {
+        const summary = await orchestrator.resume(runId, { onEvent: streamEvent });
+        printSummary(summary);
+        process.exitCode = runExitCode(summary.status);
+      } catch (err) {
+        console.log('');
+        console.log(pc.red(`  ✖ Resume failed: ${err instanceof Error ? err.message : String(err)}`));
+        console.log('');
+        process.exitCode = 1;
+      }
     });
 
   cmd

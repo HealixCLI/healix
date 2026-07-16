@@ -34,7 +34,22 @@ export type RunStatus =
   /** Terminal: nothing failed, but ≥1 test was blocked (prerequisite such as Tier-B auth not met) — NOT a green run. */
   | 'blocked'
   | 'error'
-  | 'cancelled';
+  | 'cancelled'
+  /**
+   * Stopped short of a verdict, but resumable from a checkpoint (see
+   * orchestrator/checkpoint.ts) — NOT terminal. Never reaped by
+   * failOrphanedRuns(); see `pauseReason` for why it's here and whether it's
+   * eligible for automatic resume.
+   */
+  | 'paused';
+
+/**
+ * Why a 'paused' run stopped. 'manual' is the only reason boot-time
+ * reconciliation must never auto-resume — the user paused it on purpose and
+ * must explicitly resume it themselves. The other three are transient
+ * interruptions Healix can safely retry on its own.
+ */
+export type PauseReason = 'manual' | 'network' | 'credits-exhausted' | 'crashed';
 
 /** How a run's suite was produced: fully regenerated, topped-up from a prior run, or re-executed as-is. */
 export type SuiteMode = 'fresh' | 'topup' | 'reuse';
@@ -52,6 +67,8 @@ export interface Run {
   suiteMode: SuiteMode | null;
   /** The prior run this one topped-up/reused from, if any. */
   baseRunId: string | null;
+  /** Set only when status is 'paused'; null otherwise (including for runs predating this feature). */
+  pauseReason: PauseReason | null;
 }
 
 export type Tier = 'tierA-public' | 'tierB-auth' | 'tierC-api' | (string & {});

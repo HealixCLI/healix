@@ -82,9 +82,7 @@ export function buildTriagePrompt(input: TriageInput): string {
     ? [
         '',
         `--- MATCHED SOURCE FILE: ${input.sourceFile} ---`,
-        input.sourceExcerpt
-          ? truncate(input.sourceExcerpt, MAX_SOURCE_CHARS)
-          : '(file content unavailable)',
+        input.sourceExcerpt ? truncate(input.sourceExcerpt, MAX_SOURCE_CHARS) : '(file content unavailable)',
       ]
     : [];
 

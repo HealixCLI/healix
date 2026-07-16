@@ -79,30 +79,33 @@ function listSourceFiles(dir: string): string[] {
 
 const rbacAvailable = RBAC_DIRS.some((d) => fs.existsSync(d));
 
-describe.skipIf(!rbacAvailable)('parseModule against Role-Based-Access-Control-RBAC- (isolated check)', () => {
-  it('never throws across the real repo, and parses the large majority of files', () => {
-    const files = RBAC_DIRS.flatMap(listSourceFiles);
-    expect(files.length).toBeGreaterThan(0);
+describe.skipIf(!rbacAvailable)(
+  'parseModule against Role-Based-Access-Control-RBAC- (isolated check)',
+  () => {
+    it('never throws across the real repo, and parses the large majority of files', () => {
+      const files = RBAC_DIRS.flatMap(listSourceFiles);
+      expect(files.length).toBeGreaterThan(0);
 
-    let failed = 0;
-    const failures: string[] = [];
-    for (const file of files) {
-      const source = fs.readFileSync(file, 'utf-8');
-      let ast: ReturnType<typeof parseModule> = null;
-      expect(() => {
-        ast = parseModule(source, file);
-      }).not.toThrow();
-      if (ast === null) {
-        failed += 1;
-        failures.push(file);
+      let failed = 0;
+      const failures: string[] = [];
+      for (const file of files) {
+        const source = fs.readFileSync(file, 'utf-8');
+        let ast: ReturnType<typeof parseModule> = null;
+        expect(() => {
+          ast = parseModule(source, file);
+        }).not.toThrow();
+        if (ast === null) {
+          failed += 1;
+          failures.push(file);
+        }
       }
-    }
 
-    // Informational: report which files failed to parse (if any) without
-    // asserting a specific count, since fixture content may change.
-    if (failed > 0) {
-      console.log(`parseModule: ${failed}/${files.length} file(s) failed to parse:`, failures);
-    }
-    expect(failed).toBeLessThan(files.length);
-  });
-});
+      // Informational: report which files failed to parse (if any) without
+      // asserting a specific count, since fixture content may change.
+      if (failed > 0) {
+        console.log(`parseModule: ${failed}/${files.length} file(s) failed to parse:`, failures);
+      }
+      expect(failed).toBeLessThan(files.length);
+    });
+  },
+);

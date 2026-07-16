@@ -113,11 +113,7 @@ async function parseCheck(
   relPosixPath: string,
 ): Promise<{ ok: boolean; tail: string }> {
   const res = await runCommand(ctx, 'npx', ['playwright', 'test', '--list', relPosixPath], LIST_TIMEOUT_MS);
-  const tail = `${res.stdout}\n${res.stderr}`
-    .split(/\r?\n/)
-    .filter(Boolean)
-    .slice(-6)
-    .join(' | ');
+  const tail = `${res.stdout}\n${res.stderr}`.split(/\r?\n/).filter(Boolean).slice(-6).join(' | ');
   return { ok: res.code === 0, tail };
 }
 

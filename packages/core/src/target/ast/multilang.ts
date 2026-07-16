@@ -12,9 +12,7 @@ function extractPython(rel: string, source: string): FunctionalityUnit[] {
   const routeRe = /@\w+\.route\(\s*(["'])(.*?)\1(?:\s*,\s*methods\s*=\s*\[([^\]]*)\])?\s*\)/g;
   for (const m of source.matchAll(routeRe)) {
     const routePath = m[2];
-    const methods = m[3]
-      ? [...m[3].matchAll(/["'](\w+)["']/g)].map((mm) => mm[1].toUpperCase())
-      : ['GET'];
+    const methods = m[3] ? [...m[3].matchAll(/["'](\w+)["']/g)].map((mm) => mm[1].toUpperCase()) : ['GET'];
     for (const method of methods) units.push(unit(method, routePath, rel));
   }
 

@@ -68,7 +68,10 @@ function isSubmitControl(el: JSXOpeningElement, tagName: string): boolean {
 function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number): FormField | null {
   const isNative = NATIVE_INPUT_TAGS.has(tagName);
   const declaredType = attrString(el, 'type');
-  const isInputLike = isNative || (declaredType && KNOWN_INPUT_TYPES.has(declaredType)) || INPUT_COMPONENT_NAME_RE.test(tagName);
+  const isInputLike =
+    isNative ||
+    (declaredType && KNOWN_INPUT_TYPES.has(declaredType)) ||
+    INPUT_COMPONENT_NAME_RE.test(tagName);
   if (!isInputLike) return null;
 
   const testId = attrString(el, 'data-testid');
@@ -78,7 +81,8 @@ function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number
     testId ??
     attrString(el, 'id') ??
     `field-${fallbackIndex}`;
-  const type = declaredType ?? (tagName === 'select' ? 'select' : tagName === 'textarea' ? 'textarea' : 'text');
+  const type =
+    declaredType ?? (tagName === 'select' ? 'select' : tagName === 'textarea' ? 'textarea' : 'text');
   const required = hasTruthyAttr(el, 'required');
 
   return { name, type, required, ...(testId ? { testId } : {}) };

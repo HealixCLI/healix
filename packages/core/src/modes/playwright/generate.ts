@@ -217,7 +217,9 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
   if (routes.length === 0) return '';
 
   const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
-  const ordered = [...routes].sort((a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole));
+  const ordered = [...routes].sort(
+    (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
+  );
 
   const lines: string[] = [];
   let totalCount = 0;
@@ -252,7 +254,9 @@ ${lines.join('\n')}${more}`;
 function formatRoutingGuidance(ctx: TestModeContext): string {
   const routing = ctx.exploration?.routing;
   if (!routing?.hashRouted) return '';
-  const prefixNote = routing.invariantPrefix ? ` with an observed invariant prefix "${routing.invariantPrefix}"` : '';
+  const prefixNote = routing.invariantPrefix
+    ? ` with an observed invariant prefix "${routing.invariantPrefix}"`
+    : '';
   return `
 
 This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
@@ -299,8 +303,10 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string
     lines.push(
       'This endpoint is defined in an authoritative API spec below — do not invent request/response fields beyond what is shown.',
     );
-    if (unit.requestSchema !== undefined) lines.push(`Request shape: ${truncateJson(unit.requestSchema, MAX_SCHEMA_CHARS)}`);
-    if (unit.responseSchema !== undefined) lines.push(`Response shape: ${truncateJson(unit.responseSchema, MAX_SCHEMA_CHARS)}`);
+    if (unit.requestSchema !== undefined)
+      lines.push(`Request shape: ${truncateJson(unit.requestSchema, MAX_SCHEMA_CHARS)}`);
+    if (unit.responseSchema !== undefined)
+      lines.push(`Response shape: ${truncateJson(unit.responseSchema, MAX_SCHEMA_CHARS)}`);
     if (unit.authRequired !== undefined) lines.push(`Auth required: ${unit.authRequired ? 'yes' : 'no'}.`);
   }
 
@@ -489,7 +495,9 @@ async function generateOne(
     // Source-citation gate: only enforced when this item actually matched a real
     // source-context unit (formatSourceGrounding only demands the citation in that case) — an
     // item with no unitKey/match has no file to cite, so nothing to gate here.
-    const matchedUnit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+    const matchedUnit = item.unitKey
+      ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey)
+      : undefined;
     if (matchedUnit && !hasSrcCitation(source, matchedUnit.file)) {
       emit(
         ctx,

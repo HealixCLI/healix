@@ -310,7 +310,10 @@ export async function crawlWithAuth(
     budgetExhausted: anonymous.budgetExhausted || authCrawl.budgetExhausted,
     redirectLoopsDetected: [...anonymous.redirectLoopsDetected, ...authCrawl.redirectLoopsDetected],
     shellCollapsed: anonymous.shellCollapsed || authCrawl.shellCollapsed,
-    degenerateRedirectsSkipped: [...anonymous.degenerateRedirectsSkipped, ...authCrawl.degenerateRedirectsSkipped],
+    degenerateRedirectsSkipped: [
+      ...anonymous.degenerateRedirectsSkipped,
+      ...authCrawl.degenerateRedirectsSkipped,
+    ],
     authAttempted: true,
     authVerified: true,
   };
@@ -428,7 +431,11 @@ const DYNAMIC_SEGMENT_RE = /[:[*]/;
  * segment (":id", "[id]", "*") are dropped: there's no real value to crawl
  * them with, and guessing one produces noise, not signal.
  */
-export function reconcileStaticRoutePaths(paths: string[], routing: RoutePrefixInfo, baseUrl: string): string[] {
+export function reconcileStaticRoutePaths(
+  paths: string[],
+  routing: RoutePrefixInfo,
+  baseUrl: string,
+): string[] {
   const out: string[] = [];
   for (const path of paths) {
     if (DYNAMIC_SEGMENT_RE.test(path)) continue;

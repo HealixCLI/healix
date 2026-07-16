@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { crawl, crawlWithAuth, reconcileStaticRoutePaths } from './crawler.js';
-import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, InteractiveElement, Point } from './types.js';
+import type {
+  BrowserSurface,
+  BrowserSurfaceOptions,
+  DomSnapshot,
+  InteractiveElement,
+  Point,
+} from './types.js';
 
 interface FakePage {
   title?: string;
@@ -287,7 +293,12 @@ describe('crawl()', () => {
   });
 });
 
-const EMAIL_FIELD: InteractiveElement = { role: 'textbox', name: 'Email', selector: '#email', inputType: 'email' };
+const EMAIL_FIELD: InteractiveElement = {
+  role: 'textbox',
+  name: 'Email',
+  selector: '#email',
+  inputType: 'email',
+};
 const PASSWORD_FIELD: InteractiveElement = {
   role: 'textbox',
   name: 'Password',
@@ -333,9 +344,14 @@ describe('crawlWithAuth()', () => {
         'https://a.test/': { elements: [link('https://a.test/login')] },
         'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
         'https://a.test/dashboard': {
-          elements: [link('https://a.test/dashboard/settings'), { role: 'heading', name: 'Dashboard', selector: 'h1' }],
+          elements: [
+            link('https://a.test/dashboard/settings'),
+            { role: 'heading', name: 'Dashboard', selector: 'h1' },
+          ],
         },
-        'https://a.test/dashboard/settings': { elements: [{ role: 'heading', name: 'Settings', selector: 'h1' }] },
+        'https://a.test/dashboard/settings': {
+          elements: [{ role: 'heading', name: 'Settings', selector: 'h1' }],
+        },
       },
       onClickGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
     });

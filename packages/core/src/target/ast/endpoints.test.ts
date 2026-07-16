@@ -32,7 +32,7 @@ describe('extractExpressRouterInfo', () => {
     expect(info?.exportsRouterVar).toBe(true);
   });
 
-  it('does not treat an unrelated object\'s .get(...) call as an endpoint (Map/Set false-positive avoidance)', () => {
+  it("does not treat an unrelated object's .get(...) call as an endpoint (Map/Set false-positive avoidance)", () => {
     const source = `
       const cache = new Map();
       cache.get('someKey');

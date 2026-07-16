@@ -107,7 +107,7 @@ describe('createTriageEngine().analyze — grounded with a real matched source f
   );
 
   it.skipIf(!fs.existsSync(RBAC_ROOT))(
-    'includes the real matched file\'s content in the prompt sent to the provider',
+    "includes the real matched file's content in the prompt sent to the provider",
     async () => {
       const sourceContext = await indexSource(RBAC_ROOT, { maxUnits: 500 });
       const unit = sourceContext.units.find((u) => u.key === 'endpoint:GET /api/users/:id');

@@ -89,7 +89,10 @@ function passwordField(): InteractiveElement {
   return { role: 'textbox', name: 'Password', selector: '#pw', inputType: 'password' };
 }
 
-function makeEmit(): { emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void; events: Array<{ phase: string; level: string; message: string; data?: unknown }> } {
+function makeEmit(): {
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void;
+  events: Array<{ phase: string; level: string; message: string; data?: unknown }>;
+} {
   const events: Array<{ phase: string; level: string; message: string; data?: unknown }> = [];
   return {
     events,
@@ -105,7 +108,10 @@ describe('splitStaticUnitsForExplore()', () => {
   }
 
   it('routes route-kind units to routePaths, stripping the "route:" prefix', () => {
-    const { routePaths } = splitStaticUnitsForExplore([unit('route', 'route:/dashboard'), unit('route', 'route:/settings')]);
+    const { routePaths } = splitStaticUnitsForExplore([
+      unit('route', 'route:/dashboard'),
+      unit('route', 'route:/settings'),
+    ]);
     expect(routePaths).toEqual(['/dashboard', '/settings']);
   });
 
@@ -118,7 +124,10 @@ describe('splitStaticUnitsForExplore()', () => {
   });
 
   it('never mixes route units into endpointPaths or vice versa', () => {
-    const result = splitStaticUnitsForExplore([unit('route', 'route:/home'), unit('endpoint', 'endpoint:GET /api/health')]);
+    const result = splitStaticUnitsForExplore([
+      unit('route', 'route:/home'),
+      unit('endpoint', 'endpoint:GET /api/health'),
+    ]);
     expect(result.routePaths).toEqual(['/home']);
     expect(result.endpointPaths).toEqual(['/api/health']);
   });
@@ -182,7 +191,9 @@ describe('assessExplorationUsefulness()', () => {
   });
 
   it('flags shell-collapsed results as not useful', () => {
-    const result = assessExplorationUsefulness(crawlResult({ routes: [], shellCollapsed: true, visitedCount: 5 }));
+    const result = assessExplorationUsefulness(
+      crawlResult({ routes: [], shellCollapsed: true, visitedCount: 5 }),
+    );
     // shellCollapsed alone with zero routes hits the zero-routes branch first; use >=2 routes for this case.
     const withRoutes = assessExplorationUsefulness(
       crawlResult({
@@ -192,7 +203,11 @@ describe('assessExplorationUsefulness()', () => {
           {
             url: 'https://a.test/a',
             title: 'A',
-            snapshot: { url: 'https://a.test/a', title: 'A', interactiveElements: [heading('x'), heading('y')] },
+            snapshot: {
+              url: 'https://a.test/a',
+              title: 'A',
+              interactiveElements: [heading('x'), heading('y')],
+            },
             depth: 0,
             hasPasswordField: false,
             role: 'anonymous',
@@ -200,7 +215,11 @@ describe('assessExplorationUsefulness()', () => {
           {
             url: 'https://a.test/b',
             title: 'B',
-            snapshot: { url: 'https://a.test/b', title: 'B', interactiveElements: [heading('x'), heading('y')] },
+            snapshot: {
+              url: 'https://a.test/b',
+              title: 'B',
+              interactiveElements: [heading('x'), heading('y')],
+            },
             depth: 1,
             hasPasswordField: false,
             role: 'anonymous',
@@ -286,7 +305,9 @@ describe('runExplorePhase()', () => {
 
     expect(artifact.useful).toBe(false);
     expect(artifact.uselessReason).toMatch(/single thin route/i);
-    const warn = events.find((e) => e.phase === 'explore' && e.level === 'warn' && /thin context/i.test(e.message));
+    const warn = events.find(
+      (e) => e.phase === 'explore' && e.level === 'warn' && /thin context/i.test(e.message),
+    );
     expect(warn).toBeDefined();
   });
 
@@ -294,7 +315,9 @@ describe('runExplorePhase()', () => {
     const browser = makeFakeBrowser({ pages: {}, throwOnGoto: new Set(['https://a.test/']) });
     const { emit } = makeEmit();
 
-    await expect(runExplorePhase({ browser, baseUrl: 'https://a.test/', emit })).rejects.toThrow(/fake nav failure/);
+    await expect(runExplorePhase({ browser, baseUrl: 'https://a.test/', emit })).rejects.toThrow(
+      /fake nav failure/,
+    );
 
     // Teardown still ran even though the phase itself threw.
     expect(browser.stopped).toBe(true);
@@ -304,7 +327,9 @@ describe('runExplorePhase()', () => {
     const browser = makeFakeBrowser({
       pages: {
         'https://a.test/': { elements: [link('https://a.test/login')] },
-        'https://a.test/login': { elements: [passwordField(), { role: 'textbox', name: 'Email', selector: '#e', inputType: 'email' }] },
+        'https://a.test/login': {
+          elements: [passwordField(), { role: 'textbox', name: 'Email', selector: '#e', inputType: 'email' }],
+        },
       },
       // No onClickGoTo — submitting leaves the session on /login, so login is never verified.
     });

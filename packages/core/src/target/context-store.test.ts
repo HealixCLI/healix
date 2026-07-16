@@ -62,7 +62,11 @@ describe('persistSourceContext / loadSourceContext', () => {
     const dir = makeDir();
     const ctx = sampleContext({
       forms: Array.from({ length: 60 }, (_, i) => ({ file: `f${i}.tsx`, fields: [] })),
-      authPatterns: Array.from({ length: 60 }, (_, i) => ({ file: `a${i}.ts`, libraries: [], routeGuards: [] })),
+      authPatterns: Array.from({ length: 60 }, (_, i) => ({
+        file: `a${i}.ts`,
+        libraries: [],
+        routeGuards: [],
+      })),
       selectorHints: Array.from({ length: 250 }, (_, i) => ({
         file: `s${i}.tsx`,
         attribute: 'data-testid' as const,

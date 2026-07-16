@@ -28,7 +28,11 @@ function unit(rel: string, routePath: string): FunctionalityUnit {
 function walkRouteObjects(obj: ObjectExpression, rel: string, out: FunctionalityUnit[]): void {
   for (const prop of obj.properties) {
     if (!isObjectProperty(prop) || prop.computed) continue;
-    const keyName = isIdentifier(prop.key) ? prop.key.name : isStringLiteral(prop.key) ? prop.key.value : null;
+    const keyName = isIdentifier(prop.key)
+      ? prop.key.name
+      : isStringLiteral(prop.key)
+        ? prop.key.value
+        : null;
     if (keyName === 'path' && isStringLiteral(prop.value)) {
       out.push(unit(rel, prop.value.value));
     }

@@ -78,7 +78,11 @@ describe('attemptBracketRepair', () => {
 
 // ---- validateSuite() ---------------------------------------------------------
 
-function makeFakeChild(code: number | null, stdout = '', stderr = ''): EventEmitter & {
+function makeFakeChild(
+  code: number | null,
+  stdout = '',
+  stderr = '',
+): EventEmitter & {
   stdout: EventEmitter;
   stderr: EventEmitter;
   kill: () => boolean;

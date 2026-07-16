@@ -247,7 +247,15 @@ export function extractExportedHandlers(rel: string, source: string): Functional
 }
 
 /** Exported so source-index.ts's AST-based extraction gates on the same framework sets. */
-export const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set(['react', 'cra', 'vite', 'vue', 'svelte', 'angular', 'remix']);
+export const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set([
+  'react',
+  'cra',
+  'vite',
+  'vue',
+  'svelte',
+  'angular',
+  'remix',
+]);
 export const SERVER_FRAMEWORKS = new Set(['express', 'fastify', 'koa', 'nest']);
 
 /**

@@ -82,7 +82,7 @@ const PSV_LOGIN_PAGE = path.join(
 describe.skipIf(!fs.existsSync(PSV_LOGIN_PAGE))(
   'extractFormsAst against psv-ui-c-and-a LoginPage.tsx (isolated check)',
   () => {
-    it('extracts the real login form\'s custom MatInput fields by data-testid, and the submit control', () => {
+    it("extracts the real login form's custom MatInput fields by data-testid, and the submit control", () => {
       const source = fs.readFileSync(PSV_LOGIN_PAGE, 'utf-8');
       const forms = extractFormsAst('src/pages/login/LoginPage.tsx', source);
       expect(forms).toHaveLength(1);

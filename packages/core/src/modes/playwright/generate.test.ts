@@ -443,12 +443,34 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
   }
 
   it('adds no source grounding when the item has no unitKey', async () => {
-    await generate(ctxWith({ units: [], forms: [], authPatterns: [], selectorHints: [], specSources: [], summary: '', truncated: false }), PLAN);
+    await generate(
+      ctxWith({
+        units: [],
+        forms: [],
+        authPatterns: [],
+        selectorHints: [],
+        specSources: [],
+        summary: '',
+        truncated: false,
+      }),
+      PLAN,
+    );
     expect(calls[0].prompt).not.toContain('Source grounding');
   });
 
   it('adds no source grounding when the unitKey matches nothing in sourceContext', async () => {
-    await generate(ctxWith({ units: [], forms: [], authPatterns: [], selectorHints: [], specSources: [], summary: '', truncated: false }), PLAN_WITH_UNIT_KEY);
+    await generate(
+      ctxWith({
+        units: [],
+        forms: [],
+        authPatterns: [],
+        selectorHints: [],
+        specSources: [],
+        summary: '',
+        truncated: false,
+      }),
+      PLAN_WITH_UNIT_KEY,
+    );
     expect(calls[0].prompt).not.toContain('Source grounding');
   });
 
@@ -508,7 +530,7 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     expect(prompt).toContain('"id":{"type":"string"}');
   });
 
-  it('includes real form fields observed in the matched unit\'s file', async () => {
+  it("includes real form fields observed in the matched unit's file", async () => {
     const sourceContext: TestModeContext['sourceContext'] = {
       units: [
         {

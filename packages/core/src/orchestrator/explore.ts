@@ -44,7 +44,10 @@ function errMsg(err: unknown): string {
  * — generation would be no better grounded than with no exploration at all.
  * Never blocks the run; callers surface the reason as a breadcrumb instead.
  */
-export function assessExplorationUsefulness(result: CrawlWithAuthResult): { useful: boolean; reason?: string } {
+export function assessExplorationUsefulness(result: CrawlWithAuthResult): {
+  useful: boolean;
+  reason?: string;
+} {
   if (result.routes.length === 0) {
     return { useful: false, reason: 'exploration crawled zero routes' };
   }
@@ -53,7 +56,10 @@ export function assessExplorationUsefulness(result: CrawlWithAuthResult): { usef
     return { useful: false, reason: 'only a single thin route was crawled (login-only or near-empty shell)' };
   }
   if (result.shellCollapsed) {
-    return { useful: false, reason: 'crawled routes render a near-identical DOM (single-shell SPA collapse)' };
+    return {
+      useful: false,
+      reason: 'crawled routes render a near-identical DOM (single-shell SPA collapse)',
+    };
   }
   return { useful: true };
 }
@@ -139,14 +145,19 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
           });
           // Reuses whatever session state crawlWithAuth left the browser in
           // (its last action was on the authenticated session if login succeeded).
-          const role: 'anonymous' | 'authenticated' = crawlResult.authVerified ? 'authenticated' : 'anonymous';
+          const role: 'anonymous' | 'authenticated' = crawlResult.authVerified
+            ? 'authenticated'
+            : 'anonymous';
           const staticRoutes = staticCrawl.routes.map((r) => ({ ...r, role }));
           crawlResult = {
             ...crawlResult,
             routes: [...crawlResult.routes, ...staticRoutes],
             visitedCount: crawlResult.visitedCount + staticRoutes.length,
             budgetExhausted: crawlResult.budgetExhausted || staticCrawl.budgetExhausted,
-            redirectLoopsDetected: [...crawlResult.redirectLoopsDetected, ...staticCrawl.redirectLoopsDetected],
+            redirectLoopsDetected: [
+              ...crawlResult.redirectLoopsDetected,
+              ...staticCrawl.redirectLoopsDetected,
+            ],
             shellCollapsed: crawlResult.shellCollapsed || staticCrawl.shellCollapsed,
             degenerateRedirectsSkipped: [
               ...crawlResult.degenerateRedirectsSkipped,

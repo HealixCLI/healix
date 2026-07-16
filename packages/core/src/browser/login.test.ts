@@ -1,6 +1,12 @@
 import { describe, expect, it } from 'vitest';
 import { attemptLogin } from './login.js';
-import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, InteractiveElement, Point } from './types.js';
+import type {
+  BrowserSurface,
+  BrowserSurfaceOptions,
+  DomSnapshot,
+  InteractiveElement,
+  Point,
+} from './types.js';
 
 interface FakePage {
   elements: InteractiveElement[];
@@ -42,7 +48,12 @@ function makeFakeBrowser(config: {
   };
 }
 
-const EMAIL_FIELD: InteractiveElement = { role: 'textbox', name: 'Email', selector: '#email', inputType: 'email' };
+const EMAIL_FIELD: InteractiveElement = {
+  role: 'textbox',
+  name: 'Email',
+  selector: '#email',
+  inputType: 'email',
+};
 const PASSWORD_FIELD: InteractiveElement = {
   role: 'textbox',
   name: 'Password',

@@ -14,7 +14,11 @@ import {
 } from './functionality-index.js';
 import { parseModule } from './ast/parse.js';
 import { extractReactRouterRoutesFromAst } from './ast/routes.js';
-import { extractExpressRouterInfoFromAst, resolveExpressEndpointsFromInfo, type FileRouterInfo } from './ast/endpoints.js';
+import {
+  extractExpressRouterInfoFromAst,
+  resolveExpressEndpointsFromInfo,
+  type FileRouterInfo,
+} from './ast/endpoints.js';
 import { extractFormsFromAst, type FormInfo } from './ast/forms.js';
 import { extractAuthPatternsFromAst, type AuthPatternInfo } from './ast/auth-patterns.js';
 import { extractSelectorHintsFromAst, type SelectorHint } from './ast/selectors.js';
@@ -80,7 +84,9 @@ export async function indexSource(repoPath: string, opts?: { maxUnits?: number }
     const ast: File | null = parseModule(source, f.rel);
 
     if (wantsRouter || framework === null) {
-      codeUnits.push(...(ast ? extractReactRouterRoutesFromAst(f.rel, ast) : extractReactRouterRoutes(f.rel, source)));
+      codeUnits.push(
+        ...(ast ? extractReactRouterRoutesFromAst(f.rel, ast) : extractReactRouterRoutes(f.rel, source)),
+      );
     }
 
     if (isServer || framework === null) {

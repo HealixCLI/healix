@@ -851,12 +851,9 @@ async function runPipeline(
         const probe = await target.probeUrl(effectiveBaseUrl, 8_000);
         reachable = probe.reachable;
         if (!reachable) {
-          emit(
-            'explore',
-            'warn',
-            `Base URL ${effectiveBaseUrl} is not reachable; skipping exploration.`,
-            { probe },
-          );
+          emit('explore', 'warn', `Base URL ${effectiveBaseUrl} is not reachable; skipping exploration.`, {
+            probe,
+          });
         }
       }
       if (reachable) {
@@ -912,9 +909,7 @@ async function runPipeline(
           // server-side) that EXPLORE's form-based login detection can't see. Never blocks;
           // surfaces the ambiguity instead of silently reporting "no login found" as if the app
           // were simply unauthenticated.
-          const detectedLibraries = new Set(
-            (sourceContext?.authPatterns ?? []).flatMap((a) => a.libraries),
-          );
+          const detectedLibraries = new Set((sourceContext?.authPatterns ?? []).flatMap((a) => a.libraries));
           const hasCrawledLoginCandidate = exploration.loginCandidates.some((c) => c.source === 'crawled');
           if (detectedLibraries.size > 0 && !hasCrawledLoginCandidate) {
             emit(
@@ -924,7 +919,9 @@ async function runPipeline(
             );
           }
         } catch (err) {
-          emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
+          emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, {
+            stack: errStack(err),
+          });
         }
       }
     } else {
@@ -1019,7 +1016,9 @@ async function runPipeline(
           );
         }
         const validatedByPath = new Map([...validation.ok, ...validation.repaired].map((s) => [s.path, s]));
-        newSpecs = newSpecs.flatMap((s) => (validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : []));
+        newSpecs = newSpecs.flatMap((s) =>
+          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+        );
         carriedSpecs = carriedSpecs.flatMap((s) =>
           validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
         );
@@ -1365,7 +1364,11 @@ async function runPipeline(
                 const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
                 b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
               } catch (err) {
-                emit('triage', 'debug', `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`);
+                emit(
+                  'triage',
+                  'debug',
+                  `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
+                );
               }
             }
             const controller = new AbortController();

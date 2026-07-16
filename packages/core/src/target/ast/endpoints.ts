@@ -93,7 +93,8 @@ export function extractExpressRouterInfoFromAst(ast: File): FileRouterInfo {
   /** Returns the called method name (e.g. "get"/"use") iff `call` is `X.method(...)` on a known router/app identifier. */
   function routerCallMethod(call: CallExpression): string | null {
     const callee = call.callee;
-    if (!isMemberExpression(callee) || !isIdentifier(callee.object) || !isIdentifier(callee.property)) return null;
+    if (!isMemberExpression(callee) || !isIdentifier(callee.object) || !isIdentifier(callee.property))
+      return null;
     if (!routerVarNames.has(callee.object.name)) return null;
     return callee.property.name;
   }

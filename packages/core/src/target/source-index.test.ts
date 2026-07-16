@@ -140,7 +140,14 @@ paths:
 
 // --- Isolated check against the real RBAC repo, combining backend + frontend + Postman (Item D1) --
 
-const RBAC_ROOT = path.join('C:', 'Users', 'AdroyFernandes', 'Documents', 'TestApps', 'Role-Based-Access-Control-RBAC-');
+const RBAC_ROOT = path.join(
+  'C:',
+  'Users',
+  'AdroyFernandes',
+  'Documents',
+  'TestApps',
+  'Role-Based-Access-Control-RBAC-',
+);
 
 describe.skipIf(!fs.existsSync(RBAC_ROOT))(
   'indexSource against the real Role-Based-Access-Control-RBAC- repo (isolated check)',

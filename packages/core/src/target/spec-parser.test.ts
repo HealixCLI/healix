@@ -194,7 +194,11 @@ const RBAC_COLLECTION = path.join(
   'Role-Based-Access-Control-RBAC-',
   'RBAC-API.postman_collection.json',
 );
-const HERFY_COLLECTION = path.join(FIXTURES_ROOT, 'psv-ui-herfy-development', 'HerfyToken.postman_collection.json');
+const HERFY_COLLECTION = path.join(
+  FIXTURES_ROOT,
+  'psv-ui-herfy-development',
+  'HerfyToken.postman_collection.json',
+);
 
 describe.skipIf(!fs.existsSync(RBAC_COLLECTION))(
   'parsePostmanCollection against the real RBAC-API.postman_collection.json (isolated check)',

@@ -47,9 +47,9 @@ export interface RunOptions {
    * Suite lifecycle strategy: 'fresh' regenerates everything (default, current
    * behavior, byte-identical when omitted); 'topup' plans as normal but skips
    * AI-generating any item that matches (by reqTag, else normalized title) a
-   * still-passing test from the base run, copying that test's spec file forward
-   * instead; 'reuse' skips planning/generation entirely and re-executes the base
-   * run's passing tests as-is.
+   * test from the base run — regardless of that test's prior status — copying
+   * its spec file forward instead; 'reuse' skips planning/generation entirely
+   * and re-executes every test from the base run as-is.
    */
   suiteMode?: SuiteMode;
   /**

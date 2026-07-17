@@ -9,22 +9,24 @@ export function computeIdentityKey(reqTag: string | null | undefined, title: str
 }
 
 export interface SuiteDiff {
-  /** Plan items with no matching passing test in the base run — these need AI generation. */
+  /** Plan items with no matching test (of any status) in the base run — these need AI generation. */
   toGenerate: TestPlanItem[];
-  /** Every passing test from the base run, carried forward unconditionally. */
+  /** Every test from the base run, carried forward unconditionally, regardless of status. */
   carried: TestCase[];
 }
 
 /**
- * Top-up diff: the base run's passing tests all come along for the ride
- * unconditionally (nothing that already passed is thrown away), and a plan
- * item only needs a fresh AI generation when no carried test already covers
- * its identity key — i.e. it's new/missing functionality.
+ * Top-up diff: every test from the base run comes along for the ride
+ * unconditionally — passed, failed, blocked, or flaky alike, so top-up
+ * reproduces the base run's exact test count plus whatever's newly generated
+ * on top. A plan item only needs a fresh AI generation when no carried test
+ * already covers its identity key — i.e. it's new/missing functionality;
+ * an existing test's prior status is never a reason to regenerate it.
  */
-export function diffAgainstBase(planItems: TestPlanItem[], basePassingTests: TestCase[]): SuiteDiff {
-  const coveredKeys = new Set(basePassingTests.map((t) => computeIdentityKey(t.reqTag, t.title)));
+export function diffAgainstBase(planItems: TestPlanItem[], baseTests: TestCase[]): SuiteDiff {
+  const coveredKeys = new Set(baseTests.map((t) => computeIdentityKey(t.reqTag, t.title)));
   const toGenerate = planItems.filter(
     (item) => !coveredKeys.has(computeIdentityKey(item.reqTag, item.title)),
   );
-  return { toGenerate, carried: basePassingTests };
+  return { toGenerate, carried: baseTests };
 }

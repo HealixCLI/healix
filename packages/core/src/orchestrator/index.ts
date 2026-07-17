@@ -238,15 +238,23 @@ async function runPipeline(
       return { runId: '', status: 'error' };
     }
   }
-  // Every base-run test with a known spec file — the only thing that gates
-  // carrying a test forward is having a physical file to copy, not its
-  // previous status.
-  const baseTestsWithSpec: TestCase[] = baseRun ? store.listTests(baseRun.id).filter((t) => t.specPath) : [];
-  // TOP-UP only carries forward proven-good (passing) tests — a failing/
-  // blocked test is left for the fresh exploration to decide whether it's
-  // still worth testing (and, if so, regenerate) rather than silently
-  // re-including a known-bad test unchanged.
-  const basePassingTests: TestCase[] = baseTestsWithSpec.filter((t) => t.status === 'passed');
+  // Every base-run test, carried forward regardless of status — reuse/top-up
+  // must reproduce the base run's exact test count, not a subset of it.
+  // Carrying a test forward needs its spec FILE, not just its own DB row: a
+  // row can lack `specPath` (e.g. persistResults' fallback-insert path, hit
+  // when a resumed/re-executed tier's result didn't positionally match its
+  // pre-registered row) while a SIBLING row for the same reqTag still has it
+  // — same underlying .spec.ts file, so the file (and this scenario inside
+  // it) is already known and must not be silently dropped. Resolve a missing
+  // specPath from any sibling sharing the same reqTag before filtering.
+  const baseTests: TestCase[] = baseRun ? store.listTests(baseRun.id) : [];
+  const specPathByReqTag = new Map<string, string>();
+  for (const t of baseTests) {
+    if (t.specPath && t.reqTag && !specPathByReqTag.has(t.reqTag)) specPathByReqTag.set(t.reqTag, t.specPath);
+  }
+  const baseTestsWithSpec: TestCase[] = baseTests
+    .map((t) => (t.specPath || !t.reqTag ? t : { ...t, specPath: specPathByReqTag.get(t.reqTag) ?? null }))
+    .filter((t) => t.specPath);
 
   let run: Run;
   let runId: string;
@@ -982,7 +990,7 @@ async function runPipeline(
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
         } else if (suiteMode === 'topup') {
-          const diff = diffAgainstBase(planForGeneration.items, basePassingTests);
+          const diff = diffAgainstBase(planForGeneration.items, baseTestsWithSpec);
           emit(
             'generate',
             'info',
@@ -1018,12 +1026,21 @@ async function runPipeline(
             { quarantined: validation.quarantined.map((q) => ({ title: q.spec.title, reason: q.reason })) },
           );
         }
-        const validatedByPath = new Map([...validation.ok, ...validation.repaired].map((s) => [s.path, s]));
+        // Only `contents` legitimately flows out of validation (a bracket-repair
+        // rewrite — see validate.ts's `{ ...spec, contents: fixed }`); title/
+        // reqTag/tier must stay whatever the ORIGINAL entry carried. Keying a
+        // Map by `path` alone and swapping in its whole value would collapse
+        // every entry sharing that path onto a single winner's identity —
+        // exactly what happens for a multi-scenario carried-forward file,
+        // where one physical spec legitimately backs several distinct rows.
+        const contentsByPath = new Map(
+          [...validation.ok, ...validation.repaired].map((s) => [s.path, s.contents]),
+        );
         newSpecs = newSpecs.flatMap((s) =>
-          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+          contentsByPath.has(s.path) ? [{ ...s, contents: contentsByPath.get(s.path)! }] : [],
         );
         carriedSpecs = carriedSpecs.flatMap((s) =>
-          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+          contentsByPath.has(s.path) ? [{ ...s, contents: contentsByPath.get(s.path)! }] : [],
         );
 
         specs = [...newSpecs, ...carriedSpecs];

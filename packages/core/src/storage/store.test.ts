@@ -337,6 +337,27 @@ describe('deleteRun cascade', () => {
   });
 });
 
+describe('insertResult', () => {
+  it('DUPLICATE-RESULT GUARD: re-persisting a result for the same testId replaces the prior row instead of adding a second one', async () => {
+    // Simulates a tier re-executed after a resume that raced the checkpoint
+    // write (see insertResult's doc comment) — the orchestrator calls
+    // insertResult again for a test that already has a result row from the
+    // earlier, unacknowledged attempt.
+    const s = await store();
+    const project = s.createProject({ name: 'result-upsert', baseUrl: 'https://result-upsert.test' });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({ runId: run.id, title: 't0', reqTag: null, tier: null, status: 'pending' });
+
+    s.insertResult({ testId: t.id, status: 'failed', durationMs: 10, error: 'boom', artifactsJson: null });
+    s.insertResult({ testId: t.id, status: 'passed', durationMs: 12, error: null, artifactsJson: null });
+
+    const results = s.listResults(run.id);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ testId: t.id, status: 'passed', durationMs: 12 });
+    expect(await countRows('results')).toBe(1);
+  });
+});
+
 describe('deleteUnexecutedTests', () => {
   it('removes only test rows with zero result rows, leaving executed ones (including a genuine "pending"/skipped result) untouched', async () => {
     const s = await store();

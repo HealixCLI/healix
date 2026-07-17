@@ -197,8 +197,9 @@ export class HealixStore {
    * top-up/reuse base — 'passed', 'failed', or 'blocked' (it produced a real
    * verdict over real tests), but NOT 'error' (verified nothing — no runnable
    * specs) or 'cancelled' (aborted mid-run, unreliable). Deliberately NOT
-   * restricted to 'passed' only: a run with some failures still has plenty of
-   * passing tests worth carrying forward — that's the whole point of top-up.
+   * restricted to 'passed' only: a run with some failures still has its whole
+   * suite worth carrying forward (regardless of each test's own status) —
+   * that's the whole point of top-up.
    */
   getLastSuccessfulRun(projectId: string): Run | null {
     const row = this.db
@@ -358,8 +359,18 @@ export class HealixStore {
     this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
   }
 
+  /**
+   * Upsert-by-test: a test row maps to exactly one result (see updateTestStatus's
+   * doc comment), so any prior result for this testId is deleted before the new
+   * one is inserted. Without this, re-persisting a test's outcome — e.g. a
+   * resumed run re-executing a tier whose results already made it to the DB
+   * before the checkpoint recorded that tier as done — leaves a stale row
+   * behind, silently inflating any count that sums `results` rather than
+   * joining through one-row-per-test.
+   */
   insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
     const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
+    this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
         'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)',

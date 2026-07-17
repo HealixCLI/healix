@@ -342,13 +342,15 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
   }));
 }
 
+// Skipped/pending have no tile — the exported report.html doesn't break them
+// out either (its Total is just outcome.results.length), so a dedicated tile
+// here would show a number the report can't corroborate. Total below still
+// counts every row regardless of status, matching the report's Total exactly.
 const STATUS_TILES: ReadonlyArray<{ status: TestStatus; label: string }> = [
   { status: 'passed', label: 'Passed' },
   { status: 'failed', label: 'Failed' },
   { status: 'blocked', label: 'Blocked' },
   { status: 'flaky', label: 'Flaky' },
-  { status: 'skipped', label: 'Skipped' },
-  { status: 'pending', label: 'Pending' },
 ];
 
 type StatusCounts = Record<TestStatus, number>;
@@ -376,11 +378,14 @@ function TestSummary({
   totalTimeMs: number | null;
   stageDurations: StageDuration[];
 }) {
-  const total = STATUS_TILES.reduce((n, t) => n + summary[t.status], 0);
+  // Every row counts toward Total regardless of status (including the
+  // untiled skipped/pending), so Total always matches the report's
+  // outcome.results.length rather than only the sum of the visible tiles.
+  const total = Object.values(summary).reduce((n, c) => n + c, 0);
   const rate = total > 0 ? Math.round((summary.passed / total) * 100) : null;
 
   return (
-    <StatTileRow className="mt-3 sm:grid-cols-9">
+    <StatTileRow className="mt-3 sm:grid-cols-7">
       <StatTile
         label="Total"
         value={total}

@@ -338,6 +338,17 @@ function ProjectForm({
   const [testPassword, setTestPassword] = useState(project?.testPassword ?? '');
   const [showTestPassword, setShowTestPassword] = useState(false);
   const [submitting, setSubmitting] = useState(false);
+  const [browsingRepoPath, setBrowsingRepoPath] = useState(false);
+
+  const browseRepoPath = async (): Promise<void> => {
+    setBrowsingRepoPath(true);
+    try {
+      const result = await window.healix.pickRepoPath();
+      if (!result.canceled && result.path) setRepoPath(result.path);
+    } finally {
+      setBrowsingRepoPath(false);
+    }
+  };
 
   // Same rules as core validateNewProject: a project needs a name, at least one
   // of repo/URL, and a well-formed http(s) URL when a base URL is provided.
@@ -404,13 +415,29 @@ function ProjectForm({
             )}
           </Field>
           <Field label="Repo path or git URL (white-box)">
-            <Input
-              value={repoPath}
-              onChange={(e) => setRepoPath(e.target.value)}
-              placeholder="/Users/me/code/acme or https://github.com/org/repo"
-              className="font-mono"
-              disabled={readOnly}
-            />
+            <div className="flex gap-1.5">
+              <div className="min-w-0 flex-1">
+                <Input
+                  value={repoPath}
+                  onChange={(e) => setRepoPath(e.target.value)}
+                  placeholder="/Users/me/code/acme or https://github.com/org/repo"
+                  className="font-mono"
+                  disabled={readOnly}
+                />
+              </div>
+              {!readOnly && (
+                <Button
+                  type="button"
+                  variant="outline"
+                  onClick={() => void browseRepoPath()}
+                  disabled={browsingRepoPath}
+                  title="Browse for a local folder"
+                >
+                  <FolderGit2 className="h-4 w-4" />
+                  Browse…
+                </Button>
+              )}
+            </div>
             {repoIsUrl && (
               <p className="mt-1 text-xs text-muted">Will be cloned locally when you create the project.</p>
             )}

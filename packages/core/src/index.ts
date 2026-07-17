@@ -67,6 +67,7 @@ export {
   projectsDir,
   reposDir,
   deleteProjectAssets,
+  deleteRunAssets,
 } from './env/app-data.js';
 export { logger, setLogLevel, type LogLevel } from './logger.js';
 export { runCli, which, type RunResult } from './exec/run-cli.js';

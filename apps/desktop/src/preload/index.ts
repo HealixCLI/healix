@@ -84,6 +84,7 @@ const api = {
 
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
+  deleteRun: (runId: string) => ipcRenderer.invoke('runs:delete', { runId }),
   lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),
   suiteDiff: (runId: string) => ipcRenderer.invoke('runs:suiteDiff', { runId }),
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
@@ -107,6 +108,9 @@ const api = {
 
   // PRD file upload (native picker + text extraction, main-process side)
   pickPrdFile: () => ipcRenderer.invoke('dialog:pickPrdFile'),
+
+  // Repo path folder picker (Project create/edit form)
+  pickRepoPath: () => ipcRenderer.invoke('dialog:pickRepoPath'),
 
   /**
    * Subscribe to the full run lifecycle. The callback receives a discriminated

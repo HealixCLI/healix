@@ -8,7 +8,14 @@ import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 const require = createRequire(import.meta.url);
 const { DatabaseSync } = require('node:sqlite') as { DatabaseSync: typeof DatabaseSyncType };
 
-import { dbPath, deleteProjectAssets, getStore, projectsDir, resetStoreForTests } from '@healix/core';
+import {
+  dbPath,
+  deleteProjectAssets,
+  deleteRunAssets,
+  getStore,
+  projectsDir,
+  resetStoreForTests,
+} from '@healix/core';
 
 /** Hermetic tests for project soft-archive and on-disk asset deletion. */
 
@@ -84,5 +91,31 @@ describe('deleteProjectAssets', () => {
     await expect(deleteProjectAssets('../evil')).rejects.toThrow(/suspicious project id/);
     await expect(deleteProjectAssets('prj_okay/../..')).rejects.toThrow(/suspicious project id/);
     await expect(deleteProjectAssets('')).rejects.toThrow(/suspicious project id/);
+  });
+});
+
+describe('deleteRunAssets', () => {
+  it("removes only the given run's directory, leaving a sibling run untouched", async () => {
+    const targetDir = join(projectsDir(), 'prj_keep', 'runs', 'run_gone', 'suite', 'test-results');
+    mkdirSync(targetDir, { recursive: true });
+    writeFileSync(join(targetDir, 'video.webm'), 'fake');
+    const siblingDir = join(projectsDir(), 'prj_keep', 'runs', 'run_keep');
+    mkdirSync(siblingDir, { recursive: true });
+    writeFileSync(join(siblingDir, 'marker.txt'), 'fake');
+
+    await deleteRunAssets('prj_keep', 'run_gone');
+    expect(existsSync(join(projectsDir(), 'prj_keep', 'runs', 'run_gone'))).toBe(false);
+    expect(existsSync(join(siblingDir, 'marker.txt'))).toBe(true);
+  });
+
+  it('is a no-op for a run with no assets on disk', async () => {
+    await expect(deleteRunAssets('prj_never_existed', 'run_never_existed')).resolves.toBeUndefined();
+  });
+
+  it("refuses ids that could escape the run's own directory", async () => {
+    await expect(deleteRunAssets('../evil', 'run_1')).rejects.toThrow(/suspicious project id/);
+    await expect(deleteRunAssets('prj_okay', '../evil')).rejects.toThrow(/suspicious run id/);
+    await expect(deleteRunAssets('prj_okay', 'run_okay/../..')).rejects.toThrow(/suspicious run id/);
+    await expect(deleteRunAssets('prj_okay', '')).rejects.toThrow(/suspicious run id/);
   });
 });

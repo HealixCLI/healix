@@ -102,6 +102,8 @@ export function RunsView({
   // project was deleted in another window) — distinct from engine.error,
   // which is scoped to the run the engine is actively tracking, not this button.
   const [queueError, setQueueError] = useState<string | null>(null);
+  // Set when a run-delete IPC call itself failed (e.g. the run was already gone).
+  const [runDeleteError, setRunDeleteError] = useState<string | null>(null);
   // Session-only: resets to expanded on next launch.
   const [historyCollapsed, setHistoryCollapsed] = useState(false);
   // Collapsing "Start a run" frees most of the column for the report/timeline
@@ -292,6 +294,29 @@ export function RunsView({
     return () => clearTimeout(id);
   }, [queueError]);
 
+  useEffect(() => {
+    if (!runDeleteError) return;
+    const id = setTimeout(() => setRunDeleteError(null), 8000);
+    return () => clearTimeout(id);
+  }, [runDeleteError]);
+
+  /**
+   * Delete a single historical run (DB rows + on-disk assets). Refuses (via
+   * the main-process handler) while that run is still executing. Clears the
+   * selection when the deleted run was the one on screen, so RunDetailPanel
+   * doesn't keep showing detail for a run that no longer exists.
+   */
+  const deleteRun = async (runId: string): Promise<void> => {
+    setRunDeleteError(null);
+    try {
+      await window.healix.deleteRun(runId);
+      if (selectedRunId === runId) setSelectedRunId(null);
+      await refreshRuns();
+    } catch (err) {
+      setRunDeleteError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const startOrQueue = (): void => {
     if (!projectId) return;
     const args = { projectId, testingScope, suiteMode, prd: prd.trim() || undefined };
@@ -390,6 +415,7 @@ export function RunsView({
             setSelectedRunId(id);
           }}
           onRefresh={() => void refreshRuns()}
+          onDelete={(id) => void deleteRun(id)}
           projectsById={projectsById}
           collapsed={historyCollapsed}
           onToggleCollapse={() => setHistoryCollapsed((v) => !v)}
@@ -569,6 +595,20 @@ export function RunsView({
             <button
               type="button"
               onClick={() => setQueueError(null)}
+              aria-label="Dismiss"
+              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
+        {runDeleteError && (
+          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+            <p>{runDeleteError}</p>
+            <button
+              type="button"
+              onClick={() => setRunDeleteError(null)}
               aria-label="Dismiss"
               className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
             >

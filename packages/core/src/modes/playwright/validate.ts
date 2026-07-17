@@ -3,9 +3,21 @@ import { basename, join, relative, sep } from 'node:path';
 
 import type { GeneratedSpec, QuarantinedSpec, TestModeContext, ValidationResult } from '../types.js';
 import { hasExpect, looksLikePlaywrightSpec } from './generate.js';
-import { runCommand } from './execute.js';
+import { ensureSuiteDeps, runCommand } from './execute.js';
 
 const LIST_TIMEOUT_MS = 60_000;
+
+/**
+ * Same intent as orchestrator's looksLikeMissingDeps (not imported directly —
+ * that module imports this mode, so importing back would be circular):
+ * launch/parse output that indicates the suite's own node_modules aren't
+ * installed, rather than a genuine syntax defect in the generated spec.
+ */
+function looksLikeMissingDeps(text: string): boolean {
+  return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND|node_modules/i.test(
+    text,
+  );
+}
 
 /**
  * Bracket/paren/brace + unterminated-string/template-literal repair.
@@ -149,6 +161,12 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
     return { ok: [...specs], repaired: [], quarantined: [] };
   }
 
+  // The parse-check below runs `npx playwright test --list`, which requires
+  // the scaffolded suite's own node_modules — install them here rather than
+  // waiting for execute() (too late: by then every spec would already be
+  // quarantined for the same reason, one at a time). No-ops if already present.
+  await ensureSuiteDeps(ctx);
+
   const ok: GeneratedSpec[] = [];
   const repaired: GeneratedSpec[] = [];
   const quarantined: QuarantinedSpec[] = [];
@@ -167,6 +185,21 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
     if (first.ok) {
       ok.push(spec);
       continue;
+    }
+
+    if (looksLikeMissingDeps(first.tail)) {
+      // Not a per-spec syntax defect — the suite still can't resolve its own
+      // deps (e.g. ensureSuiteDeps' install failed). Quarantining every
+      // remaining spec one-by-one would just repeat the same misleading
+      // "fails to parse" message N times. Ship the rest unvalidated instead
+      // and surface it once, same fail-open shape as the cancellation path above.
+      ctx.emit?.(
+        'generate',
+        `[validate] Skipping parse-check for ${specs.length - i} spec(s): suite dependencies appear to be missing`,
+        { reason: first.tail },
+      );
+      ok.push(...specs.slice(i));
+      break;
     }
 
     const fixed = attemptBracketRepair(spec.contents);

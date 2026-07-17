@@ -377,8 +377,14 @@ export function runCommand(
  * Ensure the scaffolded suite has its node_modules. The Playwright browser
  * binaries live in the shared global cache, so only the npm deps need
  * installing here; browsers are handled lazily on a missing-browser failure.
+ *
+ * Exported so validate.ts's parse-check gate can call it too — that gate runs
+ * `npx playwright test --list` right after generation, before execute() ever
+ * gets a chance to install deps, so without this it fails identically for
+ * every spec (misreported as "fails to parse") whenever a suite is freshly
+ * scaffolded.
  */
-async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
+export async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
   const marker = join(ctx.projectDir, 'node_modules', '@playwright');
   try {
     await access(marker);

@@ -10,7 +10,7 @@
  *     mass-quarantine.
  */
 import { EventEmitter } from 'node:events';
-import { mkdir, mkdtemp, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
@@ -121,6 +121,10 @@ describe('validateSuite', () => {
 
   beforeEach(async () => {
     projectDir = await mkdtemp(join(tmpdir(), 'healix-validate-'));
+    // Simulate deps already installed by default, so existing parse-check
+    // expectations (call counts/order) aren't disturbed by ensureSuiteDeps.
+    // Tests that care about the install path itself override this below.
+    await mkdir(join(projectDir, 'node_modules', '@playwright'), { recursive: true });
   });
 
   afterEach(async () => {
@@ -251,5 +255,38 @@ describe('validateSuite', () => {
     expect(result.quarantined).toEqual([]);
     // Only one spawn call for specA — specB was never probed once cancelled.
     expect(spawnMock).toHaveBeenCalledTimes(1);
+  });
+
+  it('installs suite deps before the first parse-check when node_modules is missing (regression: was previously quarantining every spec as "fails to parse")', async () => {
+    await rm(join(projectDir, 'node_modules'), { recursive: true, force: true });
+    const spec = await writeSpec('tests/tierA-public/works.spec.ts', CLEAN_SPEC_SOURCE);
+    // First spawn: `npm install` (ensureSuiteDeps). Second spawn: `playwright test --list`.
+    queueSpawnResults([{ code: 0 }, { code: 0 }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.ok).toEqual([spec]);
+    expect(result.quarantined).toEqual([]);
+    expect(vi.mocked(spawn)).toHaveBeenCalledTimes(2);
+    expect(vi.mocked(spawn).mock.calls[0][0]).toBe('npm');
+    expect(vi.mocked(spawn).mock.calls[1][0]).toBe('npx');
+  });
+
+  it('ships remaining specs unvalidated (not quarantined) when the parse-check failure indicates missing deps rather than a syntax defect', async () => {
+    const specA = await writeSpec('tests/tierA-public/a.spec.ts', CLEAN_SPEC_SOURCE);
+    const specB = await writeSpec('tests/tierA-public/b.spec.ts', CLEAN_SPEC_SOURCE);
+    // node_modules/@playwright exists (from beforeEach), so ensureSuiteDeps
+    // no-ops, but the parse-check itself still reports a missing-module error
+    // (e.g. a corrupted/partial install) — this must not be treated as a
+    // per-spec syntax defect and mass-quarantined.
+    queueSpawnResults([{ code: 1, stderr: "Cannot find package '@playwright/test'" }]);
+
+    const result = await validateSuite(makeCtx(), [specA, specB]);
+
+    expect(result.ok.map((s) => s.path).sort()).toEqual([specA.path, specB.path].sort());
+    expect(result.quarantined).toEqual([]);
+    expect(result.repaired).toEqual([]);
+    // Only one probe was made before recognizing the missing-deps signal and bailing out.
+    expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
   });
 });

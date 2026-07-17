@@ -97,8 +97,13 @@ const api = {
     ipcRenderer.invoke('plan:reviseItem', args),
 
   // export / shell
-  exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>
-    ipcRenderer.invoke('export:suite', args),
+  exportSuite: (args: {
+    suiteDir: string;
+    outDir?: string;
+    sanitize?: boolean;
+    zip?: boolean;
+    projectId?: string;
+  }) => ipcRenderer.invoke('export:suite', args),
   revealPath: (target: string) => ipcRenderer.invoke('shell:reveal', target),
   showItemInFolder: (target: string) => ipcRenderer.invoke('shell:showItem', target),
 

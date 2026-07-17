@@ -70,13 +70,25 @@ export function computeCoverage(
   return { coveredUnitKeys, ratio, uncovered };
 }
 
-/** Merge two ExecOutcome objects (base pass/fail/blocked/flaky counts plus concatenated results). */
+/**
+ * Merge two ExecOutcome objects. Deduplicates by normalized title, keeping
+ * `b`'s result on a collision — a test executed in both `a` and `b` (e.g. a
+ * tier re-executed after a resume that raced the checkpoint write, see
+ * insertResult's doc comment) must count once, with its latest outcome, not
+ * twice. Counters are recomputed from the deduplicated results rather than
+ * summed, so passed/failed/blocked/flaky can never drift out of sync with
+ * `results.length` the way plain addition would if a title collided.
+ */
 export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
+  const byTitle = new Map<string, ExecOutcome['results'][number]>();
+  for (const r of a.results) byTitle.set(normalizeTitle(r.title), r);
+  for (const r of b.results) byTitle.set(normalizeTitle(r.title), r);
+  const results = [...byTitle.values()];
   return {
-    passed: a.passed + b.passed,
-    failed: a.failed + b.failed,
-    blocked: a.blocked + b.blocked,
-    flaky: a.flaky + b.flaky,
-    results: [...a.results, ...b.results],
+    passed: results.filter((r) => r.status === 'passed').length,
+    failed: results.filter((r) => r.status === 'failed').length,
+    blocked: results.filter((r) => r.status === 'blocked').length,
+    flaky: results.filter((r) => r.status === 'flaky').length,
+    results,
   };
 }

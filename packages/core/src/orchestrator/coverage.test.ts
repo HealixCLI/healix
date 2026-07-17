@@ -113,4 +113,24 @@ describe('mergeExecOutcomes', () => {
     expect(merged.failed).toBe(1);
     expect(merged.results.map((r) => r.title)).toEqual(['a', 'b', 'c']);
   });
+
+  it('DUPLICATE-TIER GUARD: a title present in both merge inputs counts once, keeping the later result', () => {
+    // Simulates a tier re-executed after a resume that raced the checkpoint
+    // write: the same test appears in both the earlier (stale) and later
+    // (authoritative) outcome. Without dedup this would double-count it in
+    // both the total and the per-status tallies (the report.html vs Results
+    // tab mismatch this test guards against).
+    const a = outcome([
+      { title: '[REQ:REQ-1] positive: loads', status: 'failed' },
+      { title: '[REQ:REQ-2] positive: loads', status: 'passed' },
+    ]);
+    const b = outcome([{ title: '[REQ:REQ-1] positive: loads', status: 'passed' }]);
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.results).toHaveLength(2);
+    expect(merged.passed).toBe(2);
+    expect(merged.failed).toBe(0);
+    expect(merged.results.find((r) => r.title.includes('REQ-1'))?.status).toBe('passed');
+  });
 });

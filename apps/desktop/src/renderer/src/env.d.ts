@@ -63,6 +63,7 @@ export interface HealixBridge {
     outDir?: string;
     sanitize?: boolean;
     zip?: boolean;
+    projectId?: string;
   }) => Promise<SuiteBundle>;
   revealPath: (target: string) => Promise<{ ok: boolean }>;
   showItemInFolder: (target: string) => Promise<{ ok: boolean }>;

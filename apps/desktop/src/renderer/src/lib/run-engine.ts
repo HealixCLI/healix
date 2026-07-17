@@ -754,7 +754,7 @@ export const SUITE_MODES: ReadonlyArray<{ value: SuiteMode; label: string; hint:
   {
     value: 'topup',
     label: 'Top up existing suite',
-    hint: 'Keep passing tests from the last successful run; generate only new/missing ones.',
+    hint: 'Carry every test from the last successful run forward as-is; generate only new/missing ones.',
   },
   {
     value: 'reuse',

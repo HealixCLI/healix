@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb, resetDbForTests } from './db.js';
+import { decryptSecret, encryptSecret } from './crypto.js';
 import { validateNewProject } from './validate.js';
 import type {
   AgentEvent,
@@ -55,7 +56,7 @@ export class HealixStore {
         project.baseUrl,
         project.createdAt,
         project.testUsername,
-        project.testPassword,
+        encryptSecret(project.testPassword),
       );
     return project;
   }
@@ -77,7 +78,7 @@ export class HealixStore {
       .prepare(
         'UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ?, test_username = ?, test_password = ? WHERE id = ?',
       )
-      .run(name, mode, repoPath, baseUrl, testUsername, testPassword, id);
+      .run(name, mode, repoPath, baseUrl, testUsername, encryptSecret(testPassword), id);
     return { ...existing, name, mode, repoPath, baseUrl, testUsername, testPassword };
   }
 
@@ -196,8 +197,9 @@ export class HealixStore {
    * top-up/reuse base — 'passed', 'failed', or 'blocked' (it produced a real
    * verdict over real tests), but NOT 'error' (verified nothing — no runnable
    * specs) or 'cancelled' (aborted mid-run, unreliable). Deliberately NOT
-   * restricted to 'passed' only: a run with some failures still has plenty of
-   * passing tests worth carrying forward — that's the whole point of top-up.
+   * restricted to 'passed' only: a run with some failures still has its whole
+   * suite worth carrying forward (regardless of each test's own status) —
+   * that's the whole point of top-up.
    */
   getLastSuccessfulRun(projectId: string): Run | null {
     const row = this.db
@@ -357,8 +359,18 @@ export class HealixStore {
     this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
   }
 
+  /**
+   * Upsert-by-test: a test row maps to exactly one result (see updateTestStatus's
+   * doc comment), so any prior result for this testId is deleted before the new
+   * one is inserted. Without this, re-persisting a test's outcome — e.g. a
+   * resumed run re-executing a tier whose results already made it to the DB
+   * before the checkpoint recorded that tier as done — leaves a stale row
+   * behind, silently inflating any count that sums `results` rather than
+   * joining through one-row-per-test.
+   */
   insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
     const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
+    this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
         'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)',
@@ -478,7 +490,7 @@ function rowToProject(r: Record<string, unknown>): Project {
     createdAt: String(r.created_at),
     archivedAt: s(r.archived_at),
     testUsername: s(r.test_username),
-    testPassword: s(r.test_password),
+    testPassword: decryptSecret(s(r.test_password)),
   };
 }
 

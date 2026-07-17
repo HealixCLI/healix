@@ -44,6 +44,13 @@ export interface RunOptions {
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
   /**
+   * Freeform additional instructions from the user, steering HOW the plan is
+   * built rather than describing WHAT the app does (that's the PRD's job) —
+   * e.g. "focus on accessibility", "skip mobile viewport checks", "prefer
+   * data-testid selectors". Passed to the planning provider verbatim.
+   */
+  instructions?: string;
+  /**
    * Suite lifecycle strategy: 'fresh' regenerates everything (default, current
    * behavior, byte-identical when omitted); 'topup' plans as normal but skips
    * AI-generating any item that matches (by reqTag, else normalized title) a

@@ -27,6 +27,12 @@ export interface StartRunArgs {
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;
+  /**
+   * Freeform additional instructions from the user, steering HOW the plan is
+   * built (e.g. "focus on accessibility", "prefer data-testid selectors") —
+   * distinct from the PRD, which describes WHAT the app does.
+   */
+  instructions?: string;
   /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */

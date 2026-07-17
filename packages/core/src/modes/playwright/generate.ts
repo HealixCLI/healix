@@ -85,14 +85,25 @@ function collectModuleSpecifiers(source: string): string[] {
  * This is a tripwire against a compromised/hallucinating model, not a sandbox:
  * a determined adversary can evade static analysis. Defense in depth continues
  * at execution time (env allowlist in execute.ts).
+ *
+ * `extraAllowedImport` widens the allowlist by exactly one additional module
+ * specifier — used only when mocking is enabled for the run, to permit specs
+ * to import test/expect from the Healix-authored (not model-authored) mock
+ * fixture instead of '@playwright/test' directly. That fixture file's own
+ * contents are never model output, so this doesn't reopen the untrusted-import
+ * surface the gate exists to close.
  */
-export function findForbiddenApis(source: string): string[] {
+export function findForbiddenApis(source: string, extraAllowedImport?: string): string[] {
   const violations = new Set<string>();
 
-  // Import allowlist: exactly '@playwright/test'. Everything else is flagged.
+  // Import allowlist: '@playwright/test', plus exactly one extra module when
+  // mocking is enabled for this run. Everything else is flagged.
   for (const mod of collectModuleSpecifiers(source)) {
-    if (mod !== '@playwright/test') {
-      violations.add(`import/require of '${mod}' (only '@playwright/test' is allowed)`);
+    if (mod !== '@playwright/test' && mod !== extraAllowedImport) {
+      const allowed = extraAllowedImport
+        ? `'@playwright/test' or '${extraAllowedImport}'`
+        : "'@playwright/test'";
+      violations.add(`import/require of '${mod}' (only ${allowed} is allowed)`);
     }
   }
 
@@ -124,8 +135,19 @@ export function findForbiddenApis(source: string): string[] {
   return [...violations];
 }
 
-function looksLikePlaywrightSpec(source: string): boolean {
-  return /@playwright\/test/.test(source) && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
+/**
+ * Relative import path (constant across all specs, which always land two
+ * directories deep at tests/<tier>/<slug>.spec.ts) to the Healix-authored mock
+ * fixture — see scaffold.ts's mockFixtureContents(). Used in place of
+ * '@playwright/test' when mocking is enabled for the run.
+ */
+export const MOCK_FIXTURE_IMPORT_PATH = '../../fixtures/mock.fixture';
+
+function looksLikePlaywrightSpec(source: string, extraAllowedImport?: string): boolean {
+  const importsTest =
+    /@playwright\/test/.test(source) ||
+    (extraAllowedImport !== undefined && source.includes(extraAllowedImport));
+  return importsTest && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
 }
 
 /** Matches bare `test(...)` and `test.only/skip/fixme(...)` calls — deliberately excludes `test.describe(...)`. */
@@ -170,8 +192,8 @@ function countReqTagOccurrences(source: string, reqTag: string): number {
 }
 
 /** Retry note when the previous attempt used forbidden APIs (deny-list gate). */
-function retryNoteForbidden(violations: string[]): string {
-  return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '@playwright/test'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
+function retryNoteForbidden(violations: string[], allowedImport: string): string {
+  return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '${allowedImport}'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
 }
 
 /** Cap on interactive elements injected into a prompt (keeps it bounded). */
@@ -219,7 +241,8 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
-  const scenarios = item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
+  const scenarios =
+    item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
 
   const tierGuidance =
@@ -229,13 +252,18 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
         ? 'This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.'
         : 'This is a public flow requiring no authentication.';
 
+  const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : '@playwright/test';
+  const mockNote = ctx.mockExternalDependencies
+    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would.`
+    : '';
+
   return `You are generating ONE Playwright test spec file in TypeScript covering ONE feature with
 multiple test cases (positive/negative/edge), not just a single check.
 
 Output ONLY the TypeScript source for the spec. No markdown, no code fences, no explanation.
 
 Requirements:
-- Begin with: import { test, expect } from '@playwright/test';
+- Begin with: import { test, expect } from '${importSource}';
 - Wrap all cases in: test.describe('[REQ:${reqTag}] ${item.title}', () => { ... });
 - Output exactly one test(...) per scenario listed below, IN THE SAME ORDER.
 - EVERY test(...) title MUST itself start with "[REQ:${reqTag}]" too (not just the describe title),
@@ -243,8 +271,8 @@ Requirements:
   This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
-- Be self-contained and runnable; do not import local helpers.
-- ${tierGuidance}${strictNote}${inventory}
+- Be self-contained and runnable; do not import any other local helpers beyond the one import above.
+- ${tierGuidance}${mockNote}${strictNote}${inventory}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -286,6 +314,7 @@ async function generateOne(
   const tier = resolveTier(item.tier);
   const reqTag = item.reqTag ?? item.id;
   const slug = slugify(item.title || item.id);
+  const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : undefined;
 
   // Carried across attempts: the note explaining WHY the last output was
   // rejected (fed back into the retry prompt) and the last violation list
@@ -323,7 +352,7 @@ async function generateOne(
     if (!source) {
       continue;
     }
-    if (!looksLikePlaywrightSpec(source)) {
+    if (!looksLikePlaywrightSpec(source, extraAllowedImport)) {
       emit(
         ctx,
         `Output for "${item.title}" did not look like a Playwright spec (attempt ${attempt + 1}); retrying`,
@@ -368,7 +397,7 @@ async function generateOne(
     // Deny-list gate: same retry-once-then-skip treatment as the zero-expect
     // case, but the stricter note lists the concrete violations so the retry
     // can actually fix them.
-    const violations = findForbiddenApis(source);
+    const violations = findForbiddenApis(source, extraAllowedImport);
     if (violations.length > 0) {
       emit(
         ctx,
@@ -377,7 +406,7 @@ async function generateOne(
           violations,
         },
       );
-      retryNote = retryNoteForbidden(violations);
+      retryNote = retryNoteForbidden(violations, extraAllowedImport ?? '@playwright/test');
       lastReason = `forbidden APIs in generated spec: ${violations.join('; ')}`;
       lastViolations = violations;
       continue;
@@ -409,10 +438,7 @@ const GEN_CONCURRENCY = 3;
  * Run up to `concurrency` promises at a time from `tasks`. Returns results in
  * the same order as `tasks` regardless of completion order.
  */
-async function runWithConcurrency<T>(
-  tasks: Array<() => Promise<T>>,
-  concurrency: number,
-): Promise<T[]> {
+async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   let nextIndex = 0;
 

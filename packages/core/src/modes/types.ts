@@ -1,5 +1,5 @@
 import type { ProviderAdapter } from '../providers/types.js';
-import type { TargetAdapter } from '../target/types.js';
+import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/types.js';
 import type { BrowserSurface, DomSnapshot } from '../browser/types.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
 
@@ -160,6 +160,17 @@ export interface TestModeContext {
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
+  /**
+   * When true, the run is mocking external dependencies (see RunOptions.
+   * mockExternalDependencies) — scaffold() writes a page.route() fixture for
+   * 'route-intercept'/'both' dependencies, and generate() directs specs to
+   * import test/expect from it instead of '@playwright/test' directly.
+   */
+  mockExternalDependencies?: boolean;
+  /** Dependencies detected for this run (only set when mockExternalDependencies is true). */
+  externalDependencies?: ExternalDependency[];
+  /** Resolved canned response per dependency id (see externalDependencies), keyed by ExternalDependency.id. */
+  mockResponses?: Record<string, MockResponse>;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

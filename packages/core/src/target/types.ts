@@ -69,3 +69,67 @@ export interface TargetAdapter {
   launch(opts: LaunchOptions): Promise<LaunchHandle>;
   probeUrl(url: string, timeoutMs?: number): Promise<UrlProbe>;
 }
+
+/** Broad kind of external dependency, used to pick a plausible canned mock response. */
+export type ExternalDependencyCategory = 'sms' | 'email' | 'payment' | 'auth' | 'otp' | 'backend' | 'other';
+
+/** How a dependency was discovered. */
+export type ExternalDependencySource = 'package' | 'url-literal' | 'env-var';
+
+/**
+ * How Healix can mock a given dependency:
+ *  - 'route-intercept': browser-visible (frontend fetch/XHR or a client-side SDK) —
+ *    handled entirely inside a Playwright fixture via page.route(), no server needed.
+ *  - 'env-override': server-side call whose base URL the app reads from an env var
+ *    Healix can safely rewrite before launch, redirecting it to the local mock server.
+ *  - 'both': browser-visible AND env-override capable (e.g. the app's own backend
+ *    API base URL, read by the frontend and overridable at launch time).
+ *  - 'undeterminable': detected, but neither mechanism applies (e.g. SMTP-based
+ *    email, or a server-side SDK with no discoverable base-URL override) — reported
+ *    to the user, not silently mocked.
+ */
+export type MockStrategy = 'route-intercept' | 'env-override' | 'both' | 'undeterminable';
+
+export interface ExternalDependency {
+  /** Stable identity for de-duplication and mock-response lookups. */
+  id: string;
+  category: ExternalDependencyCategory;
+  /** Human-readable label for reports/CLI output. */
+  label: string;
+  source: ExternalDependencySource;
+  mockStrategy: MockStrategy;
+  /** Matched npm package name, when detected via package.json/import. */
+  packageName?: string;
+  /** Hostnames this dependency is reachable at — used to build page.route() matchers. */
+  hostnames?: string[];
+  /** Env var Healix can override to redirect this dependency to the mock server. */
+  envVar?: string;
+  /** Source file the dependency was detected in, when applicable. */
+  file?: string;
+  /** For category 'backend': whether the resolved URL was reachable at detection time. */
+  reachable?: boolean;
+  /** Human-readable explanation, e.g. why a dependency is undeterminable. */
+  note?: string;
+}
+
+/** A canned response Healix serves in place of a real call to an ExternalDependency. */
+export interface MockResponse {
+  status: number;
+  headers?: Record<string, string>;
+  body: unknown;
+}
+
+/** One intercepted request, recorded for the run report. */
+export interface MockRequestRecord {
+  method: string;
+  url: string;
+  dependencyId: string;
+  at: string;
+}
+
+/** Handle for the local mock HTTP server started for 'env-override'/'both' dependencies. */
+export interface MockServerHandle {
+  baseUrl: string;
+  stop(): Promise<void>;
+  requestLog: MockRequestRecord[];
+}

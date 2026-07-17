@@ -5,6 +5,9 @@ import { launch } from './launcher.js';
 import { probeUrl } from './http-probe.js';
 
 export * from './types.js';
+export { detectExternalDependencies } from './dependencies.js';
+export { generateMockResponses, staticMockResponse } from './mock-responses.js';
+export { startMockServer, mockDependencyUrl } from './mock-server.js';
 
 /**
  * White-box (repo) + black-box (URL) access to the app under test.

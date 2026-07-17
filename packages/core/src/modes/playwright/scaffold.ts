@@ -6,11 +6,28 @@ import {
   TIERS,
   authSetupContents,
   gitignoreContents,
+  mockFixtureContents,
   packageJsonContents,
   playwrightConfigContents,
   suiteReadmeContents,
   tierReadmeContents,
+  type MockRouteEntry,
 } from './templates.js';
+
+/** Route-intercept/both dependencies with resolved mock content, for the mock fixture. */
+function mockRouteEntries(ctx: TestModeContext): MockRouteEntry[] {
+  const deps = ctx.externalDependencies ?? [];
+  const responses = ctx.mockResponses ?? {};
+  const entries: MockRouteEntry[] = [];
+  for (const dep of deps) {
+    if (dep.mockStrategy !== 'route-intercept' && dep.mockStrategy !== 'both') continue;
+    if (!dep.hostnames || dep.hostnames.length === 0) continue;
+    const response = responses[dep.id];
+    if (!response) continue;
+    entries.push({ id: dep.id, hostnames: dep.hostnames, response });
+  }
+  return entries;
+}
 
 function emit(ctx: TestModeContext, message: string, data?: unknown): void {
   ctx.emit?.('scaffold', message, data);
@@ -66,6 +83,15 @@ export async function scaffold(ctx: TestModeContext): Promise<void> {
 
   // Keep an empty anonymous storageState so Tier B can load before any login.
   await writeFile(join(authDir, 'user.json'), JSON.stringify({ cookies: [], origins: [] }), 'utf-8');
+
+  // Mock fixture: always written when mocking is enabled for the run (even with
+  // zero route-intercept dependencies — an empty routes list is a harmless
+  // passthrough), so generate.ts's import path always resolves.
+  if (ctx.mockExternalDependencies) {
+    const routes = mockRouteEntries(ctx);
+    await writeFile(join(fixturesDir, 'mock.fixture.ts'), mockFixtureContents(routes), 'utf-8');
+    emit(ctx, `Wrote mock fixture with ${routes.length} route(s)`, { routes: routes.map((r) => r.id) });
+  }
 
   emit(ctx, 'Scaffold complete', { tiers: TIERS });
 }

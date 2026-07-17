@@ -19,12 +19,22 @@ import type {
 import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
+import { detectExternalDependencies } from '../target/dependencies.js';
+import { generateMockResponses } from '../target/mock-responses.js';
+import { mockDependencyUrl, startMockServer } from '../target/mock-server.js';
+import type { ExternalDependency, MockResponse, MockServerHandle } from '../target/types.js';
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
-import { buildPlanPrompt, buildGapFillPlanPrompt, parsePlan, synthesizePlan, type PlanRepoContext } from './plan.js';
+import {
+  buildPlanPrompt,
+  buildGapFillPlanPrompt,
+  parsePlan,
+  synthesizePlan,
+  type PlanRepoContext,
+} from './plan.js';
 import { indexFunctionality } from '../target/functionality-index.js';
 import { diffAgainstBase } from './topup.js';
 import {
@@ -251,6 +261,13 @@ async function runPipeline(
   // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
   // loop, which needs the same functionality inventory the initial plan was grounded on.
   let repoIndex: PlanRepoContext | undefined;
+  // Detected during PLAN when opts.mockExternalDependencies is set (white-box only);
+  // mockResponses holds the resolved canned content per dependency id. mockServerHandle
+  // is only non-null once LAUNCH has started the local server for env-override/both
+  // dependencies, and is always stopped in the run's cleanup alongside launchHandle.
+  let externalDependencies: ExternalDependency[] = [];
+  let mockResponses: Map<string, MockResponse> = new Map();
+  let mockServerHandle: MockServerHandle | null = null;
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
   let artifactFiles: string[] = [];
@@ -318,7 +335,52 @@ async function runPipeline(
             );
           }
         } catch (err) {
-          emit('plan', 'debug', `Functionality indexing failed (planning without route context): ${errMsg(err)}`);
+          emit(
+            'plan',
+            'debug',
+            `Functionality indexing failed (planning without route context): ${errMsg(err)}`,
+          );
+        }
+
+        // ---- 3b. DEPENDENCIES (white-box, opt-in) ----
+        // Detect external dependencies (backend APIs the frontend calls, third-party
+        // SMS/email/OTP/payment SDKs) and resolve mock content for them BEFORE launch,
+        // so LAUNCH can redirect env-override dependencies and GENERATE can scaffold
+        // the route-intercept fixture with real content already in hand.
+        if (opts.mockExternalDependencies) {
+          try {
+            externalDependencies = await detectExternalDependencies(project.repoPath);
+            emit(
+              'dependencies',
+              'info',
+              `Detected ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'}.`,
+              { dependencies: externalDependencies },
+            );
+          } catch (err) {
+            emit(
+              'dependencies',
+              'warn',
+              `Dependency detection failed (continuing without mocks): ${errMsg(err)}`,
+            );
+          }
+          if (externalDependencies.length > 0) {
+            try {
+              mockResponses = await generateMockResponses(externalDependencies, provider, {
+                repoPath: project.repoPath,
+                signal,
+              });
+            } catch (err) {
+              emit(
+                'dependencies',
+                'debug',
+                `Mock response generation failed (using static fallbacks): ${errMsg(err)}`,
+              );
+            }
+          }
+          await writeJson(
+            join(runDir, 'plan', 'dependencies.json'),
+            externalDependencies.map((d) => ({ ...d, mockResponse: mockResponses.get(d.id) ?? null })),
+          );
         }
       }
 
@@ -439,6 +501,40 @@ async function runPipeline(
             { detectedPort: det.port, port },
           );
         }
+        // Mock env-override/both dependencies: start the local mock server once
+        // and point each dependency's own env var at it, so the spawned app's
+        // outbound calls hit the mock instead of the real (unreachable) service.
+        // Best-effort — a failure here must not block the launch, it just means
+        // those dependencies won't be mocked for this run.
+        const mockableEnvDeps = externalDependencies.filter(
+          (d) => d.envVar && (d.mockStrategy === 'env-override' || d.mockStrategy === 'both'),
+        );
+        let launchEnv: Record<string, string> | undefined;
+        if (mockableEnvDeps.length > 0) {
+          try {
+            mockServerHandle = await startMockServer(mockResponses);
+            launchEnv = {};
+            for (const dep of mockableEnvDeps) {
+              if (!dep.envVar) continue;
+              launchEnv[dep.envVar] = mockDependencyUrl(mockServerHandle.baseUrl, dep.id);
+            }
+            emit(
+              'launch',
+              'info',
+              `[launch] Mock server started at ${mockServerHandle.baseUrl} for ${mockableEnvDeps.length} dependenc${mockableEnvDeps.length === 1 ? 'y' : 'ies'}.`,
+              { env: Object.keys(launchEnv) },
+            );
+          } catch (err) {
+            emit(
+              'launch',
+              'warn',
+              `[launch] Failed to start mock server (continuing without it): ${errMsg(err)}`,
+            );
+            mockServerHandle = null;
+            launchEnv = undefined;
+          }
+        }
+
         const doLaunch = async (): Promise<void> => {
           const handle = await target.launch({
             repoPath,
@@ -458,6 +554,7 @@ async function runPipeline(
             baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
             port,
             readyTimeoutMs: 120000,
+            ...(launchEnv ? { env: launchEnv } : {}),
           });
           launchHandle = handle;
           effectiveBaseUrl = handle.baseUrl;
@@ -527,6 +624,8 @@ async function runPipeline(
           outcome,
           triageEntries,
           artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
           noteStoreOk,
           noteStoreFailure,
         );
@@ -550,6 +649,13 @@ async function runPipeline(
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
       signal,
+      ...(opts.mockExternalDependencies
+        ? {
+            mockExternalDependencies: true,
+            externalDependencies,
+            mockResponses: Object.fromEntries(mockResponses),
+          }
+        : {}),
     };
     const mode = getMode(project.mode);
 
@@ -675,7 +781,8 @@ async function runPipeline(
       // real test-case counts, matching the report — not spec-file counts.
       // Carried-forward specs (copied bytes from a prior run, already at
       // whatever granularity that run used) get a single row, as before.
-      for (const spec of newSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+      for (const spec of newSpecs)
+        registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
       for (const spec of carriedSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
       emit('generate', 'info', `Generated ${specs.length} spec(s).`);
     } catch (err) {
@@ -690,6 +797,8 @@ async function runPipeline(
         outcome,
         triageEntries,
         artifactFiles,
+        externalDependencies,
+        computeMockedRequestCounts(mockServerHandle),
         noteStoreOk,
         noteStoreFailure,
       );
@@ -721,6 +830,8 @@ async function runPipeline(
         outcome,
         triageEntries,
         artifactFiles,
+        externalDependencies,
+        computeMockedRequestCounts(mockServerHandle),
         noteStoreOk,
         noteStoreFailure,
       );
@@ -819,7 +930,8 @@ async function runPipeline(
           emit('generate', 'info', 'Gap-fill generation produced no accepted specs; stopping coverage loop.');
           break;
         }
-        for (const spec of gapSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
+        for (const spec of gapSpecs)
+          registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
         specs = [...specs, ...gapSpecs];
 
         if (checkCancelled()) break;
@@ -935,6 +1047,8 @@ async function runPipeline(
         outcome,
         triageEntries,
         artifactFiles,
+        externalDependencies,
+        computeMockedRequestCounts(mockServerHandle),
         noteStoreOk,
         noteStoreFailure,
       )
@@ -1011,6 +1125,8 @@ async function runPipeline(
           outcome,
           triageEntries,
           artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
           noteStoreOk,
           noteStoreFailure,
         )
@@ -1028,6 +1144,16 @@ async function runPipeline(
         emit('launch', 'debug', '[launch] App stopped.');
       } catch (err) {
         emit('launch', 'warn', `[launch] Failed to stop app: ${errMsg(err)}`, { stack: errStack(err) });
+      }
+    }
+    if (mockServerHandle) {
+      try {
+        await mockServerHandle.stop();
+        emit('launch', 'debug', '[launch] Mock server stopped.');
+      } catch (err) {
+        emit('launch', 'warn', `[launch] Failed to stop mock server: ${errMsg(err)}`, {
+          stack: errStack(err),
+        });
       }
     }
   }
@@ -1242,7 +1368,9 @@ function persistResults(
       const reqTagKey = tagFromTitle ?? matched?.reqTag ?? base;
       const scenarioIndex = scenarioIndexByReqTag.get(reqTagKey) ?? 0;
       scenarioIndexByReqTag.set(reqTagKey, scenarioIndex + 1);
-      testId = testIdByKey.get(`${base}#${scenarioIndex}`) ?? (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
+      testId =
+        testIdByKey.get(`${base}#${scenarioIndex}`) ??
+        (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
       if (testId) store.updateTestTitle(testId, r.title);
     }
     if (!testId) {
@@ -1374,6 +1502,8 @@ async function finalizeReport(
   outcome: ExecOutcome | null,
   triage: ReportTriageEntry[],
   artifacts: string[],
+  dependencies: ExternalDependency[],
+  mockedRequestCounts: Record<string, number>,
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
 ): Promise<{ reportPath: string | undefined }> {
@@ -1385,6 +1515,8 @@ async function finalizeReport(
     outcome,
     triage,
     artifacts,
+    dependencies,
+    mockedRequestCounts,
   });
   const reportPath = join(runDir, 'reports', 'report.json');
   try {
@@ -1492,6 +1624,14 @@ export function looksLikeMissingDeps(message: string): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Tally the mock server's request log by dependency id, for the report. */
+function computeMockedRequestCounts(handle: MockServerHandle | null): Record<string, number> {
+  if (!handle) return {};
+  const counts: Record<string, number> = {};
+  for (const r of handle.requestLog) counts[r.dependencyId] = (counts[r.dependencyId] ?? 0) + 1;
+  return counts;
 }
 
 function errMsg(err: unknown): string {

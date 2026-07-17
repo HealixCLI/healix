@@ -1,4 +1,5 @@
 import type { Tier } from '../../storage/types.js';
+import type { MockResponse } from '../../target/types.js';
 
 /** The three tiers a scaffolded suite always provisions, in execution order. */
 export const TIERS: Tier[] = ['tierA-public', 'tierB-auth', 'tierC-api'];
@@ -183,6 +184,70 @@ setup('authenticate', async ({ page }) => {
     await writeFile(authFile, JSON.stringify({ cookies: [], origins: [] }), 'utf-8');
   }
 });
+`;
+}
+
+export interface MockRouteEntry {
+  id: string;
+  hostnames: string[];
+  response: MockResponse;
+}
+
+/**
+ * Fixture wrapping @playwright/test's `test`/`page` with automatic page.route()
+ * interception for every 'route-intercept'/'both' external dependency, fulfilling
+ * with the (AI-generated or static-fallback) canned response resolved before
+ * generation. Generated specs import { test, expect } from this file instead of
+ * '@playwright/test' directly whenever mocking is enabled for the run — see
+ * generate.ts's conditional import allowlist carve-out.
+ *
+ * Always written when mocking is enabled, even with an empty route list (a
+ * harmless no-op passthrough), so generate.ts's import path always resolves
+ * regardless of what was actually detected.
+ */
+export function mockFixtureContents(routes: MockRouteEntry[]): string {
+  const serialized = JSON.stringify(routes, null, 2);
+  return `import { test as base, expect } from '@playwright/test';
+
+/**
+ * Healix-generated mock fixture — intercepts network requests to detected
+ * external dependencies (backend APIs, third-party SMS/email/OTP/payment SDKs)
+ * and fulfills them with a canned response, so tests run without those
+ * services being reachable.
+ */
+
+const MOCKED_ROUTES = ${serialized};
+
+function hostMatches(url, pattern) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (pattern.includes(':')) return parsed.host === pattern;
+  return parsed.hostname === pattern || parsed.hostname.endsWith('.' + pattern);
+}
+
+export const test = base.extend({
+  page: async ({ page }, use) => {
+    for (const route of MOCKED_ROUTES) {
+      await page.route(
+        (url) => route.hostnames.some((h) => hostMatches(url.toString(), h)),
+        async (r) => {
+          await r.fulfill({
+            status: route.response.status,
+            headers: { 'content-type': 'application/json', ...(route.response.headers || {}) },
+            body: JSON.stringify(route.response.body ?? {}),
+          });
+        },
+      );
+    }
+    await use(page);
+  },
+});
+
+export { expect };
 `;
 }
 

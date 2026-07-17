@@ -1,6 +1,7 @@
 import type { Project, Run } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
+import type { ExternalDependency } from '../target/types.js';
 
 /** One triaged failure, attached to the report. */
 export interface ReportTriageEntry {
@@ -18,6 +19,10 @@ export interface RunReport {
   triage: ReportTriageEntry[];
   /** Artifact files collected from the mode after execution (relative paths). */
   artifacts: string[];
+  /** External dependencies detected/mocked for this run (empty when mocking wasn't enabled). */
+  dependencies: ExternalDependency[];
+  /** How many requests the local mock server actually intercepted, keyed by dependency id. */
+  mockedRequestCounts: Record<string, number>;
   generatedAt: string;
 }
 
@@ -28,6 +33,8 @@ export function buildReport(input: {
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
   artifacts?: string[];
+  dependencies?: ExternalDependency[];
+  mockedRequestCounts?: Record<string, number>;
 }): RunReport {
   return {
     run: input.run,
@@ -36,18 +43,33 @@ export function buildReport(input: {
     outcome: input.outcome,
     triage: input.triage,
     artifacts: input.artifacts ?? [],
+    dependencies: input.dependencies ?? [],
+    mockedRequestCounts: input.mockedRequestCounts ?? {},
     generatedAt: new Date().toISOString(),
   };
 }
 
 /** Render a self-contained, dependency-free HTML report. */
 export function renderReportHtml(report: RunReport): string {
-  const { run, project, plan, outcome, triage } = report;
+  const { run, project, plan, outcome, triage, dependencies, mockedRequestCounts } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
   const blocked = outcome?.blocked ?? 0;
   const flaky = outcome?.flaky ?? 0;
+
+  const dependencyRows = dependencies
+    .map((d) => {
+      const mocked = d.mockStrategy !== 'undeterminable';
+      const requestCount = mockedRequestCounts[d.id] ?? 0;
+      const statusLabel = mocked
+        ? `mocked (${d.mockStrategy})${requestCount > 0 ? ` — ${requestCount} request(s) intercepted` : ''}`
+        : `not mocked${d.note ? ` — ${d.note}` : ''}`;
+      return `<tr class="${mocked ? '' : 'rejected'}"><td>${esc(d.label)}</td><td>${esc(d.category)}</td><td>${esc(
+        d.source,
+      )}</td><td>${esc(statusLabel)}</td></tr>`;
+    })
+    .join('');
 
   const planRows = plan.items
     .map((it) => {
@@ -150,6 +172,19 @@ export function renderReportHtml(report: RunReport): string {
     <table>
       <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>
+    </table>
+  </section>`
+      : ''
+  }
+
+  ${
+    dependencies.length > 0
+      ? `<section>
+    <h2>External dependencies</h2>
+    <p>${dependencies.filter((d) => d.mockStrategy !== 'undeterminable').length} of ${dependencies.length} detected dependenc${dependencies.length === 1 ? 'y was' : 'ies were'} mocked for this run.</p>
+    <table>
+      <thead><tr><th>Dependency</th><th>Category</th><th>Detected via</th><th>Status</th></tr></thead>
+      <tbody>${dependencyRows}</tbody>
     </table>
   </section>`
       : ''

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { playwrightConfigContents } from './templates.js';
+import { mockFixtureContents, playwrightConfigContents } from './templates.js';
 
 describe('playwrightConfigContents — artifact capture policy', () => {
   it('records a screenshot AND video for every test, pass or fail', () => {
@@ -31,5 +31,23 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     // as flaky; CI gets 2; HEALIX_RETRIES overrides both.
     expect(cfg).toContain('process.env.HEALIX_RETRIES');
     expect(cfg).toContain('process.env.CI ? 2 : 1');
+  });
+});
+
+describe('mockFixtureContents', () => {
+  it('embeds the given routes and re-exports test/expect from @playwright/test', () => {
+    const src = mockFixtureContents([
+      { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+    ]);
+    expect(src).toContain("from '@playwright/test'");
+    expect(src).toContain('"id": "pkg:twilio"');
+    expect(src).toContain('"api.twilio.com"');
+    expect(src).toContain('page.route(');
+    expect(src).toContain('export { expect };');
+  });
+
+  it('produces a harmless no-op fixture for an empty route list', () => {
+    const src = mockFixtureContents([]);
+    expect(src).toContain('const MOCKED_ROUTES = []');
   });
 });

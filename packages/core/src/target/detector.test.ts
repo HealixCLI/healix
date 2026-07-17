@@ -55,6 +55,53 @@ describe('detect', () => {
     expect(result.baseUrl).toBe('http://localhost:5173');
   });
 
+  it('honors an explicit server.port in vite.config.ts over the generic 5173 default', async () => {
+    const dir = makeRepo();
+    writeJson(dir, 'package.json', {
+      name: 'vite-react-app',
+      scripts: { dev: 'vite', build: 'vite build' },
+      dependencies: { react: '^18.3.1', 'react-dom': '^18.3.1' },
+      devDependencies: { vite: '^5.4.0' },
+    });
+    writeFile(dir, 'package-lock.json', '{}\n');
+    writeFile(
+      dir,
+      'vite.config.ts',
+      `import { defineConfig } from 'vite';
+export default defineConfig({
+  server: {
+    host: true,
+    port: 4202,
+  },
+  preview: {
+    port: 4202,
+  },
+});
+`,
+    );
+
+    const result = await detect(dir);
+
+    expect(result.port).toBe(4202);
+    expect(result.baseUrl).toBe('http://localhost:4202');
+  });
+
+  it('falls back to the 5173 default when vite.config.ts has no explicit server.port', async () => {
+    const dir = makeRepo();
+    writeJson(dir, 'package.json', {
+      name: 'vite-react-app',
+      scripts: { dev: 'vite' },
+      dependencies: { react: '^18.3.1' },
+      devDependencies: { vite: '^5.4.0' },
+    });
+    writeFile(dir, 'package-lock.json', '{}\n');
+    writeFile(dir, 'vite.config.ts', "import { defineConfig } from 'vite';\nexport default defineConfig({});\n");
+
+    const result = await detect(dir);
+
+    expect(result.port).toBe(5173);
+  });
+
   it('detects a Next.js app (fullstack, port 3000, npm)', async () => {
     const dir = makeRepo();
     writeJson(dir, 'package.json', {

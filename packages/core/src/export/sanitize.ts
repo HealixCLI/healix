@@ -143,11 +143,7 @@ function redactLiteralCredentials(content: string, credentials: ExportCredential
  * Order matters: the (longer, more specific) suite directory is replaced before
  * the home directory so nested paths collapse correctly.
  */
-export function sanitizeContent(
-  content: string,
-  suiteDir: string,
-  credentials?: ExportCredentials,
-): string {
+export function sanitizeContent(content: string, suiteDir: string, credentials?: ExportCredentials): string {
   const home = os.homedir();
   const normalizedSuite = path.resolve(suiteDir);
 

@@ -738,9 +738,7 @@ ipcMain.handle(
       outDir,
       sanitize: args.sanitize ?? true,
       zip: args.zip ?? true,
-      credentials: project
-        ? { username: project.testUsername, password: project.testPassword }
-        : undefined,
+      credentials: project ? { username: project.testUsername, password: project.testPassword } : undefined,
     });
     return bundle;
   },

@@ -358,7 +358,7 @@ describe('orchestrator top-up / reuse suite modes', () => {
     expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-001', 'REQ-002']));
   });
 
-  it('REUSE COUNT MATCHES BASE: a base-run test row missing its own specPath (e.g. persistResults\' fallback-insert path) still carries forward via a sibling row sharing the same reqTag', async () => {
+  it("REUSE COUNT MATCHES BASE: a base-run test row missing its own specPath (e.g. persistResults' fallback-insert path) still carries forward via a sibling row sharing the same reqTag", async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Fallback Row Demo',
@@ -406,7 +406,15 @@ describe('orchestrator top-up / reuse suite modes', () => {
     // scenario than the DB tracked cleanly.
     const siblings = store.listTests(run1.runId).filter((t) => t.reqTag === 'REQ-001');
     expect(siblings.every((t) => t.specPath)).toBe(true);
-    const specAbsPath = join(dataDir, 'projects', project.id, 'runs', run1.runId, 'suite', siblings[0].specPath!);
+    const specAbsPath = join(
+      dataDir,
+      'projects',
+      project.id,
+      'runs',
+      run1.runId,
+      'suite',
+      siblings[0].specPath!,
+    );
     await writeFile(specAbsPath, (await readFile(specAbsPath, 'utf-8')) + "test('scenario 3');\n", 'utf-8');
     store.insertTest({
       runId: run1.runId,

@@ -652,10 +652,13 @@ async function runPipeline(
         // runs:detail, and the report all read from here on.
         await writeJson(join(runDir, 'plan', 'plan.json'), plan);
         const includedItems = plan.items.filter(isPlanItemIncluded);
-        if (includedItems.length === 0) {
+        if (includedItems.length === 0 && plan.planSource !== 'reuse') {
           // Every item was rejected — a deliberate empty plan, not a pipeline
           // failure, so this reads as a cancellation rather than falling into
-          // the "verified nothing" error path further down.
+          // the "verified nothing" error path further down. Reuse plans are
+          // exempt: they never had AI-generated items to approve in the first
+          // place (see suiteMode === 'reuse' above), so an empty items array
+          // there is the expected shape, not a rejection.
           emit('approve', 'info', 'All plan items were rejected; cancelling run.');
           setStatus('cancelled', { finishedAt: nowIso() });
           return { runId, status: 'cancelled' };

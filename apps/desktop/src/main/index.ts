@@ -48,6 +48,18 @@ import {
   type HealthResult,
 } from '@healix/core';
 
+// Last-resort net: every ipcMain handler already catches its own errors and
+// reports them as run/queue failures, but an error escaping that net (a bug
+// in the catch path itself, a rejection with no attached .catch, an error
+// thrown outside any handler) would otherwise crash the whole Electron main
+// process and take the app down with it. Log and keep running instead.
+process.on('uncaughtException', (err) => {
+  console.error('[healix:uncaughtException]', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[healix:unhandledRejection]', reason);
+});
+
 /**
  * Custom scheme that serves run artifacts (screenshots / videos / traces) into
  * the renderer's <img>/<video> tags. Must be registered before app ready.
@@ -702,14 +714,25 @@ ipcMain.handle(
 
 ipcMain.handle(
   'export:suite',
-  async (_e, args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) => {
+  async (
+    _e,
+    args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean; projectId?: string },
+  ) => {
     if (!args?.suiteDir) throw new Error('suiteDir is required to export a suite.');
     const outDir = args.outDir ?? join(projectsDir(), 'exports');
+    // Thread the project's own test-login credentials through so sanitize can
+    // redact literal occurrences of them (e.g. a hardcoded password in a
+    // generated spec) — the generic KEY=value secret patterns don't catch that.
+    const store = await getStore();
+    const project = args.projectId ? store?.getProject(args.projectId) : undefined;
     const bundle = await exportSuite({
       suiteDir: args.suiteDir,
       outDir,
       sanitize: args.sanitize ?? true,
       zip: args.zip ?? true,
+      credentials: project
+        ? { username: project.testUsername, password: project.testPassword }
+        : undefined,
     });
     return bundle;
   },

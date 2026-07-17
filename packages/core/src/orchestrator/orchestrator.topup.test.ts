@@ -358,6 +358,55 @@ describe('orchestrator top-up / reuse suite modes', () => {
     expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-001', 'REQ-002']));
   });
 
+  it('REUSE WITH APPROVAL GATE: an empty (by design) reuse plan is not mistaken for "all items rejected"', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Approval Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1Provider = fakeProviderWithPlan(
+      [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'Landing renders.' }],
+      [],
+    );
+    const run1Orchestrator = createOrchestrator({
+      provider: run1Provider,
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run1 = await run1Orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    // ---- Run 2: reuse, WITH a real approval gate (autoApprove: false) — this is
+    // the desktop app's actual shape ("Approve & Continue" on the Plan Review
+    // panel). The gate approves whatever plan it's handed; reuse mode hands it
+    // an intentionally empty items array (see suiteMode === 'reuse' above), and
+    // that must not be read as "the user rejected everything."
+    let gateReceivedPlan: TestPlan | undefined;
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run(
+      { projectId: project.id, suiteMode: 'reuse', autoApprove: false },
+      {
+        onPlan: async (plan) => {
+          gateReceivedPlan = plan;
+          return { decision: 'proceed', plan };
+        },
+      },
+    );
+
+    expect(gateReceivedPlan?.planSource).toBe('reuse');
+    expect(gateReceivedPlan?.items).toHaveLength(0);
+    expect(run2.status).toBe('passed');
+    expect(store.listTests(run2.runId)).toHaveLength(1);
+  });
+
   it('REUSE CARRIES THE ENTIRE SUITE: a failing test from the base run is re-run too, not silently dropped', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

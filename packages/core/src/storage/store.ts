@@ -1,6 +1,7 @@
 import { nanoid } from 'nanoid';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb, resetDbForTests } from './db.js';
+import { decryptSecret, encryptSecret } from './crypto.js';
 import { validateNewProject } from './validate.js';
 import type {
   AgentEvent,
@@ -55,7 +56,7 @@ export class HealixStore {
         project.baseUrl,
         project.createdAt,
         project.testUsername,
-        project.testPassword,
+        encryptSecret(project.testPassword),
       );
     return project;
   }
@@ -77,7 +78,7 @@ export class HealixStore {
       .prepare(
         'UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ?, test_username = ?, test_password = ? WHERE id = ?',
       )
-      .run(name, mode, repoPath, baseUrl, testUsername, testPassword, id);
+      .run(name, mode, repoPath, baseUrl, testUsername, encryptSecret(testPassword), id);
     return { ...existing, name, mode, repoPath, baseUrl, testUsername, testPassword };
   }
 
@@ -478,7 +479,7 @@ function rowToProject(r: Record<string, unknown>): Project {
     createdAt: String(r.created_at),
     archivedAt: s(r.archived_at),
     testUsername: s(r.test_username),
-    testPassword: s(r.test_password),
+    testPassword: decryptSecret(s(r.test_password)),
   };
 }
 

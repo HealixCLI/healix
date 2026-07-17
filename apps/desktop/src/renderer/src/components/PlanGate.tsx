@@ -517,7 +517,9 @@ export function PlanGate({
           </span>
         </div>
         <Badge tone="default">
-          {plan.items.length} spec {plan.items.length === 1 ? 'file' : 'files'}
+          {plan.planSource === 'reuse'
+            ? 'reusing existing suite'
+            : `${plan.items.length} spec ${plan.items.length === 1 ? 'file' : 'files'}`}
         </Badge>
       </div>
 
@@ -560,7 +562,9 @@ export function PlanGate({
         <p className="text-xs text-muted">
           {streaming
             ? 'Waiting for remaining batches to finish generating before you can approve or reject all.'
-            : 'Unreviewed items will be approved as-is.'}
+            : plan.planSource === 'reuse'
+              ? 'No new tests to review — approve to re-run the existing suite as-is.'
+              : 'Unreviewed items will be approved as-is.'}
         </p>
         <div className="flex items-center gap-2">
           <Button variant="outline" onClick={onRejectAll} disabled={decided || streaming}>

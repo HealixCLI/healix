@@ -108,16 +108,46 @@ function replaceAllPaths(content: string, needle: string, replacement: string): 
   return out;
 }
 
+/** The target app's own login credentials — only known to the caller (project record). */
+export interface ExportCredentials {
+  username?: string | null;
+  password?: string | null;
+}
+
+/**
+ * Redact literal occurrences of the project's stored test credentials. The
+ * KEY=value / "key": "value" patterns above only catch secrets that are
+ * labeled as such; a generated spec that hardcodes the literal password
+ * (e.g. `await page.fill('#pw', 'Real+Passw0rd')`) has no such label and
+ * would otherwise ship in the clear. Guarded by a minimum length so a short
+ * value (e.g. a 2-3 char username) doesn't blow away unrelated text.
+ */
+function redactLiteralCredentials(content: string, credentials: ExportCredentials | undefined): string {
+  if (!credentials) return content;
+  let out = content;
+  for (const value of [credentials.username, credentials.password]) {
+    if (value && value.length >= 4) {
+      out = out.replace(new RegExp(escapeRegExp(value), 'g'), '<REDACTED>');
+    }
+  }
+  return out;
+}
+
 /**
  * Sanitize the textual contents of a copied suite file:
  *  - rewrites the absolute suite directory prefix to a relative placeholder,
  *  - rewrites the user's home directory prefix to a stable placeholder,
- *  - redacts obvious secrets (API keys, tokens, passwords, bearer tokens).
+ *  - redacts obvious secrets (API keys, tokens, passwords, bearer tokens),
+ *  - redacts literal occurrences of the project's own test credentials.
  *
  * Order matters: the (longer, more specific) suite directory is replaced before
  * the home directory so nested paths collapse correctly.
  */
-export function sanitizeContent(content: string, suiteDir: string): string {
+export function sanitizeContent(
+  content: string,
+  suiteDir: string,
+  credentials?: ExportCredentials,
+): string {
   const home = os.homedir();
   const normalizedSuite = path.resolve(suiteDir);
 
@@ -135,6 +165,8 @@ export function sanitizeContent(content: string, suiteDir: string): string {
     pattern.regex.lastIndex = 0;
     out = out.replace(pattern.regex, pattern.replace);
   }
+
+  out = redactLiteralCredentials(out, credentials);
 
   return out;
 }

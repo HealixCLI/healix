@@ -137,7 +137,12 @@ export function RunDetailPanel({
     setBusy('export');
     setNote(null);
     try {
-      const bundle = await window.healix.exportSuite({ suiteDir, zip: true, sanitize: true });
+      const bundle = await window.healix.exportSuite({
+        suiteDir,
+        zip: true,
+        sanitize: true,
+        projectId: run.projectId,
+      });
       const target = bundle.zipPath ?? bundle.dir;
       setNote(`Exported to ${target}`);
       await window.healix.revealPath(target);

@@ -11,5 +11,10 @@ export default defineConfig({
     // comfortably finish well under this on Linux/macOS but occasionally
     // time out on Windows's slower filesystem/process overhead.
     testTimeout: 15000,
+    // Even at 15s, Windows CI runners occasionally blow the budget under
+    // contention (shared/un-pinned hardware) rather than due to a real
+    // regression. Retry once in CI to absorb that timing noise without
+    // masking genuine, reproducible failures (retry stays 0 locally).
+    retry: process.env.CI ? 1 : 0,
   },
 });

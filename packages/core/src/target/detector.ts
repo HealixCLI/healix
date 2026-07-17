@@ -274,6 +274,60 @@ function readEnvPort(repoPath: string): number | null {
   return null;
 }
 
+/** vite.config.* files, checked in the order Vite itself resolves them. */
+const VITE_CONFIG_FILES = [
+  'vite.config.ts',
+  'vite.config.js',
+  'vite.config.mjs',
+  'vite.config.mts',
+  'vite.config.cjs',
+];
+const VITE_FRAMEWORKS = new Set(['vite', 'vite-react', 'vite-vue']);
+
+/** Extract the balanced `{...}` block following `key:` in `source`, or null if not found. */
+function extractBraceBlock(source: string, key: string): string | null {
+  const keyRe = new RegExp(`\\b${key}\\s*:\\s*\\{`);
+  const m = keyRe.exec(source);
+  if (!m) return null;
+  const start = m.index + m[0].length - 1; // position of the opening '{'
+  let depth = 0;
+  for (let i = start; i < source.length; i++) {
+    if (source[i] === '{') depth++;
+    else if (source[i] === '}') {
+      depth--;
+      if (depth === 0) return source.slice(start, i + 1);
+    }
+  }
+  return null;
+}
+
+/**
+ * Read an explicit `server.port` from the project's vite.config.*, when
+ * present. Vite frequently hardcodes its dev-server port there (rather than
+ * relying on Vite's 5173 default or reading `process.env.PORT`, which Vite
+ * does not honor unless the config explicitly wires it) — without this,
+ * relying on the generic framework-default guess makes launch() poll the
+ * WRONG port and report a false "did not become reachable" failure even
+ * though the app is actually running and healthy on its configured port.
+ */
+function detectVitePort(repoPath: string): number | null {
+  for (const file of VITE_CONFIG_FILES) {
+    let source: string;
+    try {
+      source = fs.readFileSync(path.join(repoPath, file), 'utf-8');
+    } catch {
+      continue;
+    }
+    const serverBlock = extractBraceBlock(source, 'server');
+    if (!serverBlock) continue;
+    const m = serverBlock.match(/\bport\s*:\s*(\d{2,5})\b/);
+    if (!m) continue;
+    const n = Number.parseInt(m[1], 10);
+    if (Number.isInteger(n) && n > 0 && n <= 65535) return n;
+  }
+  return null;
+}
+
 /**
  * Pick the start command + the script we derived it from. Prefers dev-like
  * scripts. Returns null command when no package manager / scripts available.
@@ -305,11 +359,19 @@ function detectPort(
     const fromScript = parsePortFromScript(pkg.scripts[scriptName]);
     if (fromScript !== null) return fromScript;
   }
-  // 2. A framework-known config / .env PORT.
+  // 2. vite.config.*'s explicit server.port, for Vite-family frameworks —
+  // takes priority over the generic .env/PORT convention below since Vite
+  // does not read process.env.PORT unless the project's config explicitly
+  // does so itself.
+  if (framework && VITE_FRAMEWORKS.has(framework)) {
+    const vitePort = detectVitePort(repoPath);
+    if (vitePort !== null) return vitePort;
+  }
+  // 3. A framework-known config / .env PORT.
   const envPort = readEnvPort(repoPath);
   if (envPort !== null) return envPort;
 
-  // 3. Framework default.
+  // 4. Framework default.
   return defaultPort(framework);
 }
 

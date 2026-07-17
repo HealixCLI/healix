@@ -1,4 +1,5 @@
 import type { Tier } from '../../storage/types.js';
+import type { MockResponse } from '../../target/types.js';
 
 /** The three tiers a scaffolded suite always provisions, in execution order. */
 export const TIERS: Tier[] = ['tierA-public', 'tierB-auth', 'tierC-api'];
@@ -205,6 +206,186 @@ setup('authenticate', async ({ page }) => {
     await writeFile(authFile, JSON.stringify({ cookies: [], origins: [] }), 'utf-8');
   }
 });
+`;
+}
+
+export interface MockRouteEntry {
+  id: string;
+  hostnames: string[];
+  response: MockResponse;
+  /** Statically-detected (method, path) call sites, when found — see EndpointMock. */
+  endpoints?: Array<{ method: string; pathPattern: string; response?: MockResponse }>;
+}
+
+/**
+ * Fixture wrapping @playwright/test's `test`/`page` with automatic page.route()
+ * interception for every 'route-intercept'/'both' external dependency, fulfilling
+ * with the (AI-generated or static-fallback) canned response resolved before
+ * generation. Generated specs import { test, expect } from this file instead of
+ * '@playwright/test' directly whenever mocking is enabled for the run — see
+ * generate.ts's conditional import allowlist carve-out.
+ *
+ * Always written when mocking is enabled, even with an empty route list (a
+ * harmless no-op passthrough), so generate.ts's import path always resolves
+ * regardless of what was actually detected.
+ */
+export function mockFixtureContents(routes: MockRouteEntry[]): string {
+  const serialized = JSON.stringify(routes, null, 2);
+  return `import { test as base, expect } from '@playwright/test';
+
+/**
+ * Healix-generated mock fixture — intercepts network requests to detected
+ * external dependencies (backend APIs, third-party SMS/email/OTP/payment SDKs)
+ * and fulfills them with a canned response, so tests run without those
+ * services being reachable.
+ */
+
+const MOCKED_ROUTES = ${serialized};
+
+function hostMatches(url, pattern) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (pattern.includes(':')) return parsed.host === pattern;
+  return parsed.hostname === pattern || parsed.hostname.endsWith('.' + pattern);
+}
+
+// \`:param\` segments (e.g. "/reward/:param") match any single path segment —
+// see dependencies.ts's normalizeEndpointPath for how these are produced.
+// Case-insensitive: a detected "/API/Foo" and a real request to "/api/foo"
+// are the same endpoint to any real HTTP router.
+function pathMatches(pattern, requestPath) {
+  const patternSegs = pattern.split('/').filter(Boolean);
+  const pathSegs = requestPath.split('/').filter(Boolean);
+  if (patternSegs.length !== pathSegs.length) return false;
+  return patternSegs.every(
+    (seg, i) => seg === ':param' || seg.toLowerCase() === pathSegs[i].toLowerCase(),
+  );
+}
+
+// Serialize a response body per its declared content-type — JSON.stringify
+// only when the type is (or defaults to) JSON, so a deliberately non-JSON
+// mocked response (text/xml/etc, body given as a raw string) isn't
+// double-encoded.
+function serializeBody(response) {
+  const contentType = (response.headers && response.headers['content-type']) || 'application/json';
+  if (!/json/i.test(contentType) && typeof response.body === 'string') {
+    return { contentType, text: response.body };
+  }
+  return { contentType, text: JSON.stringify(response.body ?? {}) };
+}
+
+// Per-test runtime overrides set via the \`mockOverride\` fixture below — always
+// checked FIRST, so a negative/error-path test (e.g. "simulate a 500") can
+// force a specific status/body for one call without touching any other test
+// or the shared static defaults. Reset after each test.
+let overrides = [];
+
+function resolveResponse(route, method, requestPath) {
+  const override = overrides.find(
+    (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
+  );
+  if (override) return override.response;
+  const endpoint = route.endpoints?.find(
+    (e) => e.method.toUpperCase() === method.toUpperCase() && pathMatches(e.pathPattern, requestPath),
+  );
+  if (endpoint?.response) return endpoint.response;
+  return route.response;
+}
+
+export const test = base.extend({
+  // Lets a spec force a specific status/body for one (method, path) call,
+  // scoped to just that test — e.g.
+  //   mockOverride('GET', '/customer_lookup', { status: 500, body: {} })
+  // Use this for negative/error-simulation tests (500/401/403/timeout-style
+  // scenarios); everything else keeps using the resolved default response.
+  // Malformed calls (wrong arg types) are ignored with a console.warn rather
+  // than throwing, so a mistaken call degrades to "no override" instead of
+  // crashing the whole test.
+  mockOverride: async ({}, use) => {
+    const fn = (method, pathPattern, response) => {
+      if (typeof method !== 'string' || typeof pathPattern !== 'string' || !response || typeof response !== 'object') {
+        console.warn('[mockOverride] ignored invalid call:', { method, pathPattern, response });
+        return;
+      }
+      overrides.push({ method, pathPattern, response });
+    };
+    await use(fn);
+    overrides = [];
+  },
+  page: async ({ page, mockOverride }, use) => {
+    void mockOverride; // ensures overrides reset alongside this test via the fixture above
+    for (const route of MOCKED_ROUTES) {
+      await page.route(
+        (url) => route.hostnames.some((h) => hostMatches(url.toString(), h)),
+        async (r) => {
+          let requestPath = '/';
+          try {
+            requestPath = new URL(r.request().url()).pathname;
+          } catch {
+            // keep default '/'
+          }
+          const response = resolveResponse(route, r.request().method(), requestPath);
+          const { contentType, text } = serializeBody(response);
+          await r.fulfill({
+            status: response.status,
+            headers: { 'content-type': contentType, ...(response.headers || {}) },
+            body: text,
+          });
+        },
+      );
+    }
+    await use(page);
+  },
+  // Playwright's page.route() only intercepts requests a BROWSER makes — it
+  // cannot see calls made through the standalone \`request\` fixture (used by
+  // API-contract-style specs), since that's a raw HTTP client with no
+  // interception hooks at all. Fake it directly instead, matching by (method,
+  // path) against the same route.endpoints/overrides resolution page uses
+  // above. Only the first mocked dependency is served this way — request-
+  // fixture calls use relative paths with no hostname to disambiguate between
+  // multiple dependencies.
+  request: async ({ request, mockOverride }, use) => {
+    void mockOverride;
+    if (MOCKED_ROUTES.length === 0) {
+      await use(request);
+      return;
+    }
+    const route = MOCKED_ROUTES[0];
+    const respond = (method, requestPath) => {
+      const canned = resolveResponse(route, method, (requestPath || '/').split('?')[0]);
+      const { contentType, text } = serializeBody(canned);
+      return {
+        ok: () => canned.status >= 200 && canned.status < 300,
+        status: () => canned.status,
+        statusText: () => '',
+        headers: () => ({ 'content-type': contentType, ...(canned.headers || {}) }),
+        json: async () => canned.body ?? {},
+        text: async () => text,
+        body: async () => Buffer.from(text),
+        url: () => requestPath || '',
+        dispose: async () => undefined,
+      };
+    };
+    const fakeRequest = {
+      get: async (url) => respond('GET', url),
+      post: async (url) => respond('POST', url),
+      put: async (url) => respond('PUT', url),
+      patch: async (url) => respond('PATCH', url),
+      delete: async (url) => respond('DELETE', url),
+      head: async (url) => respond('HEAD', url),
+      options: async (url) => respond('OPTIONS', url),
+      fetch: async (url, opts) => respond(opts?.method ?? 'GET', url),
+      dispose: async () => undefined,
+    };
+    await use(fakeRequest);
+  },
+});
+
+export { expect };
 `;
 }
 

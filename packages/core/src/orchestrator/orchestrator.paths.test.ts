@@ -1189,4 +1189,52 @@ describe('orchestrator paths (offline DI seam)', () => {
     // Never blocks the run — it's a breadcrumb, not a gate.
     expect(['passed', 'failed']).toContain(summary.status);
   });
+
+  it('DEPENDENCIES: detection and mocking run automatically for a white-box project — no opt-in flag', async () => {
+    // Real repo dir (not the DI seam) — detectExternalDependencies() reads real
+    // files from disk. No RunOptions field enables this; RunOptions has no
+    // mockExternalDependencies flag at all — detection must fire unconditionally
+    // whenever the project has a repoPath, per the requirement that Healix
+    // "should be able to identify any External dependency" on its own.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-deps-'));
+    writeFileSync(join(repoPath, 'package.json'), JSON.stringify({ dependencies: { twilio: '^4.0.0' } }));
+    mkdirSync(join(repoPath, 'src'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'src', 'sms.js'),
+      "import twilio from 'twilio';\nconst client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN, { edge: process.env.TWILIO_API_URL });\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Dependency Auto-Detect Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    rmSync(repoPath, { recursive: true, force: true });
+
+    const detected = events.find(
+      (e) => e.phase === 'dependencies' && e.message.includes('Detected 1 external dependency'),
+    );
+    expect(detected).toBeDefined();
+
+    const reportPath = join(projectsDir(), project.id, 'runs', summary.runId, 'reports', 'report.json');
+    const report = JSON.parse(await readFile(reportPath, 'utf8')) as RunReport;
+    expect(report.dependencies.length).toBe(1);
+    expect(report.dependencies[0]?.packageName).toBe('twilio');
+  });
 });

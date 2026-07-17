@@ -27,6 +27,12 @@ export * from './storage/types.js';
 export { createTargetAdapter } from './target/index.js';
 export * from './target/types.js';
 export { isGitRemoteUrl, cloneRepo, type CloneRepoResult } from './target/clone.js';
+export { findFreePort } from './target/launcher.js';
+
+// External-dependency detection + mocking
+export { detectExternalDependencies } from './target/dependencies.js';
+export { generateMockResponses, staticMockResponse } from './target/mock-responses.js';
+export { startMockServer, mockDependencyUrl } from './target/mock-server.js';
 
 // Browser surface (computer-use + browser-use)
 export { createBrowserSurface } from './browser/index.js';

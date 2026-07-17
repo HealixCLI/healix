@@ -108,6 +108,19 @@ describe('findForbiddenApis — deny-list gate over generated specs', () => {
     const source = `import { test, expect } from '@playwright/test';\nimport { login } from './helpers/auth';\n${CLEAN_SPEC.split('\n').slice(1).join('\n')}`;
     expect(findForbiddenApis(source).some((v) => v.includes("'./helpers/auth'"))).toBe(true);
   });
+
+  it('allows a spec importing test/expect from the mock fixture when it is passed as extraAllowedImport', () => {
+    const source = CLEAN_SPEC.replace("from '@playwright/test'", "from '../../fixtures/mock.fixture'");
+    expect(findForbiddenApis(source, '../../fixtures/mock.fixture')).toEqual([]);
+  });
+
+  it('still flags a foreign import even when a mock fixture extraAllowedImport is set', () => {
+    const source = `import { test, expect } from '../../fixtures/mock.fixture';\nimport net from 'net';\n${CLEAN_SPEC.split('\n').slice(1).join('\n')}`;
+    const violations = findForbiddenApis(source, '../../fixtures/mock.fixture');
+    expect(violations).toContain(
+      "import/require of 'net' (only '@playwright/test' or '../../fixtures/mock.fixture' is allowed)",
+    );
+  });
 });
 
 // ---- generate() integration over a fake provider ----------------------------

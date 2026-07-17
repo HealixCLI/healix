@@ -25,6 +25,7 @@ import {
   projectsDir,
   reposDir,
   deleteProjectAssets,
+  deleteRunAssets,
   isGitRemoteUrl,
   cloneRepo,
   computeIdentityKey,
@@ -780,6 +781,22 @@ ipcMain.handle('dialog:pickPrdFile', async (event: IpcMainInvokeEvent): Promise<
   }
 });
 
+// ---- Repo path folder picker (Project create/edit form) ----
+
+export interface PickRepoPathResult {
+  canceled: boolean;
+  path?: string;
+}
+
+ipcMain.handle('dialog:pickRepoPath', async (event: IpcMainInvokeEvent): Promise<PickRepoPathResult> => {
+  const win = BrowserWindow.fromWebContents(event.sender);
+  const picked = win
+    ? await dialog.showOpenDialog(win, { properties: ['openDirectory'] })
+    : await dialog.showOpenDialog({ properties: ['openDirectory'] });
+  if (picked.canceled || picked.filePaths.length === 0) return { canceled: true };
+  return { canceled: false, path: picked.filePaths[0] };
+});
+
 // ---- Provider login (open the CLI login flow) ----
 
 export interface ProviderLoginResult {
@@ -1021,6 +1038,39 @@ ipcMain.handle('runs:suiteDiff', async (_e, payload: { runId: string }): Promise
 
   return { runId: run.id, baseRunId: run.baseRunId, addedCount, carriedCount, removedCount, totalCount };
 });
+
+/**
+ * Delete a single historical run: its DB rows (tests/results/agent_events,
+ * cascaded by store.deleteRun) plus its on-disk assets (suite, plan, reports,
+ * artifacts). Refuses a run that's currently executing — its orchestrator has
+ * no idea the row it's about to write to just vanished, and cancelling first
+ * is the well-defined path (mirrors run:cancel) rather than racing a delete
+ * against in-flight store writes.
+ */
+ipcMain.handle(
+  'runs:delete',
+  async (_e, payload: { runId: string }): Promise<{ ok: true; assetsRemoved: boolean }> => {
+    const store = await requireStore();
+    const runId = payload?.runId;
+    if (!runId) throw new Error('Run id is required.');
+    if (activeRuns.has(runId)) {
+      throw new Error('This run is still executing — cancel it before deleting.');
+    }
+
+    const run = store.getRun(runId);
+    if (!run) throw new Error(`Run not found: ${runId}`);
+
+    store.deleteRun(runId);
+
+    let assetsRemoved = true;
+    try {
+      await deleteRunAssets(run.projectId, runId);
+    } catch {
+      assetsRemoved = false;
+    }
+    return { ok: true, assetsRemoved };
+  },
+);
 
 export interface TestCaseHistoryEntry {
   runId: string;

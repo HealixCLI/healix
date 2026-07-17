@@ -223,6 +223,19 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       }
     }
 
+    function isInForm(el: DomElement): boolean {
+      let node: DomElement | null = el.parentElement;
+      while (node) {
+        if (node.tagName.toLowerCase() === 'form') return true;
+        node = node.parentElement;
+      }
+      return false;
+    }
+
+    function isDisabled(el: DomElement): boolean {
+      return el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+    }
+
     function isVisible(el: DomElement): boolean {
       if (el.hidden) {
         return false;
@@ -250,6 +263,9 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         selector: selectorFor(el),
         href: tag === 'a' ? (el.getAttribute('href') ?? undefined) : undefined,
         inputType: tag === 'input' ? (el.getAttribute('type') ?? 'text').toLowerCase() : undefined,
+        buttonType: tag === 'button' ? (el.getAttribute('type') ?? '').toLowerCase() : undefined,
+        inForm: isInForm(el),
+        disabled: isDisabled(el),
       });
     }
 

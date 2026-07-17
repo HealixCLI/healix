@@ -1,5 +1,5 @@
 import { attemptLogin } from './login.js';
-import type { BrowserSurface, DomSnapshot } from './types.js';
+import type { BrowserSurface, DomSnapshot, InteractiveElement } from './types.js';
 
 export interface CrawledRoute {
   url: string;
@@ -85,6 +85,86 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
   return out;
 }
 
+/**
+ * Elements a click-probe may safely try: a real `<button>` (or a non-anchor
+ * `role="link"` element, e.g. a `<span role="link">` that extractLinks() can't
+ * see), visible, enabled, NOT inside a `<form>` (never touch an in-progress
+ * form), not a submit control, and whose accessible name doesn't read as a
+ * destructive/mutating action. This is what makes it safe to click things on
+ * a real, possibly-production app unattended.
+ */
+const UNSAFE_CLICK_TEXT_RE =
+  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|register|sign up|add to cart|clear|cancel/i;
+/** Cap on click candidates considered per page, before the per-visit MAX_CLICKS_PER_PAGE slice. */
+const CLICK_CANDIDATES_PER_PAGE = 8;
+/** Click-probe candidates actually clicked on a single page in one visit. */
+const MAX_CLICKS_PER_PAGE = 4;
+/** Total click-probe budget across a whole crawl() call — a fallback for link-following, not the primary discovery mechanism, so it's bounded tightly. */
+const MAX_CLICK_PROBES_PER_CRAWL = 20;
+/** Only click-probe a page once the link-following queue is running low — following a real link is cheaper and safer than guessing at a click target. */
+const LINK_QUEUE_THIN_THRESHOLD = 3;
+
+function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
+  return snapshot.interactiveElements
+    .filter((el) => el.role === 'button' || (el.role === 'link' && !el.href))
+    .filter((el) => !el.inForm)
+    .filter((el) => !el.disabled)
+    .filter((el) => el.buttonType !== 'submit')
+    .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
+    .slice(0, CLICK_CANDIDATES_PER_PAGE);
+}
+
+export interface ClickDiscoveryResult {
+  attempted: number;
+  discoveredUrls: string[];
+}
+
+/**
+ * Probes a bounded number of same-page click candidates to discover routes a
+ * pure `<a href>` scan can't see — common in SPAs that route their primary
+ * navigation via button/onClick handlers rather than real anchors (this is
+ * why a link-only crawl can stall at a single thin route on such an app; see
+ * GAP-042). Never clicks anything inside a form, disabled, a submit control,
+ * or with a name matching UNSAFE_CLICK_TEXT_RE. After each click, resets to
+ * `originalUrl` (if the click navigated) or presses Escape (if it likely just
+ * opened a menu/dropdown in place) before trying the next candidate, so the
+ * page is always back in a known state for the caller.
+ */
+async function discoverClickRoutes(
+  browser: BrowserSurface,
+  snapshot: DomSnapshot,
+  origin: string,
+  maxClicks: number,
+): Promise<ClickDiscoveryResult> {
+  const originalUrl = snapshot.url;
+  const candidates = extractClickCandidates(snapshot).slice(0, Math.max(0, maxClicks));
+  const discoveredUrls: string[] = [];
+  let attempted = 0;
+
+  for (const candidate of candidates) {
+    attempted += 1;
+    try {
+      await browser.click(candidate.selector);
+      const after = await browser.snapshot();
+      if (normalizeUrl(after.url) !== normalizeUrl(originalUrl)) {
+        if (sameOrigin(after.url, origin)) discoveredUrls.push(after.url);
+        discoveredUrls.push(...extractLinks(after, origin));
+        await browser.goto(originalUrl).catch(() => undefined);
+      } else {
+        // Click likely opened a menu/dropdown in place rather than navigating
+        // — collect any newly revealed anchors, then close it.
+        discoveredUrls.push(...extractLinks(after, origin));
+        await browser.pressKey('Escape').catch(() => undefined);
+      }
+    } catch {
+      // Dead click target or click failed — best-effort reset, keep probing the rest.
+      await browser.goto(originalUrl).catch(() => undefined);
+    }
+  }
+
+  return { attempted, discoveredUrls };
+}
+
 /** A stable per-route signature used to detect a single-shell SPA (every route looks identical). */
 function fingerprintOf(snapshot: DomSnapshot): string {
   return snapshot.interactiveElements
@@ -163,6 +243,7 @@ export async function crawl(
   const fingerprintCounts = new Map<string, number>();
   const routes: CrawledRoute[] = [];
   let budgetExhausted = false;
+  let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
 
   while (queue.length > 0) {
     if (routes.length >= maxRoutes || Date.now() >= deadline) {
@@ -230,6 +311,25 @@ export async function crawl(
       if (!requested.has(norm) && !queued.has(norm)) {
         queued.add(norm);
         queue.push({ url: norm, depth: item.depth + 1 });
+      }
+    }
+
+    // Link-following alone stalls on SPAs that route their primary navigation
+    // via button/onClick handlers rather than real `<a href>` anchors (see
+    // GAP-042). Only probe once the link queue is running thin — following a
+    // real link is cheaper and safer than guessing at a click target.
+    if (remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD) {
+      const maxClicks = Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes);
+      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks).catch(
+        (): ClickDiscoveryResult => ({ attempted: 0, discoveredUrls: [] }),
+      );
+      remainingClickProbes -= clickResult.attempted;
+      for (const discovered of clickResult.discoveredUrls) {
+        const norm = normalizeUrl(discovered);
+        if (!requested.has(norm) && !queued.has(norm)) {
+          queued.add(norm);
+          queue.push({ url: discovered, depth: item.depth + 1 });
+        }
       }
     }
   }

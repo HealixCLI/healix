@@ -1,6 +1,6 @@
 import { spawn, type ChildProcess } from 'node:child_process';
 import { access, readFile, stat } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, relative } from 'node:path';
 
 import type { Tier, TestStatus } from '../../storage/types.js';
 import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestingScope, TestModeContext } from '../types.js';
@@ -120,6 +120,41 @@ export function playwrightProjectArgs(scope: TestingScope | undefined): string[]
   return tiersForScope(scope).flatMap((tier) => ['--project', tier]);
 }
 
+/**
+ * The `npx playwright test [...pathArgs] [...projectArgs]` CLI args for one
+ * execute() invocation. Precedence: `onlySpecs` (the coverage loop's
+ * gap-fill batch) wins when given — it restricts to exactly those spec
+ * FILES (as positional path args, relative to projectDir) plus --project
+ * flags for whichever tier(s) they belong to (so a tierB-auth gap-fill spec
+ * still pulls in its auth-setup dependency via Playwright's own project-
+ * dependency semantics). Otherwise `onlyTier` (resume's per-tier batching)
+ * restricts to one project; with neither, falls back to the scope-wide
+ * `playwrightProjectArgs`.
+ *
+ * Without `onlySpecs`, a gap-fill re-run has NO file restriction at all, so
+ * `npx playwright test` re-runs every spec already on disk from earlier
+ * tiers/iterations — not just the new batch — and every one of those re-run
+ * results gets appended a second (third, fourth...) time to outcome.results
+ * (report.ts's Total), while the DB side silently collapses the duplicate
+ * result rows back onto the same existing test row (persistResults'
+ * fallback-key matching), so only the Report's count balloons, not the
+ * Results tab's.
+ */
+export function resolvePlaywrightRunArgs(
+  projectDir: string,
+  scope: TestingScope | undefined,
+  onlyTier?: Tier,
+  onlySpecs?: GeneratedSpec[],
+): string[] {
+  if (onlySpecs && onlySpecs.length > 0) {
+    const tiers = [...new Set(onlySpecs.map((s) => s.tier))];
+    const projectArgs = tiers.flatMap((tier) => ['--project', tier]);
+    const pathArgs = onlySpecs.map((s) => relative(projectDir, s.path));
+    return [...pathArgs, ...projectArgs];
+  }
+  return onlyTier ? ['--project', onlyTier] : playwrightProjectArgs(scope);
+}
+
 interface RawCommand {
   code: number | null;
   signal: NodeJS.Signals | null;
@@ -131,7 +166,11 @@ interface RawCommand {
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
-function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawCommand> {
+function runPlaywright(
+  ctx: TestModeContext,
+  onlyTier?: Tier,
+  onlySpecs?: GeneratedSpec[],
+): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
     // Cancelled before we even spawned — return immediately; nothing to kill.
     if (ctx.signal?.aborted) {
@@ -149,10 +188,9 @@ function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawComman
     // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
-    // onlyTier (resume's per-tier batching — see execute()'s opts) restricts
-    // to exactly that one tier, overriding the scope-wide project selection.
-    const projectArgs = onlyTier ? ['--project', onlyTier] : playwrightProjectArgs(ctx.testingScope);
-    const args = ['playwright', 'test', ...projectArgs];
+    // See resolvePlaywrightRunArgs for the onlyTier/onlySpecs precedence.
+    const runArgs = resolvePlaywrightRunArgs(ctx.projectDir, ctx.testingScope, onlyTier, onlySpecs);
+    const args = ['playwright', 'test', ...runArgs];
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -774,9 +812,10 @@ function abortedOutcome(exitCode: number | null = null): ExecOutcome {
 export async function execute(
   ctx: TestModeContext,
   specs: GeneratedSpec[],
-  opts?: { onlyTier?: Tier },
+  opts?: { onlyTier?: Tier; onlySpecs?: GeneratedSpec[] },
 ): Promise<ExecOutcome> {
   const onlyTier = opts?.onlyTier;
+  const onlySpecs = opts?.onlySpecs;
   emit(ctx, `Executing ${specs.length} spec(s) via Playwright${onlyTier ? ` (${onlyTier} only)` : ''}`, {
     count: specs.length,
     onlyTier,
@@ -797,7 +836,7 @@ export async function execute(
 
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
-  let cmd = await runPlaywright(ctx, onlyTier);
+  let cmd = await runPlaywright(ctx, onlyTier, onlySpecs);
 
   // Cancelled during (or right before) the run: partial results are
   // meaningless and would mislabel interrupted tests as failures — discard
@@ -819,7 +858,7 @@ export async function execute(
     );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
-    cmd = await runPlaywright(ctx, onlyTier);
+    cmd = await runPlaywright(ctx, onlyTier, onlySpecs);
 
     // The retry run can be cancelled too (as can the install before it).
     if (cmd.aborted || ctx.signal?.aborted) {

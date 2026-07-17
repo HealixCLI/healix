@@ -1243,7 +1243,15 @@ async function runPipeline(
         if (checkCancelled()) break;
         try {
           emit('execute', 'info', `Executing ${gapSpecs.length} gap-fill spec(s).`);
-          const gapOutcome = await mode.execute(ctx, gapSpecs);
+          // onlySpecs restricts Playwright to exactly these new gap-fill spec
+          // files (see execute.ts's runPlaywright) — without it, an unscoped
+          // invocation re-runs EVERY spec already on disk from earlier tiers/
+          // iterations, and each re-run result gets appended a second (third,
+          // fourth...) time to outcome.results (the Report's Total), while the
+          // DB side silently collapses the duplicate result rows onto the same
+          // existing test row — so only the Report's count balloons, not the
+          // Results tab's.
+          const gapOutcome = await mode.execute(ctx, gapSpecs, { onlySpecs: gapSpecs });
           persistResults(store, runId, gapSpecs, gapOutcome, testIdByKey, noteStoreOk, noteStoreFailure);
           outcome = mergeExecOutcomes(outcome, gapOutcome);
         } catch (err) {

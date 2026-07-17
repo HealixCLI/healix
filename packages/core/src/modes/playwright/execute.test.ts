@@ -8,6 +8,7 @@
  *     throwing.
  */
 import { describe, it, expect, vi, afterEach } from 'vitest';
+import { join } from 'node:path';
 
 // Spy on spawn so the pre-abort test can prove NOTHING was executed. The
 // actual implementation is preserved for any test that legitimately spawns.
@@ -24,6 +25,7 @@ import {
   parseReport,
   findAuthSetupOutcome,
   playwrightProjectArgs,
+  resolvePlaywrightRunArgs,
   type AuthSignals,
 } from './execute.js';
 
@@ -216,6 +218,74 @@ describe('playwrightProjectArgs — testing-scope --project restriction', () => 
 
   it('restricts to tierC-api for backend', () => {
     expect(playwrightProjectArgs('backend')).toEqual(['--project', 'tierC-api']);
+  });
+});
+
+function spec(
+  overrides: Partial<GeneratedSpec> & { path: string; tier: GeneratedSpec['tier'] },
+): GeneratedSpec {
+  return { title: 'spec', reqTag: undefined, contents: '', ...overrides };
+}
+
+describe('resolvePlaywrightRunArgs — gap-fill re-execution must not re-run the whole suite', () => {
+  it('REGRESSION: onlySpecs restricts to exactly those files, not an unscoped whole-suite run', () => {
+    // Before this fix, the coverage loop's gap-fill call omitted onlySpecs
+    // entirely, so this resolved to playwrightProjectArgs('both') === [] —
+    // an UNSCOPED `npx playwright test` that re-runs every spec already on
+    // disk, duplicating results in outcome.results (report.ts's Total) on
+    // every gap-fill iteration.
+    const args = resolvePlaywrightRunArgs('/suite', 'both', undefined, [
+      spec({ path: '/suite/tests/tierA-public/new-a.spec.ts', tier: 'tierA-public' }),
+    ]);
+    expect(args).not.toEqual([]);
+    expect(args).toContain(join('tests', 'tierA-public', 'new-a.spec.ts'));
+  });
+
+  it('passes each onlySpecs path relative to projectDir, plus one --project flag per distinct tier', () => {
+    const args = resolvePlaywrightRunArgs('/suite', 'both', undefined, [
+      spec({ path: '/suite/tests/tierA-public/new-a.spec.ts', tier: 'tierA-public' }),
+      spec({ path: '/suite/tests/tierB-auth/new-b.spec.ts', tier: 'tierB-auth' }),
+    ]);
+    expect(args).toEqual([
+      join('tests', 'tierA-public', 'new-a.spec.ts'),
+      join('tests', 'tierB-auth', 'new-b.spec.ts'),
+      '--project',
+      'tierA-public',
+      '--project',
+      'tierB-auth',
+    ]);
+  });
+
+  it('de-duplicates --project flags when multiple onlySpecs share a tier', () => {
+    const args = resolvePlaywrightRunArgs('/suite', 'both', undefined, [
+      spec({ path: '/suite/tests/tierA-public/a.spec.ts', tier: 'tierA-public' }),
+      spec({ path: '/suite/tests/tierA-public/b.spec.ts', tier: 'tierA-public' }),
+    ]);
+    expect(args.filter((a) => a === '--project')).toHaveLength(1);
+  });
+
+  it('onlySpecs takes precedence over onlyTier when both are somehow given', () => {
+    const args = resolvePlaywrightRunArgs('/suite', 'both', 'tierC-api', [
+      spec({ path: '/suite/tests/tierA-public/new-a.spec.ts', tier: 'tierA-public' }),
+    ]);
+    expect(args).not.toContain('tierC-api');
+    expect(args).toContain('tierA-public');
+  });
+
+  it('falls back to onlyTier (single --project, no path args) when onlySpecs is omitted', () => {
+    expect(resolvePlaywrightRunArgs('/suite', 'both', 'tierB-auth')).toEqual(['--project', 'tierB-auth']);
+  });
+
+  it('falls back to the scope-wide playwrightProjectArgs when neither onlyTier nor onlySpecs is given', () => {
+    expect(resolvePlaywrightRunArgs('/suite', 'frontend')).toEqual(playwrightProjectArgs('frontend'));
+    expect(resolvePlaywrightRunArgs('/suite', 'both')).toEqual([]);
+  });
+
+  it('treats an empty onlySpecs array the same as omitted (falls back, does not produce zero-file no-op args)', () => {
+    expect(resolvePlaywrightRunArgs('/suite', 'both', 'tierA-public', [])).toEqual([
+      '--project',
+      'tierA-public',
+    ]);
   });
 });
 

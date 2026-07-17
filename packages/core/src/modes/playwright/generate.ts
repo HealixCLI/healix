@@ -3,9 +3,15 @@ import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
 import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
+import { ProviderUnavailableError } from '../types.js';
 import { TIERS, tierLabel } from './templates.js';
 
 const GEN_TIMEOUT_MS = 180_000;
+
+// Re-exported for call sites/tests that import it alongside generate() —
+// the class itself lives in modes/types.ts since it's shared across modes,
+// not Playwright-specific (see that definition for the full rationale).
+export { ProviderUnavailableError } from '../types.js';
 
 function emit(ctx: TestModeContext, message: string, data?: unknown): void {
   ctx.emit?.('generate', message, data);
@@ -124,7 +130,7 @@ export function findForbiddenApis(source: string): string[] {
   return [...violations];
 }
 
-function looksLikePlaywrightSpec(source: string): boolean {
+export function looksLikePlaywrightSpec(source: string): boolean {
   return /@playwright\/test/.test(source) && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
 }
 
@@ -169,6 +175,17 @@ function countReqTagOccurrences(source: string, reqTag: string): number {
   return [...source.matchAll(re)].length;
 }
 
+/** Retry note when a source-grounded item's output is missing its mandatory [SRC:file] citation. */
+function retryNoteMissingSrcCitation(file: string): string {
+  return `Your previous output was rejected because it didn't include a "// [SRC:${file}]" comment. Add exactly that comment, naming this file, somewhere in the generated spec so its grounding is traceable.`;
+}
+
+/** True iff a "// [SRC:<file>]"-shaped comment naming this exact file appears anywhere in the source. */
+function hasSrcCitation(source: string, file: string): boolean {
+  const escaped = file.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  return new RegExp(`\\[SRC:${escaped}\\]`).test(source);
+}
+
 /** Retry note when the previous attempt used forbidden APIs (deny-list gate). */
 function retryNoteForbidden(violations: string[]): string {
   return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '@playwright/test'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
@@ -180,33 +197,69 @@ const MAX_SNAPSHOT_ELEMENTS = 40;
 const MAX_ELEMENT_NAME_LEN = 80;
 
 /**
- * Render the interactive-element inventory captured during computer-use
- * exploration (ctx.snapshot) as a compact list, so generation targets REAL
- * selectors instead of guessing. Returns '' when there is nothing to add:
- *   - no snapshot (no live URL to explore, or exploration failed) or no elements observed;
+ * Render the interactive-element inventory captured during the multi-page
+ * EXPLORE crawl (ctx.exploration) as a compact list, so generation targets
+ * REAL selectors instead of guessing. Returns '' when there is nothing to
+ * add:
+ *   - no exploration artifact (no live URL to explore, or exploration failed) or no elements observed;
  *   - an API tier (tierC-api), which must not drive a browser page at all.
- * The list is capped at MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so
- * a huge page can't blow up the prompt (and the omission isn't silent).
+ * Elements from every crawled route are included (not just the entry page),
+ * each tagged with its route URL and role so a tierB-auth item knows which
+ * elements require the authenticated session. Tier-aware ordering surfaces
+ * the most relevant role first: authenticated routes for tierB-auth items,
+ * anonymous routes otherwise. The combined list is capped at
+ * MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so a huge crawl can't
+ * blow up the prompt (and the omission isn't silent).
  */
 function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
   if (tier === 'tierC-api') return '';
-  const elements = ctx.snapshot?.interactiveElements ?? [];
-  if (elements.length === 0) return '';
+  const routes = ctx.exploration?.crawl.routes ?? [];
+  if (routes.length === 0) return '';
 
-  const shown = elements.slice(0, MAX_SNAPSHOT_ELEMENTS);
-  const lines = shown.map((el) => {
-    const name =
-      el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
-    return `- ${el.role} "${name}" -> ${el.selector}`;
-  });
-  const omitted = elements.length - shown.length;
+  const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
+  const ordered = [...routes].sort(
+    (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
+  );
+
+  const lines: string[] = [];
+  let totalCount = 0;
+  for (const route of ordered) {
+    for (const el of route.snapshot.interactiveElements) {
+      totalCount += 1;
+      if (lines.length >= MAX_SNAPSHOT_ELEMENTS) continue;
+      const name =
+        el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
+      lines.push(`- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}`);
+    }
+  }
+  if (lines.length === 0) return '';
+
+  const omitted = totalCount - lines.length;
   const more = omitted > 0 ? `\n(+${omitted} more not shown)` : '';
-  const where = ctx.snapshot?.url ? ` on ${ctx.snapshot.url}` : '';
 
   return `
 
-Interactive elements observed${where} during exploration — PREFER these real selectors over guessing:
+Interactive elements observed during exploration across ${ordered.length} route(s) — PREFER these real selectors over guessing. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies):
 ${lines.join('\n')}${more}`;
+}
+
+/**
+ * Hash-routed SPAs (React Router HashRouter etc.) often gate content behind
+ * an invariant locale/region segment (e.g. "#/SK") observed via the app's own
+ * redirect during EXPLORE (see browser/crawler.ts detectRoutePrefix). Without
+ * this, generated specs default to a plain path-based page.goto() that never
+ * reaches the real route. Returns '' for non-hash apps or when no routing
+ * info was captured.
+ */
+function formatRoutingGuidance(ctx: TestModeContext): string {
+  const routing = ctx.exploration?.routing;
+  if (!routing?.hashRouted) return '';
+  const prefixNote = routing.invariantPrefix
+    ? ` with an observed invariant prefix "${routing.invariantPrefix}"`
+    : '';
+  return `
+
+This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
 }
 
 /** Render a plan item's scenarios as a numbered list for the generation prompt. */
@@ -214,11 +267,67 @@ function formatScenarios(scenarios: PlanScenario[]): string {
   return scenarios.map((s, i) => `${i + 1}. [${s.kind}] ${s.description}`).join('\n');
 }
 
+/** Cap on a JSON-stringified schema's length injected into the prompt, so one huge spec-derived schema can't blow it up. */
+const MAX_SCHEMA_CHARS = 600;
+
+function truncateJson(value: unknown, maxChars: number): string {
+  let json: string;
+  try {
+    json = JSON.stringify(value) ?? 'null';
+  } catch {
+    return 'null';
+  }
+  return json.length > maxChars ? `${json.slice(0, maxChars)}…` : json;
+}
+
+/**
+ * Render white-box static-analysis grounding for the plan item's matched source unit (see
+ * target/source-index.ts), when one exists: the real source file (with a mandatory `[SRC:...]`
+ * citation requirement, enforced by generateOne()'s own gate below — the same closed-loop pattern
+ * already used for the `[REQ:...]` tag), authoritative request/response schema + auth-requiredness
+ * for spec-derived (provenance: 'spec') units, and any real form fields observed in that file.
+ * Returns '' when the item has no unitKey or nothing in sourceContext matches it.
+ */
+function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string {
+  const unit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+  if (!unit) return '';
+
+  const lines: string[] = [
+    '',
+    '',
+    `Source grounding — this feature maps to real source at ${unit.file}${unit.method ? ` (${unit.method})` : ''}.`,
+    `You MUST include a comment "// [SRC:${unit.file}]" somewhere in the generated spec, naming this exact file, so its grounding is traceable.`,
+  ];
+
+  if (unit.provenance === 'spec') {
+    lines.push(
+      'This endpoint is defined in an authoritative API spec below — do not invent request/response fields beyond what is shown.',
+    );
+    if (unit.requestSchema !== undefined)
+      lines.push(`Request shape: ${truncateJson(unit.requestSchema, MAX_SCHEMA_CHARS)}`);
+    if (unit.responseSchema !== undefined)
+      lines.push(`Response shape: ${truncateJson(unit.responseSchema, MAX_SCHEMA_CHARS)}`);
+    if (unit.authRequired !== undefined) lines.push(`Auth required: ${unit.authRequired ? 'yes' : 'no'}.`);
+  }
+
+  const form = ctx.sourceContext?.forms.find((f) => f.file === unit.file);
+  if (form && form.fields.length > 0) {
+    const fieldList = form.fields
+      .map((f) => `${f.name} (${f.type}${f.required ? ', required' : ''})`)
+      .join(', ');
+    lines.push(`Real form fields observed in ${unit.file}: ${fieldList}.`);
+  }
+
+  return lines.join('\n');
+}
+
 function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
+  const routingGuidance = formatRoutingGuidance(ctx);
+  const sourceGrounding = formatSourceGrounding(ctx, item);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
@@ -245,7 +354,7 @@ Requirements:
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
 - Be self-contained and runnable; do not import local helpers.
-- ${tierGuidance}${strictNote}${inventory}
+- ${tierGuidance}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -260,6 +369,15 @@ interface GenOneOutcome {
   reason?: string;
   /** Deny-list violations from the LAST rejected attempt (for the skip event). */
   violations?: string[];
+  /**
+   * Set only when EVERY attempt failed at the provider-communication level
+   * (thrown, or `res.ok === false`) — never once got far enough to validate
+   * model output. Distinguishes "the AI produced something we rejected"
+   * (normal, not a systemic problem) from "we couldn't reach the provider at
+   * all" (see generate()'s ProviderUnavailableError, which resume/checkpoint
+   * treats very differently from an ordinary content-validation skip).
+   */
+  providerFailureDetail?: string;
 }
 
 /**
@@ -294,6 +412,11 @@ async function generateOne(
   let retryNote: string | null = null;
   let lastReason = 'no valid spec with an expect(...) after retry';
   let lastViolations: string[] | undefined;
+  // Tracks whether we EVER got far enough to validate model output — cleared
+  // the moment a completion succeeds, regardless of what content-validation
+  // does with it afterward. Stays set only when every attempt failed before
+  // that point (thrown, or ok:false), which is the systemic-outage signal.
+  let providerFailureDetail: string | undefined;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
     let text = '';
@@ -312,11 +435,14 @@ async function generateOne(
       });
       if (!res.ok) {
         emit(ctx, `Codegen provider error for "${item.title}" (attempt ${attempt + 1}): ${res.detail}`);
+        providerFailureDetail = res.detail;
         continue;
       }
+      providerFailureDetail = undefined;
       text = res.text;
     } catch (err) {
       emit(ctx, `Codegen threw for "${item.title}" (attempt ${attempt + 1}): ${String(err)}`);
+      providerFailureDetail = err instanceof Error ? err.message : String(err);
       continue;
     }
 
@@ -366,6 +492,22 @@ async function generateOne(
       continue;
     }
 
+    // Source-citation gate: only enforced when this item actually matched a real
+    // source-context unit (formatSourceGrounding only demands the citation in that case) — an
+    // item with no unitKey/match has no file to cite, so nothing to gate here.
+    const matchedUnit = item.unitKey
+      ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey)
+      : undefined;
+    if (matchedUnit && !hasSrcCitation(source, matchedUnit.file)) {
+      emit(
+        ctx,
+        `Output for "${item.title}" is missing its [SRC:${matchedUnit.file}] citation (attempt ${attempt + 1}); retrying`,
+      );
+      retryNote = retryNoteMissingSrcCitation(matchedUnit.file);
+      lastReason = `missing [SRC:${matchedUnit.file}] citation after retry`;
+      continue;
+    }
+
     // Deny-list gate: same retry-once-then-skip treatment as the zero-expect
     // case, but the stricter note lists the concrete violations so the retry
     // can actually fix them.
@@ -400,7 +542,7 @@ async function generateOne(
     };
   }
 
-  return { spec: null, reason: lastReason, violations: lastViolations };
+  return { spec: null, reason: lastReason, violations: lastViolations, providerFailureDetail };
 }
 
 /** Number of plan items generated concurrently. */
@@ -450,7 +592,10 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // usedPaths set, so each accepted spec persists to a unique file on disk
   // even when several items are generated at once.
   const tasks = items.map((item, i) => async () => {
-    emit(ctx, `[${i + 1}/${items.length}] Generating "${item.title}"`, { id: item.id, tier: item.tier });
+    emit(ctx, `Dispatched ${i + 1}/${items.length}: Generating "${item.title}"`, {
+      id: item.id,
+      tier: item.tier,
+    });
     const outcome = await generateOne(ctx, item, usedPaths);
     completed += 1;
     emit(ctx, `Progress: ${completed}/${items.length} done`, { completed, total: items.length });
@@ -459,7 +604,8 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
 
   const outcomes = await runWithConcurrency(tasks, GEN_CONCURRENCY);
 
-  for (const { item, spec, reason, violations } of outcomes) {
+  let lastProviderFailureDetail: string | undefined;
+  for (const { item, spec, reason, violations, providerFailureDetail } of outcomes) {
     if (!spec) {
       // Include the violation list so the UI/logs show WHAT was forbidden,
       // not just that the spec was skipped.
@@ -467,11 +613,28 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
         id: item.id,
         ...(violations ? { violations } : {}),
       });
+      if (providerFailureDetail) lastProviderFailureDetail = providerFailureDetail;
       continue;
     }
 
     specs.push(spec);
     emit(ctx, `Wrote ${spec.path}`, { title: spec.title });
+  }
+
+  // Systemic outage check: every item failed, and NONE of them ever got past
+  // the provider-communication stage (every outcome carried a
+  // providerFailureDetail — a partial mix of provider- and content-failures
+  // is ordinary generation, not this). Only then is this a network/credits
+  // interruption worth checkpointing, rather than "the model produced
+  // nothing usable," which stays today's normal zero-specs outcome.
+  if (
+    items.length > 0 &&
+    specs.length === 0 &&
+    outcomes.every((o) => o.providerFailureDetail !== undefined)
+  ) {
+    throw new ProviderUnavailableError(
+      lastProviderFailureDetail ?? 'Provider unavailable during generation.',
+    );
   }
 
   emit(ctx, `Generation complete: ${specs.length}/${items.length} spec(s) accepted`, {

@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { playwrightConfigContents } from './templates.js';
+import { authSetupContents, playwrightConfigContents } from './templates.js';
 
 describe('playwrightConfigContents — artifact capture policy', () => {
   it('records a screenshot AND video for every test, pass or fail', () => {
@@ -31,5 +31,35 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     // as flaky; CI gets 2; HEALIX_RETRIES overrides both.
     expect(cfg).toContain('process.env.HEALIX_RETRIES');
     expect(cfg).toContain('process.env.CI ? 2 : 1');
+  });
+});
+
+describe('authSetupContents — locale-aware login fixture', () => {
+  it('matches email/password fields and the submit button in both English and common Slovak forms', () => {
+    const fixture = authSetupContents();
+    // Email: plain "email" and hyphenated "e-mail"/"e-mailová" forms.
+    expect(fixture).toContain('/e-?mail/i');
+    // Password: English + Slovak "Heslo".
+    expect(fixture).toContain('/heslo|password/i');
+    // Submit/reveal: English + Slovak "Prihlásiť" (matched via the "prihl" stem).
+    expect(fixture).toContain('prihl');
+  });
+
+  it('clicks through a login-reveal control before searching for the form when no email field is visible', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('hasEmailField');
+    expect(fixture).toContain("getByRole('button', { name: loginRevealRe })");
+    expect(fixture).toContain("getByRole('link', { name: loginRevealRe })");
+  });
+
+  it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {
+    const fixture = authSetupContents();
+    const beforeIdx = fixture.indexOf('writeMeta(false)');
+    const gotoIdx = fixture.indexOf('page.goto(loginUrl)');
+    const storageIdx = fixture.indexOf('storageState({ path: authFile })');
+    const afterIdx = fixture.indexOf('writeMeta(true)');
+    expect(beforeIdx).toBeGreaterThanOrEqual(0);
+    expect(beforeIdx).toBeLessThan(gotoIdx);
+    expect(storageIdx).toBeLessThan(afterIdx);
   });
 });

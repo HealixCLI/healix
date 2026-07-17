@@ -11,12 +11,44 @@ import type {
 } from '@healix/core';
 import type { RunChannelMessage, StartRunArgs } from './ipc-types';
 
-export type RunPhase = 'idle' | 'starting' | 'running' | 'awaiting-approval' | 'done' | 'cancelled' | 'error';
+export type RunPhase =
+  | 'idle'
+  | 'starting'
+  | 'running'
+  | 'plan-streaming'
+  | 'awaiting-approval'
+  | 'paused'
+  | 'done'
+  | 'cancelled'
+  | 'error';
 
-/** Map a final run summary status onto the engine phase. */
+/** Data carried by a `kind: 'plan-batch'` OrchestratorEvent.data payload (see core's runPlanPhase). */
+interface PlanBatchEventData {
+  kind: 'plan-batch';
+  batchIndex: number;
+  totalBatches: number;
+  items: TestPlanItem[];
+  status: 'ok' | 'failed';
+  reason?: string;
+}
+
+function isPlanBatchEventData(data: unknown): data is PlanBatchEventData {
+  return typeof data === 'object' && data !== null && (data as { kind?: unknown }).kind === 'plan-batch';
+}
+
+export interface PlanBatchProgress {
+  batchIndex: number;
+  totalBatches: number;
+  receivedItems: number;
+  /** Human-readable notes for batches that failed outright (index-ordered, not deduped). */
+  failedNotes: string[];
+}
+
+/** Map a final run summary status onto the engine phase. 'paused' is NOT terminal — see RunPhase's own doc. */
 function settledPhase(status: RunSummary['status']): RunPhase {
   if (status === 'error') return 'error';
   if (status === 'cancelled') return 'cancelled';
+  if (status === 'paused') return 'paused';
   return 'done';
 }
 
@@ -43,6 +75,8 @@ export interface RunEngineState {
   revisingItemIds: Set<string>;
   /** itemId -> the last revise error for that item, if any. */
   reviseErrors: Record<string, string>;
+  /** Non-null while plan items are still streaming in batch-by-batch (phase 'plan-streaming'). */
+  planBatchProgress: PlanBatchProgress | null;
   summary: RunSummary | null;
   error: string | null;
   /**
@@ -58,6 +92,8 @@ export interface RunEngineState {
 
 export interface RunEngine extends RunEngineState {
   start: (args: StartRunArgs) => Promise<void>;
+  /** Queue a run behind whatever is currently executing, instead of starting it directly. */
+  queueRun: (args: StartRunArgs) => Promise<void>;
   /** Approve a single item (whatever its current status). */
   approveItem: (itemId: string) => void;
   /** Reject a single item — excluded from generation entirely. */
@@ -72,6 +108,13 @@ export interface RunEngine extends RunEngineState {
   rejectAll: () => Promise<void>;
   /** Request cancellation of the active run; run:done ('cancelled') confirms. */
   cancel: () => Promise<void>;
+  /** Request a manual pause of the active run; run:done ('paused') confirms. */
+  pause: () => Promise<void>;
+  /**
+   * Resume a specific paused run (from a history row, not necessarily the
+   * run this engine was last tracking) and adopt it as the live run.
+   */
+  resume: (runId: string) => Promise<void>;
   reset: () => void;
   /**
    * Re-attach to a run that is still genuinely parked awaiting approval in the
@@ -94,6 +137,7 @@ const INITIAL: RunEngineState = {
   planDecided: false,
   revisingItemIds: new Set(),
   reviseErrors: {},
+  planBatchProgress: null,
   summary: null,
   error: null,
   hydrated: false,
@@ -122,6 +166,33 @@ function clonePlan(plan: TestPlan): TestPlan {
 
 function mapItem(plan: TestPlan, itemId: string, fn: (item: TestPlanItem) => TestPlanItem): TestPlan {
   return { ...plan, items: plan.items.map((it) => (it.id === itemId ? fn(it) : it)) };
+}
+
+/**
+ * Reconcile the final, authoritative plan with whatever working draft the
+ * reviewer already has (possibly built up from plan-batch streaming events).
+ * Items already present in the working draft keep their in-progress
+ * status/edits/revisions untouched; items only present in the final plan
+ * (no prior working-plan draft) are the exceptional case (unbatched plans,
+ * or none of that item's batch reached the UI in time) and get a fresh clone.
+ * Preserves working-draft item order, then appends any not-yet-seen items.
+ */
+function mergeFinalPlan(workingPlan: TestPlan | null, finalPlan: TestPlan): TestPlan {
+  const cloned = clonePlan(finalPlan);
+  if (!workingPlan) return cloned;
+  const finalById = new Map(cloned.items.map((it) => [it.id, it]));
+  const seen = new Set<string>();
+  const merged: TestPlanItem[] = [];
+  for (const draftItem of workingPlan.items) {
+    if (finalById.has(draftItem.id)) {
+      merged.push(draftItem);
+      seen.add(draftItem.id);
+    }
+  }
+  for (const item of cloned.items) {
+    if (!seen.has(item.id)) merged.push(item);
+  }
+  return { ...cloned, items: merged };
 }
 
 function snapshotOf(item: TestPlanItem): PlanItemSnapshot {
@@ -171,21 +242,109 @@ export function useRunEngine(): RunEngine {
     }));
   }, []);
 
+  // One-time hydration on mount: this hook is now called once, at the App
+  // root, so a normal navigation never remounts it — but a fresh renderer
+  // (first load, or a future window re-create) could still mount while a run
+  // is already executing in the main process. Rebuild the console from its
+  // persisted event history instead of sitting idle until the next live
+  // event happens to arrive, so the log reads gap-free from the very start.
+  useEffect(() => {
+    let cancelled = false;
+    void (async () => {
+      let active: Awaited<ReturnType<typeof window.healix.getActiveRun>>;
+      try {
+        active = await window.healix.getActiveRun();
+      } catch {
+        return;
+      }
+      if (cancelled || !active || activeRunId.current) return;
+
+      let detail: Awaited<ReturnType<typeof window.healix.runDetail>>;
+      try {
+        detail = await window.healix.runDetail(active.runId);
+      } catch {
+        return;
+      }
+      if (cancelled || !detail.run || activeRunId.current) return;
+
+      activeRunId.current = active.runId;
+      const lines: ConsoleLine[] = detail.events.map((e) => ({
+        id: ++lineSeq.current,
+        level: e.level,
+        phase: e.phase,
+        message: e.message,
+        ts: new Date(e.createdAt).toLocaleTimeString(undefined, { hour12: false }),
+      }));
+      setState({
+        ...INITIAL,
+        runId: active.runId,
+        lines,
+        phase:
+          detail.run.status === 'awaiting-approval'
+            ? 'awaiting-approval'
+            : detail.run.status === 'paused'
+              ? 'paused'
+              : 'running',
+        plan: detail.plan,
+        workingPlan: detail.plan ? clonePlan(detail.plan) : null,
+        hydrated: true,
+      });
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
   useEffect(() => {
     const unsubscribe = window.healix.onRunEvent((msg: RunChannelMessage) => {
+      if (msg.channel === 'queue:updated' || msg.channel === 'queue:failed') return; // handled by useRunQueue, not this engine.
+
+      // run:started always wins, even over a DIFFERENT previously-tracked run:
+      // this is exactly how a queued request announces "it's my turn now" —
+      // the engine must adopt it and drop whatever the last (now-settled) run
+      // left behind, not filter it out for not matching the stale id.
+      if (msg.channel === 'run:started') {
+        activeRunId.current = msg.payload.runId;
+        lineSeq.current = 0;
+        setState({ ...INITIAL, runId: msg.payload.runId, phase: 'running' });
+        return;
+      }
+
       const incomingRunId = msg.payload.runId;
       // Ignore stray messages from a previous/other run.
       if (activeRunId.current && incomingRunId !== activeRunId.current) return;
 
       switch (msg.channel) {
-        case 'run:started': {
-          activeRunId.current = msg.payload.runId;
-          setState((prev) => ({ ...prev, runId: msg.payload.runId, phase: 'running' }));
-          break;
-        }
         case 'run:event': {
           const e = msg.payload.event;
           pushLine(e.level, String(e.phase), e.message);
+          if (e.phase === 'plan' && isPlanBatchEventData(e.data)) {
+            const batch = e.data;
+            setState((prev) => {
+              const basePlan: TestPlan = prev.plan ?? { summary: '', items: [], planSource: 'ai' };
+              const baseWorking: TestPlan = prev.workingPlan ?? { summary: '', items: [], planSource: 'ai' };
+              const failedNotes =
+                batch.status === 'failed'
+                  ? [
+                      ...(prev.planBatchProgress?.failedNotes ?? []),
+                      `Batch ${batch.batchIndex + 1}/${batch.totalBatches} failed${batch.reason ? `: ${batch.reason}` : ''}.`,
+                    ]
+                  : (prev.planBatchProgress?.failedNotes ?? []);
+              const receivedItems = (prev.planBatchProgress?.receivedItems ?? 0) + batch.items.length;
+              return {
+                ...prev,
+                plan: { ...basePlan, items: [...basePlan.items, ...batch.items] },
+                workingPlan: { ...baseWorking, items: [...baseWorking.items, ...batch.items] },
+                phase: prev.phase === 'awaiting-approval' ? prev.phase : 'plan-streaming',
+                planBatchProgress: {
+                  batchIndex: batch.batchIndex,
+                  totalBatches: batch.totalBatches,
+                  receivedItems,
+                  failedNotes,
+                },
+              };
+            });
+          }
           break;
         }
         case 'run:plan': {
@@ -193,10 +352,17 @@ export function useRunEngine(): RunEngine {
           setState((prev) => ({
             ...prev,
             plan,
-            workingPlan: clonePlan(plan),
+            // Merge (not replace): preserve any per-item status/edits/revisions the
+            // reviewer already applied to items that streamed in via plan-batch
+            // events, keyed by id (stable from the moment a batch is parsed, see
+            // core's normalizeItem/nanoid — never reassigned across the merge).
+            // Items with no prior working-plan entry (non-batched plans, or any
+            // gap) are added fresh from the final plan.
+            workingPlan: mergeFinalPlan(prev.workingPlan, plan),
             planDecided: false,
             revisingItemIds: new Set(),
             reviseErrors: {},
+            planBatchProgress: null,
             phase: 'awaiting-approval',
           }));
           break;
@@ -222,7 +388,17 @@ export function useRunEngine(): RunEngine {
     try {
       // Note: startRun resolves only when the whole run finishes; the live
       // updates flow through onRunEvent. We still await to surface hard errors.
-      const summary = await window.healix.startRun(args);
+      const result = await window.healix.startRun(args);
+      if (result.queued) {
+        // Caller expected this to start immediately (a small race: another run
+        // began between this component's last idle check and this call landing)
+        // — it's sitting in the queue now instead. Drop back to idle; the
+        // queue view shows it, and run:started will pick the engine up
+        // automatically once it's actually this request's turn.
+        setState(INITIAL);
+        return;
+      }
+      const summary = result.summary;
       setState((prev) => ({
         ...prev,
         summary,
@@ -233,6 +409,18 @@ export function useRunEngine(): RunEngine {
       const message = err instanceof Error ? err.message : String(err);
       setState((prev) => ({ ...prev, phase: 'error', error: message }));
     }
+  }, []);
+
+  /**
+   * Queue a run request behind whatever is currently executing — see
+   * RunsView's "Queue run" action. Deliberately does not touch this engine's
+   * own state: the queued entry shows up via useRunQueue's queue:updated
+   * broadcast, and if a race means it actually starts immediately instead,
+   * this engine picks it up on its own via the (always-accepted) run:started
+   * broadcast — either way, nothing further to do here.
+   */
+  const queueRun = useCallback(async (args: StartRunArgs): Promise<void> => {
+    await window.healix.startRun(args);
   }, []);
 
   const approveItem = useCallback((itemId: string): void => {
@@ -414,12 +602,25 @@ export function useRunEngine(): RunEngine {
   const cancel = useCallback(async (): Promise<void> => {
     const runId = activeRunId.current;
     if (!runId) return;
+    // A paused run never has a live controller to abort (it was already
+    // released back when it paused — see main/index.ts's activeRuns
+    // bookkeeping), so cancelling one ALWAYS takes the "nothing live, force-
+    // settle" path below. That's the normal, expected outcome here, not an
+    // anomaly — captured before the call so the response below can tell the
+    // two cases apart.
+    const wasPaused = stateRef.current.phase === 'paused';
     // Cancellation is asynchronous and cooperative: the main process aborts the
     // orchestrator, which winds down at the next phase boundary. We do NOT flip
     // the phase here — the authoritative 'cancelled' arrives via run:done.
     try {
       const result = await window.healix.cancelRun(runId);
       if (!result.cancelled) {
+        if (wasPaused) {
+          // Expected path for a paused run — force-settled to 'cancelled' by
+          // design, not because anything was orphaned. No error banner.
+          setState((prev) => ({ ...prev, phase: 'cancelled', hydrated: false }));
+          return;
+        }
         // Nothing was actually running on the backend for this runId — most
         // likely orphaned by an app restart since it started (same class of
         // gap as approveAndContinue/rejectAll's !settled case). run:done will
@@ -439,6 +640,55 @@ export function useRunEngine(): RunEngine {
       }
     } catch {
       // The run may have already settled; run:done tells the real story.
+    }
+  }, []);
+
+  const pause = useCallback(async (): Promise<void> => {
+    const runId = activeRunId.current;
+    if (!runId) return;
+    // Same cooperative shape as cancel(): we do NOT flip the phase here — the
+    // authoritative 'paused' status arrives via run:done once the orchestrator
+    // actually winds down at its next checkpoint boundary.
+    try {
+      const result = await window.healix.pauseRun(runId);
+      if (!result.paused) {
+        // Nothing live to pause (already settled, or an app-restart orphan).
+        // run:done will already have told the real story, or never arrives —
+        // either way there's nothing further to force here (unlike cancel,
+        // which has an explicit "mark it cancelled" fallback: a run that's
+        // gone is simply not pausable, so leaving it alone is correct).
+      }
+    } catch {
+      /* the run may have already settled; run:done tells the real story */
+    }
+  }, []);
+
+  const resume = useCallback(async (runId: string): Promise<void> => {
+    // Adopt this run as the live one immediately, mirroring start(): resuming
+    // makes a paused history row live again, so its console/plan/summary
+    // should reset just like a freshly-started run rather than carry over
+    // whatever this engine was last showing.
+    lineSeq.current = 0;
+    activeRunId.current = runId;
+    setState({ ...INITIAL, runId, phase: 'starting' });
+    try {
+      // Note: resumeRun resolves only when the run finishes (or pauses again);
+      // live updates flow through onRunEvent same as start().
+      const result = await window.healix.resumeRun(runId);
+      if (!result.resumed) {
+        setState((prev) => ({ ...prev, phase: 'error', error: result.reason }));
+        return;
+      }
+      const summary = result.summary;
+      setState((prev) => ({
+        ...prev,
+        summary,
+        // run:done may have already set phase; keep error sticky.
+        phase: prev.phase === 'error' ? 'error' : settledPhase(summary.status),
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setState((prev) => ({ ...prev, phase: 'error', error: message }));
     }
   }, []);
 
@@ -468,6 +718,7 @@ export function useRunEngine(): RunEngine {
   return {
     ...state,
     start,
+    queueRun,
     approveItem,
     rejectItem,
     editItem,
@@ -475,6 +726,8 @@ export function useRunEngine(): RunEngine {
     approveAndContinue,
     rejectAll,
     cancel,
+    pause,
+    resume,
     reset,
     hydrate,
     clearError,

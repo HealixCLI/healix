@@ -203,7 +203,7 @@ export class ClaudeProvider implements ProviderAdapter {
     // contract (analysis over a user's working tree must never mutate it).
     if (opts.readOnly || opts.mode === 'plan') args.push('--permission-mode', 'plan');
     const r = await runCli(this.bin, args, {
-      timeoutMs: opts.timeoutMs ?? 180_000,
+      timeoutMs: opts.timeoutMs ?? 300_000,
       cwd: opts.cwd,
       signal: opts.signal,
       input: prompt,

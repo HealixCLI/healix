@@ -8,10 +8,12 @@ import type {
   TestMode,
   TestModeContext,
   TestPlan,
+  ValidationResult,
 } from '../types.js';
 import { scaffold } from './scaffold.js';
 import { generate } from './generate.js';
 import { execute } from './execute.js';
+import { validateSuite } from './validate.js';
 
 /** Directories whose presence is purely build/runtime noise — never traversed for export. */
 const EXPORT_IGNORE_DIRS = new Set(['node_modules', '.git', 'test-results', 'playwright-report']);
@@ -71,6 +73,10 @@ export function createPlaywrightMode(): TestMode {
 
     generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
       return generate(ctx, plan);
+    },
+
+    validate(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult> {
+      return validateSuite(ctx, specs);
     },
 
     execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {

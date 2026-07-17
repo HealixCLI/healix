@@ -16,6 +16,9 @@ out/
 *.log
 .DS_Store
 coverage/
+# Persisted source-context artifact written into a project's own repoPath by
+# target/context-store.ts; also created here when a test uses repoPath: process.cwd().
+.healix/
 
 # Secrets / env
 .env

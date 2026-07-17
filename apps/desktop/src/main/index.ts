@@ -39,6 +39,8 @@ import {
   type PlanApprovalResult,
   type RunSummary,
   type Run,
+  type PauseReason,
+  readCheckpoint,
   type SuiteMode,
   type TestCase,
   type TestResult,
@@ -212,7 +214,36 @@ ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProjec
 ipcMain.handle('projects:delete', async (_e, id: string): Promise<{ ok: true; assetsRemoved: boolean }> => {
   const store = await requireStore();
   if (!id) throw new Error('Project id is required.');
+
+  // Cancel any run of this project that's actively executing right now —
+  // must happen BEFORE store.deleteProject, which cascade-deletes the run
+  // row this looks up. Without this, the engine watching that run would sit
+  // on "running" (button stuck on "Queue run") forever: the orchestrator has
+  // no idea its project just vanished, so run:done would never arrive to
+  // settle it. Mirrors run:cancel's own settleApproval + abort sequence.
+  for (const [runId, controller] of activeRuns) {
+    if (store.getRun(runId)?.projectId !== id) continue;
+    broadcastAll('run:event', {
+      runId,
+      event: { phase: 'error', level: 'error', message: "This run's project was deleted — cancelling." },
+    });
+    settleApproval(runId, { decision: 'cancel' });
+    controller.abort();
+  }
+
   store.deleteProject(id);
+
+  // Drop any of this project's requests still waiting in the run queue —
+  // otherwise they'd sit there until their turn, then fail once dequeued
+  // (still handled gracefully, but there's no reason to let a doomed request
+  // occupy a queue slot when we already know it can never run).
+  const remaining = runQueue.filter((q) => q.projectId !== id);
+  if (remaining.length !== runQueue.length) {
+    runQueue.length = 0;
+    runQueue.push(...remaining);
+    broadcastAll('queue:updated', { queue: serializeQueue() });
+  }
+
   // Remove the project's on-disk assets (runs, suites, screenshots, videos).
   // Best-effort: the DB rows are already gone; a disk failure should not
   // resurrect the project, only be reported.
@@ -260,6 +291,41 @@ function settleApproval(runId: string, result: PlanApprovalResult): boolean {
   return true;
 }
 
+/**
+ * A run request that arrived while another run was active. Queued explicitly
+ * (the renderer only calls this path when the user chose "Queue run", not
+ * "Run now") and started automatically, in order, once the run ahead of it
+ * settles — see startNextQueued(). Planning/approval for a queued entry never
+ * happens ahead of time; it's just "project + options waiting its turn."
+ */
+interface QueuedRunRequest {
+  id: string;
+  projectId: string;
+  projectName: string;
+  args: StartRunArgs;
+  queuedAt: string;
+  sender: WebContents;
+}
+
+/** FIFO queue of pending run requests. Only ever mutated by run:start, queue:remove, and startNextQueued. */
+const runQueue: QueuedRunRequest[] = [];
+
+/** Serializable (no WebContents) view of the queue, sent to every renderer. */
+function serializeQueue(): Array<
+  Omit<QueuedRunRequest, 'sender' | 'args'> & { testingScope?: TestingScope; suiteMode?: SuiteMode }
+> {
+  return runQueue.map(({ sender: _sender, args, ...rest }) => ({
+    ...rest,
+    testingScope: args.testingScope,
+    suiteMode: args.suiteMode,
+  }));
+}
+
+/** Send a message to every open window — queue updates aren't scoped to whichever window started a particular run. */
+function broadcastAll(channel: string, payload: unknown): void {
+  for (const win of BrowserWindow.getAllWindows()) safeSend(win.webContents, channel, payload);
+}
+
 export interface StartRunArgs {
   projectId: string;
   /** What to test — drives tier selection; the underlying exploration
@@ -275,23 +341,13 @@ export interface StartRunArgs {
   baseRunId?: string;
 }
 
-ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs): Promise<RunSummary> => {
-  if (!args?.projectId) throw new Error('A projectId is required to start a run.');
-  // One run at a time: every run shares the single live-browser mirror surface
-  // and the target adapter binds fixed local ports, so concurrent runs would
-  // fight over both. Guard here until the run pipeline is multi-tenant.
-  if (activeRuns.size > 0) {
-    throw new Error('A run is already in progress. Cancel it or wait for it to finish.');
-  }
-  const sender = event.sender;
-
-  // The orchestrator owns the canonical runId. We learn it via the onRunCreated
-  // hook (fired right after the run row is created, before any phase event) and
-  // correlate run:started / approval / events to THAT id — no duplicate run row.
-  const store = await requireStore();
-  const project = store.getProject(args.projectId);
-  if (!project) throw new Error(`Project not found: ${args.projectId}`);
-
+/**
+ * Run the orchestrator end-to-end for `args`, streaming events to `sender`.
+ * Shared by the immediate ("Run now") and queued ("Queue run", once its turn
+ * comes) paths — the only difference between them is what happens BEFORE
+ * this is called (queued requests wait in runQueue first).
+ */
+async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunSummary> {
   let runId: string | null = null;
 
   // One controller per run; run:cancel aborts it and the orchestrator winds the
@@ -356,6 +412,148 @@ ipcMain.handle('run:start', async (event: IpcMainInvokeEvent, args: StartRunArgs
 
   safeSend(sender, 'run:done', { runId: runId ?? summary.runId, summary });
   return summary;
+}
+
+/**
+ * Continue a paused run from its last checkpoint (see @healix/core's
+ * orchestrator/checkpoint.ts) — a manual pause, or an automatic one from a
+ * network/credits interruption. Shares executeRun's event/frame wiring, but
+ * `send` is a callback instead of a fixed WebContents: boot-time auto-resume
+ * has no single renderer to target yet, so it passes broadcastAll, while the
+ * run:resume IPC handler passes a sender-scoped safeSend.
+ *
+ * A resumed run re-registers under activeRuns exactly like a fresh one (a
+ * paused run's controller was already deleted when it paused — see
+ * executeRun's finally), so the "one run at a time" gate and the queue both
+ * treat it identically to a brand-new run.
+ */
+async function resumeRun(
+  runId: string,
+  send: (channel: string, payload: unknown) => void,
+): Promise<RunSummary> {
+  const controller = new AbortController();
+  activeRuns.set(runId, controller);
+
+  const store = await requireStore();
+  const run = store.getRun(runId);
+  // Reuses 'run:started' (not a distinct channel) — the renderer's handler
+  // already does exactly what a resume needs: reset its live view to
+  // 'running' for this runId. See run-engine.ts's onRunEvent switch.
+  send('run:started', { runId, projectId: run?.projectId ?? 'unknown' });
+
+  const orchestrator = createOrchestrator();
+  const summary = await orchestrator
+    .resume(
+      runId,
+      {
+        onEvent: (e) => send('run:event', { runId, event: e }),
+        onFrame: (frame: Buffer) => send('run:frame', { runId, frameBase64: frame.toString('base64') }),
+      },
+      controller.signal,
+    )
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      send('run:event', { runId, event: { phase: 'error', level: 'error', message } });
+      const failed: RunSummary = { runId, status: 'error' };
+      return failed;
+    })
+    .finally(() => {
+      settleApproval(runId, { decision: 'cancel' });
+      activeRuns.delete(runId);
+    });
+
+  send('run:done', { runId, summary });
+  return summary;
+}
+
+/**
+ * Pop the next queued request (if any) and run it, chaining onward to the one
+ * after that once IT settles — this is what makes the queue actually drain
+ * itself, one at a time, without any renderer involvement.
+ */
+async function startNextQueued(): Promise<void> {
+  const next = runQueue.shift();
+  if (!next) return;
+  broadcastAll('queue:updated', { queue: serializeQueue() });
+  try {
+    await executeRun(next.args, next.sender);
+  } catch (err) {
+    // executeRun already turns orchestrator failures into a resolved 'error'
+    // summary internally — this only catches something failing before that
+    // safety net (e.g. createOrchestrator() throwing synchronously). Without
+    // this, one bad queued run would reject here and the recursive call below
+    // would never run, silently stranding every request still waiting behind it.
+    const message = err instanceof Error ? err.message : String(err);
+    console.error(`[healix] queued run for "${next.projectName}" failed to start:`, err);
+    broadcastAll('queue:failed', {
+      message: `Queued run for "${next.projectName}" failed to start: ${message}`,
+    });
+  } finally {
+    void startNextQueued();
+  }
+}
+
+ipcMain.handle(
+  'run:start',
+  async (
+    event: IpcMainInvokeEvent,
+    args: StartRunArgs,
+  ): Promise<
+    { queued: false; summary: RunSummary } | { queued: true; queueEntryId: string; position: number }
+  > => {
+    if (!args?.projectId) throw new Error('A projectId is required to start a run.');
+
+    const store = await requireStore();
+    const project = store.getProject(args.projectId);
+    if (!project) throw new Error(`Project not found: ${args.projectId}`);
+
+    // One run EXECUTES at a time — every run shares the single live-browser
+    // mirror surface and the target adapter binds fixed local ports, so
+    // concurrent execution would fight over both. A request that arrives
+    // while another is active queues instead of being rejected; it starts
+    // automatically once the run ahead of it finishes (see startNextQueued).
+    if (activeRuns.size > 0) {
+      const entry: QueuedRunRequest = {
+        id: `q_${Date.now().toString(36)}${Math.random().toString(36).slice(2, 8)}`,
+        projectId: args.projectId,
+        projectName: project.name,
+        args,
+        queuedAt: new Date().toISOString(),
+        sender: event.sender,
+      };
+      runQueue.push(entry);
+      broadcastAll('queue:updated', { queue: serializeQueue() });
+      return { queued: true, queueEntryId: entry.id, position: runQueue.length };
+    }
+
+    const summary = await executeRun(args, event.sender);
+    void startNextQueued();
+    return { queued: false, summary };
+  },
+);
+
+ipcMain.handle('queue:remove', (_e, payload: { queueEntryId: string }): { removed: boolean } => {
+  const index = runQueue.findIndex((q) => q.id === payload?.queueEntryId);
+  if (index === -1) return { removed: false };
+  runQueue.splice(index, 1);
+  broadcastAll('queue:updated', { queue: serializeQueue() });
+  return { removed: true };
+});
+
+ipcMain.handle('queue:list', (): ReturnType<typeof serializeQueue> => serializeQueue());
+
+/** Snapshot of the currently-executing run (if any), for a fresh renderer to hydrate its live view against. */
+ipcMain.handle('run:active', async (): Promise<{ runId: string; projectId: string } | null> => {
+  const [runId] = activeRuns.keys();
+  if (!runId) return null;
+  const store = await getStore();
+  if (!store) return null;
+  try {
+    const run = store.getRun(runId);
+    return run ? { runId, projectId: run.projectId } : null;
+  } catch {
+    return null;
+  }
 });
 
 /**
@@ -425,6 +623,51 @@ ipcMain.handle('run:cancel', async (_e, payload: { runId: string }): Promise<{ c
   controller.abort();
   return { cancelled: true };
 });
+
+ipcMain.handle('run:pause', async (_e, payload: { runId: string }): Promise<{ paused: boolean }> => {
+  const runId = payload?.runId;
+  if (!runId) return { paused: false };
+  // A parked approval gate would hold the orchestrator before it ever checks
+  // the abort signal — same reasoning as run:cancel.
+  settleApproval(runId, { decision: 'cancel' });
+  const controller = activeRuns.get(runId);
+  if (!controller) return { paused: false };
+  // The reason string IS the signal: the orchestrator's isPauseRequested()
+  // checks `signal.reason === 'pause'` to distinguish this from a plain cancel.
+  controller.abort('pause');
+  return { paused: true };
+});
+
+ipcMain.handle(
+  'run:resume',
+  async (
+    event,
+    payload: { runId: string },
+  ): Promise<{ resumed: true; summary: RunSummary } | { resumed: false; reason: string }> => {
+    const runId = payload?.runId;
+    if (!runId) return { resumed: false, reason: 'A runId is required.' };
+
+    const store = await requireStore();
+    const run = store.getRun(runId);
+    if (!run) return { resumed: false, reason: `No run found with id ${runId}.` };
+    if (run.status !== 'paused') {
+      return { resumed: false, reason: `Run is ${run.status}, not paused.` };
+    }
+    // Same "one run executes at a time" gate run:start enforces — resuming
+    // doesn't get to cut in front of whatever is currently live.
+    if (activeRuns.size > 0) {
+      return { resumed: false, reason: 'Another run is currently active. Try again once it finishes.' };
+    }
+
+    // Mirrors run:start: block on the full run (the renderer already gets live
+    // progress via the run:started/run:event/run:done push channels), then
+    // let the queue advance once this one truly settles.
+    const sender = event.sender;
+    const summary = await resumeRun(runId, (channel, msg) => safeSend(sender, channel, msg));
+    void startNextQueued();
+    return { resumed: true, summary };
+  },
+);
 
 /** Swallows the level param so resolveProvider's emit callback has somewhere harmless to go. */
 function noopEmit(_phase: string, _level: 'debug' | 'info' | 'warn' | 'error', _message: string): void {
@@ -1012,20 +1255,106 @@ function safeSend(sender: WebContents, channel: string, payload: unknown): void 
   sender.send(channel, payload);
 }
 
+/**
+ * Boot-time reconciliation: fully automatic, no confirmation prompt (a paused
+ * run just quietly picks back up). Three cases, in order:
+ *
+ * 1. Runs already cleanly 'paused' for a non-manual reason (network/credits —
+ *    see HealixStore.listAutoResumableRuns()) from a PRIOR session: resume
+ *    each directly. A 'manual' pause is never touched here — the user must
+ *    resume it themselves.
+ * 2. Runs still showing an in-flight status (planning/generating/…) with a
+ *    checkpoint surviving on disk — the process driving them is gone
+ *    (crash/quit) before it could mark them 'paused' itself, but there IS
+ *    something to pick back up: claim the row as 'paused'/'crashed' and
+ *    resume it.
+ * 3. Runs still in-flight with NO checkpoint — e.g. the app was closed mid
+ *    PLAN, before GENERATE ever got a chance to write one. There is nothing
+ *    to resume from (redoing PLAN from scratch is just... starting over), so
+ *    unlike case 2 this fails the row immediately instead of leaving it
+ *    stuck showing a live-looking status indefinitely (previously this fell
+ *    through to failOrphanedRuns()'s 6-HOUR age buffer, which reads as
+ *    "auto-resume is broken" to anyone testing this within the same hour).
+ *
+ * Runs strictly one at a time: each resumeRun() call is awaited fully before
+ * the next one starts, so at most one auto-resume (and therefore at most one
+ * orchestrator pipeline / Playwright invocation) is ever active from this
+ * pass. Any run:start request that arrives mid-batch correctly queues itself
+ * behind whichever resume is currently active (see run:start's activeRuns
+ * gate) and is drained once, after the whole batch settles.
+ */
+async function reconcileRunsOnBoot(): Promise<void> {
+  const store = await getStore();
+  if (!store) return;
+
+  const toResume: Run[] = [...store.listAutoResumableRuns()];
+  let failedNow = 0;
+  for (const run of store.listInFlightRuns()) {
+    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
+    const checkpoint = await readCheckpoint(runDir);
+    if (!checkpoint) {
+      store.updateRunStatus(run.id, 'error', { finishedAt: new Date().toISOString() });
+      try {
+        store.appendEvent(
+          run.id,
+          'done',
+          'Run interrupted (app closed or crashed) before any checkpoint existed — nothing to resume from.',
+          { level: 'error' },
+        );
+      } catch {
+        /* best-effort */
+      }
+      failedNow += 1;
+      continue;
+    }
+    const pauseReason: PauseReason = 'crashed';
+    store.updateRunStatus(run.id, 'paused', { pauseReason, finishedAt: new Date().toISOString() });
+    toResume.push({ ...run, status: 'paused', pauseReason });
+  }
+  if (failedNow > 0) {
+    console.log(
+      `[healix] boot: marked ${failedNow} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
+    );
+  }
+
+  // Resumed strictly one at a time: resumeRun() registers into `activeRuns`
+  // as soon as it starts, and every other run-starting path in this file
+  // enforces "one run executes at a time" (see run:start's activeRuns.size
+  // gate) because every run shares the single live-browser mirror surface and
+  // fixed local ports. Firing all of these concurrently would violate that
+  // invariant.
+  for (const run of toResume) {
+    console.log(`[healix] auto-resuming run ${run.id} (paused: ${run.pauseReason ?? 'unknown'}).`);
+    try {
+      await resumeRun(run.id, (channel, payload) => broadcastAll(channel, payload));
+    } catch (err) {
+      console.error(`[healix] auto-resume of run ${run.id} failed:`, err);
+    }
+  }
+  // Drain any run:start requests that queued (behind activeRuns) while the
+  // above was resuming — exactly once, after the whole batch, not per
+  // iteration: draining mid-loop could let a queued run start concurrently
+  // with the NEXT boot-time resume, reintroducing the same bug in a new spot.
+  if (toResume.length > 0) void startNextQueued();
+
+  // Fallback janitor for anything the pass above didn't touch (e.g. storage
+  // was briefly unavailable) — still age-buffered (default 6h) so it never
+  // reaps a run genuinely still in flight in another process (e.g. the CLI).
+  try {
+    const reaped = store.failOrphanedRuns();
+    if (reaped > 0) console.log(`[healix] janitor: marked ${reaped} orphaned run(s) as error`);
+  } catch {
+    /* best-effort */
+  }
+}
+
 app.whenReady().then(() => {
   registerArtifactProtocol();
-  // Orphaned-run janitor: runs left in non-terminal states by a crashed or
-  // quit session would otherwise look "running" forever in the history rail
-  // (a real one sat in 'planning' for a week). Best-effort and fire-and-forget
-  // so a missing/broken store never blocks window creation.
-  void (async () => {
-    try {
-      const reaped = (await getStore())?.failOrphanedRuns() ?? 0;
-      if (reaped > 0) console.log(`[healix] janitor: marked ${reaped} orphaned run(s) as error`);
-    } catch {
-      /* storage unavailable — nothing to reap */
-    }
-  })();
+  // Best-effort and fire-and-forget so a missing/broken store never blocks
+  // window creation.
+  void reconcileRunsOnBoot().catch(() => {
+    /* storage unavailable — nothing to reconcile */
+  });
   applyDevDockIcon();
   createWindow();
   app.on('activate', () => {

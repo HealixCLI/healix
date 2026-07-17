@@ -101,6 +101,10 @@ function migrate(db: DatabaseSync): void {
     ensureColumn(db, 'runs', 'suite_mode', 'TEXT');
     ensureColumn(db, 'runs', 'base_run_id', 'TEXT');
     ensureColumn(db, 'tests', 'spec_path', 'TEXT');
+    // v6: pause/resume — why a 'paused' run stopped (manual | network |
+    // credits-exhausted | crashed). Drives whether boot-time reconciliation
+    // is allowed to auto-resume it (never for 'manual').
+    ensureColumn(db, 'runs', 'pause_reason', 'TEXT');
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     logger.info(`Database migrated to schema v${SCHEMA_VERSION}`);
   }

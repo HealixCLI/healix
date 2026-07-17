@@ -8,12 +8,24 @@ export interface TriageInput {
   specSource?: string;
   reqTag?: string;
   tracePath?: string;
+  /** Relative path of the source-context unit (see target/source-index.ts) the failing test's plan item mapped to, when known. */
+  sourceFile?: string;
+  /** That file's content (or a leading slice of it) — first-party repo code, cited normally rather than fenced as untrusted. */
+  sourceExcerpt?: string;
 }
 
 export interface TriageResult {
   verdict: Verdict;
   confidence: number;
   rationale: string;
+  /**
+   * Recommended fix, present when the model could be concrete. Its shape
+   * depends on `verdict`: for `test_is_wrong` it's a corrected test code
+   * snippet; for `app_is_wrong` it's a prose recommendation for engineers
+   * (likely root cause + where to look), not literal app source — the
+   * triage engine never sees the app's codebase. Omitted for
+   * environment/flaky/ambiguous, where there is no code-level fix.
+   */
   suggestedPatch?: string;
 }
 

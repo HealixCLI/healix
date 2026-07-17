@@ -42,6 +42,7 @@ interface PlanItemSeed {
   reqTag: string;
   tier: string;
   intent: string;
+  scenarios?: Array<{ kind: string; description: string }>;
 }
 
 function fakeProviderWithPlan(items: PlanItemSeed[], completeCalls: CompleteOptions[]): ProviderAdapter {
@@ -108,7 +109,17 @@ function makeRealisticFakeMode(
         const relPath = join('tests', item.tier, `${item.reqTag}.spec.ts`);
         const absPath = join(ctx.projectDir, relPath);
         await mkdir(dirname(absPath), { recursive: true });
-        const contents = `// spec for ${item.title} (${item.reqTag})\n`;
+        // One `test(...)` marker line per scenario — real generate.ts emits one
+        // test() per planned scenario, and execute() below counts these markers
+        // to decide how many results to return. Writing them into the actual
+        // file (rather than tracking scenario counts in a JS-side map) means a
+        // carried-forward spec (copied byte-for-byte by hydrateCarriedSpecs,
+        // read back from disk) still reports its true scenario count even
+        // though this mode's own generate() never ran for it.
+        const scenarioCount = Math.max(item.scenarios?.length ?? 0, 1);
+        const contents =
+          `// spec for ${item.title} (${item.reqTag})\n` +
+          Array.from({ length: scenarioCount }, (_, i) => `test('scenario ${i + 1}');\n`).join('');
         await writeFile(absPath, contents, 'utf-8');
         specs.push({
           path: absPath,
@@ -121,11 +132,18 @@ function makeRealisticFakeMode(
       return specs;
     },
     async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-      const results = specs.map((s) => ({
-        title: s.title,
-        status: (s.reqTag && failReqTags.has(s.reqTag) ? 'failed' : 'passed') as 'failed' | 'passed',
-        durationMs: 10,
-      }));
+      // Real Playwright discovers test files from disk and runs each physical
+      // file exactly once, regardless of how many bookkeeping entries the JS
+      // side has for it — hydrateCarriedSpecs deliberately pushes one
+      // GeneratedSpec per carried TEST ROW, so a 3-scenario carried spec can
+      // appear 3x here for the same file. Dedupe by path before counting
+      // scenarios, or a carried multi-scenario spec's results get multiplied.
+      const uniqueSpecs = [...new Map(specs.map((s) => [s.path, s])).values()];
+      const results = uniqueSpecs.flatMap((s) => {
+        const scenarioCount = Math.max((s.contents.match(/^test\(/gm) ?? []).length, 1);
+        const status = (s.reqTag && failReqTags.has(s.reqTag) ? 'failed' : 'passed') as 'failed' | 'passed';
+        return Array.from({ length: scenarioCount }, () => ({ title: s.title, status, durationMs: 10 }));
+      });
       return {
         passed: results.filter((r) => r.status === 'passed').length,
         failed: results.filter((r) => r.status === 'failed').length,
@@ -520,6 +538,80 @@ describe('orchestrator top-up / reuse suite modes', () => {
       expect(summary.status).toBe('error');
       expect(summary.runId).toBe('');
       expect(calls).toHaveLength(0);
+    }
+  });
+
+  it('MULTI-SCENARIO CARRY-FORWARD: carrying a multi-scenario spec forward preserves one row per scenario, not one orphaned/duplicated per collision', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Multi Scenario Carry Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // ---- Run 1: fresh, one item with 3 scenarios → one spec file, 3 test rows. ----
+    const run1GenerateCalls: TestPlan[] = [];
+    const run1Provider = fakeProviderWithPlan(
+      [
+        {
+          title: 'Checkout',
+          reqTag: 'REQ-100',
+          tier: 'tierA-public',
+          intent: 'Checkout flow works.',
+          scenarios: [
+            { kind: 'positive', description: 'completes with a valid card' },
+            { kind: 'negative', description: 'rejects an expired card' },
+            { kind: 'edge', description: 'handles a zero-total cart' },
+          ],
+        },
+      ],
+      [],
+    );
+    const run1Orchestrator = createOrchestrator({
+      provider: run1Provider,
+      getMode: () => makeRealisticFakeMode(run1GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run1 = await run1Orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    const run1Tests = store.listTests(run1.runId).filter((t) => t.reqTag === 'REQ-100');
+    expect(run1Tests).toHaveLength(3);
+
+    // ---- Run 2: reuse. The whole 3-scenario spec carries forward. ----
+    const run2Calls: CompleteOptions[] = [];
+    const run2GenerateCalls: TestPlan[] = [];
+    const run2Provider = fakeProviderWithPlan([], run2Calls);
+    const run2Orchestrator = createOrchestrator({
+      provider: run2Provider,
+      getMode: () => makeRealisticFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+
+    // All 3 scenario rows carry forward — not collapsed to 1 (silent collision) nor
+    // inflated to more than 3 (orphaned-plus-fallback duplication).
+    const run2Tests = store.listTests(run2.runId).filter((t) => t.reqTag === 'REQ-100');
+    expect(run2Tests).toHaveLength(3);
+
+    // Every carried row must actually receive its own real result — the collision
+    // bug left 2 of 3 rows permanently 'pending' (never matched to a result) while
+    // a 3rd absorbed every real result in turn, each overwriting the last.
+    expect(run2Tests.every((t) => t.status === 'passed')).toBe(true);
+
+    // Each row has exactly one result attached to it — not zero (orphaned) and not
+    // several (repeated overwrites landing on the same colliding row).
+    const run2Results = store.listResults(run2.runId);
+    for (const t of run2Tests) {
+      expect(run2Results.filter((r) => r.testId === t.id)).toHaveLength(1);
     }
   });
 });

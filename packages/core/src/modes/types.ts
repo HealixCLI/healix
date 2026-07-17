@@ -1,7 +1,19 @@
 import type { ProviderAdapter } from '../providers/types.js';
 import type { TargetAdapter } from '../target/types.js';
-import type { BrowserSurface, DomSnapshot } from '../browser/types.js';
+import type { BrowserSurface } from '../browser/types.js';
+import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
+import type { SourceContext } from '../target/source-context.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
+
+/** Result of the multi-page/multi-role EXPLORE crawl, grounding GENERATE. */
+export interface ExplorationArtifact {
+  crawl: CrawlWithAuthResult;
+  routing: RoutePrefixInfo;
+  loginCandidates: LoginCandidate[];
+  /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
+  useful: boolean;
+  uselessReason?: string;
+}
 
 export type ExplorationMode = 'computer-use' | 'codegen';
 
@@ -103,6 +115,22 @@ export interface TestPlan {
   summary: string;
   items: TestPlanItem[];
   raw?: unknown;
+  /**
+   * How this plan's items were obtained. 'ai' when the model's own plan
+   * completion(s) parsed successfully (even if some batches degraded — see
+   * fallbackReason); 'fallback' when every attempt failed and the plan is
+   * synthesizePlan()'s minimal hardcoded smoke plan; 'reuse' when suiteMode
+   * 'reuse' replayed a prior run's suite with no AI planning at all.
+   * Undefined for legacy/synthetic plans predating this field (e.g. tests).
+   */
+  planSource?: 'ai' | 'fallback' | 'reuse';
+  /**
+   * Present whenever planning degraded in some way — either the whole plan
+   * is a fallback (planSource: 'fallback') or an otherwise-successful
+   * batched plan (planSource: 'ai') had one or more batches fail outright.
+   * Human-readable, meant for the report/UI, not machine parsing.
+   */
+  fallbackReason?: string;
 }
 
 /** True unless the item was explicitly rejected during per-item plan review. */
@@ -116,6 +144,18 @@ export interface GeneratedSpec {
   reqTag?: string;
   tier: Tier;
   contents: string;
+}
+
+export interface QuarantinedSpec {
+  spec: GeneratedSpec;
+  reason: string;
+}
+
+/** Result of a mode's pre-execution parse-check gate — see modes/playwright/validate.ts. */
+export interface ValidationResult {
+  ok: GeneratedSpec[];
+  repaired: GeneratedSpec[];
+  quarantined: QuarantinedSpec[];
 }
 
 export interface ExecResultItem {
@@ -155,8 +195,10 @@ export interface TestModeContext {
   explorationMode?: ExplorationMode;
   /** Which tiers this run is in scope for; drives generation and execution. */
   testingScope?: TestingScope;
-  /** DOM snapshot captured during computer-use exploration; grounds generation. */
-  snapshot?: DomSnapshot;
+  /** Multi-page/multi-role EXPLORE crawl artifact; grounds generation. */
+  exploration?: ExplorationArtifact;
+  /** White-box static-analysis result (routes/endpoints/forms/auth patterns), set during PLAN; grounds generation and triage with real source-file citations. */
+  sourceContext?: SourceContext;
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
@@ -167,7 +209,25 @@ export interface TestMode {
   readonly id: ModeId;
   scaffold(ctx: TestModeContext): Promise<void>;
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
-  execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
+  /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
+  validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
+  execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: Tier }): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;
+}
+
+/**
+ * Thrown by a mode's generate() ONLY when every requested item failed at the
+ * provider-communication level — never once got far enough to validate model
+ * output. Shared across modes (not Playwright-specific) so the orchestrator
+ * can catch it without depending on any one mode's implementation. See
+ * orchestrator/checkpoint.ts's classifyTransientFailure for what happens next:
+ * this is the signal to checkpoint+pause instead of hard-erroring on what
+ * would otherwise look like "verified nothing."
+ */
+export class ProviderUnavailableError extends Error {
+  constructor(detail: string) {
+    super(detail);
+    this.name = 'ProviderUnavailableError';
+  }
 }

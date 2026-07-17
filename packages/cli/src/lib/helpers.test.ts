@@ -125,6 +125,7 @@ describe('shapeRunShow', () => {
       createdAt: '2026-07-01T00:00:00.000Z',
       suiteMode: null,
       baseRunId: null,
+      pauseReason: null,
     };
     const tests: TestCase[] = [
       { id: 't1', runId: 'r1', title: 'login', reqTag: null, tier: null, status: 'passed', specPath: null },

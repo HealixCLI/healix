@@ -5,8 +5,31 @@
  * `codex exec` and hit the network. Instead we test the pure JSONL parser
  * (parseCodexExec) plus the static shape and the offline detect() contract.
  */
-import { describe, expect, it } from 'vitest';
+import { beforeEach, describe, expect, it, vi } from 'vitest';
+
+vi.mock('../exec/run-cli.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('../exec/run-cli.js')>();
+  return { ...actual, runCli: vi.fn() };
+});
+
+import { runCli } from '../exec/run-cli.js';
 import { OpenAIProvider, parseCodexExec } from './openai.js';
+
+// Harmless default so the existing detect()/health() shape tests keep working
+// on hosts where `codex` actually is on PATH; call-count assertions in the
+// timeout tests below clear history first.
+const runCliMock = vi.mocked(runCli);
+runCliMock.mockResolvedValue({
+  code: 0,
+  stdout: '',
+  stderr: '',
+  timedOut: false,
+  aborted: false,
+  durationMs: 0,
+});
+beforeEach(() => {
+  runCliMock.mockClear();
+});
 
 describe('OpenAIProvider static shape', () => {
   const provider = new OpenAIProvider();
@@ -92,6 +115,39 @@ describe('parseCodexExec (codex exec --json output)', () => {
     const r = parseCodexExec('', 'error: please sign in again');
     expect(r.authError).toBe(true);
     expect(r.ok).toBe(false);
+  });
+});
+
+describe('OpenAIProvider.complete — default timeout (mocked runCli)', () => {
+  const provider = new OpenAIProvider();
+  const okStdout = '{"type":"item.completed","item":{"type":"agent_message","text":"ok"}}';
+
+  it('defaults to a 300s timeout when no timeoutMs override is given', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    await provider.complete('prompt');
+    const [, , callOpts] = runCliMock.mock.calls[0]!;
+    expect(callOpts?.timeoutMs).toBe(300_000);
+  });
+
+  it('honours an explicit timeoutMs override instead of the default', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+    await provider.complete('prompt', { timeoutMs: 42_000 });
+    const [, , callOpts] = runCliMock.mock.calls[0]!;
+    expect(callOpts?.timeoutMs).toBe(42_000);
   });
 });
 

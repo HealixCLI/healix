@@ -46,6 +46,7 @@ export * from './modes/types.js';
 // Orchestrator
 export { createOrchestrator, resolveProvider } from './orchestrator/index.js';
 export * from './orchestrator/types.js';
+export { readCheckpoint, type ResumeCheckpoint } from './orchestrator/checkpoint.js';
 export { computeIdentityKey, diffAgainstBase, type SuiteDiff } from './orchestrator/topup.js';
 export {
   buildPlanPrompt,

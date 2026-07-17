@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -125,6 +125,16 @@ const ALL_PASS_OUTCOME: ExecOutcome = {
 
 /** Build a fresh TestMode whose phases return canned, side-effect-free data. */
 function makeFakeMode(outcome: ExecOutcome): TestMode {
+  // Tier-aware: the orchestrator now invokes execute() once per in-scope tier
+  // (see EXECUTE's per-tier loop in orchestrator/index.ts) rather than once
+  // for the whole suite, so a canned outcome has to be split across those
+  // calls the same way a real mode would: a result whose title matches one of
+  // THIS call's specs belongs to this tier. A result matching no generated
+  // spec at all (e.g. a blocked-prerequisite entry with no corresponding
+  // spec, as in the MIXED-BLOCKED GUARD fixture) is delivered exactly once,
+  // on the first call, so it isn't dropped or double-counted.
+  let executeCallCount = 0;
+  const allGeneratedTitles = new Set(CANNED_SPECS.map((s) => s.title));
   return {
     id: 'playwright',
     async scaffold(_ctx: TestModeContext): Promise<void> {
@@ -133,8 +143,21 @@ function makeFakeMode(outcome: ExecOutcome): TestMode {
     async generate(_ctx: TestModeContext, _plan: TestPlan): Promise<GeneratedSpec[]> {
       return CANNED_SPECS.map((s) => ({ ...s }));
     },
-    async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
-      return { ...outcome, results: outcome.results.map((r) => ({ ...r })) };
+    async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+      executeCallCount += 1;
+      const specTitles = new Set(specs.map((s) => s.title));
+      const results = outcome.results
+        .filter(
+          (r) => specTitles.has(r.title) || (executeCallCount === 1 && !allGeneratedTitles.has(r.title)),
+        )
+        .map((r) => ({ ...r }));
+      return {
+        passed: results.filter((r) => r.status === 'passed').length,
+        failed: results.filter((r) => r.status === 'failed').length,
+        blocked: results.filter((r) => r.status === 'blocked').length,
+        flaky: results.filter((r) => r.status === 'flaky').length,
+        results,
+      };
     },
     async collectArtifacts(_ctx: TestModeContext): Promise<{ dir: string; files: string[] }> {
       return { dir: 'artifacts', files: ['test-results/x.png'] };
@@ -1033,5 +1056,137 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(store.getRun(summary.runId)?.status).toBe('error');
     const launchError = events.find((e) => e.phase === 'launch' && e.level === 'error');
     expect(launchError?.message).toMatch(/could not be started/i);
+  });
+
+  it('REACHABILITY GATE: an unreachable black-box baseUrl skips exploration but the run still completes', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Unreachable BaseUrl Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    let started = false;
+    const untouchedBrowser: BrowserSurface = {
+      ...fakeBrowser,
+      async start(_opts?: BrowserSurfaceOptions): Promise<void> {
+        started = true;
+      },
+    };
+    const unreachableTarget: TargetAdapter = {
+      ...fakeTarget,
+      async probeUrl(_url: string): Promise<UrlProbe> {
+        return { reachable: false };
+      },
+    };
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => unreachableTarget,
+      makeBrowser: () => untouchedBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    // The run never crawled a dead URL, but still runs generate/execute to completion.
+    expect(started).toBe(false);
+    expect(['passed', 'failed']).toContain(summary.status);
+    const warn = events.find((e) => e.phase === 'explore' && e.level === 'warn');
+    expect(warn?.message).toMatch(/not reachable/i);
+  });
+
+  it('REACHABILITY GATE: a white-box launch skips the redundant reachability probe', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'WhiteBox No Double Probe',
+      mode: 'playwright',
+      repoPath: join(tmpdir(), 'healix-fake-repo'),
+    });
+
+    let probeCalls = 0;
+    const target: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        return {
+          kind: 'frontend',
+          framework: 'react',
+          packageManager: 'npm',
+          startCommand: 'npm run dev',
+          installCommand: 'npm install',
+          installDir: '.',
+          port: null,
+          baseUrl: null,
+        };
+      },
+      async launch(): Promise<LaunchHandle> {
+        return { baseUrl: 'http://127.0.0.1:4198', pid: null, async stop(): Promise<void> {} };
+      },
+      async probeUrl(url: string): Promise<UrlProbe> {
+        probeCalls += 1;
+        return fakeTarget.probeUrl(url);
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => target,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    // launch()'s own readiness race already proved the URL reachable — the new
+    // black-box-only reachability gate must not probe it a second time.
+    expect(probeCalls).toBe(0);
+    expect(summary.status).toBe('passed');
+  });
+
+  it('AUTH-PATTERN BREADCRUMB: a recognized auth library with no discovered login form warns, never blocks', async () => {
+    // Real repo dir (not the DI seam) — indexSource() reads real files from disk, so this
+    // exercises the actual source-index.ts auth-pattern detection, not a mocked TargetAdapter.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-authpattern-'));
+    mkdirSync(join(repoPath, 'middleware'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'middleware', 'auth.js'),
+      "const jwt = require('jsonwebtoken');\nfunction verify(token) { return jwt.verify(token, 'secret'); }\nmodule.exports = { verify };\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Auth Pattern Breadcrumb Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    const events: OrchestratorEvent[] = [];
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      // fakeBrowser's snapshot() always returns zero interactiveElements — no password field is
+      // ever found, so loginCandidates stays empty despite the detected jsonwebtoken usage.
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run(
+      { projectId: project.id, autoApprove: true },
+      { onEvent: (e) => events.push(e) },
+    );
+
+    rmSync(repoPath, { recursive: true, force: true });
+
+    const warn = events.find((e) => e.phase === 'explore' && e.message.includes('jsonwebtoken'));
+    expect(warn).toBeDefined();
+    expect(warn?.level).toBe('warn');
+    expect(warn?.message).toContain('non-form/token-based auth');
+    // Never blocks the run — it's a breadcrumb, not a gate.
+    expect(['passed', 'failed']).toContain(summary.status);
   });
 });

@@ -6,6 +6,7 @@ import type {
   AgentEvent,
   EventLevel,
   NewProject,
+  PauseReason,
   Project,
   Run,
   RunStatus,
@@ -168,10 +169,11 @@ export class HealixStore {
       createdAt: new Date().toISOString(),
       suiteMode: opts.suiteMode ?? null,
       baseRunId: opts.baseRunId ?? null,
+      pauseReason: null,
     };
     this.db
       .prepare(
-        'INSERT INTO runs (id, project_id, status, provider, mode, started_at, finished_at, created_at, suite_mode, base_run_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO runs (id, project_id, status, provider, mode, started_at, finished_at, created_at, suite_mode, base_run_id, pause_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         run.id,
@@ -184,6 +186,7 @@ export class HealixStore {
         run.createdAt,
         run.suiteMode,
         run.baseRunId,
+        run.pauseReason,
       );
     return run;
   }
@@ -209,11 +212,18 @@ export class HealixStore {
   }
 
   /**
-   * Janitor for runs orphaned by a crash/quit mid-pipeline: any run still in a
-   * non-terminal status whose row is older than `olderThanMs` (default 6h) is
-   * marked 'error' with a finishedAt stamp. The age threshold exists because a
-   * run may legitimately be in flight in ANOTHER process (CLI vs desktop) — we
-   * only reap runs old enough that no real pipeline could still be driving them.
+   * Janitor for runs orphaned by a crash/quit mid-pipeline that have NO
+   * checkpoint to resume from (see checkpoint.ts) — genuinely nothing to
+   * recover, so any run still in a non-terminal status whose row is older
+   * than `olderThanMs` (default 6h) is marked 'error' with a finishedAt
+   * stamp. The age threshold exists because a run may legitimately be in
+   * flight in ANOTHER process (CLI vs desktop) — we only reap runs old
+   * enough that no real pipeline could still be driving them.
+   *
+   * A run that DOES have a checkpoint is never reaped here: the desktop
+   * app's boot-time reconciliation claims those first (marking them 'paused'
+   * with pauseReason 'crashed' and auto-resuming), so by the time this runs
+   * they're already 'paused' and excluded by the status filter below.
    * Returns the number of runs reaped.
    */
   failOrphanedRuns(opts: { olderThanMs?: number } = {}): number {
@@ -222,7 +232,7 @@ export class HealixStore {
     const result = this.db
       .prepare(
         `UPDATE runs SET status = 'error', finished_at = ?
-         WHERE status NOT IN ('passed', 'failed', 'blocked', 'error', 'cancelled') AND created_at < ?`,
+         WHERE status NOT IN ('passed', 'failed', 'blocked', 'error', 'cancelled', 'paused') AND created_at < ?`,
       )
       .run(new Date().toISOString(), cutoff);
     return Number(result.changes ?? 0);
@@ -231,7 +241,7 @@ export class HealixStore {
   updateRunStatus(
     id: string,
     status: RunStatus,
-    patch: { startedAt?: string; finishedAt?: string } = {},
+    patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
   ): void {
     const fields: string[] = ['status = ?'];
     const values: unknown[] = [status];
@@ -243,8 +253,44 @@ export class HealixStore {
       fields.push('finished_at = ?');
       values.push(patch.finishedAt);
     }
+    if (patch.pauseReason !== undefined) {
+      fields.push('pause_reason = ?');
+      values.push(patch.pauseReason);
+    }
     values.push(id);
     this.db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
+  }
+
+  /**
+   * Runs currently 'paused' with a reason other than 'manual' — candidates
+   * for boot-time auto-resume (see checkpoint.ts / the desktop app's
+   * reconciliation step). A manually-paused run never appears here; the user
+   * must resume it themselves.
+   */
+  listAutoResumableRuns(): Run[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM runs WHERE status = 'paused' AND pause_reason != 'manual' ORDER BY created_at ASC`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map(rowToRun);
+  }
+
+  /**
+   * Non-terminal, non-paused runs — i.e. still showing an in-flight status
+   * (planning/generating/executing/...) from a process that's no longer
+   * driving them. Used by boot-time reconciliation to find crashed runs
+   * BEFORE deciding (via checkpoint presence) whether to mark them resumable
+   * or hand them to failOrphanedRuns().
+   */
+  listInFlightRuns(): Run[] {
+    const rows = this.db
+      .prepare(
+        `SELECT * FROM runs WHERE status NOT IN ('passed', 'failed', 'blocked', 'error', 'cancelled', 'paused')
+         ORDER BY created_at ASC`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    return rows.map(rowToRun);
   }
 
   getRun(id: string): Run | null {
@@ -334,6 +380,26 @@ export class HealixStore {
         .prepare('SELECT r.* FROM results r JOIN tests t ON r.test_id = t.id WHERE t.run_id = ?')
         .all(runId) as Array<Record<string, unknown>>
     ).map(rowToResult);
+  }
+
+  /**
+   * Remove test rows pre-registered for a scenario that never actually got an
+   * execution result — e.g. the plan called for 3 scenarios but generation
+   * only produced 2 `test()` blocks, or the coverage loop broke early after
+   * registering gap-fill rows but before executing them. Without this, those
+   * rows sit at their initial 'pending' status forever, so the Results tab's
+   * Total (which counts every `tests` row) ends up higher than the Report's
+   * Total (`outcome.results.length`, grounded in what actually ran) — the
+   * `tests` table and `outcome.results` must agree on "how many test cases".
+   * A row with zero result rows (any status, including a genuine 'pending'/
+   * skipped result) is unambiguously never-executed, so this only ever
+   * removes rows that would otherwise silently inflate the count.
+   */
+  deleteUnexecutedTests(runId: string): number {
+    const res = this.db
+      .prepare('DELETE FROM tests WHERE run_id = ? AND id NOT IN (SELECT test_id FROM results)')
+      .run(runId);
+    return Number(res.changes ?? 0);
   }
 
   // ---- orchestrator events (resumable checkpoints) ----
@@ -428,6 +494,7 @@ function rowToRun(r: Record<string, unknown>): Run {
     createdAt: String(r.created_at),
     suiteMode: s(r.suite_mode) as Run['suiteMode'],
     baseRunId: s(r.base_run_id),
+    pauseReason: s(r.pause_reason) as Run['pauseReason'],
   };
 }
 

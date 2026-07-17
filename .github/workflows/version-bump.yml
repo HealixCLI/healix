@@ -1,21 +1,22 @@
 name: Version bump
 
-# Auto-increments the desktop app's PATCH version on every push/merge to main
-# and commits the bump back to main.
-#
-# No infinite loop: the bump is pushed with the repo's GITHUB_TOKEN, and GitHub
-# does NOT re-trigger workflows for GITHUB_TOKEN pushes. The `[skip ci]` tag and
-# the commit-message guard below are belt-and-braces (they also cover the case
-# where someone later swaps in a PAT).
+# ON-DEMAND ONLY. Run this manually (Actions -> Version bump -> Run workflow)
+# to bump the desktop app's version and commit it back to main. It no longer
+# fires on every push/merge — the version changes only when you ask it to,
+# e.g. right before cutting a release.
 
 on:
-  push:
-    branches: [main]
+  workflow_dispatch:
+    inputs:
+      level:
+        description: 'Semver level to bump'
+        type: choice
+        options: [patch, minor, major]
+        default: patch
 
 permissions:
   contents: write
 
-# Serialize bumps so two quick merges can't race on the same file/push.
 concurrency:
   group: version-bump-main
   cancel-in-progress: false
@@ -23,10 +24,6 @@ concurrency:
 jobs:
   bump:
     runs-on: ubuntu-latest
-    # Don't act on our own bump commit, or anything explicitly marked [skip ci].
-    if: >-
-      ${{ !contains(github.event.head_commit.message, '[skip ci]')
-          && !startsWith(github.event.head_commit.message, 'chore(release): bump version') }}
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -34,23 +31,29 @@ jobs:
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Bump desktop patch version
+      - name: Bump desktop version
         id: bump
+        env:
+          LEVEL: ${{ inputs.level }}
         run: |
           set -euo pipefail
-          # Bump only the version field; preserve key order + 2-space + trailing
-          # newline so the file stays prettier-clean.
+          # Bump only the version field for the chosen level; preserve key order
+          # + 2-space + trailing newline so the file stays prettier-clean.
           new=$(node -e '
             const fs = require("fs");
             const p = "apps/desktop/package.json";
             const j = JSON.parse(fs.readFileSync(p, "utf8"));
             const [maj, min, pat] = j.version.split(".").map(Number);
-            j.version = [maj, min, pat + 1].join(".");
+            const lvl = process.env.LEVEL || "patch";
+            const v = lvl === "major" ? [maj + 1, 0, 0]
+                    : lvl === "minor" ? [maj, min + 1, 0]
+                    : [maj, min, pat + 1];
+            j.version = v.join(".");
             fs.writeFileSync(p, JSON.stringify(j, null, 2) + "\n");
             console.log(j.version);
           ')
           echo "version=${new}" >> "$GITHUB_OUTPUT"
-          echo "Bumped desktop version to ${new}"
+          echo "Bumped desktop version (${LEVEL}) to ${new}"
 
       - name: Commit and push
         run: |

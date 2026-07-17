@@ -121,9 +121,15 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   lines.push('      "unitKey": "the unitKey from the detected list above, or null",');
   lines.push('      "scenarios": [');
   lines.push('        { "kind": "positive", "description": "a happy-path case" },');
-  lines.push('        { "kind": "positive", "description": "another distinct happy-path case, if the feature has more than one" },');
-  lines.push('        { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
-  lines.push('        { "kind": "negative", "description": "another distinct negative case, if applicable" },');
+  lines.push(
+    '        { "kind": "positive", "description": "another distinct happy-path case, if the feature has more than one" },',
+  );
+  lines.push(
+    '        { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },',
+  );
+  lines.push(
+    '        { "kind": "negative", "description": "another distinct negative case, if applicable" },',
+  );
   lines.push('        { "kind": "edge", "description": "a boundary condition, if applicable" }');
   lines.push('      ]');
   lines.push('    }');
@@ -146,6 +152,22 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   return lines.join('\n');
 }
 
+/** Build buildPlanPrompt scoped to only `units`, with a caller-supplied prefix explaining the scoping. */
+function buildScopedPlanPrompt(
+  project: Project,
+  opts: RunOptions,
+  units: FunctionalityUnit[],
+  repoIndex: PlanRepoContext | undefined,
+  prefix: string,
+): string {
+  const scopedIndex: PlanRepoContext = {
+    summary: repoIndex?.summary ?? '',
+    files: [],
+    functionality: units,
+  };
+  return prefix + buildPlanPrompt(project, opts, scopedIndex);
+}
+
 /**
  * Build a follow-up plan prompt scoped to ONLY the given uncovered functionality
  * units — used by the orchestrator's coverage-feedback loop (see coverage.ts) to
@@ -158,16 +180,40 @@ export function buildGapFillPlanPrompt(
   uncoveredUnits: FunctionalityUnit[],
   repoIndex?: PlanRepoContext,
 ): string {
-  const scopedIndex: PlanRepoContext = {
-    summary: repoIndex?.summary ?? '',
-    files: [],
-    functionality: uncoveredUnits,
-  };
-  const prompt = buildPlanPrompt(project, opts, scopedIndex);
-  const prefix =
+  return buildScopedPlanPrompt(
+    project,
+    opts,
+    uncoveredUnits,
+    repoIndex,
     'A previous pass already planned and tested other parts of this application. ' +
-    'The list below is ONLY the functionality still missing coverage — focus exclusively on these.\n\n';
-  return prefix + prompt;
+      'The list below is ONLY the functionality still missing coverage — focus exclusively on these.\n\n',
+  );
+}
+
+/**
+ * Build an initial-planning prompt scoped to ONLY one batch of the detected
+ * functionality units — used by the orchestrator's plan phase (index.ts) to
+ * split a large functionality inventory across several smaller completions
+ * instead of one monolithic request covering every unit at once. Asking for
+ * an unbounded single JSON response over e.g. 150 units is what makes the
+ * model's output likely to get cut off (see PlanParseFailureReason
+ * 'truncated'); batching keeps each individual response small.
+ */
+export function buildBatchPlanPrompt(
+  project: Project,
+  opts: RunOptions,
+  batchUnits: FunctionalityUnit[],
+  batchIndex: number,
+  totalBatches: number,
+  repoIndex?: PlanRepoContext,
+): string {
+  const prefix =
+    totalBatches > 1
+      ? `This application has more detected functionality than fits in one planning pass. This is ` +
+        `batch ${batchIndex} of ${totalBatches} — the list below is ONLY this batch's units; a separate ` +
+        `pass covers the rest. Plan for ONLY the units listed below.\n\n`
+      : '';
+  return buildScopedPlanPrompt(project, opts, batchUnits, repoIndex, prefix);
 }
 
 function scopeLabel(scope: TestingScope): string {
@@ -191,37 +237,71 @@ function tierGuidanceFor(tiers: ReadonlyArray<Tier>): string {
 }
 
 /**
- * Robustly parse a model completion into a TestPlan. Tries (in order):
+ * Why `parsePlan` produced no usable plan — lets callers decide whether the
+ * failure is worth retrying:
+ *   - 'no-json': no `{...}` object found at all (model refused/replied prose only).
+ *   - 'truncated': an opening `{` was found but never balanced by EOF — the
+ *     classic signature of the model's output getting cut off mid-response
+ *     (output-length/token limit) before the JSON closed. Transient by nature:
+ *     the identical request may well complete on a retry.
+ *   - 'invalid-json': a complete, balanced `{...}` was found but JSON.parse
+ *     failed on it (genuinely malformed syntax, not a length cutoff).
+ *   - 'no-items': valid JSON, but zero usable items survived normalization
+ *     (e.g. every item was missing a title).
+ */
+export type PlanParseFailureReason = 'no-json' | 'truncated' | 'invalid-json' | 'no-items';
+
+export interface PlanParseResult {
+  plan: TestPlan | null;
+  failureReason?: PlanParseFailureReason;
+}
+
+/**
+ * Robustly parse a model completion into a TestPlan, with diagnostics on
+ * *why* parsing failed (see PlanParseFailureReason) so callers can decide
+ * whether the failure is worth retrying instead of treating every parse
+ * failure identically. Tries (in order):
  *   1. a fenced ```json block,
  *   2. a fenced ``` block,
  *   3. the first balanced top-level JSON object in the text.
- * Returns null when nothing parseable/usable is found.
  */
-export function parsePlan(text: string, scope: TestingScope = 'both'): TestPlan | null {
-  const candidate = extractJsonObject(text);
-  if (!candidate) return null;
+export function parsePlanWithDiagnostics(text: string, scope: TestingScope = 'both'): PlanParseResult {
+  const extracted = extractJsonObject(text);
+  if (!extracted.json) {
+    return { plan: null, failureReason: extracted.truncated ? 'truncated' : 'no-json' };
+  }
 
   let raw: RawPlan;
   try {
-    raw = JSON.parse(candidate) as RawPlan;
+    raw = JSON.parse(extracted.json) as RawPlan;
   } catch {
-    return null;
+    return { plan: null, failureReason: 'invalid-json' };
   }
-  if (!raw || typeof raw !== 'object') return null;
+  if (!raw || typeof raw !== 'object') return { plan: null, failureReason: 'invalid-json' };
 
   const itemsRaw = Array.isArray(raw.items) ? (raw.items as RawPlanItem[]) : [];
   const items: TestPlanItem[] = itemsRaw
     .map((it) => normalizeItem(it, scope))
     .filter((it): it is TestPlanItem => it !== null);
 
-  if (items.length === 0) return null;
+  if (items.length === 0) return { plan: null, failureReason: 'no-items' };
 
   const summary =
     typeof raw.summary === 'string' && raw.summary.trim().length > 0
       ? raw.summary.trim()
       : 'Generated test plan.';
 
-  return { summary, items, raw };
+  return { plan: { summary, items, raw } };
+}
+
+/**
+ * Robustly parse a model completion into a TestPlan. Thin wrapper around
+ * parsePlanWithDiagnostics for callers that only care whether parsing
+ * succeeded, not why it failed. Returns null when nothing parseable/usable
+ * is found.
+ */
+export function parsePlan(text: string, scope: TestingScope = 'both'): TestPlan | null {
+  return parsePlanWithDiagnostics(text, scope).plan;
 }
 
 /**
@@ -284,7 +364,10 @@ export function synthesizePlan(project: Project, scope: TestingScope = 'both'): 
       tier: 'tierA-public',
       intent: 'Confirm the application under test starts and serves its entry point.',
       scenarios: [
-        { kind: 'positive', description: 'Confirm the application under test starts and serves its entry point.' },
+        {
+          kind: 'positive',
+          description: 'Confirm the application under test starts and serves its entry point.',
+        },
       ],
     });
   }
@@ -363,7 +446,9 @@ export function buildReviseItemPrompt(
   lines.push('  "unitKey": "keep the current unitKey, or null",');
   lines.push('  "scenarios": [');
   lines.push('    { "kind": "positive", "description": "the happy-path case" },');
-  lines.push('    { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },');
+  lines.push(
+    '    { "kind": "negative", "description": "an invalid-input/unauthorized/error case, if applicable" },',
+  );
   lines.push('    { "kind": "edge", "description": "a boundary condition, if applicable" }');
   lines.push('  ]');
   lines.push('}');
@@ -389,7 +474,7 @@ export function parseReviseItemResponse(
   scope: TestingScope,
   existingId: string,
 ): TestPlanItem | null {
-  const candidate = extractJsonObject(text);
+  const candidate = extractJsonObject(text).json;
   if (!candidate) return null;
   let raw: RawPlanItem;
   try {
@@ -498,29 +583,44 @@ function normalizeTier(value: unknown, scope: TestingScope): Tier {
   return tiersForScope(scope)[0];
 }
 
-/** Extract a JSON object string from arbitrary model output. */
-function extractJsonObject(text: string): string | null {
-  if (!text) return null;
+interface BalancedResult {
+  json: string | null;
+  /** True when an opening `{` was found but never balanced before EOF — the
+   * signature of output cut off mid-response, as opposed to no JSON at all. */
+  truncated: boolean;
+}
 
+/** Extract a JSON object string from arbitrary model output, with a truncation signal. */
+function extractJsonObject(text: string): BalancedResult {
+  if (!text) return { json: null, truncated: false };
+
+  // A response cut off mid-generation, before ever emitting the closing ```
+  // fence, means neither fenced regex below matches at all (both require a
+  // closing fence) — falling through to sliceBalanced(text) on the raw text
+  // still finds the (unclosed) opening brace and correctly reports truncation.
   const fencedJson = /```json\s*([\s\S]*?)```/i.exec(text);
   if (fencedJson && fencedJson[1]) {
     const inner = sliceBalanced(fencedJson[1]);
-    if (inner) return inner;
+    if (inner.json || inner.truncated) return inner;
   }
 
   const fenced = /```\s*([\s\S]*?)```/.exec(text);
   if (fenced && fenced[1]) {
     const inner = sliceBalanced(fenced[1]);
-    if (inner) return inner;
+    if (inner.json || inner.truncated) return inner;
   }
 
   return sliceBalanced(text);
 }
 
-/** Return the first balanced {...} object substring, respecting strings/escapes. */
-function sliceBalanced(text: string): string | null {
+/**
+ * Return the first balanced {...} object substring, respecting strings/
+ * escapes, plus whether an opening `{` was found but never balanced by EOF
+ * (truncated output) as distinct from no `{` at all (no JSON present).
+ */
+function sliceBalanced(text: string): BalancedResult {
   const start = text.indexOf('{');
-  if (start === -1) return null;
+  if (start === -1) return { json: null, truncated: false };
   let depth = 0;
   let inString = false;
   let escaped = false;
@@ -542,8 +642,10 @@ function sliceBalanced(text: string): string | null {
       depth++;
     } else if (ch === '}') {
       depth--;
-      if (depth === 0) return text.slice(start, i + 1);
+      if (depth === 0) return { json: text.slice(start, i + 1), truncated: false };
     }
   }
-  return null;
+  // Reached EOF with an opening brace that never closed (depth > 0, or still
+  // mid-string) — the classic output-truncation signature.
+  return { json: null, truncated: true };
 }

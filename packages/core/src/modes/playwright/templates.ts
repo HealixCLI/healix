@@ -168,9 +168,31 @@ setup('authenticate', async ({ page }) => {
     // performedLogin:false on disk; overwritten with true only on success.
     await writeMeta(false);
     await page.goto(loginUrl);
-    await page.getByLabel(/email/i).fill(email);
-    await page.getByLabel(/password/i).fill(password);
-    await page.getByRole('button', { name: /sign in|log ?in|continue/i }).click();
+
+    // Locale-aware matchers (English + common Slovak forms observed in the
+    // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
+    // i18n engine, just enough to not be English-only.
+    const emailField = page.getByLabel(/e-?mail/i);
+    const loginRevealRe = /prihl|sign in|log ?in/i;
+
+    // Some apps gate the login form behind a reveal button/link (e.g. a
+    // "Prihlásiť sa" click before the email/password fields even render) —
+    // click through it before searching for the form.
+    const hasEmailField = await emailField
+      .first()
+      .isVisible()
+      .catch(() => false);
+    if (!hasEmailField) {
+      const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
+      await reveal
+        .first()
+        .click({ timeout: 5000 })
+        .catch(() => {});
+    }
+
+    await page.getByLabel(/e-?mail/i).fill(email);
+    await page.getByLabel(/heslo|password/i).fill(password);
+    await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.context().storageState({ path: authFile });
     await writeMeta(true);

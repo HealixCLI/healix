@@ -148,7 +148,7 @@ export class OpenAIProvider implements ProviderAdapter {
     if (opts.cwd) args.push('-C', opts.cwd);
     args.push(prompt);
     const r = await runCli(this.bin, args, {
-      timeoutMs: opts.timeoutMs ?? 180_000,
+      timeoutMs: opts.timeoutMs ?? 300_000,
       cwd: opts.cwd,
       signal: opts.signal,
     });

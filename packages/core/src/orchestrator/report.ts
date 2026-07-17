@@ -2,12 +2,32 @@ import type { Project, Run } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
 import type { ExternalDependency } from '../target/types.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** One triaged failure, attached to the report. */
 export interface ReportTriageEntry {
   title: string;
   error: string;
   triage: TriageResult;
+}
+
+/** How many planned items actually got a generated spec vs. were silently dropped. */
+export interface GenerationStats {
+  requestedItems: number;
+  acceptedItems: number;
+}
+
+/**
+ * Serializable snapshot of the coverage-feedback loop's final state (see
+ * orchestrator/coverage.ts's CoverageResult) — a plain object instead of a
+ * Set, so it survives JSON.stringify/report.json round-tripping intact.
+ */
+export interface ReportCoverageSummary {
+  ratio: number;
+  target: number;
+  coveredCount: number;
+  totalCount: number;
+  uncovered: FunctionalityUnit[];
 }
 
 /** Serializable run report written to reports/report.json. */
@@ -23,6 +43,10 @@ export interface RunReport {
   dependencies: ExternalDependency[];
   /** How many requests the local mock server actually intercepted, keyed by dependency id. */
   mockedRequestCounts: Record<string, number>;
+  /** Item-level generation accounting across GENERATE and any gap-fill iterations. */
+  generation?: GenerationStats;
+  /** Functionality-unit coverage reached by the coverage-feedback loop; null when it didn't run (e.g. reuse mode, or no functionality inventory). */
+  coverage: ReportCoverageSummary | null;
   generatedAt: string;
 }
 
@@ -35,6 +59,8 @@ export function buildReport(input: {
   artifacts?: string[];
   dependencies?: ExternalDependency[];
   mockedRequestCounts?: Record<string, number>;
+  generation?: GenerationStats;
+  coverage?: ReportCoverageSummary | null;
 }): RunReport {
   return {
     run: input.run,
@@ -45,18 +71,142 @@ export function buildReport(input: {
     artifacts: input.artifacts ?? [],
     dependencies: input.dependencies ?? [],
     mockedRequestCounts: input.mockedRequestCounts ?? {},
+    generation: input.generation,
+    coverage: input.coverage ?? null,
     generatedAt: new Date().toISOString(),
   };
 }
 
+/**
+ * Human-readable degradation notes for this report, or an empty array when
+ * nothing degraded. Covers three independent silent-failure paths that used
+ * to look identical to a normal, fully-AI-authored run:
+ *   1. planSource === 'fallback' — every planning attempt failed and this is
+ *      synthesizePlan()'s minimal hardcoded smoke plan.
+ *   2. plan.fallbackReason present with planSource still 'ai' — a batched
+ *      plan where some (not all) batches failed; the rest is real AI content.
+ *   3. generation.acceptedItems < requestedItems — items were planned but
+ *      silently dropped after failed generation attempts.
+ *   4. coverage.ratio < coverage.target — the coverage-feedback loop stopped
+ *      short of its target.
+ */
+export function degradationNotes(report: RunReport): string[] {
+  const notes: string[] = [];
+  if (report.plan.planSource === 'fallback') {
+    notes.push(
+      `AI planning failed; this run used a minimal fallback plan instead of a full AI-generated one` +
+        (report.plan.fallbackReason ? ` (reason: ${report.plan.fallbackReason}).` : '.'),
+    );
+  } else if (report.plan.fallbackReason) {
+    notes.push(`Part of the plan could not be AI-generated (${report.plan.fallbackReason}).`);
+  }
+  const gen = report.generation;
+  if (gen && gen.acceptedItems < gen.requestedItems) {
+    const dropped = gen.requestedItems - gen.acceptedItems;
+    notes.push(
+      `Generated ${gen.acceptedItems}/${gen.requestedItems} planned spec(s); ${dropped} dropped after failed generation attempts.`,
+    );
+  }
+  const cov = report.coverage;
+  if (cov && cov.ratio < cov.target) {
+    notes.push(
+      `Coverage-feedback loop stopped at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%).`,
+    );
+  }
+  return notes;
+}
+
+/** Last path segment, for display only — avoids printing a full local filesystem path into the report. */
+function baseName(path: string): string {
+  return path.split(/[\\/]/).pop() || path;
+}
+
+/** Scales ms -> s -> "Xm Ys" -> "Xh Ym" so a slow scenario reads as "23m 52s" instead of a raw "1432300 ms". */
+function formatDuration(ms: number | null | undefined): string {
+  if (ms == null) return '';
+  if (ms < 1000) return `${ms}ms`;
+  const totalSeconds = ms / 1000;
+  // Round once, up front, so the sub-minute display and the minute/hour
+  // branch boundary agree (otherwise e.g. 59.96s would print "60.0s" while
+  // still taking the seconds-only branch instead of rolling over to "1m 0s").
+  const roundedSeconds = Math.round(totalSeconds);
+  if (roundedSeconds < 60) return `${totalSeconds.toFixed(1)}s`;
+  const totalMinutes = Math.floor(roundedSeconds / 60);
+  const seconds = roundedSeconds % 60;
+  if (totalMinutes < 60) return `${totalMinutes}m ${seconds}s`;
+  const hours = Math.floor(totalMinutes / 60);
+  const minutes = totalMinutes % 60;
+  return `${hours}h ${minutes}m`;
+}
+
+const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
+  app_is_wrong: 'App defect',
+  test_is_wrong: 'Test defect',
+  environment: 'Environment',
+  flaky: 'Flaky',
+  ambiguous: 'Ambiguous',
+};
+
+/**
+ * Split a raw Playwright error blob into a one-line summary (for the row
+ * itself) and the remaining call log / stack trace (tucked behind a
+ * <details> toggle) — a full multi-paragraph dump inline made the Results
+ * table unreadable at a glance.
+ */
+function splitErrorText(raw: string): { summary: string; rest: string } {
+  const lines = raw.split('\n');
+  const summary = (lines[0] ?? '').trim() || raw.trim();
+  const rest = lines.slice(1).join('\n').trim();
+  return { summary, rest };
+}
+
+/**
+ * suggestedPatch's shape depends on the verdict (see TriageResult) — a
+ * corrected test snippet reads naturally as code, but an app-bug
+ * recommendation is prose (the triage engine never sees the app's own
+ * source), so it gets its own label and isn't wrapped in a <code> block.
+ */
+function renderSuggestedFix(verdict: TriageResult['verdict'], patch: string, className = ''): string {
+  const cls = className ? ` class="${className}"` : '';
+  if (verdict === 'test_is_wrong') {
+    return `<div${cls}><strong>Suggested test fix:</strong> <code>${esc(patch)}</code></div>`;
+  }
+  return `<div${cls}><strong>Recommended fix:</strong> ${esc(patch)}</div>`;
+}
+
+function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
+  if (!error) return '';
+  const { summary, rest } = splitErrorText(error);
+  const detailsBlock = rest
+    ? `<details><summary>Full details</summary><pre>${esc(rest)}</pre></details>`
+    : '';
+  const triageBlock = triage
+    ? `<div class="diagnosis"><span class="tag verdict-${esc(triage.triage.verdict)}">${esc(
+        VERDICT_LABEL[triage.triage.verdict] ?? triage.triage.verdict,
+      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span>
+      <div>${esc(triage.triage.rationale)}</div>
+      ${triage.triage.suggestedPatch ? renderSuggestedFix(triage.triage.verdict, triage.triage.suggestedPatch) : ''}
+    </div>`
+    : '';
+  return `<div class="err-summary">${esc(summary)}</div>${triageBlock}${detailsBlock}`;
+}
+
 /** Render a self-contained, dependency-free HTML report. */
 export function renderReportHtml(report: RunReport): string {
-  const { run, project, plan, outcome, triage, dependencies, mockedRequestCounts } = report;
+  const { run, project, plan, outcome, triage, dependencies, mockedRequestCounts, coverage } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
   const blocked = outcome?.blocked ?? 0;
   const flaky = outcome?.flaky ?? 0;
+  const notes = degradationNotes(report);
+  const degradationBanner =
+    notes.length > 0
+      ? `<section class="degraded">
+    <h2>⚠ This run's suite may be smaller than intended</h2>
+    <ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>
+  </section>`
+      : '';
 
   const dependencyRows = dependencies
     .map((d) => {
@@ -88,13 +238,20 @@ export function renderReportHtml(report: RunReport): string {
     })
     .join('');
 
+  // Triage is keyed by title so a failed row can show its verdict/rationale
+  // inline instead of forcing readers to cross-reference a separate table.
+  const triageByTitle = new Map<string, ReportTriageEntry>(triage.map((t) => [t.title, t]));
+
   const resultRows = (outcome?.results ?? [])
-    .map(
-      (r) =>
-        `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${
-          r.durationMs != null ? esc(String(r.durationMs)) + ' ms' : ''
-        }</td><td>${esc(r.error ?? '')}</td></tr>`,
-    )
+    .map((r) => {
+      const artifactNote =
+        r.artifacts && r.artifacts.length > 0
+          ? `<div class="hist">${r.artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`
+          : '';
+      return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
+        formatDuration(r.durationMs),
+      )}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
+    })
     .join('');
 
   const triageRows = triage
@@ -102,9 +259,31 @@ export function renderReportHtml(report: RunReport): string {
       (t) =>
         `<tr><td>${esc(t.title)}</td><td>${esc(t.triage.verdict)}</td><td>${esc(
           (t.triage.confidence * 100).toFixed(0),
-        )}%</td><td>${esc(t.triage.rationale)}</td></tr>`,
+        )}%</td><td>${esc(t.triage.rationale)}${
+          t.triage.suggestedPatch ? renderSuggestedFix(t.triage.verdict, t.triage.suggestedPatch, 'hist') : ''
+        }</td></tr>`,
     )
     .join('');
+
+  const coverageSection =
+    coverage != null
+      ? `<section>
+    <h2>Coverage</h2>
+    <p>${coverage.coveredCount}/${coverage.totalCount} functionality unit(s) covered (${Math.round(
+      coverage.ratio * 100,
+    )}%).</p>
+    ${
+      coverage.uncovered.length > 0
+        ? `<table>
+      <thead><tr><th>Uncovered unit</th><th>Kind</th><th>File</th></tr></thead>
+      <tbody>${coverage.uncovered
+        .map((u) => `<tr><td>${esc(u.label)}</td><td>${esc(u.kind)}</td><td>${esc(u.file)}</td></tr>`)
+        .join('')}</tbody>
+    </table>`
+        : ''
+    }
+  </section>`
+      : '';
 
   return `<!doctype html>
 <html lang="en">
@@ -131,7 +310,20 @@ export function renderReportHtml(report: RunReport): string {
     padding: 0 .35rem; border-radius: 4px; background: #8884; text-decoration: none; }
   .hist { font-size: .75rem; color: #888; margin-top: .15rem; text-decoration: none; }
   code, pre { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; }
+  pre { white-space: pre-wrap; word-break: break-word; font-size: .75rem; margin: .35rem 0 0; }
   section { margin-bottom: 1rem; }
+  section.degraded { border: 1px solid #9a670066; background: #9a67000f; border-radius: 8px; padding: .25rem 1rem 1rem; }
+  section.degraded h2 { color: #9a6700; }
+  section.degraded ul { margin: 0; padding-left: 1.25rem; }
+  .err-summary { font-weight: 600; }
+  .diagnosis { margin-top: .35rem; font-size: .8rem; }
+  .diagnosis .hist { display: inline; }
+  .verdict-app_is_wrong { background: #cf222e30; }
+  .verdict-test_is_wrong { background: #9a670030; }
+  .verdict-environment { background: #9a670030; }
+  .verdict-flaky { background: #9a670030; }
+  .verdict-ambiguous { background: #88848430; }
+  details summary { cursor: pointer; font-size: .75rem; color: #888; }
 </style>
 </head>
 <body>
@@ -140,13 +332,22 @@ export function renderReportHtml(report: RunReport): string {
     run.status,
   )}</strong></div>
 
+  ${degradationBanner}
+
   <div class="cards">
     <div class="card"><div class="n">${total}</div><div>total</div></div>
     <div class="card"><div class="n pass">${passed}</div><div>passed</div></div>
     <div class="card"><div class="n fail">${failed}</div><div>failed</div></div>
     <div class="card"><div class="n warn">${blocked}</div><div>blocked</div></div>
     <div class="card"><div class="n warn">${flaky}</div><div>flaky</div></div>
+    ${
+      coverage != null
+        ? `<div class="card"><div class="n">${Math.round(coverage.ratio * 100)}%</div><div>coverage</div></div>`
+        : ''
+    }
   </div>
+
+  ${coverageSection}
 
   <section>
     <h2>Plan</h2>

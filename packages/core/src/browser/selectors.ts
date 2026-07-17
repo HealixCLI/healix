@@ -40,6 +40,10 @@ interface DomWindow {
   document: DomDocument;
 }
 
+/** Shared with {@link BrowserSurface.goto} so the post-navigation settle wait
+ * polls for the same notion of "real content" that this function extracts. */
+export const INTERACTIVE_ELEMENT_SELECTOR = 'button, a[href], input, select, textarea, [role="button"]';
+
 /**
  * Extract interactive elements (buttons, links, inputs, selects, textareas and
  * `[role=button]`), computing a stable selector (preferring `#id`) and an
@@ -47,12 +51,10 @@ interface DomWindow {
  * per-element round-trips.
  */
 export async function collectInteractiveElements(page: Page): Promise<InteractiveElement[]> {
-  return page.evaluate<InteractiveElement[]>(() => {
+  return page.evaluate<InteractiveElement[], string>((SELECTOR) => {
     // Inside the browser these globals exist; we narrow them to our local view.
     const win = globalThis as unknown as DomWindow;
     const doc = win.document;
-
-    const SELECTOR = 'button, a[href], input, select, textarea, [role="button"]';
 
     function cssEscape(value: string): string {
       if (win.CSS && typeof win.CSS.escape === 'function') {
@@ -241,13 +243,16 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         continue;
       }
       seen.add(el);
+      const tag = el.tagName.toLowerCase();
       out.push({
         role: roleFor(el),
         name: accessibleName(el),
         selector: selectorFor(el),
+        href: tag === 'a' ? (el.getAttribute('href') ?? undefined) : undefined,
+        inputType: tag === 'input' ? (el.getAttribute('type') ?? 'text').toLowerCase() : undefined,
       });
     }
 
     return out;
-  });
+  }, INTERACTIVE_ELEMENT_SELECTOR);
 }

@@ -2,7 +2,7 @@ import { spawn, type ChildProcess } from 'node:child_process';
 import { access, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
-import type { TestStatus } from '../../storage/types.js';
+import type { Tier, TestStatus } from '../../storage/types.js';
 import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestingScope, TestModeContext } from '../types.js';
 import { tiersForScope } from '../types.js';
 
@@ -91,10 +91,17 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     env.HEALIX_TIERB_EMAIL = ctx.testUsername;
     env.HEALIX_TIERB_PASSWORD = ctx.testPassword;
     // The auth fixture requires all three of email/password/loginUrl to
-    // attempt a real login (see authSetupContents() in templates.ts) — absent
-    // a dedicated "login URL" field on the project, default to the common
-    // `/login` convention relative to the configured base URL.
-    if (ctx.baseUrl) env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    // attempt a real login (see authSetupContents() in templates.ts). Prefer
+    // EXPLORE's discovered/scored login candidate (hash- and region-prefix
+    // aware — see browser/crawler.ts scoreLoginCandidates) over the naive
+    // `/login` path join, which 404s or falls back to the app's default
+    // route on a HashRouter + region-prefixed app (the RCA's Branch 2).
+    const discovered = ctx.exploration?.loginCandidates?.[0]?.url;
+    if (discovered) {
+      env.HEALIX_TIERB_LOGIN_URL = discovered;
+    } else if (ctx.baseUrl) {
+      env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    }
   }
   return env;
 }
@@ -124,7 +131,7 @@ interface RawCommand {
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
-function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
+function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
     // Cancelled before we even spawned — return immediately; nothing to kill.
     if (ctx.signal?.aborted) {
@@ -142,7 +149,10 @@ function runPlaywright(ctx: TestModeContext): Promise<RawCommand> {
     // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
-    const args = ['playwright', 'test', ...playwrightProjectArgs(ctx.testingScope)];
+    // onlyTier (resume's per-tier batching — see execute()'s opts) restricts
+    // to exactly that one tier, overriding the scope-wide project selection.
+    const projectArgs = onlyTier ? ['--project', onlyTier] : playwrightProjectArgs(ctx.testingScope);
+    const args = ['playwright', 'test', ...projectArgs];
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -265,8 +275,14 @@ interface CmdResult {
   aborted: boolean;
 }
 
-/** Run a one-off command (npm install / browser install) in the suite dir. */
-function runCommand(
+/**
+ * Run a one-off command (npm install / browser install / `playwright test
+ * --list` parse-check) in the suite dir, with the same allowlisted env as
+ * runPlaywright() — see SUITE_ENV_ALLOWLIST. Exported for validate.ts's
+ * pre-execution spec parse-check, which must never hand generated specs a
+ * broader env than the run they're eventually executed in.
+ */
+export function runCommand(
   ctx: TestModeContext,
   command: string,
   args: string[],
@@ -361,8 +377,14 @@ function runCommand(
  * Ensure the scaffolded suite has its node_modules. The Playwright browser
  * binaries live in the shared global cache, so only the npm deps need
  * installing here; browsers are handled lazily on a missing-browser failure.
+ *
+ * Exported so validate.ts's parse-check gate can call it too — that gate runs
+ * `npx playwright test --list` right after generation, before execute() ever
+ * gets a chance to install deps, so without this it fails identically for
+ * every spec (misreported as "fails to parse") whenever a suite is freshly
+ * scaffolded.
  */
-async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
+export async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
   const marker = join(ctx.projectDir, 'node_modules', '@playwright');
   try {
     await access(marker);
@@ -530,13 +552,26 @@ async function readSetupMeta(projectDir: string): Promise<boolean | null> {
   return null;
 }
 
+/**
+ * `result.error` and `result.errors[]` usually describe the SAME failure —
+ * Playwright's `errors` array typically repeats `error` verbatim, or with
+ * only a slightly different captured call-log frame — so concatenating them
+ * used to print near-duplicate "Test timeout of 60000ms exceeded." blocks
+ * two or three times in a row. Show a single, clearest error (the richest
+ * field of the first candidate) instead of joining every entry; a wall of
+ * repeated call logs is noise, not diagnosis.
+ */
 function errorText(result: PwResult | undefined): string {
   if (!result) return '';
-  const parts: string[] = [];
-  if (result.error)
-    parts.push(result.error.message ?? '', result.error.stack ?? '', result.error.value ?? '');
-  for (const e of result.errors ?? []) parts.push(e.message ?? '', e.stack ?? '', e.value ?? '');
-  return stripAnsi(parts.filter(Boolean).join('\n')).trim();
+  const candidates: PwError[] = [];
+  if (result.error) candidates.push(result.error);
+  for (const e of result.errors ?? []) candidates.push(e);
+
+  for (const err of candidates) {
+    const text = stripAnsi(err.stack || err.message || err.value || '').trim();
+    if (text) return text;
+  }
+  return '';
 }
 
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
@@ -736,8 +771,16 @@ function abortedOutcome(exitCode: number | null = null): ExecOutcome {
  * aborted outcome (raw.aborted) is returned so callers can distinguish
  * "cancelled" from "ran and everything failed".
  */
-export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-  emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
+export async function execute(
+  ctx: TestModeContext,
+  specs: GeneratedSpec[],
+  opts?: { onlyTier?: Tier },
+): Promise<ExecOutcome> {
+  const onlyTier = opts?.onlyTier;
+  emit(ctx, `Executing ${specs.length} spec(s) via Playwright${onlyTier ? ` (${onlyTier} only)` : ''}`, {
+    count: specs.length,
+    onlyTier,
+  });
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');
@@ -754,7 +797,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
-  let cmd = await runPlaywright(ctx);
+  let cmd = await runPlaywright(ctx, onlyTier);
 
   // Cancelled during (or right before) the run: partial results are
   // meaningless and would mislabel interrupted tests as failures — discard
@@ -776,7 +819,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
-    cmd = await runPlaywright(ctx);
+    cmd = await runPlaywright(ctx, onlyTier);
 
     // The retry run can be cancelled too (as can the install before it).
     if (cmd.aborted || ctx.signal?.aborted) {

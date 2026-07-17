@@ -1,7 +1,14 @@
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../storage/types.js';
 import { tiersForScope } from '../modes/types.js';
-import { buildGapFillPlanPrompt, buildPlanPrompt, parsePlan, synthesizePlan } from './plan.js';
+import {
+  buildBatchPlanPrompt,
+  buildGapFillPlanPrompt,
+  buildPlanPrompt,
+  parsePlan,
+  parsePlanWithDiagnostics,
+  synthesizePlan,
+} from './plan.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** Minimal black-box project fixture (baseUrl set so synthesize yields URL-flavoured items). */
@@ -193,6 +200,108 @@ describe('parsePlan', () => {
     expect(plan?.items[0]?.scenarios).toEqual([
       { kind: 'positive', description: 'Still works without scenarios.' },
     ]);
+  });
+});
+
+describe('parsePlanWithDiagnostics', () => {
+  it('classifies a response cut off mid-fence (no closing fence at all) as truncated', () => {
+    // The model's output stopped generating before it ever emitted a closing
+    // ``` fence — the classic output-length/token-limit cutoff signature.
+    const text = '```json\n{\n  "summary": "A big plan",\n  "items": [\n    { "title": "First item"';
+    const result = parsePlanWithDiagnostics(text);
+    expect(result.plan).toBeNull();
+    expect(result.failureReason).toBe('truncated');
+  });
+
+  it('classifies a closed fence with an unbalanced object body as truncated', () => {
+    // Fence closes, but the JSON body itself never balances its braces —
+    // structurally indistinguishable from truncation, so treated the same
+    // (worth one retry) rather than as a hard parse failure.
+    const result = parsePlanWithDiagnostics('```json\n{ "summary": "x", "items": [ ]\n```');
+    expect(result.plan).toBeNull();
+    expect(result.failureReason).toBe('truncated');
+  });
+
+  it('classifies prose with no JSON object at all as no-json (not truncated)', () => {
+    const result = parsePlanWithDiagnostics('I could not produce a plan, sorry.');
+    expect(result.plan).toBeNull();
+    expect(result.failureReason).toBe('no-json');
+  });
+
+  it('classifies an empty response as no-json', () => {
+    const result = parsePlanWithDiagnostics('');
+    expect(result.plan).toBeNull();
+    expect(result.failureReason).toBe('no-json');
+  });
+
+  it('classifies a complete but syntactically invalid JSON object as invalid-json', () => {
+    // Balanced braces (so not truncated), but the content between them isn't
+    // valid JSON syntax.
+    const result = parsePlanWithDiagnostics('```json\n{ "items": [1, 2,] }\n```');
+    expect(result.plan).toBeNull();
+    expect(result.failureReason).toBe('invalid-json');
+  });
+
+  it('classifies valid JSON with zero usable items as no-items', () => {
+    const result = parsePlanWithDiagnostics(
+      JSON.stringify({ summary: 'empty', items: [{ tier: 'tierA-public' }] }),
+    );
+    expect(result.plan).toBeNull();
+    expect(result.failureReason).toBe('no-items');
+  });
+
+  it('returns the parsed plan with no failureReason on success', () => {
+    const text = JSON.stringify({
+      summary: 'A fine plan.',
+      items: [{ title: 'Works', tier: 'tierA-public', intent: 'It works.' }],
+    });
+    const result = parsePlanWithDiagnostics(text);
+    expect(result.plan).not.toBeNull();
+    expect(result.failureReason).toBeUndefined();
+  });
+
+  it('parsePlan stays a thin wrapper returning only the plan (or null)', () => {
+    expect(parsePlan('no json here')).toBeNull();
+    expect(
+      parsePlan(JSON.stringify({ items: [{ title: 'X', tier: 'tierA-public', intent: 'x' }] })),
+    ).not.toBeNull();
+  });
+});
+
+describe('buildBatchPlanPrompt', () => {
+  it('scopes the prompt to only the given batch units and notes the batch position when there are multiple batches', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const batchUnits: FunctionalityUnit[] = [
+      { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+    ];
+    const prompt = buildBatchPlanPrompt(project, { projectId: project.id }, batchUnits, 2, 5, {
+      summary: 'Framework: next.',
+      files: [],
+      functionality: [
+        { key: 'route:/other', kind: 'route', label: 'page: /other', file: 'app/other/page.tsx' },
+        ...batchUnits,
+      ],
+    });
+
+    expect(prompt).toContain('batch 2 of 5');
+    expect(prompt).toContain('route:/checkout');
+    // Only this batch's unit is listed, not the other detected unit.
+    expect(prompt).not.toContain('route:/other');
+  });
+
+  it('omits the batch-position prefix entirely when there is only one batch', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const batchUnits: FunctionalityUnit[] = [
+      { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+    ];
+    const prompt = buildBatchPlanPrompt(project, { projectId: project.id }, batchUnits, 1, 1, {
+      summary: '',
+      files: [],
+      functionality: batchUnits,
+    });
+
+    expect(prompt).not.toContain('batch 1 of 1');
+    expect(prompt).not.toContain('more detected functionality');
   });
 });
 

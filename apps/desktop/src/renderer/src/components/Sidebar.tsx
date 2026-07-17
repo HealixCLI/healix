@@ -22,7 +22,22 @@ const ITEMS: NavItem[] = [
 // Settings is pinned to the bottom; provider connection/auth lives inside it.
 const SETTINGS_ITEM: NavItem = { id: 'settings', label: 'Settings', icon: <Settings className="h-4 w-4" /> };
 
-export function Sidebar({ active, onSelect }: { active: ViewId; onSelect: (id: ViewId) => void }) {
+/** Live run status badge shown on the Runs nav item, visible from any view. */
+export interface RunStatusBadge {
+  label: string;
+  tone: 'live' | 'warn';
+}
+
+export function Sidebar({
+  active,
+  onSelect,
+  runStatus,
+}: {
+  active: ViewId;
+  onSelect: (id: ViewId) => void;
+  /** Badge for the Runs nav item — null when there's nothing to show (idle, no queue). */
+  runStatus?: RunStatusBadge | null;
+}) {
   return (
     <aside className="flex w-56 shrink-0 flex-col border-r border-border bg-panel/40">
       {/* drag region aligned with the frameless title bar */}
@@ -37,7 +52,13 @@ export function Sidebar({ active, onSelect }: { active: ViewId; onSelect: (id: V
 
       <nav className="no-drag flex flex-col gap-0.5 px-2">
         {ITEMS.map((item) => (
-          <NavButton key={item.id} item={item} active={item.id === active} onSelect={onSelect} />
+          <NavButton
+            key={item.id}
+            item={item}
+            active={item.id === active}
+            onSelect={onSelect}
+            badge={item.id === 'runs' ? runStatus : null}
+          />
         ))}
       </nav>
 
@@ -63,10 +84,12 @@ function NavButton({
   item,
   active,
   onSelect,
+  badge,
 }: {
   item: NavItem;
   active: boolean;
   onSelect: (id: ViewId) => void;
+  badge?: RunStatusBadge | null;
 }) {
   return (
     <button
@@ -86,7 +109,20 @@ function NavButton({
         )}
       />
       <span className={cn(active ? 'text-accent' : 'text-muted')}>{item.icon}</span>
-      {item.label}
+      <span className="flex-1 text-left">{item.label}</span>
+      {badge && (
+        <span
+          className={cn(
+            'flex shrink-0 items-center gap-1 rounded-full px-1.5 py-0.5 text-[10px] font-medium leading-none',
+            badge.tone === 'warn' ? 'bg-warn/15 text-warn' : 'bg-accent/15 text-accent',
+          )}
+        >
+          {badge.tone === 'live' && (
+            <span className="inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-accent" />
+          )}
+          {badge.label}
+        </span>
+      )}
     </button>
   );
 }

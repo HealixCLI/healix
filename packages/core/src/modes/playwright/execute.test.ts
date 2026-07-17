@@ -122,6 +122,62 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
   });
 
+  it('prefers a discovered login candidate from EXPLORE over the naive /login default', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        testUsername: 'user@test.com',
+        testPassword: 'hunter2',
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: false,
+            authVerified: false,
+          },
+          routing: { hashRouted: true, invariantPrefix: '#/SK' },
+          loginCandidates: [
+            { url: 'http://localhost:3000/#/SK/login', score: 5, source: 'crawled' },
+            { url: 'http://localhost:3000/login', score: 1, source: 'common-path' },
+          ],
+          useful: true,
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/login');
+  });
+
+  it('falls back to the naive /login default when EXPLORE found no login candidates', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        testUsername: 'user@test.com',
+        testPassword: 'hunter2',
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: false,
+            authVerified: false,
+          },
+          routing: { hashRouted: false },
+          loginCandidates: [],
+          useful: false,
+          uselessReason: 'exploration crawled zero routes',
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
+  });
+
   it('injects neither credential var when only one of username/password is set (fixture requires both)', () => {
     const withOnlyUsername = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user' }));
     expect(withOnlyUsername.HEALIX_TIERB_EMAIL).toBeUndefined();
@@ -356,6 +412,58 @@ describe('parseReport — structural Tier B classification', () => {
     const parsed = parseReport(r, auth);
     expect(parsed.results[0]?.status).toBe('failed');
     expect(parsed.blocked).toBe(0);
+  });
+});
+
+describe('parseReport — error text stays simple, not a wall of duplicates', () => {
+  it('picks a single clear error instead of concatenating result.error and every result.errors[] entry', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'click reveals greeting',
+              file: 'tests/tierA-public/click.spec.ts',
+              tests: [
+                {
+                  status: 'failed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'failed',
+                      duration: 11_235,
+                      // Playwright commonly repeats the same failure in both
+                      // `error` and `errors[]` (sometimes with a differing
+                      // captured call-log frame) — this used to concatenate
+                      // into 2-3x duplicated blocks in the report.
+                      error: {
+                        message: 'Test timeout of 60000ms exceeded.',
+                        stack:
+                          "Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole('button')\nat click.spec.ts:8:31",
+                      },
+                      errors: [
+                        {
+                          message: 'Test timeout of 60000ms exceeded.',
+                          stack:
+                            "Error: locator.click: Test timeout of 60000ms exceeded.\nCall log:\n  - waiting for getByRole('button')\nat click.spec.ts:8:31",
+                        },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    const error = parsed.results[0]?.error ?? '';
+    // The message must appear exactly once, not two or three times back to back.
+    const occurrences = error.split('Test timeout of 60000ms exceeded.').length - 1;
+    expect(occurrences).toBe(1);
+    expect(error).toContain('Call log:');
   });
 });
 

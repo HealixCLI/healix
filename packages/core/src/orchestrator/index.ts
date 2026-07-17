@@ -180,6 +180,7 @@ async function resumePipeline(
     provider: checkpoint.runOptions.provider,
     autoApprove: true,
     prd: checkpoint.runOptions.prd,
+    instructions: checkpoint.runOptions.instructions,
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
@@ -457,6 +458,7 @@ async function runPipeline(
         provider: opts.provider,
         autoApprove: opts.autoApprove,
         prd: opts.prd,
+        instructions: opts.instructions,
       },
       plan: effectivePlan,
       generatedItemIds: effectivePlan.items

@@ -68,6 +68,7 @@ const api = {
     provider?: string;
     autoApprove?: boolean;
     prd?: string;
+    instructions?: string;
     suiteMode?: string;
     baseRunId?: string;
   }) => ipcRenderer.invoke('run:start', args),

@@ -85,6 +85,15 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
     lines.push(opts.prd.trim());
     lines.push('"""');
   }
+  if (opts.instructions && opts.instructions.trim().length > 0) {
+    lines.push('');
+    lines.push(
+      'Additional instructions from the user — follow these when deciding what/how to plan (they describe HOW to test, not what the app does):',
+    );
+    lines.push('"""');
+    lines.push(opts.instructions.trim());
+    lines.push('"""');
+  }
   if (repoIndex && repoIndex.summary.trim().length > 0) {
     lines.push('');
     lines.push('Repository context (indexed):');

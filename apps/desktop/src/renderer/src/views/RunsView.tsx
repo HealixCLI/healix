@@ -85,6 +85,10 @@ export function RunsView({
   const [prdFileName, setPrdFileName] = useState<string | null>(null);
   const [prdFileBusy, setPrdFileBusy] = useState(false);
   const [prdFileError, setPrdFileError] = useState<string | null>(null);
+  // Interactive prompting: freeform steering instructions ("how to test"),
+  // distinct from the PRD ("what the app does") — sent to the planning
+  // provider verbatim alongside it (see RunOptions.instructions).
+  const [instructions, setInstructions] = useState('');
   const [selectedRunId, setSelectedRunIdState] = useState<string | null>(
     () => persistedSelectedRunId ?? null,
   );
@@ -319,7 +323,13 @@ export function RunsView({
 
   const startOrQueue = (): void => {
     if (!projectId) return;
-    const args = { projectId, testingScope, suiteMode, prd: prd.trim() || undefined };
+    const args = {
+      projectId,
+      testingScope,
+      suiteMode,
+      prd: prd.trim() || undefined,
+      instructions: instructions.trim() || undefined,
+    };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
       // active — this never silently supersedes the run currently on screen.
@@ -545,6 +555,18 @@ export function RunsView({
                     <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
                   </div>
                   {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
+                </div>
+                <div className="sm:col-span-3">
+                  <Label className="mb-1.5 block">Additional instructions (optional)</Label>
+                  <Textarea
+                    value={instructions}
+                    onChange={(e) => setInstructions(e.target.value)}
+                    placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
+                  />
+                  <p className="mt-1 text-[11px] text-muted">
+                    Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for
+                    directives on how Healix should approach testing it.
+                  </p>
                 </div>
               </div>
 

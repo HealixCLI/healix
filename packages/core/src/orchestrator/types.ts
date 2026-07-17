@@ -63,15 +63,6 @@ export interface RunOptions {
    * marked 'cancelled', and run() resolves with that summary — it never rejects.
    */
   signal?: AbortSignal;
-  /**
-   * Detect the white-box project's external dependencies (backend APIs the
-   * frontend calls, third-party SMS/email/OTP/payment SDKs) and mock them —
-   * via Playwright page.route() interception and/or env-var redirection at
-   * launch time — so the run works fully offline. Default false (byte-
-   * identical behavior to today when omitted). No-op for black-box (URL-only)
-   * projects, which have no source to scan.
-   */
-  mockExternalDependencies?: boolean;
 }
 
 export interface OrchestratorEvent {

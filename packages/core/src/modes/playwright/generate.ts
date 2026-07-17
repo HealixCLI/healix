@@ -17,6 +17,45 @@ function emit(ctx: TestModeContext, message: string, data?: unknown): void {
   ctx.emit?.('generate', message, data);
 }
 
+const MAX_MOCK_CONTENT_LINES = 20;
+const MAX_MOCK_BODY_CHARS = 400;
+
+/**
+ * Ground assertions in the ACTUAL resolved mock content, not a guess. Without
+ * this, GENERATE only knows mocking is active (see mockNote below) but not
+ * what a mocked call actually returns — a model can write a perfectly
+ * plausible assertion (e.g. a specific balance/name) that simply doesn't
+ * match what the mock server/fixture will serve, failing for a reason
+ * that has nothing to do with the app under test.
+ */
+function formatMockContent(ctx: TestModeContext): string {
+  const deps = ctx.externalDependencies ?? [];
+  const lines: string[] = [];
+  for (const dep of deps) {
+    if (dep.mockStrategy === 'undeterminable') continue;
+    if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+    if (dep.endpoints && dep.endpoints.length > 0) {
+      for (const e of dep.endpoints) {
+        if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+        if (!e.response) continue;
+        const body = JSON.stringify(e.response.body).slice(0, MAX_MOCK_BODY_CHARS);
+        lines.push(`- ${e.method} ${e.pathPattern} -> status ${e.response.status}, body: ${body}`);
+      }
+    } else {
+      const fallback = ctx.mockResponses?.[dep.id];
+      if (!fallback) continue;
+      const body = JSON.stringify(fallback.body).slice(0, MAX_MOCK_BODY_CHARS);
+      lines.push(`- ${dep.label} (any call to this dependency) -> status ${fallback.status}, body: ${body}`);
+    }
+  }
+  if (lines.length === 0) return '';
+  return (
+    '\n\nMocked response content — assert against this EXACT data (do not invent plausible-sounding ' +
+    'values that differ from it):\n' +
+    lines.join('\n')
+  );
+}
+
 /** Coerce an arbitrary plan-item tier into one of the three known tiers. */
 function resolveTier(raw: Tier | string | undefined): Tier {
   const v = String(raw ?? '').toLowerCase();
@@ -363,7 +402,7 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
 
   const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : '@playwright/test';
   const mockNote = ctx.mockExternalDependencies
-    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would.`
+    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario.${formatMockContent(ctx)}`
     : '';
 
   return `You are generating ONE Playwright test spec file in TypeScript covering ONE feature with

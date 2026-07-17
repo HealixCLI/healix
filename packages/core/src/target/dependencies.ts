@@ -1,7 +1,7 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { probeUrl } from './http-probe.js';
-import type { ExternalDependency, ExternalDependencyCategory, MockStrategy } from './types.js';
+import type { EndpointMock, ExternalDependency, ExternalDependencyCategory, MockStrategy } from './types.js';
 
 interface PackageJson {
   dependencies?: Record<string, string>;
@@ -335,6 +335,82 @@ function findKnownProviderForHost(host: string): KnownProvider | null {
 }
 
 /**
+ * `client.get('/path')` / `client.post(\`/path/${id}\`)` style call sites —
+ * generic across any HTTP client (axios instance, fetch wrapper, custom
+ * service class), not tied to any particular app. Only string/template-
+ * literal first arguments are extractable; a computed/variable path is
+ * skipped (nothing static to read). Interpolations in a template literal are
+ * normalized to a `:param` placeholder so `/reward/${id}` and `/reward/${x}`
+ * collapse to the same pattern and can later match a real request's path.
+ *
+ * `.get(`/`.post(` etc. are also common non-HTTP method names (Map/Storage
+ * getters, generic setters) — gated by requiring the literal argument to
+ * look like a path (starts with '/') to keep false positives low, matching
+ * this module's existing "best-effort, not exhaustive" static-analysis
+ * philosophy elsewhere.
+ */
+const CALL_SITE_RE =
+  /\b[\w$]+\.(get|post|put|patch|delete|head|options)\(\s*(?:`([^`]*)`|'([^']*)'|"([^"]*)")/gi;
+
+/**
+ * Object-config call style: `axios({ method: 'get', url: '/path' })` (or
+ * `.request({...})`) — method/url can appear in either order, so this
+ * matches the pair independently within a bounded window rather than
+ * requiring one fixed key order.
+ */
+const CONFIG_CALL_RE = /\b[\w$]+\.?(?:request)?\(\s*\{([^{}]{0,300})\}\s*\)/gi;
+const CONFIG_METHOD_RE = /\bmethod\s*:\s*['"](\w+)['"]/i;
+const CONFIG_URL_RE = /\burl\s*:\s*(?:`([^`]*)`|'([^']*)'|"([^"]*)")/i;
+
+const MAX_ENDPOINTS_PER_DEP = 40;
+
+function normalizeEndpointPath(raw: string): string {
+  return raw.replace(/\$\{[^}]*\}/g, ':param');
+}
+
+/** Best-effort (method, path) call-site scan across every source file. Capped and deduped. */
+function extractEndpointCallSites(files: WalkFile[]): { endpoints: EndpointMock[]; truncated: boolean } {
+  const seen = new Set<string>();
+  const endpoints: EndpointMock[] = [];
+  let truncated = false;
+
+  const tryAdd = (method: string | undefined, raw: string | undefined): boolean => {
+    if (!method || raw === undefined || !raw.startsWith('/')) return false;
+    const pathPattern = normalizeEndpointPath(raw);
+    const key = `${method.toUpperCase()} ${pathPattern}`;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    endpoints.push({ method: method.toUpperCase(), pathPattern });
+    return true;
+  };
+
+  outer: for (const f of files) {
+    const source = readSafe(f.abs);
+    if (!source) continue;
+
+    for (const m of source.matchAll(CALL_SITE_RE)) {
+      tryAdd(m[1], m[2] ?? m[3] ?? m[4]);
+      if (endpoints.length >= MAX_ENDPOINTS_PER_DEP) {
+        truncated = true;
+        break outer;
+      }
+    }
+    for (const m of source.matchAll(CONFIG_CALL_RE)) {
+      const inner = m[1] ?? '';
+      const method = CONFIG_METHOD_RE.exec(inner)?.[1];
+      const urlMatch = CONFIG_URL_RE.exec(inner);
+      tryAdd(method, urlMatch?.[1] ?? urlMatch?.[2] ?? urlMatch?.[3]);
+      if (endpoints.length >= MAX_ENDPOINTS_PER_DEP) {
+        truncated = true;
+        break outer;
+      }
+    }
+  }
+
+  return { endpoints, truncated };
+}
+
+/**
  * Detect a white-box repo's external dependencies: known third-party SMS/
  * email/payment/auth SDKs (via package.json + import-site scan), hardcoded
  * third-party API URLs referenced in a network call, and any env var (any
@@ -496,6 +572,25 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
           ? `Reads ${varName}=${value} (currently reachable).`
           : `Reads ${varName}=${value}; not reachable at detection time.`,
       });
+    }
+  }
+
+  // Attach statically-detected (method, path) call sites to whichever single
+  // mockable dependency exists — the common shape for a frontend SPA (one
+  // backend, called from many service files). With MULTIPLE mockable
+  // dependencies there is no reliable static signal for which endpoint
+  // belongs to which host without deeper import-graph tracing, so endpoint-
+  // level detail is skipped rather than risk misattributing it — those
+  // dependencies still get the coarser dependency-level mock as before.
+  const mockableDeps = deps.filter((d) => d.mockStrategy !== 'undeterminable');
+  if (mockableDeps.length === 1) {
+    const { endpoints, truncated } = extractEndpointCallSites(files);
+    if (endpoints.length > 0) {
+      const dep = mockableDeps[0];
+      dep.endpoints = endpoints;
+      if (truncated) {
+        dep.note = `${dep.note ? `${dep.note} ` : ''}Endpoint list capped at ${MAX_ENDPOINTS_PER_DEP}; some call sites were not scanned.`;
+      }
     }
   }
 

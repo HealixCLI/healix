@@ -24,7 +24,12 @@ function mockRouteEntries(ctx: TestModeContext): MockRouteEntry[] {
     if (!dep.hostnames || dep.hostnames.length === 0) continue;
     const response = responses[dep.id];
     if (!response) continue;
-    entries.push({ id: dep.id, hostnames: dep.hostnames, response });
+    entries.push({
+      id: dep.id,
+      hostnames: dep.hostnames,
+      response,
+      ...(dep.endpoints && dep.endpoints.length > 0 ? { endpoints: dep.endpoints } : {}),
+    });
   }
   return entries;
 }

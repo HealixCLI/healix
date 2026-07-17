@@ -30,6 +30,11 @@ interface RawMockResponses {
   responses?: unknown;
 }
 
+/** Composite key for an endpoint-level response entry: distinct from a plain dependency id, never collides with one. */
+function endpointKey(depId: string, method: string, pathPattern: string): string {
+  return `${depId}::${method}::${pathPattern}`;
+}
+
 function buildPrompt(deps: ExternalDependency[]): string {
   const lines: string[] = [];
   lines.push('You are configuring a local mock server for an offline test run. For each external dependency');
@@ -42,6 +47,12 @@ function buildPrompt(deps: ExternalDependency[]): string {
   for (const d of deps) {
     const seenIn = d.file ? ` | seen in: ${d.file}` : '';
     lines.push(`- id: "${d.id}" | category: ${d.category} | label: ${d.label}${seenIn}`);
+    if (d.endpoints && d.endpoints.length > 0) {
+      lines.push('  Known endpoints for this dependency (produce a distinct, endpoint-appropriate response for EACH):');
+      for (const e of d.endpoints) {
+        lines.push(`    - key: "${endpointKey(d.id, e.method, e.pathPattern)}" | ${e.method} ${e.pathPattern}`);
+      }
+    }
   }
   lines.push('');
   lines.push('Respond with exactly one fenced ```json code block of the shape:');
@@ -49,15 +60,17 @@ function buildPrompt(deps: ExternalDependency[]): string {
   lines.push('{');
   lines.push('  "responses": [');
   lines.push(
-    '    { "id": "<the dependency id above, verbatim>", "status": 200, "body": { "...": "realistic JSON" } }',
+    '    { "id": "<a dependency id, OR an endpoint key exactly as printed above>", "status": 200, "body": { "...": "realistic JSON" } }',
   );
   lines.push('  ]');
   lines.push('}');
   lines.push('```');
   lines.push(
-    'Produce exactly one entry per dependency id listed above, using realistic field names and values for ' +
-      'that provider/category (e.g. an SMS send returns a message id and a "sent"/"queued" status; a payment ' +
-      'charge returns an id and "succeeded"; an OTP/auth call returns a success flag or token).',
+    'Produce exactly one entry per dependency id (or, when endpoints are listed, one entry per endpoint key — ' +
+      'endpoint keys take priority over a single dependency-level entry). Use realistic field names and values ' +
+      'appropriate to what that specific endpoint path suggests it does — e.g. a path containing "login"/"auth" ' +
+      'returns a token; "list"/plural nouns return an array; "balance"/"points"/"ledger" return numeric fields; ' +
+      'a POST "redeem"/"create" returns a confirmation id.',
   );
   return lines.join('\n');
 }
@@ -153,7 +166,14 @@ export async function generateMockResponses(
 ): Promise<Map<string, MockResponse>> {
   const mockable = deps.filter((d) => d.mockStrategy !== 'undeterminable');
   const result = new Map<string, MockResponse>();
-  for (const d of mockable) result.set(d.id, staticMockResponse(d.category));
+  for (const d of mockable) {
+    result.set(d.id, staticMockResponse(d.category));
+    // Every detected endpoint gets a static fallback up front too, same as the
+    // dependency-level entry — an AI override below replaces it when usable,
+    // but a run with no ready provider still gets a (generic) response per
+    // endpoint instead of falling back to the coarser dependency-wide one.
+    for (const e of d.endpoints ?? []) e.response = staticMockResponse(d.category);
+  }
   if (mockable.length === 0 || !provider) return result;
 
   try {
@@ -164,13 +184,24 @@ export async function generateMockResponses(
       signal: opts?.signal,
     });
     if (completion.ok && completion.text) {
-      const validIds = new Set(mockable.map((d) => d.id));
-      const parsed = parseMockResponses(completion.text, validIds);
-      for (const [id, response] of parsed) result.set(id, response);
+      const validKeys = new Set<string>();
+      for (const d of mockable) {
+        validKeys.add(d.id);
+        for (const e of d.endpoints ?? []) validKeys.add(endpointKey(d.id, e.method, e.pathPattern));
+      }
+      const parsed = parseMockResponses(completion.text, validKeys);
+      for (const d of mockable) {
+        const depLevel = parsed.get(d.id);
+        if (depLevel) result.set(d.id, depLevel);
+        for (const e of d.endpoints ?? []) {
+          const perEndpoint = parsed.get(endpointKey(d.id, e.method, e.pathPattern));
+          if (perEndpoint) e.response = perEndpoint;
+        }
+      }
     }
   } catch {
-    // AI content generation is best-effort; every dependency already has its
-    // static fallback set above, so a thrown/failed call changes nothing.
+    // AI content generation is best-effort; every dependency/endpoint already
+    // has its static fallback set above, so a thrown/failed call changes nothing.
   }
 
   return result;

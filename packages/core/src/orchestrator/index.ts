@@ -184,7 +184,6 @@ async function resumePipeline(
     provider: checkpoint.runOptions.provider,
     autoApprove: true,
     prd: checkpoint.runOptions.prd,
-    mockExternalDependencies: checkpoint.runOptions.mockExternalDependencies,
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
@@ -398,8 +397,9 @@ async function runPipeline(
   // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
   // loop, which needs the same functionality inventory the initial plan was grounded on.
   let repoIndex: PlanRepoContext | undefined;
-  // Detected during PLAN when opts.mockExternalDependencies is set (white-box only);
-  // mockResponses holds the resolved canned content per dependency id. mockServerHandle
+  // Detected automatically during PLAN for every white-box project (no opt-in
+  // needed — see the DEPENDENCIES sub-phase below); mockResponses holds the
+  // resolved canned content per dependency id. mockServerHandle
   // is only non-null once LAUNCH has started the local server for env-override/both
   // dependencies, and is always stopped in the run's cleanup alongside launchHandle.
   let externalDependencies: ExternalDependency[] = [];
@@ -461,7 +461,6 @@ async function runPipeline(
         provider: opts.provider,
         autoApprove: opts.autoApprove,
         prd: opts.prd,
-        mockExternalDependencies: opts.mockExternalDependencies,
       },
       plan: effectivePlan,
       generatedItemIds: effectivePlan.items
@@ -543,20 +542,19 @@ async function runPipeline(
       // same skipped PLAN pass) — reload what was already detected/resolved
       // from plan/dependencies.json so LAUNCH can still restart the mock
       // server and GENERATE/report still see the same dependencies. Best
-      // effort: an unreadable/missing file just means no mocking on resume,
-      // same as if detection had found nothing.
-      if (opts.mockExternalDependencies) {
-        try {
-          const raw = await readFile(join(runDir, 'plan', 'dependencies.json'), 'utf-8');
-          const saved = JSON.parse(raw) as Array<ExternalDependency & { mockResponse: MockResponse | null }>;
-          externalDependencies = saved.map(({ mockResponse: _mockResponse, ...dep }) => dep);
-          mockResponses = new Map(
-            saved.filter((d) => d.mockResponse !== null).map((d) => [d.id, d.mockResponse as MockResponse]),
-          );
-          emit('plan', 'debug', `Resumed ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'} for mocking.`);
-        } catch (err) {
-          emit('plan', 'debug', `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`);
-        }
+      // effort: an unreadable/missing file (e.g. a black-box project, which
+      // never had one to begin with) just means no mocking on resume, same
+      // as if detection had found nothing.
+      try {
+        const raw = await readFile(join(runDir, 'plan', 'dependencies.json'), 'utf-8');
+        const saved = JSON.parse(raw) as Array<ExternalDependency & { mockResponse: MockResponse | null }>;
+        externalDependencies = saved.map(({ mockResponse: _mockResponse, ...dep }) => dep);
+        mockResponses = new Map(
+          saved.filter((d) => d.mockResponse !== null).map((d) => [d.id, d.mockResponse as MockResponse]),
+        );
+        emit('plan', 'debug', `Resumed ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'} for mocking.`);
+      } catch (err) {
+        emit('plan', 'debug', `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`);
       }
       setStatus('awaiting-approval');
       if (checkCancelled()) return await pauseOrCancel('approve');
@@ -624,46 +622,46 @@ async function runPipeline(
             );
           }
 
-          // ---- 3b. DEPENDENCIES (white-box, opt-in) ----
+          // ---- 3b. DEPENDENCIES (white-box, automatic) ----
           // Detect external dependencies (backend APIs the frontend calls, third-party
           // SMS/email/OTP/payment SDKs) and resolve mock content for them BEFORE launch,
           // so LAUNCH can redirect env-override dependencies and GENERATE can scaffold
-          // the route-intercept fixture with real content already in hand.
-          if (opts.mockExternalDependencies) {
+          // the route-intercept fixture with real content already in hand. Always runs
+          // for a white-box project — no opt-in needed; a project with nothing to mock
+          // just gets an empty list here, which is harmless downstream.
+          try {
+            externalDependencies = await detectExternalDependencies(project.repoPath);
+            emit(
+              'dependencies',
+              'info',
+              `Detected ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'}.`,
+              { dependencies: externalDependencies },
+            );
+          } catch (err) {
+            emit(
+              'dependencies',
+              'warn',
+              `Dependency detection failed (continuing without mocks): ${errMsg(err)}`,
+            );
+          }
+          if (externalDependencies.length > 0) {
             try {
-              externalDependencies = await detectExternalDependencies(project.repoPath);
-              emit(
-                'dependencies',
-                'info',
-                `Detected ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'}.`,
-                { dependencies: externalDependencies },
-              );
+              mockResponses = await generateMockResponses(externalDependencies, provider, {
+                repoPath: project.repoPath,
+                signal,
+              });
             } catch (err) {
               emit(
                 'dependencies',
-                'warn',
-                `Dependency detection failed (continuing without mocks): ${errMsg(err)}`,
+                'debug',
+                `Mock response generation failed (using static fallbacks): ${errMsg(err)}`,
               );
             }
-            if (externalDependencies.length > 0) {
-              try {
-                mockResponses = await generateMockResponses(externalDependencies, provider, {
-                  repoPath: project.repoPath,
-                  signal,
-                });
-              } catch (err) {
-                emit(
-                  'dependencies',
-                  'debug',
-                  `Mock response generation failed (using static fallbacks): ${errMsg(err)}`,
-                );
-              }
-            }
-            await writeJson(
-              join(runDir, 'plan', 'dependencies.json'),
-              externalDependencies.map((d) => ({ ...d, mockResponse: mockResponses.get(d.id) ?? null })),
-            );
           }
+          await writeJson(
+            join(runDir, 'plan', 'dependencies.json'),
+            externalDependencies.map((d) => ({ ...d, mockResponse: mockResponses.get(d.id) ?? null })),
+          );
         }
 
         plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
@@ -795,7 +793,7 @@ async function runPipeline(
         let launchEnv: Record<string, string> | undefined;
         if (mockableEnvDeps.length > 0) {
           try {
-            mockServerHandle = await startMockServer(mockResponses);
+            mockServerHandle = await startMockServer(externalDependencies, mockResponses);
             launchEnv = {};
             for (const dep of mockableEnvDeps) {
               if (!dep.envVar) continue;
@@ -933,7 +931,7 @@ async function runPipeline(
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
       signal,
-      ...(opts.mockExternalDependencies
+      ...(externalDependencies.length > 0
         ? {
             mockExternalDependencies: true,
             externalDependencies,

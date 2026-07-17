@@ -110,6 +110,23 @@ export interface ExternalDependency {
   reachable?: boolean;
   /** Human-readable explanation, e.g. why a dependency is undeterminable. */
   note?: string;
+  /**
+   * Distinct (method, path) call sites statically found for this dependency's
+   * client, e.g. a call like `apiClient.get('/customer_lookup')`. `pathPattern`
+   * normalizes template-literal interpolations (`` `/reward/${id}` ``) to a
+   * `:param` placeholder so a real request's path can still match it. Present
+   * only when at least one literal call site could be extracted — a dependency
+   * with none of these still gets the single dependency-level MockResponse as
+   * a fallback (see mock-responses.ts / mock-server.ts).
+   */
+  endpoints?: EndpointMock[];
+}
+
+/** One statically-detected (method, path) call site for an ExternalDependency's client. */
+export interface EndpointMock {
+  method: string;
+  pathPattern: string;
+  response?: MockResponse;
 }
 
 /** A canned response Healix serves in place of a real call to an ExternalDependency. */

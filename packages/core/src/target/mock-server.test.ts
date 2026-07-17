@@ -29,7 +29,7 @@ describe('startMockServer', () => {
     const responses = new Map<string, MockResponse>([
       ['pkg:twilio', { status: 201, body: { sid: 'SM123', status: 'sent' } }],
     ]);
-    const handle = await startMockServer(responses);
+    const handle = await startMockServer([], responses);
     handles.push(handle);
 
     const url = mockDependencyUrl(handle.baseUrl, 'pkg:twilio');
@@ -40,7 +40,7 @@ describe('startMockServer', () => {
 
   it('records intercepted requests in requestLog', async () => {
     const responses = new Map<string, MockResponse>([['pkg:twilio', { status: 200, body: {} }]]);
-    const handle = await startMockServer(responses);
+    const handle = await startMockServer([], responses);
     handles.push(handle);
 
     await get(mockDependencyUrl(handle.baseUrl, 'pkg:twilio'));
@@ -49,7 +49,7 @@ describe('startMockServer', () => {
   });
 
   it('returns a generic 200 for an unmatched/unknown dependency id', async () => {
-    const handle = await startMockServer(new Map());
+    const handle = await startMockServer([], new Map());
     handles.push(handle);
 
     const res = await get(mockDependencyUrl(handle.baseUrl, 'pkg:unknown'));
@@ -61,7 +61,7 @@ describe('startMockServer', () => {
     const responses = new Map<string, MockResponse>([
       ['pkg:stripe', { status: 200, body: { ok: true }, headers: { 'x-request-id': 'abc123' } }],
     ]);
-    const handle = await startMockServer(responses);
+    const handle = await startMockServer([], responses);
     handles.push(handle);
 
     const url = mockDependencyUrl(handle.baseUrl, 'pkg:stripe');

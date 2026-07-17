@@ -126,7 +126,7 @@ export function registerMockLaunch(program: Command): void {
       let mockServer: MockServerHandle | undefined;
       if (envOverrideDeps.length > 0) {
         try {
-          mockServer = await startMockServer(mockResponses);
+          mockServer = await startMockServer(dependencies, mockResponses);
           console.log(pc.dim(`    Mock server listening at ${mockServer.baseUrl}`));
         } catch (err) {
           console.log(pc.yellow(`    Failed to start mock server (continuing without it): ${errMsg(err)}`));

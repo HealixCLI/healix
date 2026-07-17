@@ -203,10 +203,12 @@ export interface TestModeContext {
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
   /**
-   * When true, the run is mocking external dependencies (see RunOptions.
-   * mockExternalDependencies) — scaffold() writes a page.route() fixture for
-   * 'route-intercept'/'both' dependencies, and generate() directs specs to
-   * import test/expect from it instead of '@playwright/test' directly.
+   * True whenever PLAN's automatic dependency detection found at least one
+   * external dependency for this (white-box) project — scaffold() writes a
+   * page.route() fixture for 'route-intercept'/'both' dependencies, and
+   * generate() directs specs to import test/expect from it instead of
+   * '@playwright/test' directly. Always false for black-box projects (no
+   * source to scan) or when detection found nothing to mock.
    */
   mockExternalDependencies?: boolean;
   /** Dependencies detected for this run (only set when mockExternalDependencies is true). */

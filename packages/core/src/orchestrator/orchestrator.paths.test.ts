@@ -1197,10 +1197,7 @@ describe('orchestrator paths (offline DI seam)', () => {
     // whenever the project has a repoPath, per the requirement that Healix
     // "should be able to identify any External dependency" on its own.
     const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-deps-'));
-    writeFileSync(
-      join(repoPath, 'package.json'),
-      JSON.stringify({ dependencies: { twilio: '^4.0.0' } }),
-    );
+    writeFileSync(join(repoPath, 'package.json'), JSON.stringify({ dependencies: { twilio: '^4.0.0' } }));
     mkdirSync(join(repoPath, 'src'), { recursive: true });
     writeFileSync(
       join(repoPath, 'src', 'sms.js'),

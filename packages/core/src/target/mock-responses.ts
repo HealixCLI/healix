@@ -48,9 +48,13 @@ function buildPrompt(deps: ExternalDependency[]): string {
     const seenIn = d.file ? ` | seen in: ${d.file}` : '';
     lines.push(`- id: "${d.id}" | category: ${d.category} | label: ${d.label}${seenIn}`);
     if (d.endpoints && d.endpoints.length > 0) {
-      lines.push('  Known endpoints for this dependency (produce a distinct, endpoint-appropriate response for EACH):');
+      lines.push(
+        '  Known endpoints for this dependency (produce a distinct, endpoint-appropriate response for EACH):',
+      );
       for (const e of d.endpoints) {
-        lines.push(`    - key: "${endpointKey(d.id, e.method, e.pathPattern)}" | ${e.method} ${e.pathPattern}`);
+        lines.push(
+          `    - key: "${endpointKey(d.id, e.method, e.pathPattern)}" | ${e.method} ${e.pathPattern}`,
+        );
       }
     }
   }

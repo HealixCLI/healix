@@ -552,9 +552,17 @@ async function runPipeline(
         mockResponses = new Map(
           saved.filter((d) => d.mockResponse !== null).map((d) => [d.id, d.mockResponse as MockResponse]),
         );
-        emit('plan', 'debug', `Resumed ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'} for mocking.`);
+        emit(
+          'plan',
+          'debug',
+          `Resumed ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'} for mocking.`,
+        );
       } catch (err) {
-        emit('plan', 'debug', `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`);
+        emit(
+          'plan',
+          'debug',
+          `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`,
+        );
       }
       setStatus('awaiting-approval');
       if (checkCancelled()) return await pauseOrCancel('approve');

@@ -122,13 +122,7 @@ export function registerRun(program: Command): void {
     .option('--yes', 'auto-approve the plan (skip the approval gate)', false)
     .option('--prd <text>', 'PRD / acceptance-criteria text to ground generation')
     .action(
-      async (opts: {
-        project: string;
-        provider?: string;
-        mode?: string;
-        yes?: boolean;
-        prd?: string;
-      }) => {
+      async (opts: { project: string; provider?: string; mode?: string; yes?: boolean; prd?: string }) => {
         const runOpts: RunOptions = {
           projectId: opts.project,
           autoApprove: opts.yes === true,

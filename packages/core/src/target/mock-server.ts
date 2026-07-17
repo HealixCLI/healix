@@ -8,14 +8,17 @@ import type { ExternalDependency, MockRequestRecord, MockResponse, MockServerHan
  * compare case-insensitively (a detected `/API/Foo` and a real request to
  * `/api/foo` are the same endpoint to any real HTTP router).
  */
-function endpointMatches(patternMethod: string, pattern: string, requestMethod: string, requestPath: string): boolean {
+function endpointMatches(
+  patternMethod: string,
+  pattern: string,
+  requestMethod: string,
+  requestPath: string,
+): boolean {
   if (patternMethod.toUpperCase() !== requestMethod.toUpperCase()) return false;
   const patternSegs = pattern.split('/').filter(Boolean);
   const pathSegs = requestPath.split('/').filter(Boolean);
   if (patternSegs.length !== pathSegs.length) return false;
-  return patternSegs.every(
-    (seg, i) => seg === ':param' || seg.toLowerCase() === pathSegs[i].toLowerCase(),
-  );
+  return patternSegs.every((seg, i) => seg === ':param' || seg.toLowerCase() === pathSegs[i].toLowerCase());
 }
 
 /** Serialize a MockResponse body per its declared content-type — JSON.stringify only when the type is (or defaults to) JSON. */
@@ -66,8 +69,8 @@ export async function startMockServer(
 
     const dep = depId ? depsById.get(depId) : undefined;
     const endpoint = dep?.endpoints?.find((e) => endpointMatches(e.method, e.pathPattern, method, subPath));
-    const response: MockResponse =
-      endpoint?.response ?? (depId ? responses.get(depId) : undefined) ?? { status: 200, body: {} };
+    const response: MockResponse = endpoint?.response ??
+      (depId ? responses.get(depId) : undefined) ?? { status: 200, body: {} };
     const { contentType, text } = serializeBody(response);
     res.writeHead(response.status, {
       'content-type': contentType,

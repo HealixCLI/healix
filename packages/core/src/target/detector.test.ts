@@ -95,7 +95,11 @@ export default defineConfig({
       devDependencies: { vite: '^5.4.0' },
     });
     writeFile(dir, 'package-lock.json', '{}\n');
-    writeFile(dir, 'vite.config.ts', "import { defineConfig } from 'vite';\nexport default defineConfig({});\n");
+    writeFile(
+      dir,
+      'vite.config.ts',
+      "import { defineConfig } from 'vite';\nexport default defineConfig({});\n",
+    );
 
     const result = await detect(dir);
 

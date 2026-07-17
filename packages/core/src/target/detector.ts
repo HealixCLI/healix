@@ -275,7 +275,13 @@ function readEnvPort(repoPath: string): number | null {
 }
 
 /** vite.config.* files, checked in the order Vite itself resolves them. */
-const VITE_CONFIG_FILES = ['vite.config.ts', 'vite.config.js', 'vite.config.mjs', 'vite.config.mts', 'vite.config.cjs'];
+const VITE_CONFIG_FILES = [
+  'vite.config.ts',
+  'vite.config.js',
+  'vite.config.mjs',
+  'vite.config.mts',
+  'vite.config.cjs',
+];
 const VITE_FRAMEWORKS = new Set(['vite', 'vite-react', 'vite-vue']);
 
 /** Extract the balanced `{...}` block following `key:` in `source`, or null if not found. */

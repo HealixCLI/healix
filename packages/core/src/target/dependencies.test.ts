@@ -47,7 +47,11 @@ describe('detectExternalDependencies', () => {
   it('detects a known payment SDK used in frontend code as route-intercept', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({ dependencies: { stripe: '^14.0.0', react: '^18.0.0' } }));
-    write(dir, 'src/components/Checkout.tsx', "import Stripe from 'stripe';\nconst s = new Stripe('sk_test');\n");
+    write(
+      dir,
+      'src/components/Checkout.tsx',
+      "import Stripe from 'stripe';\nconst s = new Stripe('sk_test');\n",
+    );
 
     const deps = await detectExternalDependencies(dir);
     const stripeDep = deps.find((d) => d.packageName === 'stripe');
@@ -164,7 +168,7 @@ describe('detectExternalDependencies', () => {
     expect(dep?.category).toBe('auth');
   });
 
-  it('does not flag an OAuth redirect/callback URL (the app\'s own endpoint, not a dependency it calls out to)', async () => {
+  it("does not flag an OAuth redirect/callback URL (the app's own endpoint, not a dependency it calls out to)", async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({ dependencies: { react: '^18.0.0' } }));
     write(dir, 'src/services/auth.ts', 'const redirectUri = import.meta.env.VITE_COGNITO_REDIRECT_URI;\n');
@@ -177,7 +181,7 @@ describe('detectExternalDependencies', () => {
   it('does not flag a non-URL env var value (not every VITE_* var is an endpoint)', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({ dependencies: { react: '^18.0.0' } }));
-    write(dir, 'src/config/env.ts', "const brand = import.meta.env.VITE_BRAND;\n");
+    write(dir, 'src/config/env.ts', 'const brand = import.meta.env.VITE_BRAND;\n');
     write(dir, '.env', 'VITE_BRAND=DEMO\n');
 
     const deps = await detectExternalDependencies(dir);

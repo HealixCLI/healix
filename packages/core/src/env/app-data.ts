@@ -58,3 +58,24 @@ export async function deleteProjectAssets(projectId: string): Promise<void> {
   }
   await rm(target, { recursive: true, force: true });
 }
+
+/**
+ * Irreversibly remove a single run's on-disk assets (suite, plan, reports,
+ * artifacts) — same shape/safety checks as deleteProjectAssets, one level
+ * deeper (<projectId>/runs/<runId>). Both ids must look like Healix ids and
+ * the resolved path must land strictly inside that run's own directory.
+ */
+export async function deleteRunAssets(projectId: string, runId: string): Promise<void> {
+  if (!/^prj_[A-Za-z0-9_-]+$/.test(projectId)) {
+    throw new Error(`Refusing to delete assets for suspicious project id: ${JSON.stringify(projectId)}`);
+  }
+  if (!/^run_[A-Za-z0-9_-]+$/.test(runId)) {
+    throw new Error(`Refusing to delete assets for suspicious run id: ${JSON.stringify(runId)}`);
+  }
+  const runsRoot = resolve(join(projectsDir(), projectId, 'runs'));
+  const target = resolve(join(runsRoot, runId));
+  if (!target.startsWith(runsRoot + sep)) {
+    throw new Error(`Refusing to delete assets outside the run's own dir: ${target}`);
+  }
+  await rm(target, { recursive: true, force: true });
+}

@@ -48,6 +48,12 @@ export interface PickPrdFileResult {
   error?: string;
 }
 
+/** Result of the native folder picker used to browse for a project's repo path. */
+export interface PickRepoPathResult {
+  canceled: boolean;
+  path?: string;
+}
+
 /**
  * Detail bundle for a single historical run (store rows + parsed report.json).
  * `report` is the raw JSON from reports/report.json (unknown — narrow with

@@ -30,6 +30,7 @@ import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
+import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
@@ -42,7 +43,10 @@ import {
   synthesizePlan,
   type PlanRepoContext,
 } from './plan.js';
-import { indexFunctionality, type FunctionalityUnit } from '../target/functionality-index.js';
+import type { FunctionalityUnit } from '../target/functionality-index.js';
+import { indexSource } from '../target/source-index.js';
+import { persistSourceContext } from '../target/context-store.js';
+import type { SourceContext } from '../target/source-context.js';
 import { diffAgainstBase } from './topup.js';
 import {
   computeCoverage,
@@ -389,6 +393,11 @@ async function runPipeline(
   // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
   // loop, which needs the same functionality inventory the initial plan was grounded on.
   let repoIndex: PlanRepoContext | undefined;
+  // Full white-box static-analysis result (routes/endpoints + forms/auth-patterns/selector
+  // hints), set alongside repoIndex during PLAN. repoIndex.functionality is a projection of
+  // sourceContext.units for backward compatibility; sourceContext itself is what GENERATE and
+  // TRIAGE consume for their own grounding (see modes/types.ts's TestModeContext.sourceContext).
+  let sourceContext: SourceContext | undefined;
   const triageEntries: ReportTriageEntry[] = [];
   // Artifact files collected from the mode after EXECUTE (relative paths), surfaced in the report.
   let artifactFiles: string[] = [];
@@ -562,18 +571,19 @@ async function runPipeline(
             emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
           }
           try {
-            const functionality = await indexFunctionality(project.repoPath);
-            if (functionality.units.length > 0) {
+            sourceContext = await indexSource(project.repoPath);
+            if (sourceContext.units.length > 0) {
               repoIndex = {
                 ...(repoIndex ?? { summary: '', files: [] }),
-                functionality: functionality.units,
+                functionality: sourceContext.units,
               };
               emit(
                 'plan',
                 'debug',
-                `Detected ${functionality.units.length} functionality unit(s) for plan grounding.`,
+                `Detected ${sourceContext.units.length} functionality unit(s) for plan grounding.`,
               );
             }
+            persistSourceContext(project.repoPath, sourceContext);
           } catch (err) {
             emit(
               'plan',
@@ -807,6 +817,7 @@ async function runPipeline(
       browser,
       explorationMode: opts.explorationMode ?? deriveExplorationMode(project),
       testingScope: opts.testingScope ?? 'both',
+      sourceContext,
       emit: ctxEmit,
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
@@ -829,69 +840,89 @@ async function runPipeline(
       // a DOM snapshot to ground — skip the live browser pass entirely.
       emit('explore', 'debug', 'Skipping exploration (reuse mode).');
     } else if (effectiveBaseUrl) {
-      setStatus('exploring');
-      emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
-      // Live frame mirroring is best-effort and must never abort the run; the
-      // subscription + browser teardown both happen in this phase's finally.
-      let unsubFrames: (() => void) | null = null;
-      // Resolves the moment a frame is actually delivered to hooks.onFrame —
-      // used below to hold teardown open just long enough for the mirror's
-      // in-flight capture to land. Without this, a real screenshot capture
-      // (genuinely tens to hundreds of ms against a real browser) can still
-      // be in flight when this phase's own work (goto + one DOM snapshot)
-      // finishes first; unsubscribing/stopping the browser at that point
-      // silently drops the frame before it's ever delivered.
-      let firstFrame: Promise<void> | null = null;
-      try {
-        await browser.start({ headless: true, baseUrl: effectiveBaseUrl });
-        await browser.goto(effectiveBaseUrl);
-        // Subscribe AFTER start/goto so the UI only mirrors the live page.
-        if (hooks?.onFrame) {
-          try {
-            let resolveFirstFrame: () => void = () => undefined;
-            firstFrame = new Promise((resolve) => {
-              resolveFirstFrame = resolve;
-            });
-            let delivered = false;
-            unsubFrames = browser.onFrame((png) => {
-              hooks?.onFrame?.(png);
-              if (!delivered) {
-                delivered = true;
-                resolveFirstFrame();
-              }
-            });
-          } catch (err) {
-            emit('explore', 'debug', `Frame subscription failed (continuing): ${errMsg(err)}`);
+      // Black-box projects (a user-supplied baseUrl with no locally-spawned
+      // dev server) never had that URL verified reachable — white-box
+      // launches already prove readiness via launch()'s own probeUrl race.
+      // Without this, an unreachable black-box baseUrl fell straight into
+      // browser.goto()'s own timeout, and then GENERATE/EXECUTE still ran
+      // blind against a dead app.
+      let reachable = true;
+      if (!launchHandle) {
+        const probe = await target.probeUrl(effectiveBaseUrl, 8_000);
+        reachable = probe.reachable;
+        if (!reachable) {
+          emit('explore', 'warn', `Base URL ${effectiveBaseUrl} is not reachable; skipping exploration.`, {
+            probe,
+          });
+        }
+      }
+      if (reachable) {
+        setStatus('exploring');
+        emit('explore', 'info', `Exploring ${effectiveBaseUrl} (${ctx.explorationMode ?? 'codegen'}).`);
+        // White-box only: feed the already-computed sourceContext's static routes as extra crawl
+        // seeds, so routes with no visible in-app link (admin pages, wizard steps, deep settings)
+        // still get explored. Reuses the SAME PLAN-phase sourceContext (see indexSource above)
+        // rather than re-indexing — this used to be an independent second indexFunctionality call.
+        // Endpoint (tierC, no DOM route) units are split out for their own HTTP reachability
+        // probe instead of a wasted browser navigation — see splitStaticUnitsForExplore.
+        const { routePaths: staticRoutePaths, endpointPaths } = splitStaticUnitsForExplore(
+          sourceContext?.units ?? [],
+        );
+        if (endpointPaths.length > 0) {
+          const probeBaseUrl = effectiveBaseUrl;
+          const probes = await Promise.all(
+            endpointPaths.map(async (p) => ({
+              path: p,
+              ...(await target.probeUrl(new URL(p, probeBaseUrl).toString(), 3_000)),
+            })),
+          );
+          const unreachable = probes.filter((p) => !p.reachable);
+          if (unreachable.length > 0) {
+            emit(
+              'explore',
+              'warn',
+              `${unreachable.length}/${probes.length} statically-detected API endpoint(s) did not respond.`,
+              { unreachable: unreachable.map((p) => p.path) },
+            );
           }
         }
-        const snap = await browser.snapshot();
-        // Ground GENERATE in what we actually observed: the interactive-element
-        // inventory is fed into the generation prompt so specs target real
-        // selectors instead of guessing (was captured, then dropped).
-        ctx.snapshot = snap;
-        emit('explore', 'info', `Explored "${snap.title}".`, {
-          url: snap.url,
-          interactiveElements: snap.interactiveElements.length,
-        });
-        // Bounded best-effort wait: give the mirror a brief window to deliver
-        // its first frame if it hasn't already, so short explorations still
-        // get one before the browser tears down. Never blocks the run for
-        // more than this cap.
-        if (firstFrame) {
-          await Promise.race([firstFrame, delay(600)]);
-        }
-      } catch (err) {
-        emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, { stack: errStack(err) });
-      } finally {
-        // Always unsubscribe before stopping the browser, both best-effort.
-        if (unsubFrames) {
-          try {
-            unsubFrames();
-          } catch {
-            /* never let unsubscribe crash the run */
+
+        try {
+          const exploration = await runExplorePhase({
+            browser,
+            baseUrl: effectiveBaseUrl,
+            credentials:
+              ctx.testUsername && ctx.testPassword
+                ? { username: ctx.testUsername, password: ctx.testPassword }
+                : undefined,
+            staticRoutePaths,
+            emit,
+            onFrame: hooks?.onFrame,
+          });
+          ctx.exploration = exploration;
+
+          // Auth-pattern-aware breadcrumb: a recognized auth library was detected in source but
+          // the crawl found no REAL login form — only the always-present common-path fallback
+          // candidates scoreLoginCandidates() adds when nothing crawled scores confidently (see
+          // browser/crawler.ts), which don't indicate an actual form was found. Likely a
+          // non-form/token auth mechanism (API keys, OAuth redirect, session cookie set
+          // server-side) that EXPLORE's form-based login detection can't see. Never blocks;
+          // surfaces the ambiguity instead of silently reporting "no login found" as if the app
+          // were simply unauthenticated.
+          const detectedLibraries = new Set((sourceContext?.authPatterns ?? []).flatMap((a) => a.libraries));
+          const hasCrawledLoginCandidate = exploration.loginCandidates.some((c) => c.source === 'crawled');
+          if (detectedLibraries.size > 0 && !hasCrawledLoginCandidate) {
+            emit(
+              'explore',
+              'warn',
+              `Detected auth librar${detectedLibraries.size === 1 ? 'y' : 'ies'} (${[...detectedLibraries].join(', ')}) in source, but no login form was found during exploration — this app may use non-form/token-based auth that EXPLORE cannot currently detect.`,
+            );
           }
+        } catch (err) {
+          emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, {
+            stack: errStack(err),
+          });
         }
-        await browser.stop().catch(() => undefined);
       }
     } else {
       emit('explore', 'debug', 'Skipping exploration.');
@@ -965,6 +996,32 @@ async function runPipeline(
           newSpecItems = planForGeneration.items;
           trackGeneration(planForGeneration.items.length, newSpecs.length);
         }
+
+        // Pre-execution validation gate: generate.ts's regex/string gates
+        // never parse the TypeScript, so a spec with a genuine syntax defect
+        // (unclosed string, dropped brace) can still sail through — catch
+        // that HERE, before any row is registered or execute() ever sees the
+        // file, rather than as a raw exception mid-suite (see
+        // modes/playwright/validate.ts). Modes without a validate() are
+        // treated as always-valid.
+        const validation = mode.validate
+          ? await mode.validate(ctx, [...newSpecs, ...carriedSpecs])
+          : { ok: [...newSpecs, ...carriedSpecs], repaired: [], quarantined: [] };
+        if (validation.quarantined.length > 0) {
+          emit(
+            'generate',
+            'warn',
+            `${validation.quarantined.length} spec(s) quarantined after failing to parse (one repair attempt each).`,
+            { quarantined: validation.quarantined.map((q) => ({ title: q.spec.title, reason: q.reason })) },
+          );
+        }
+        const validatedByPath = new Map([...validation.ok, ...validation.repaired].map((s) => [s.path, s]));
+        newSpecs = newSpecs.flatMap((s) =>
+          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+        );
+        carriedSpecs = carriedSpecs.flatMap((s) =>
+          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+        );
 
         specs = [...newSpecs, ...carriedSpecs];
         // Freshly generated specs register ONE test row per scenario the plan
@@ -1267,6 +1324,15 @@ async function runPipeline(
           // but never threaded through before, so triage only ever "knew" a
           // trace existed by chance, never which file.
           const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+          // Recover the plan item this spec was generated from, to find the source-context unit
+          // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
+          // candidates below, since most failures never reach that stage.
+          const planItem = planForGeneration.items.find(
+            (it) => (spec?.reqTag && it.reqTag === spec.reqTag) || it.title === r.title,
+          );
+          const unit = planItem?.unitKey
+            ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
+            : undefined;
           const input: TriageInput = {
             title: r.title,
             error: r.error ?? '',
@@ -1280,7 +1346,7 @@ async function runPipeline(
           } catch (err) {
             emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
           }
-          return { r, input, triage };
+          return { r, input, triage, unit };
         });
 
         // Best-effort AI enrichment for the first N failures, run CONCURRENTLY
@@ -1290,6 +1356,21 @@ async function runPipeline(
         const aiCandidates = baseline.filter((b) => b.triage !== null).slice(0, TRIAGE_AI_LIMIT);
         await Promise.all(
           aiCandidates.map(async (b) => {
+            // Read the matched source-context unit's file lazily — only AI-enriched candidates
+            // need it (classify()'s deterministic rules never look at source), so most failures
+            // never pay this read.
+            if (b.unit && project.repoPath) {
+              try {
+                const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
+                b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
+              } catch (err) {
+                emit(
+                  'triage',
+                  'debug',
+                  `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
+                );
+              }
+            }
             const controller = new AbortController();
             try {
               const enriched = await withTimeoutAbort(

@@ -1,7 +1,19 @@
 import type { ProviderAdapter } from '../providers/types.js';
 import type { TargetAdapter } from '../target/types.js';
-import type { BrowserSurface, DomSnapshot } from '../browser/types.js';
+import type { BrowserSurface } from '../browser/types.js';
+import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
+import type { SourceContext } from '../target/source-context.js';
 import type { ModeId, Tier, TestStatus } from '../storage/types.js';
+
+/** Result of the multi-page/multi-role EXPLORE crawl, grounding GENERATE. */
+export interface ExplorationArtifact {
+  crawl: CrawlWithAuthResult;
+  routing: RoutePrefixInfo;
+  loginCandidates: LoginCandidate[];
+  /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
+  useful: boolean;
+  uselessReason?: string;
+}
 
 export type ExplorationMode = 'computer-use' | 'codegen';
 
@@ -134,6 +146,18 @@ export interface GeneratedSpec {
   contents: string;
 }
 
+export interface QuarantinedSpec {
+  spec: GeneratedSpec;
+  reason: string;
+}
+
+/** Result of a mode's pre-execution parse-check gate — see modes/playwright/validate.ts. */
+export interface ValidationResult {
+  ok: GeneratedSpec[];
+  repaired: GeneratedSpec[];
+  quarantined: QuarantinedSpec[];
+}
+
 export interface ExecResultItem {
   title: string;
   status: TestStatus;
@@ -171,8 +195,10 @@ export interface TestModeContext {
   explorationMode?: ExplorationMode;
   /** Which tiers this run is in scope for; drives generation and execution. */
   testingScope?: TestingScope;
-  /** DOM snapshot captured during computer-use exploration; grounds generation. */
-  snapshot?: DomSnapshot;
+  /** Multi-page/multi-role EXPLORE crawl artifact; grounds generation. */
+  exploration?: ExplorationArtifact;
+  /** White-box static-analysis result (routes/endpoints/forms/auth patterns), set during PLAN; grounds generation and triage with real source-file citations. */
+  sourceContext?: SourceContext;
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
@@ -183,6 +209,8 @@ export interface TestMode {
   readonly id: ModeId;
   scaffold(ctx: TestModeContext): Promise<void>;
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
+  /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
+  validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
   execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: Tier }): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;

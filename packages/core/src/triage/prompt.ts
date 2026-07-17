@@ -18,6 +18,7 @@ const VERDICTS: readonly Verdict[] = ['test_is_wrong', 'app_is_wrong', 'environm
 
 const MAX_ERROR_CHARS = 4_000;
 const MAX_SPEC_CHARS = 6_000;
+const MAX_SOURCE_CHARS = 3_000;
 
 /**
  * Delimiters for app-derived text embedded in the prompt. Error/stack output
@@ -73,6 +74,18 @@ export function buildTriagePrompt(input: TriageInput): string {
     ? ['', '--- TRACE PATH (untrusted) ---', fenceUntrusted(truncate(input.tracePath, 500))]
     : [];
 
+  // First-party repo source (see target/source-index.ts), not app-rendered output — cited
+  // normally like the spec source above, NOT fenced as untrusted; the app under test never
+  // controls this content.
+  const hasSourceFile = typeof input.sourceFile === 'string' && input.sourceFile.trim().length > 0;
+  const sourceBlock = hasSourceFile
+    ? [
+        '',
+        `--- MATCHED SOURCE FILE: ${input.sourceFile} ---`,
+        input.sourceExcerpt ? truncate(input.sourceExcerpt, MAX_SOURCE_CHARS) : '(file content unavailable)',
+      ]
+    : [];
+
   return [
     'You are a senior test-failure triage engine. A single automated end-to-end',
     'test failed. Decide WHO is at fault by weighing two competing hypotheses,',
@@ -109,6 +122,7 @@ export function buildTriagePrompt(input: TriageInput): string {
     '',
     '--- TEST SPEC SOURCE ---',
     specSource,
+    ...sourceBlock,
     '',
     '--- INSTRUCTIONS ---',
     'Reply with NOTHING except a single fenced JSON code block in this exact',

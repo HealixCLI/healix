@@ -12,7 +12,21 @@ export default defineConfig({
         // deps into the bundle — playwright then breaks on its runtime dynamic
         // require of chromium-bidi. Keep these external (resolved from
         // node_modules at runtime); they are listed as desktop dependencies.
-        external: ['playwright', 'playwright-core', 'chromium-bidi', 'archiver'],
+        // The @babel/* packages are also kept external: they're transitive
+        // deps of @healix/core (not desktop's own package.json), so
+        // externalizeDepsPlugin doesn't catch them, and bundling their
+        // circular-require ("hasRequired...") CJS internals breaks at
+        // runtime (Object.defineProperty called on non-object).
+        external: [
+          'playwright',
+          'playwright-core',
+          'chromium-bidi',
+          'archiver',
+          '@babel/parser',
+          '@babel/traverse',
+          '@babel/types',
+          '@babel/generator',
+        ],
       },
     },
   },

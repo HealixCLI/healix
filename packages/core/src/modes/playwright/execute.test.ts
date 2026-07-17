@@ -122,6 +122,62 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
   });
 
+  it('prefers a discovered login candidate from EXPLORE over the naive /login default', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        testUsername: 'user@test.com',
+        testPassword: 'hunter2',
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: false,
+            authVerified: false,
+          },
+          routing: { hashRouted: true, invariantPrefix: '#/SK' },
+          loginCandidates: [
+            { url: 'http://localhost:3000/#/SK/login', score: 5, source: 'crawled' },
+            { url: 'http://localhost:3000/login', score: 1, source: 'common-path' },
+          ],
+          useful: true,
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/login');
+  });
+
+  it('falls back to the naive /login default when EXPLORE found no login candidates', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        testUsername: 'user@test.com',
+        testPassword: 'hunter2',
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: false,
+            authVerified: false,
+          },
+          routing: { hashRouted: false },
+          loginCandidates: [],
+          useful: false,
+          uselessReason: 'exploration crawled zero routes',
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
+  });
+
   it('injects neither credential var when only one of username/password is set (fixture requires both)', () => {
     const withOnlyUsername = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user' }));
     expect(withOnlyUsername.HEALIX_TIERB_EMAIL).toBeUndefined();

@@ -1,8 +1,13 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { detect } from './detector.js';
 
 export type FunctionalityUnitKind = 'route' | 'endpoint' | 'component';
+
+/**
+ * Where a unit's data came from — used to resolve precedence when the same key is produced by
+ * more than one extractor (a spec is authoritative and wins over code-derived inference).
+ */
+export type FunctionalityUnitProvenance = 'code' | 'spec' | 'inferred';
 
 export interface FunctionalityUnit {
   /** Stable identity for coverage matching, e.g. "route:/checkout" or "endpoint:POST /api/orders". */
@@ -11,6 +16,16 @@ export interface FunctionalityUnit {
   /** Human-readable label for prompts/UIs, e.g. "GET /api/orders" or "page: /checkout". */
   label: string;
   file: string;
+  /** Defaults to 'code' at every existing call site; only spec-parser.ts sets 'spec'. */
+  provenance?: FunctionalityUnitProvenance;
+  /** HTTP method, when known independently of `label`/`key` parsing (spec-derived units). */
+  method?: string;
+  /** Authoritative request schema (e.g. from an OpenAPI/Postman spec), opaque JSON-Schema-ish shape. */
+  requestSchema?: unknown;
+  /** Authoritative response schema, same provenance as requestSchema. */
+  responseSchema?: unknown;
+  /** Whether this endpoint/route requires auth, when derivable from a spec's security scheme. */
+  authRequired?: boolean;
 }
 
 export interface FunctionalityIndex {
@@ -19,9 +34,6 @@ export interface FunctionalityIndex {
   /** Short natural-language summary for prompt grounding. */
   summary: string;
 }
-
-/** Hard cap on extracted units — mirrors indexRepo's maxFiles bound; a huge repo shouldn't blow the prompt. */
-const DEFAULT_MAX_UNITS = 300;
 
 const SKIP_DIRS = new Set<string>([
   'node_modules',
@@ -50,13 +62,22 @@ const SKIP_DIRS = new Set<string>([
 
 const SOURCE_EXT = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 
-interface WalkFile {
+export interface WalkFile {
   abs: string;
   rel: string;
 }
 
-/** Iterative BFS walk collecting source files, same traversal shape as repo-index.ts's walk(). */
-function walkSourceFiles(root: string, hardCap: number): { files: WalkFile[]; truncated: boolean } {
+/**
+ * Iterative BFS walk collecting source files, same traversal shape as repo-index.ts's walk().
+ * Exported for source-index.ts's composed walk, which passes `extraExtensions` to also pick up
+ * non-JS backend files (.py/.go/.rb/.php) for the multi-lang regex fallback — indexFunctionality
+ * itself never passes this, so its own JS/TS-only behavior is unchanged.
+ */
+export function walkSourceFiles(
+  root: string,
+  hardCap: number,
+  opts?: { extraExtensions?: Set<string> },
+): { files: WalkFile[]; truncated: boolean } {
   const files: WalkFile[] = [];
   let truncated = false;
   const queue: string[] = [root];
@@ -92,7 +113,7 @@ function walkSourceFiles(root: string, hardCap: number): { files: WalkFile[]; tr
       }
 
       const ext = path.extname(name).toLowerCase();
-      if (!SOURCE_EXT.has(ext)) continue;
+      if (!SOURCE_EXT.has(ext) && !opts?.extraExtensions?.has(ext)) continue;
 
       const abs = path.join(dir, name);
       const rel = path.relative(root, abs).split(path.sep).join('/');
@@ -109,7 +130,8 @@ function walkSourceFiles(root: string, hardCap: number): { files: WalkFile[]; tr
   return { files, truncated };
 }
 
-function readSafe(abs: string): string {
+/** Exported for source-index.ts's AST-fallback path. */
+export function readSafe(abs: string): string {
   try {
     return fs.readFileSync(abs, 'utf-8');
   } catch {
@@ -117,8 +139,8 @@ function readSafe(abs: string): string {
   }
 }
 
-/** Next.js file-based routing: pages/**\/*.tsx (excluding _app/_document/api) and app/**\/page.tsx, plus app/**\/route.ts as endpoints. */
-function extractNextRoutes(rel: string): FunctionalityUnit[] {
+/** Next.js file-based routing: pages/**\/*.tsx (excluding _app/_document/api) and app/**\/page.tsx, plus app/**\/route.ts as endpoints. Exported: reused as-is by source-index.ts (file-convention, no AST needed). */
+export function extractNextRoutes(rel: string): FunctionalityUnit[] {
   const units: FunctionalityUnit[] = [];
   const isPagesRoute =
     /^pages\//.test(rel) &&
@@ -174,8 +196,8 @@ function toNextAppRoutePath(rel: string, leaf: 'page' | 'route'): string {
   return p || '/';
 }
 
-/** React Router: <Route path="..."> JSX and createBrowserRouter/createRoutesFromElements object literals. */
-function extractReactRouterRoutes(rel: string, source: string): FunctionalityUnit[] {
+/** React Router: <Route path="..."> JSX and createBrowserRouter/createRoutesFromElements object literals. Exported: source-index.ts's fallback when extractReactRouterRoutesAst fails to parse a file. */
+export function extractReactRouterRoutes(rel: string, source: string): FunctionalityUnit[] {
   const units: FunctionalityUnit[] = [];
   const jsxRouteRe = /<Route\b[^>]*\bpath\s*=\s*(["'`])([^"'`]*)\1/g;
   for (const m of source.matchAll(jsxRouteRe)) {
@@ -192,8 +214,8 @@ function extractReactRouterRoutes(rel: string, source: string): FunctionalityUni
   return units;
 }
 
-/** Express/Fastify/Koa: app.get/post/... and router.get/post/... registrations. */
-function extractServerRoutes(rel: string, source: string): FunctionalityUnit[] {
+/** Express/Fastify/Koa: app.get/post/... and router.get/post/... registrations. Exported: source-index.ts runs this alongside the AST-based, mount-resolving resolveExpressEndpoints as a supplementary safety net. */
+export function extractServerRoutes(rel: string, source: string): FunctionalityUnit[] {
   const units: FunctionalityUnit[] = [];
   const re = /\b(?:app|router|server)\s*\.\s*(get|post|put|patch|delete|options)\s*\(\s*(["'`])([^"'`]*)\2/gi;
   for (const m of source.matchAll(re)) {
@@ -209,8 +231,8 @@ function extractServerRoutes(rel: string, source: string): FunctionalityUnit[] {
   return units;
 }
 
-/** Exported Next.js-style route handlers: `export function GET(...)` / `export default async function handler(...)`. */
-function extractExportedHandlers(rel: string, source: string): FunctionalityUnit[] {
+/** Exported Next.js-style route handlers: `export function GET(...)` / `export default async function handler(...)`. Exported for source-index.ts's composed extraction. */
+export function extractExportedHandlers(rel: string, source: string): FunctionalityUnit[] {
   const units: FunctionalityUnit[] = [];
   const methodRe = /\bexport\s+(?:async\s+)?function\s+(GET|POST|PUT|PATCH|DELETE|OPTIONS)\s*\(/g;
   for (const m of source.matchAll(methodRe)) {
@@ -224,80 +246,37 @@ function extractExportedHandlers(rel: string, source: string): FunctionalityUnit
   return units;
 }
 
-const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set(['react', 'cra', 'vite', 'vue', 'svelte', 'angular', 'remix']);
-const SERVER_FRAMEWORKS = new Set(['express', 'fastify', 'koa', 'nest']);
+/** Exported so source-index.ts's AST-based extraction gates on the same framework sets. */
+export const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set([
+  'react',
+  'cra',
+  'vite',
+  'vue',
+  'svelte',
+  'angular',
+  'remix',
+]);
+export const SERVER_FRAMEWORKS = new Set(['express', 'fastify', 'koa', 'nest']);
 
 /**
- * Extract a bounded inventory of testable functionality units (routes/endpoints)
- * from the repo via lightweight regex patterns — no AST dependency. Framework
- * detection from detect() gates which patterns run so unrelated regexes don't
- * fire noise on repos that don't use that framework.
+ * Extract a bounded inventory of testable functionality units (routes/endpoints) from the repo.
+ * Thin wrapper over source-index.ts's indexSource(), which composes AST-based extraction (routes,
+ * mount-resolved endpoints, forms, auth patterns, selector hints) with OpenAPI/Swagger/Postman
+ * spec parsing — kept here, with this exact signature and return shape, so every existing caller
+ * (plan.ts, orchestrator/index.ts, coverage.ts/topup.ts) keeps working unchanged.
  *
- * Best-effort and additive: returns an empty (not null) index when nothing
- * matches or the repo can't be read, so callers can fall back to the plain
- * file-path summary without special-casing failure.
+ * Best-effort and additive: returns an empty (not null) index when nothing matches or the repo
+ * can't be read, so callers can fall back to the plain file-path summary without special-casing
+ * failure.
  */
 export async function indexFunctionality(
   repoPath: string,
   opts?: { maxUnits?: number },
 ): Promise<FunctionalityIndex> {
-  const root = path.resolve(repoPath);
-  const maxUnits = opts?.maxUnits ?? DEFAULT_MAX_UNITS;
-
-  let framework: string | null = null;
-  try {
-    framework = (await detect(root)).framework;
-  } catch {
-    framework = null;
-  }
-
-  const { files, truncated: filesTruncated } = walkSourceFiles(root, 5000);
-
-  const seen = new Set<string>();
-  const units: FunctionalityUnit[] = [];
-  let truncated = filesTruncated;
-
-  const isNext = framework === 'next';
-  const wantsRouter = framework !== null && RELEVANT_FRAMEWORKS_FOR_ROUTER.has(framework);
-  const isServer = framework !== null && SERVER_FRAMEWORKS.has(framework);
-
-  for (const f of files) {
-    if (units.length >= maxUnits) {
-      truncated = true;
-      break;
-    }
-
-    let extracted: FunctionalityUnit[] = [];
-    if (isNext) {
-      extracted = extractNextRoutes(f.rel);
-    }
-    if (extracted.length === 0 && (wantsRouter || isServer || framework === null)) {
-      const source = readSafe(f.abs);
-      if (!source) continue;
-      if (wantsRouter || framework === null) extracted.push(...extractReactRouterRoutes(f.rel, source));
-      if (isServer || framework === null) extracted.push(...extractServerRoutes(f.rel, source));
-      extracted.push(...extractExportedHandlers(f.rel, source));
-    }
-
-    for (const unit of extracted) {
-      if (seen.has(unit.key)) continue;
-      seen.add(unit.key);
-      units.push(unit);
-      if (units.length >= maxUnits) {
-        truncated = true;
-        break;
-      }
-    }
-  }
-
-  const routeCount = units.filter((u) => u.kind === 'route').length;
-  const endpointCount = units.filter((u) => u.kind === 'endpoint').length;
-  const summary =
-    units.length === 0
-      ? ''
-      : `Detected functionality: ${routeCount} route(s), ${endpointCount} endpoint(s)${
-          truncated ? ` (capped at ${maxUnits})` : ''
-        }.`;
-
-  return { units, truncated, summary };
+  // Lazy import avoids a static circular-import cycle at module-init time (source-index.ts
+  // imports several helpers from this file); by the time indexFunctionality is actually called,
+  // both modules are fully initialized, so this resolves safely.
+  const { indexSource } = await import('./source-index.js');
+  const ctx = await indexSource(repoPath, opts);
+  return { units: ctx.units, truncated: ctx.truncated, summary: ctx.summary };
 }

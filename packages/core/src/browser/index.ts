@@ -1,11 +1,14 @@
 import { chromium, type Browser, type BrowserContext, type Page } from 'playwright';
-import { collectInteractiveElements } from './selectors.js';
+import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
 import { FrameMirror } from './mirror.js';
 import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from './types.js';
 
 export * from './types.js';
 
 const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
+
+/** Upper bound on how long goto() waits for the page to settle post-navigation. */
+const SETTLE_TIMEOUT_MS = 8000;
 
 /** Throw a uniform error when the surface is used before {@link start}. */
 function requireStarted<T>(value: T | undefined, what: string): T {
@@ -110,6 +113,27 @@ export function createBrowserSurface(): BrowserSurface {
     async goto(url: string): Promise<void> {
       const p = requireStarted(page, 'goto');
       await p.goto(resolveUrl(url), { waitUntil: 'domcontentloaded' });
+      // SPAs (esp. hash-routed) often finish DOMContentLoaded before client-side
+      // hydration renders real content, so a snapshot taken immediately after
+      // goto() can see 0 interactive elements on an otherwise content-rich page.
+      // Race two settle signals instead of betting on a fixed delay: as soon as
+      // a real interactive element appears, stop waiting (fast for the common
+      // case); otherwise fall back to networkidle. Both are capped so a
+      // genuinely thin page (no interactive elements, ever) still falls through
+      // in bounded time rather than hanging.
+      await Promise.race([
+        p
+          .waitForFunction(
+            (selector) =>
+              (
+                globalThis as unknown as { document: { querySelectorAll(s: string): ArrayLike<unknown> } }
+              ).document.querySelectorAll(selector).length > 0,
+            INTERACTIVE_ELEMENT_SELECTOR,
+            { timeout: SETTLE_TIMEOUT_MS },
+          )
+          .catch(() => {}),
+        p.waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS }).catch(() => {}),
+      ]);
     },
 
     async screenshot(): Promise<Buffer> {

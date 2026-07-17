@@ -91,10 +91,17 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     env.HEALIX_TIERB_EMAIL = ctx.testUsername;
     env.HEALIX_TIERB_PASSWORD = ctx.testPassword;
     // The auth fixture requires all three of email/password/loginUrl to
-    // attempt a real login (see authSetupContents() in templates.ts) — absent
-    // a dedicated "login URL" field on the project, default to the common
-    // `/login` convention relative to the configured base URL.
-    if (ctx.baseUrl) env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    // attempt a real login (see authSetupContents() in templates.ts). Prefer
+    // EXPLORE's discovered/scored login candidate (hash- and region-prefix
+    // aware — see browser/crawler.ts scoreLoginCandidates) over the naive
+    // `/login` path join, which 404s or falls back to the app's default
+    // route on a HashRouter + region-prefixed app (the RCA's Branch 2).
+    const discovered = ctx.exploration?.loginCandidates?.[0]?.url;
+    if (discovered) {
+      env.HEALIX_TIERB_LOGIN_URL = discovered;
+    } else if (ctx.baseUrl) {
+      env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    }
   }
   return env;
 }
@@ -268,8 +275,14 @@ interface CmdResult {
   aborted: boolean;
 }
 
-/** Run a one-off command (npm install / browser install) in the suite dir. */
-function runCommand(
+/**
+ * Run a one-off command (npm install / browser install / `playwright test
+ * --list` parse-check) in the suite dir, with the same allowlisted env as
+ * runPlaywright() — see SUITE_ENV_ALLOWLIST. Exported for validate.ts's
+ * pre-execution spec parse-check, which must never hand generated specs a
+ * broader env than the run they're eventually executed in.
+ */
+export function runCommand(
   ctx: TestModeContext,
   command: string,
   args: string[],
@@ -364,8 +377,14 @@ function runCommand(
  * Ensure the scaffolded suite has its node_modules. The Playwright browser
  * binaries live in the shared global cache, so only the npm deps need
  * installing here; browsers are handled lazily on a missing-browser failure.
+ *
+ * Exported so validate.ts's parse-check gate can call it too — that gate runs
+ * `npx playwright test --list` right after generation, before execute() ever
+ * gets a chance to install deps, so without this it fails identically for
+ * every spec (misreported as "fails to parse") whenever a suite is freshly
+ * scaffolded.
  */
-async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
+export async function ensureSuiteDeps(ctx: TestModeContext): Promise<void> {
   const marker = join(ctx.projectDir, 'node_modules', '@playwright');
   try {
     await access(marker);

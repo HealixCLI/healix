@@ -129,19 +129,25 @@ export default defineConfig({
 /**
  * Auth setup fixture. Healix injects real credentials into fixtures/.auth at
  * runtime; absent those, this writes an empty storageState so Tier B can still
- * load (specs then run as an anonymous user). A genuine login failure should
- * throw here — Healix surfaces that as a `blocked` Tier B outcome.
+ * load (specs then run as an anonymous user). A genuine login failure for the
+ * DEFAULT credential should throw here — Healix surfaces that as a `blocked`
+ * Tier B outcome. Additional (role-tagged) credentials each get their own
+ * storageState file (fixtures/.auth/user-<role>.json); a generated spec opts
+ * into one via test.use({ storageState: ... }) — see generate.ts's role
+ * guidance — while everything else keeps using the default session
+ * unchanged, exactly like the single-credential case always has.
  */
 export function authSetupContents(): string {
   return `import { test as setup } from '@playwright/test';
 import { mkdir, writeFile, access } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const authFile = 'fixtures/.auth/user.json';
+const authDir = 'fixtures/.auth';
+const authFile = \`\${authDir}/user.json\`;
 // Sidecar read by Healix after the run: records whether a REAL login was
-// performed, so Tier B failures can be classified structurally (blocked vs
-// genuine) instead of by matching error text.
-const metaFile = 'fixtures/.auth/setup-meta.json';
+// performed (for the DEFAULT credential), so Tier B failures can be
+// classified structurally (blocked vs genuine) instead of by matching error text.
+const metaFile = \`\${authDir}/setup-meta.json\`;
 
 async function writeMeta(performedLogin) {
   await writeFile(
@@ -151,51 +157,170 @@ async function writeMeta(performedLogin) {
   );
 }
 
+function roleStorageStatePath(role) {
+  const slug = role.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return \`\${authDir}/user-\${slug || 'role'}.json\`;
+}
+
 /**
- * Establishes the Tier B authenticated storageState. By default this produces an
- * empty (anonymous) state. Wire your real login flow here, or have Healix inject
- * credentials via HEALIX_TIERB_* env vars. Throwing here marks Tier B blocked.
+ * getByLabel() only matches a REAL accessible label (an actual <label for=...>,
+ * aria-label, or aria-labelledby) — plenty of real-world login forms show
+ * "Email"/"Password" as plain sibling text (a <p> or <span> next to the
+ * input, not an associated label) and rely on a placeholder for the
+ * accessible name instead. Falling back through placeholder, then a plain
+ * input[type=...]/name-contains selector, covers that gap without giving up
+ * the label-based match as the FIRST choice when a form does it properly.
  */
-setup('authenticate', async ({ page }) => {
+function fieldLocator(page, labelRe, placeholderRe, cssFallback) {
+  return page
+    .getByLabel(labelRe)
+    .or(page.getByPlaceholder(placeholderRe))
+    .or(page.locator(cssFallback));
+}
+
+/** One username/password form login against \`page\`, saving storageState to \`path\` on success. Throws on failure. */
+async function loginForm(page, email, password, loginUrl, path) {
+  await page.goto(loginUrl);
+
+  // Locale-aware matchers (English + common Slovak forms observed in the
+  // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
+  // i18n engine, just enough to not be English-only.
+  const emailField = fieldLocator(
+    page,
+    /e-?mail/i,
+    /e-?mail/i,
+    'input[type="email"], input[name*="email" i], input[name*="user" i], input[id*="email" i]',
+  );
+  const passwordField = fieldLocator(
+    page,
+    /heslo|password/i,
+    /heslo|password/i,
+    'input[type="password"]',
+  );
+  const loginRevealRe = /prihl|sign in|log ?in/i;
+
+  // Some apps gate the login form behind a reveal button/link (e.g. a
+  // "Prihlásiť sa" click before the email/password fields even render) —
+  // click through it before searching for the form.
+  const hasEmailField = await emailField
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (!hasEmailField) {
+    const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
+    await reveal
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
+  }
+
+  await emailField.first().fill(email);
+  await passwordField.first().fill(password);
+  await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.context().storageState({ path });
+}
+
+/**
+ * Substitute \`{token}\` (always available, from the credential's own token
+ * field) and every \`{<key>}\` in extraParams into urlTemplate, then visit the
+ * resulting URL against baseUrl — for apps with no login FORM at all: a
+ * token (and optionally other params, e.g. a mobile number/locale) delivered
+ * via the URL itself, persisted to cookies/localStorage on first load.
+ */
+async function loginUrlToken(page, cred, baseUrl, path) {
+  let target = cred.urlTemplate || '';
+  const params = Object.assign({ token: cred.token || '' }, cred.extraParams || {});
+  for (const [key, value] of Object.entries(params)) {
+    target = target.split(\`{\${key}}\`).join(encodeURIComponent(value));
+  }
+  const base = (baseUrl || '').replace(/\\/+$/, '');
+  const sep = target.startsWith('/') || target.startsWith('#') || target.startsWith('?') ? '' : '/';
+  await page.goto(\`\${base}\${sep}\${target}\`);
+
+  // Best-effort: wait for a transient "not found"/loading message to clear
+  // (a signal the token resolved), but never hard-fail on it — the
+  // storageState is still captured either way, since some apps never show
+  // such a message at all.
+  if (cred.authCheckText) {
+    await page
+      .getByText(cred.authCheckText, { exact: false })
+      .first()
+      .waitFor({ state: 'hidden', timeout: 15000 })
+      .catch(() => {});
+  } else {
+    await page.waitForLoadState('networkidle').catch(() => {});
+  }
+  await page.context().storageState({ path });
+}
+
+/** Dispatches to the right login mechanism for this credential's authType. */
+async function login(page, cred, loginUrl, baseUrl, path) {
+  if (cred.authType === 'url-token') {
+    await loginUrlToken(page, cred, baseUrl, path);
+  } else {
+    await loginForm(page, cred.username, cred.password, loginUrl, path);
+  }
+}
+
+/**
+ * Establishes the Tier B authenticated storageState(s). By default this produces
+ * an empty (anonymous) state. Wire your real login flow here, or have Healix
+ * inject credentials via HEALIX_TIERB_* env vars. A DEFAULT-credential login
+ * failure throws, marking Tier B blocked; an additional role credential's
+ * login failure is logged but never blocks the whole run — only specs that
+ * specifically opt into that role's storageState are affected.
+ */
+setup('authenticate', async ({ page, browser }) => {
   await mkdir(dirname(authFile), { recursive: true });
 
-  const email = process.env.HEALIX_TIERB_EMAIL;
-  const password = process.env.HEALIX_TIERB_PASSWORD;
   const loginUrl = process.env.HEALIX_TIERB_LOGIN_URL;
+  const baseUrl = process.env.HEALIX_BASE_URL;
+  let credentials = [];
+  try {
+    credentials = process.env.HEALIX_TIERB_CREDENTIALS_JSON
+      ? JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON)
+      : [];
+  } catch {
+    credentials = [];
+  }
+  if (credentials.length === 0 && process.env.HEALIX_TIERB_EMAIL && process.env.HEALIX_TIERB_PASSWORD) {
+    credentials = [
+      { authType: 'form', username: process.env.HEALIX_TIERB_EMAIL, password: process.env.HEALIX_TIERB_PASSWORD, role: null },
+    ];
+  }
+  // A credential is actually usable only if ITS OWN mechanism has what it
+  // needs: a form credential needs loginUrl, a url-token credential needs
+  // baseUrl (to resolve its urlTemplate against) — not both, and not
+  // whichever one happens to be set globally.
+  const usable = (c) => (c.authType === 'url-token' ? !!baseUrl : !!loginUrl);
+  credentials = credentials.filter(usable);
 
-  if (email && password && loginUrl) {
+  if (credentials.length > 0) {
+    const defaultCred = credentials.find((c) => !c.role) ?? credentials[0];
+
     // Written BEFORE the login attempt so a mid-login crash still leaves
     // performedLogin:false on disk; overwritten with true only on success.
     await writeMeta(false);
-    await page.goto(loginUrl);
-
-    // Locale-aware matchers (English + common Slovak forms observed in the
-    // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
-    // i18n engine, just enough to not be English-only.
-    const emailField = page.getByLabel(/e-?mail/i);
-    const loginRevealRe = /prihl|sign in|log ?in/i;
-
-    // Some apps gate the login form behind a reveal button/link (e.g. a
-    // "Prihlásiť sa" click before the email/password fields even render) —
-    // click through it before searching for the form.
-    const hasEmailField = await emailField
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (!hasEmailField) {
-      const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
-      await reveal
-        .first()
-        .click({ timeout: 5000 })
-        .catch(() => {});
-    }
-
-    await page.getByLabel(/e-?mail/i).fill(email);
-    await page.getByLabel(/heslo|password/i).fill(password);
-    await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
-    await page.waitForLoadState('networkidle').catch(() => {});
-    await page.context().storageState({ path: authFile });
+    await login(page, defaultCred, loginUrl, baseUrl, authFile);
     await writeMeta(true);
+
+    // Every OTHER (role-tagged) credential gets its own session, in a fresh
+    // browser context — best-effort: one credential's login failure doesn't
+    // stop the rest, and never blocks the default Tier B session above.
+    for (const cred of credentials) {
+      if (cred === defaultCred || !cred.role) continue;
+      const context = await browser.newContext();
+      const rolePage = await context.newPage();
+      try {
+        await login(rolePage, cred, loginUrl, baseUrl, roleStorageStatePath(cred.role));
+      } catch {
+        // Best-effort: a role-specific login failure only affects specs that
+        // opt into that role's storageState, not the default Tier B session.
+      } finally {
+        await context.close();
+      }
+    }
     return;
   }
 

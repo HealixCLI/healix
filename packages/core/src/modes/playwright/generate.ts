@@ -56,6 +56,76 @@ function formatMockContent(ctx: TestModeContext): string {
   );
 }
 
+/** Same slug transform as templates.ts's roleStorageStatePath — must stay in sync so a role name always resolves to the same file. */
+function roleStorageStateFilename(role: string): string {
+  const slug = role
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `fixtures/.auth/user-${slug || 'role'}.json`;
+}
+
+/**
+ * When the project has more than one test credential, tell tierB-auth
+ * generation about the available roles so a test that's clearly ABOUT one
+ * role's behavior (an admin-only page, a specific account type) can opt into
+ * that role's own session — everything else silently keeps using the
+ * default storageState, unchanged from the single-credential case. This is a
+ * best-effort HINT to the model; matchRoleForItem()/insertRoleStorageState()
+ * below are what actually GUARANTEE the routing happens, deterministically,
+ * regardless of whether the model itself added a test.use() call.
+ */
+function formatRoleGuidance(ctx: TestModeContext, tier: Tier): string {
+  if (tier !== 'tierB-auth') return '';
+  const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
+  if (roles.length === 0) return '';
+  const lines = roles.map((r) => `- "${r}" -> test.use({ storageState: '${roleStorageStateFilename(r)}' })`);
+  return (
+    '\n\nThis project has multiple test accounts with distinct roles. The default session (no action needed) ' +
+    "is a generic/roleless account. ONLY when this specific test is clearly about one of these roles' own " +
+    "behavior, add the matching test.use(...) INSIDE this file's test.describe(...) block, before any test(...) calls:\n" +
+    lines.join('\n')
+  );
+}
+
+/**
+ * Deterministic role routing: does this plan item's title/intent name one of
+ * the project's configured roles (e.g. a plan item literally titled "Admin
+ * dashboard access control")? Whole-word, case-insensitive match against
+ * EVERY configured role; the first match wins. Returns null when nothing
+ * matches — the item keeps using the default (roleless) session, exactly
+ * like a single-credential project always has.
+ */
+function matchRoleForItem(item: TestPlanItem, roles: string[]): string | null {
+  const haystack = `${item.title} ${item.intent}`.toLowerCase();
+  for (const role of roles) {
+    const escaped = role.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${escaped}\\b`).test(haystack)) return role;
+  }
+  return null;
+}
+
+/**
+ * Force the matched role's storageState onto this spec — inserted right
+ * after the test.describe(...) opening, ahead of every test(...) call — so
+ * role routing is guaranteed by the orchestrator, not left to the model's
+ * discretion. A no-op if the model already added its own test.use() (per
+ * formatRoleGuidance's hint above): never insert a second, possibly
+ * conflicting override.
+ */
+function insertRoleStorageState(source: string, role: string): string {
+  // Only skip if the model already set storageState itself — an unrelated
+  // test.use() (viewport, locale, etc.) must not block routing, since
+  // Playwright merges multiple test.use() calls in the same file anyway.
+  if (/test\.use\s*\(\s*\{[^}]*storageState/.test(source)) return source;
+  const match = /test\.describe\([\s\S]*?=>\s*\{/.exec(source);
+  if (!match) return source;
+  const insertAt = match.index + match[0].length;
+  const line = `\n  test.use({ storageState: '${roleStorageStateFilename(role)}' });`;
+  return source.slice(0, insertAt) + line + source.slice(insertAt);
+}
+
 /** Coerce an arbitrary plan-item tier into one of the three known tiers. */
 function resolveTier(raw: Tier | string | undefined): Tier {
   const v = String(raw ?? '').toLowerCase();
@@ -397,7 +467,7 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
     tier === 'tierC-api'
       ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page.'
       : tier === 'tierB-auth'
-        ? 'This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.'
+        ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
 
   const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : '@playwright/test';
@@ -594,6 +664,11 @@ async function generateOne(
     }
 
     source = ensureReqTag(source, reqTag);
+    if (tier === 'tierB-auth') {
+      const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
+      const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;
+      if (matchedRole) source = insertRoleStorageState(source, matchedRole);
+    }
     if (!source.endsWith('\n')) source += '\n';
 
     // Resolve a unique path BEFORE writing so same-tier slug collisions don't

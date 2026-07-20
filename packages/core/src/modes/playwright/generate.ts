@@ -51,7 +51,10 @@ function formatMockContent(ctx: TestModeContext): string {
   if (lines.length === 0) return '';
   return (
     '\n\nMocked response content — assert against this EXACT data (do not invent plausible-sounding ' +
-    'values that differ from it):\n' +
+    'values that differ from it). RULE: mockOverride() may only target the endpoints listed here; do not ' +
+    "invent an endpoint path. This list is statically detected and may be INCOMPLETE for dynamic endpoints — " +
+    "if a scenario genuinely needs an endpoint not listed here, follow the ESCAPE HATCH rule instead of " +
+    'guessing a plausible-looking path:\n' +
     lines.join('\n')
   );
 }
@@ -322,55 +325,261 @@ function retryNoteForbidden(violations: string[], allowedImport: string): string
   return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '${allowedImport}'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
 }
 
-/** Cap on interactive elements injected into a prompt (keeps it bounded). */
-const MAX_SNAPSHOT_ELEMENTS = 40;
-/** Truncate an accessible name so one pathological element can't bloat the prompt. */
-const MAX_ELEMENT_NAME_LEN = 80;
+// ---- Grounding-validation gate ------------------------------------------------
+
+/** A marker the model can use (per formatSnapshotInventory's ESCAPE HATCH) to acknowledge an intentionally-unobserved element instead of inventing one — findUngroundedReferences downgrades hard failures to warnings when it's present. */
+const ESCAPE_HATCH_MARKER = '// TODO: unobserved element';
+
+export interface GroundTruth {
+  testids: Set<string>;
+  selectors: Set<string>;
+  /** lowercased accessible names observed anywhere in the selected inventory */
+  names: string[];
+  /** lowercased accessible name -> observed role(s) for that name */
+  roleByName: Map<string, Set<string>>;
+  endpoints: Array<{ method: string; pathPattern: string }>;
+  /** true when at least one ExternalDependency carries statically-detected (method, path) endpoints — makes an unmatched mockOverride() provable, not just unproven */
+  hasEndpointLevelMocks: boolean;
+  /** true when selectInventoryElements() had to omit elements for length — can't prove a selector's absence against an incomplete inventory */
+  inventoryTruncated: boolean;
+}
+
+/** Pull a `data-testid="..."` (or `data-test="..."`) value out of a selectorFor()-style CSS selector string, if present. */
+function extractTestidFromSelector(selector: string): string | null {
+  const m = /data-test(?:id)?=["']([^"']+)["']/.exec(selector);
+  return m ? m[1] : null;
+}
 
 /**
- * Render the interactive-element inventory captured during the multi-page
- * EXPLORE crawl (ctx.exploration) as a compact list, so generation targets
- * REAL selectors instead of guessing. Returns '' when there is nothing to
- * add:
- *   - no exploration artifact (no live URL to explore, or exploration failed) or no elements observed;
- *   - an API tier (tierC-api), which must not drive a browser page at all.
- * Elements from every crawled route are included (not just the entry page),
- * each tagged with its route URL and role so a tierB-auth item knows which
- * elements require the authenticated session. Tier-aware ordering surfaces
- * the most relevant role first: authenticated routes for tierB-auth items,
- * anonymous routes otherwise. The combined list is capped at
- * MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so a huge crawl can't
- * blow up the prompt (and the omission isn't silent).
+ * Build the ground-truth the grounding-validation gate checks a generated spec against.
+ * MUST read from the same selectInventoryElements() the model was actually shown (see that
+ * function's doc comment) — otherwise this gate could reject a selector the model never had
+ * the option to use. Endpoint ground truth is separate: dependency-level (endpoint-less)
+ * mocks don't produce a comparable (method, path) pair, so `hasEndpointLevelMocks` tracks
+ * whether a real comparison is even possible for this run.
  */
-function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
-  if (tier === 'tierC-api') return '';
+export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTruth {
+  const { selected, truncated } = selectInventoryElements(ctx, tier);
+
+  const testids = new Set<string>();
+  const selectors = new Set<string>();
+  const names: string[] = [];
+  const roleByName = new Map<string, Set<string>>();
+  for (const { el } of selected) {
+    selectors.add(el.selector);
+    const testid = extractTestidFromSelector(el.selector);
+    if (testid) testids.add(testid);
+    const lname = el.name.trim().toLowerCase();
+    if (lname) {
+      names.push(lname);
+      const roles = roleByName.get(lname) ?? new Set<string>();
+      roles.add(el.role);
+      roleByName.set(lname, roles);
+    }
+  }
+
+  const endpoints: Array<{ method: string; pathPattern: string }> = [];
+  let hasEndpointLevelMocks = false;
+  for (const dep of ctx.externalDependencies ?? []) {
+    if (dep.endpoints && dep.endpoints.length > 0) {
+      hasEndpointLevelMocks = true;
+      for (const e of dep.endpoints) endpoints.push({ method: e.method, pathPattern: e.pathPattern });
+    }
+  }
+
+  return { testids, selectors, names, roleByName, endpoints, hasEndpointLevelMocks, inventoryTruncated: truncated };
+}
+
+const TESTID_CALL_RE = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
+const TESTID_ATTR_RE = /data-test(?:id)?=["']([^"']+)["']/g;
+const ROLE_CALL_RE = /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
+const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
+
+/** Normalize an endpoint path pattern (glob wildcards, `:param` placeholders) for a forgiving substring comparison. */
+function normalizeEndpointPath(path: string): string {
+  return path
+    .toLowerCase()
+    .replace(/\*\*/g, '')
+    .replace(/\*/g, '')
+    .replace(/:[a-zA-Z0-9_]+/g, ':param')
+    .replace(/^\/+|\/+$/g, '');
+}
+
+/** Forgiving (substring, either direction) match — exact glob/path-template reproduction isn't required, just genuine overlap. */
+function endpointMatches(calledPath: string, method: string, gt: GroundTruth): boolean {
+  const normCalled = normalizeEndpointPath(calledPath);
+  if (!normCalled) return true;
+  return gt.endpoints.some((e) => {
+    if (e.method.toUpperCase() !== method.toUpperCase()) return false;
+    const normKnown = normalizeEndpointPath(e.pathPattern);
+    return normKnown.length > 0 && (normCalled.includes(normKnown) || normKnown.includes(normCalled));
+  });
+}
+
+/**
+ * Scan a generated spec's source for selector/role/mock-endpoint references and check each
+ * against ground truth actually observed during EXPLORE (or statically detected for mocks).
+ * Severity is deliberately split so this can't become a false-positive machine that blocks
+ * legitimate generation:
+ *   - unrecognized data-testid: HARD only when the inventory was NOT truncated and is
+ *     non-empty (i.e. absence is actually provable); otherwise WARN, since we can't prove a
+ *     selector doesn't exist against an inventory we know is incomplete.
+ *   - unmatched mockOverride endpoint: HARD only when this dependency has endpoint-level
+ *     (not just dependency-level) mocks, so there's a real (method, path) list to compare
+ *     against; otherwise WARN.
+ *   - getByRole(role, {name}) vs. the name's observed role: WARN always — accessible-role
+ *     computation is fuzzy enough (implicit ARIA semantics, nested content) that a hard-fail
+ *     here risks real false positives.
+ * A `// TODO: unobserved element` marker anywhere in the source (the sanctioned ESCAPE HATCH,
+ * see formatSnapshotInventory) downgrades every hard finding in this spec to a warning — an
+ * acknowledged, intentional gap isn't the same defect as a silent fabrication.
+ */
+export function findUngroundedReferences(source: string, gt: GroundTruth): { hard: string[]; warn: string[] } {
+  const hard: string[] = [];
+  const warn: string[] = [];
+  const hasEscapeHatch = source.includes(ESCAPE_HATCH_MARKER);
+  const inventoryKnown = gt.testids.size > 0 || gt.selectors.size > 0;
+
+  const seenTestids = new Set<string>();
+  for (const m of source.matchAll(TESTID_CALL_RE)) seenTestids.add(m[1]);
+  for (const m of source.matchAll(TESTID_ATTR_RE)) seenTestids.add(m[1]);
+  for (const testid of seenTestids) {
+    if (gt.testids.has(testid)) continue;
+    const label = `data-testid "${testid}" not found in the observed element inventory`;
+    if (inventoryKnown && !gt.inventoryTruncated && !hasEscapeHatch) hard.push(label);
+    else warn.push(label);
+  }
+
+  for (const m of source.matchAll(ROLE_CALL_RE)) {
+    const role = m[1];
+    const name = (m[2] ?? m[3] ?? '').trim().toLowerCase();
+    if (!name) continue;
+    const observedRoles = gt.roleByName.get(name);
+    if (!observedRoles || observedRoles.has(role)) continue;
+    warn.push(`getByRole('${role}', { name: "${name}" }) but the observed role was ${[...observedRoles].join('/')}`);
+  }
+
+  for (const m of source.matchAll(MOCK_OVERRIDE_RE)) {
+    const method = m[1];
+    const path = m[2];
+    if (endpointMatches(path, method, gt)) continue;
+    const label = `mockOverride('${method}', '${path}') doesn't match any statically-detected endpoint`;
+    if (gt.hasEndpointLevelMocks && !hasEscapeHatch) hard.push(label);
+    else warn.push(label);
+  }
+
+  return { hard, warn };
+}
+
+/** Retry note when the grounding-validation gate finds hallucinated selectors/endpoints — lists the specific violations plus a sample of real, available ones so the retry can self-correct. */
+function retryNoteUngrounded(hard: string[], gt: GroundTruth): string {
+  const sampleSelectors = [...gt.testids].slice(0, 8).map((t) => `data-testid="${t}"`);
+  const sampleEndpoints = gt.endpoints.slice(0, 8).map((e) => `${e.method} ${e.pathPattern}`);
+  const available = [
+    sampleSelectors.length > 0 ? `Real testids available: ${sampleSelectors.join(', ')}.` : '',
+    sampleEndpoints.length > 0 ? `Real endpoints available: ${sampleEndpoints.join(', ')}.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return `Your previous output was rejected because it referenced selectors/endpoints that were never observed: ${hard.join('; ')}. Use ONLY the real selectors/endpoints provided in the prompt context, or the ESCAPE HATCH rule (a text-based locator, or a "${ESCAPE_HATCH_MARKER}" comment) for anything genuinely unobserved — never invent a plausible-sounding data-testid or endpoint path. ${available}`;
+}
+
+/** Per-route cap — keeps one busy page (header+footer+nav+form) from starving every other route's budget. */
+const MAX_ELEMENTS_PER_ROUTE = 30;
+/** Overall ceiling across the whole crawl (keeps the prompt bounded even with many routes). */
+const MAX_SNAPSHOT_ELEMENTS = 120;
+/** Truncate an accessible name so one pathological element can't bloat the prompt. */
+const MAX_ELEMENT_NAME_LEN = 80;
+/**
+ * Roles the DOM doesn't natively expose as `link`/`button` even though the element is
+ * clickable (e.g. a `<div>` with a click handler and no `role` attribute) — the single
+ * biggest source of `getByRole('link'/'button', ...)` hallucination in production.
+ */
+const NON_SEMANTIC_ROLES = new Set(['generic']);
+
+type CrawledRouteLike = NonNullable<TestModeContext['exploration']>['crawl']['routes'][number];
+interface SelectedElement {
+  route: CrawledRouteLike;
+  el: CrawledRouteLike['snapshot']['interactiveElements'][number];
+}
+interface InventorySelection {
+  ordered: CrawledRouteLike[];
+  selected: SelectedElement[];
+  totalCount: number;
+  truncated: boolean;
+}
+
+/**
+ * Select the interactive-element inventory shown to the model AND checked by the
+ * grounding-validation gate (findUngroundedReferences) — the two MUST read from this same
+ * function, or the gate could reject a selector the model was never even shown. Applies a
+ * per-route cap (MAX_ELEMENTS_PER_ROUTE) so one busy page can't starve every other route's
+ * budget, plus an overall ceiling (MAX_SNAPSHOT_ELEMENTS) so a huge crawl can't blow up the
+ * prompt. Tier-aware ordering surfaces the most relevant role first: authenticated routes
+ * for tierB-auth items, anonymous routes otherwise. Returns an empty selection for the
+ * tierC-api tier (must not drive a browser page at all) or when there's no exploration data.
+ */
+function selectInventoryElements(ctx: TestModeContext, tier: Tier): InventorySelection {
+  if (tier === 'tierC-api') return { ordered: [], selected: [], totalCount: 0, truncated: false };
   const routes = ctx.exploration?.crawl.routes ?? [];
-  if (routes.length === 0) return '';
+  if (routes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
 
   const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
   const ordered = [...routes].sort(
     (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
   );
 
-  const lines: string[] = [];
+  const selected: SelectedElement[] = [];
   let totalCount = 0;
   for (const route of ordered) {
+    let perRouteCount = 0;
     for (const el of route.snapshot.interactiveElements) {
       totalCount += 1;
-      if (lines.length >= MAX_SNAPSHOT_ELEMENTS) continue;
-      const name =
-        el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
-      lines.push(`- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}`);
+      if (perRouteCount >= MAX_ELEMENTS_PER_ROUTE || selected.length >= MAX_SNAPSHOT_ELEMENTS) continue;
+      selected.push({ route, el });
+      perRouteCount += 1;
     }
   }
-  if (lines.length === 0) return '';
+  return { ordered, selected, totalCount, truncated: totalCount > selected.length };
+}
 
-  const omitted = totalCount - lines.length;
-  const more = omitted > 0 ? `\n(+${omitted} more not shown)` : '';
+/**
+ * Render the interactive-element inventory captured during the multi-page EXPLORE crawl
+ * (ctx.exploration) as a compact list, so generation targets REAL selectors instead of
+ * guessing. Returns '' when selectInventoryElements() has nothing to show.
+ *
+ * The wording here is a HARD rule, not a preference — a softer "prefer these real
+ * selectors" framing was found (via production runs against a real app) to be routinely
+ * ignored by the model, which fabricated its own data-testids/roles instead. Non-semantic
+ * elements (role: 'generic' — a clickable <div> with no ARIA role) are annotated inline,
+ * since `getByRole('link'/'button', ...)` against one of these is the single biggest
+ * observed hallucination pattern. An ESCAPE HATCH is included so a scenario that
+ * legitimately targets a state EXPLORE never visited (e.g. content behind a mocked error
+ * response) has a sanctioned way out that isn't "invent a selector" — this same marker is
+ * recognized by findUngroundedReferences() to avoid penalizing an acknowledged gap.
+ */
+function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
+  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier);
+  if (selected.length === 0) return '';
+
+  const lines = selected.map(({ route, el }) => {
+    const name =
+      el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
+    const genericNote = NON_SEMANTIC_ROLES.has(el.role)
+      ? " (NOT a semantic link/button — use text or the selector shown, never getByRole('link'/'button'))"
+      : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}`;
+  });
+
+  const omitted = totalCount - selected.length;
+  const more = omitted > 0 ? `\n(+${omitted} more not shown — do not invent selectors for them; use the ESCAPE HATCH rule if you need one)` : '';
+  const completeness = truncated
+    ? 'This is a PARTIAL inventory (some elements were omitted for length)'
+    : 'This is the AUTHORITATIVE, COMPLETE inventory of elements observed for the routes shown';
 
   return `
 
-Interactive elements observed during exploration across ${ordered.length} route(s) — PREFER these real selectors over guessing. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies):
+Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
 ${lines.join('\n')}${more}`;
 }
 
@@ -660,6 +869,28 @@ async function generateOne(
       retryNote = retryNoteForbidden(violations, extraAllowedImport ?? '@playwright/test');
       lastReason = `forbidden APIs in generated spec: ${violations.join('; ')}`;
       lastViolations = violations;
+      continue;
+    }
+
+    // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
+    // correspond to anything actually observed during EXPLORE (or statically detected for
+    // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
+    const groundTruth = collectGroundTruth(ctx, tier);
+    const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
+    if (ungroundedWarn.length > 0) {
+      emit(
+        ctx,
+        `Output for "${item.title}" has unverifiable selector/endpoint references (attempt ${attempt + 1}, not blocking): ${ungroundedWarn.join('; ')}`,
+      );
+    }
+    if (ungroundedHard.length > 0) {
+      emit(
+        ctx,
+        `Output for "${item.title}" referenced hallucinated selectors/endpoints (attempt ${attempt + 1}): ${ungroundedHard.join('; ')}`,
+        { ungrounded: ungroundedHard },
+      );
+      retryNote = retryNoteUngrounded(ungroundedHard, groundTruth);
+      lastReason = `hallucinated selector/endpoint references: ${ungroundedHard.join('; ')}`;
       continue;
     }
 

@@ -20,7 +20,14 @@ import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../p
 import type { TestModeContext, TestPlan } from '../types.js';
 import type { ProjectCredential } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
-import { findForbiddenApis, generate, ProviderUnavailableError } from './generate.js';
+import {
+  collectGroundTruth,
+  findForbiddenApis,
+  findUngroundedReferences,
+  generate,
+  ProviderUnavailableError,
+  type GroundTruth,
+} from './generate.js';
 
 // ---- Realistic spec fixtures -------------------------------------------------
 
@@ -121,6 +128,125 @@ describe('findForbiddenApis — deny-list gate over generated specs', () => {
     expect(violations).toContain(
       "import/require of 'net' (only '@playwright/test' or '../../fixtures/mock.fixture' is allowed)",
     );
+  });
+});
+
+describe('findUngroundedReferences — grounding-validation gate over generated specs', () => {
+  function gt(overrides: Partial<GroundTruth> = {}): GroundTruth {
+    return {
+      testids: new Set(['login-email', 'login-submit']),
+      selectors: new Set(['input[data-testid="login-email"]', 'button[data-testid="login-submit"]']),
+      names: ['moje kupóny'],
+      roleByName: new Map([['moje kupóny', new Set(['generic'])]]),
+      endpoints: [{ method: 'POST', pathPattern: '/customer/passwordvalidate' }],
+      hasEndpointLevelMocks: true,
+      inventoryTruncated: false,
+      ...overrides,
+    };
+  }
+
+  it('is clean for a spec that only references known testids', () => {
+    const source = `page.locator('input[data-testid="login-email"]').fill('x');`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  it('hard-fails a fabricated testid when the inventory is untruncated and non-empty', () => {
+    const source = `page.getByTestId('reset-password-email').fill('x');`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard.some((h) => h.includes('reset-password-email'))).toBe(true);
+    expect(warn).toEqual([]);
+  });
+
+  it('downgrades a fabricated testid to a warning when the inventory was truncated', () => {
+    const source = `page.getByTestId('reset-password-email').fill('x');`;
+    const { hard, warn } = findUngroundedReferences(source, gt({ inventoryTruncated: true }));
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('reset-password-email'))).toBe(true);
+  });
+
+  it('downgrades a fabricated testid to a warning when the escape-hatch marker is present', () => {
+    const source = `// TODO: unobserved element\npage.getByTestId('reset-password-email').fill('x');`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('reset-password-email'))).toBe(true);
+  });
+
+  it('accepts a mockOverride matching a known endpoint (method + normalized path)', () => {
+    const source = `mockOverride('POST', '**/customer/passwordvalidate', { status: 200, body: {} });`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  it('hard-fails a mockOverride whose endpoint was never statically detected', () => {
+    const source = `mockOverride('POST', '**/customer/registerforpassword', { status: 200, body: {} });`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard.some((h) => h.includes('registerforpassword'))).toBe(true);
+    expect(warn).toEqual([]);
+  });
+
+  it('warns (does not hard-fail) an unmatched mockOverride when only dependency-level mocks exist', () => {
+    const source = `mockOverride('POST', '**/customer/registerforpassword', { status: 200, body: {} });`;
+    const { hard, warn } = findUngroundedReferences(source, gt({ hasEndpointLevelMocks: false }));
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('registerforpassword'))).toBe(true);
+  });
+
+  it('warns (never hard-fails) a getByRole call whose role does not match the observed role for that name', () => {
+    const source = `page.getByRole('link', { name: /Moje kupóny/i }).click();`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('generic'))).toBe(true);
+  });
+
+  it('does not flag a getByRole call whose role matches the observed role', () => {
+    const source = `page.getByRole('generic', { name: 'Moje kupóny' }).click();`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+});
+
+describe('collectGroundTruth — mirrors selectInventoryElements so the gate never rejects a selector the model was never shown', () => {
+  it('extracts testids/selectors/roles from the same inventory formatSnapshotInventory renders', () => {
+    const ctx = {
+      projectDir: '/tmp/unused',
+      baseUrl: 'http://localhost:3000',
+      provider: {} as TestModeContext['provider'],
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration: {
+        crawl: {
+          routes: [
+            {
+              url: 'https://app.acme.test/login',
+              title: 'Login',
+              depth: 0,
+              hasPasswordField: false,
+              role: 'anonymous' as const,
+              snapshot: {
+                url: 'https://app.acme.test/login',
+                title: 'Login',
+                interactiveElements: [
+                  { role: 'textbox', name: 'Email', selector: 'input[data-testid="login-email"]' },
+                ],
+              },
+            },
+          ],
+          visitedCount: 1,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+      },
+    } as unknown as TestModeContext;
+
+    const gt = collectGroundTruth(ctx, 'tierA-public');
+    expect(gt.testids.has('login-email')).toBe(true);
+    expect(gt.roleByName.get('email')?.has('textbox')).toBe(true);
+    expect(gt.inventoryTruncated).toBe(false);
   });
 });
 
@@ -278,6 +404,59 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(specs).toHaveLength(1);
     expect(calls).toHaveLength(2);
     expect(specs[0].contents).not.toContain('writeFileSync');
+  });
+
+  it('retries once when the first attempt invents a testid, naming it and listing real selectors in the retry prompt', async () => {
+    const FABRICATED_SPEC = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds with valid input', async ({ page }) => {
+  await page.goto('/');
+  await page.getByTestId('made-up-testid').fill('x');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const exploration = {
+      crawl: {
+        routes: [
+          {
+            url: 'http://localhost:3000/',
+            title: 'Home',
+            depth: 0,
+            hasPasswordField: false,
+            role: 'anonymous' as const,
+            snapshot: {
+              url: 'http://localhost:3000/',
+              title: 'Home',
+              interactiveElements: [
+                { role: 'button', name: 'Submit', selector: 'button[data-testid="real-submit"]' },
+              ],
+            },
+          },
+        ],
+        visitedCount: 1,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+    };
+    const ctx = {
+      ...makeCtx(makeProvider([FABRICATED_SPEC, CLEAN_SPEC], calls)),
+      exploration,
+    };
+
+    const specs = await generate(ctx, PLAN);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].prompt).toContain('made-up-testid');
+    expect(calls[1].prompt).toContain('real-submit');
+    expect(specs).toHaveLength(1);
+    expect(specs[0].contents).not.toContain('made-up-testid');
   });
 
   it('deterministically forces a role-matched storageState even when the model never wrote a test.use() call', async () => {
@@ -490,12 +669,61 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
     expect(calls[0].prompt).not.toContain('Interactive elements observed');
   });
 
-  it('caps the inventory and reports how many were omitted', async () => {
+  it('caps the inventory per-route and reports how many were omitted', async () => {
     await generate(ctxWith(makeExploration(50)), PLAN);
     const prompt = calls[0].prompt;
-    expect(prompt).toContain('[data-testid="act-39"]'); // 40th (0-indexed) is shown
-    expect(prompt).not.toContain('[data-testid="act-40"]'); // 41st is omitted
-    expect(prompt).toContain('(+10 more not shown)');
+    expect(prompt).toContain('[data-testid="act-29"]'); // 30th (0-indexed) is shown
+    expect(prompt).not.toContain('[data-testid="act-30"]'); // 31st is omitted by the per-route cap
+    expect(prompt).toContain('(+20 more not shown');
+  });
+
+  it('does not let one route with many elements starve the global budget available to other routes', async () => {
+    // Two routes: one with 50 elements (would exhaust the old global-40 cap alone), one with
+    // 5 — the second route's elements must still all appear, since the per-route cap (30)
+    // leaves headroom in the overall ceiling (120) for every other route.
+    const busyRoute = makeExploration(50).crawl.routes[0];
+    const quietRoute = {
+      ...busyRoute,
+      url: 'https://app.acme.test/quiet',
+      snapshot: {
+        ...busyRoute.snapshot,
+        url: 'https://app.acme.test/quiet',
+        interactiveElements: Array.from({ length: 5 }, (_, i) => ({
+          role: 'button',
+          name: `Quiet ${i}`,
+          selector: `[data-testid="quiet-${i}"]`,
+        })),
+      },
+    };
+    const exploration = {
+      ...makeExploration(50),
+      crawl: { ...makeExploration(50).crawl, routes: [busyRoute, quietRoute] },
+    };
+
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('[data-testid="quiet-4"]');
+    expect(prompt).toContain('[data-testid="act-29"]');
+  });
+
+  it('annotates a non-semantic (generic role) element so the model is steered away from getByRole', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].snapshot.interactiveElements[0] = {
+      role: 'generic',
+      name: 'Moje body',
+      selector: '[data-testid="my-points-tab"]',
+    };
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('generic "Moje body"');
+    expect(prompt).toContain("NOT a semantic link/button");
+  });
+
+  it('states the selector-grounding hard rule and the escape hatch', async () => {
+    await generate(ctxWith(makeExploration(3)), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('HALLUCINATED SELECTOR');
+    expect(prompt).toContain('ESCAPE HATCH');
   });
 
   it('tags each element line with the route role it was observed on', async () => {

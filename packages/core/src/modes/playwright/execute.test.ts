@@ -183,6 +183,7 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
             { url: 'http://localhost:3000/login', score: 1, source: 'common-path' },
           ],
           useful: true,
+          observedEndpoints: [],
         },
       }),
     );
@@ -221,6 +222,7 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
           loginCandidates: [],
           useful: false,
           uselessReason: 'exploration crawled zero routes',
+          observedEndpoints: [],
         },
       }),
     );

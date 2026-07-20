@@ -2,6 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
+import type { ObservedEndpoint } from '../../browser/network-capture.js';
 import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import { ProviderUnavailableError } from '../types.js';
 import { TIERS, tierLabel } from './templates.js';
@@ -28,15 +29,26 @@ const MAX_MOCK_BODY_CHARS = 400;
  * match what the mock server/fixture will serve, failing for a reason
  * that has nothing to do with the app under test.
  */
-function formatMockContent(ctx: TestModeContext): string {
+export function formatMockContent(ctx: TestModeContext): string {
   const deps = ctx.externalDependencies ?? [];
   const lines: string[] = [];
+  // Endpoints EXPLORE actually observed on the wire (see GAP-046) — higher-trust ground
+  // truth than a statically-inferred/AI-guessed body. Tracked so anything matched here is
+  // skipped from the "observed but not in static analysis" pass below.
+  const matchedObserved = new Set<ObservedEndpoint>();
   for (const dep of deps) {
     if (dep.mockStrategy === 'undeterminable') continue;
     if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
     if (dep.endpoints && dep.endpoints.length > 0) {
       for (const e of dep.endpoints) {
         if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+        const observed = findObservedEndpoint(ctx, e.method, e.pathPattern);
+        if (observed) {
+          matchedObserved.add(observed);
+          const body = (observed.sampleResponseBody ?? '').slice(0, MAX_MOCK_BODY_CHARS);
+          lines.push(`- ${e.method} ${e.pathPattern} -> OBSERVED status ${observed.status}, body: ${body}`);
+          continue;
+        }
         if (!e.response) continue;
         const body = JSON.stringify(e.response.body).slice(0, MAX_MOCK_BODY_CHARS);
         lines.push(`- ${e.method} ${e.pathPattern} -> status ${e.response.status}, body: ${body}`);
@@ -48,13 +60,24 @@ function formatMockContent(ctx: TestModeContext): string {
       lines.push(`- ${dep.label} (any call to this dependency) -> status ${fallback.status}, body: ${body}`);
     }
   }
+  // Real traffic EXPLORE observed that no statically-detected dependency accounts for —
+  // additive ground truth the static scan alone can't provide (see GAP-046).
+  for (const observed of ctx.exploration?.observedEndpoints ?? []) {
+    if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+    if (matchedObserved.has(observed)) continue;
+    const body = (observed.sampleResponseBody ?? '').slice(0, MAX_MOCK_BODY_CHARS);
+    lines.push(
+      `- ${observed.method} ${observed.pathPattern} -> OBSERVED (not in static analysis) status ${observed.status}, body: ${body}`,
+    );
+  }
   if (lines.length === 0) return '';
   return (
     '\n\nMocked response content — assert against this EXACT data (do not invent plausible-sounding ' +
     'values that differ from it). RULE: mockOverride() may only target the endpoints listed here; do not ' +
-    "invent an endpoint path. This list is statically detected and may be INCOMPLETE for dynamic endpoints — " +
-    "if a scenario genuinely needs an endpoint not listed here, follow the ESCAPE HATCH rule instead of " +
-    'guessing a plausible-looking path:\n' +
+    'invent an endpoint path. Lines marked OBSERVED were captured from real traffic during exploration; ' +
+    'unmarked lines are statically detected and may be INCOMPLETE for dynamic endpoints — if a scenario ' +
+    'genuinely needs an endpoint not listed here, follow the ESCAPE HATCH rule instead of guessing a ' +
+    'plausible-looking path:\n' +
     lines.join('\n')
   );
 }
@@ -386,13 +409,29 @@ export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTrut
       for (const e of dep.endpoints) endpoints.push({ method: e.method, pathPattern: e.pathPattern });
     }
   }
+  // Real traffic observed during EXPLORE (see GAP-046) is just as provable a ground truth
+  // as a statically-detected endpoint — include it, and let it make the comparison provable
+  // even on a run with no endpoint-level static dependency.
+  for (const o of ctx.exploration?.observedEndpoints ?? []) {
+    hasEndpointLevelMocks = true;
+    endpoints.push({ method: o.method, pathPattern: o.pathPattern });
+  }
 
-  return { testids, selectors, names, roleByName, endpoints, hasEndpointLevelMocks, inventoryTruncated: truncated };
+  return {
+    testids,
+    selectors,
+    names,
+    roleByName,
+    endpoints,
+    hasEndpointLevelMocks,
+    inventoryTruncated: truncated,
+  };
 }
 
 const TESTID_CALL_RE = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
 const TESTID_ATTR_RE = /data-test(?:id)?=["']([^"']+)["']/g;
-const ROLE_CALL_RE = /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
+const ROLE_CALL_RE =
+  /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
 const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
 
 /** Normalize an endpoint path pattern (glob wildcards, `:param` placeholders) for a forgiving substring comparison. */
@@ -416,6 +455,25 @@ function endpointMatches(calledPath: string, method: string, gt: GroundTruth): b
   });
 }
 
+/** Same forgiving comparison as endpointMatches(), but returns the matching ObservedEndpoint
+ * (rather than a boolean) so formatMockContent() can surface its real captured status/body
+ * in place of a statically-guessed one. */
+function findObservedEndpoint(
+  ctx: TestModeContext,
+  method: string,
+  pathPattern: string,
+): ObservedEndpoint | undefined {
+  const normStatic = normalizeEndpointPath(pathPattern);
+  if (!normStatic) return undefined;
+  return (ctx.exploration?.observedEndpoints ?? []).find((o) => {
+    if (o.method.toUpperCase() !== method.toUpperCase()) return false;
+    const normObserved = normalizeEndpointPath(o.pathPattern);
+    return (
+      normObserved.length > 0 && (normStatic.includes(normObserved) || normObserved.includes(normStatic))
+    );
+  });
+}
+
 /**
  * Scan a generated spec's source for selector/role/mock-endpoint references and check each
  * against ground truth actually observed during EXPLORE (or statically detected for mocks).
@@ -434,7 +492,10 @@ function endpointMatches(calledPath: string, method: string, gt: GroundTruth): b
  * see formatSnapshotInventory) downgrades every hard finding in this spec to a warning — an
  * acknowledged, intentional gap isn't the same defect as a silent fabrication.
  */
-export function findUngroundedReferences(source: string, gt: GroundTruth): { hard: string[]; warn: string[] } {
+export function findUngroundedReferences(
+  source: string,
+  gt: GroundTruth,
+): { hard: string[]; warn: string[] } {
   const hard: string[] = [];
   const warn: string[] = [];
   const hasEscapeHatch = source.includes(ESCAPE_HATCH_MARKER);
@@ -456,7 +517,9 @@ export function findUngroundedReferences(source: string, gt: GroundTruth): { har
     if (!name) continue;
     const observedRoles = gt.roleByName.get(name);
     if (!observedRoles || observedRoles.has(role)) continue;
-    warn.push(`getByRole('${role}', { name: "${name}" }) but the observed role was ${[...observedRoles].join('/')}`);
+    warn.push(
+      `getByRole('${role}', { name: "${name}" }) but the observed role was ${[...observedRoles].join('/')}`,
+    );
   }
 
   for (const m of source.matchAll(MOCK_OVERRIDE_RE)) {
@@ -572,7 +635,10 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
   });
 
   const omitted = totalCount - selected.length;
-  const more = omitted > 0 ? `\n(+${omitted} more not shown — do not invent selectors for them; use the ESCAPE HATCH rule if you need one)` : '';
+  const more =
+    omitted > 0
+      ? `\n(+${omitted} more not shown — do not invent selectors for them; use the ESCAPE HATCH rule if you need one)`
+      : '';
   const completeness = truncated
     ? 'This is a PARTIAL inventory (some elements were omitted for length)'
     : 'This is the AUTHORITATIVE, COMPLETE inventory of elements observed for the routes shown';

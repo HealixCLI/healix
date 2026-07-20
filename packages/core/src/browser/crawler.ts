@@ -1,5 +1,5 @@
 import { attemptLogin } from './login.js';
-import type { BrowserSurface, DomSnapshot, InteractiveElement } from './types.js';
+import type { BrowserSurface, CapturedNetworkEvent, DomSnapshot, InteractiveElement } from './types.js';
 
 export interface CrawledRoute {
   url: string;
@@ -10,6 +10,11 @@ export interface CrawledRoute {
   hasPasswordField: boolean;
   /** Whether this route was reached before or after a verified login. */
   role: 'anonymous' | 'authenticated';
+  /** XHR/fetch traffic observed while this route settled (goto + snapshot). Not
+   * perfectly attributed — a slow response from this route can land during the
+   * next route's drain window — but sufficient as endpoint/status/body ground
+   * truth (see GAP-046, `browser/network-capture.ts`). */
+  networkEvents: CapturedNetworkEvent[];
 }
 
 export interface CrawlResult {
@@ -251,6 +256,9 @@ export async function crawl(
   let budgetExhausted = false;
   let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
 
+  // Discard anything buffered before this crawl started so it doesn't leak into route 0.
+  browser.drainNetworkEvents();
+
   while (queue.length > 0) {
     if (routes.length >= maxRoutes || Date.now() >= deadline) {
       budgetExhausted = true;
@@ -268,9 +276,13 @@ export async function crawl(
       await browser.goto(requestedUrl);
       snapshot = await browser.snapshot();
     } catch {
-      // Dead link or navigation failure — skip this node, keep the crawl alive.
+      // Dead link or navigation failure — discard whatever traffic that attempt
+      // triggered (it can't be attributed to a route we're about to record) and
+      // skip this node, keeping the crawl alive.
+      browser.drainNetworkEvents();
       continue;
     }
+    const networkEvents = browser.drainNetworkEvents();
 
     const resolvedUrl = normalizeUrl(snapshot.url || requestedUrl);
 
@@ -306,6 +318,7 @@ export async function crawl(
       depth: item.depth,
       hasPasswordField: hasPasswordField(snapshot),
       role: 'anonymous',
+      networkEvents,
     });
 
     // A fingerprint that keeps repeating is a shell page rendering nothing

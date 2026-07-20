@@ -210,6 +210,9 @@ const fakeBrowser: BrowserSurface = {
   onFrame(_cb: (png: Buffer) => void): () => void {
     return () => {};
   },
+  drainNetworkEvents() {
+    return [];
+  },
   async stop(): Promise<void> {},
 };
 
@@ -938,6 +941,9 @@ describe('orchestrator paths (offline DI seam)', () => {
           unsubscribeCalled = true;
         };
       },
+      drainNetworkEvents() {
+        return [];
+      },
       async stop(): Promise<void> {
         stopCalled = true;
       },
@@ -996,6 +1002,9 @@ describe('orchestrator paths (offline DI seam)', () => {
       onFrame(cb: (png: Buffer) => void): () => void {
         cb(Buffer.from([0x89, 0x50, 0x4e, 0x47]));
         return () => {};
+      },
+      drainNetworkEvents() {
+        return [];
       },
       async stop(): Promise<void> {},
     };

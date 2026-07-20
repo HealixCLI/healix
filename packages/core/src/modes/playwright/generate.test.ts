@@ -24,6 +24,7 @@ import {
   collectGroundTruth,
   findForbiddenApis,
   findUngroundedReferences,
+  formatMockContent,
   generate,
   ProviderUnavailableError,
   type GroundTruth,
@@ -227,6 +228,7 @@ describe('collectGroundTruth — mirrors selectInventoryElements so the gate nev
                   { role: 'textbox', name: 'Email', selector: 'input[data-testid="login-email"]' },
                 ],
               },
+              networkEvents: [],
             },
           ],
           visitedCount: 1,
@@ -240,6 +242,7 @@ describe('collectGroundTruth — mirrors selectInventoryElements so the gate nev
         routing: { hashRouted: false },
         loginCandidates: [],
         useful: true,
+        observedEndpoints: [],
       },
     } as unknown as TestModeContext;
 
@@ -247,6 +250,136 @@ describe('collectGroundTruth — mirrors selectInventoryElements so the gate nev
     expect(gt.testids.has('login-email')).toBe(true);
     expect(gt.roleByName.get('email')?.has('textbox')).toBe(true);
     expect(gt.inventoryTruncated).toBe(false);
+  });
+
+  it('includes EXPLORE-observed endpoints as ground truth, provable even with no static dependency (GAP-046)', () => {
+    const ctx = {
+      projectDir: '/tmp/unused',
+      baseUrl: 'http://localhost:3000',
+      provider: {} as TestModeContext['provider'],
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      externalDependencies: [],
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [{ method: 'POST', pathPattern: '/customer/passwordvalidate', status: 200 }],
+      },
+    } as unknown as TestModeContext;
+
+    const gt = collectGroundTruth(ctx, 'tierA-public');
+    expect(gt.hasEndpointLevelMocks).toBe(true);
+    expect(gt.endpoints).toContainEqual({ method: 'POST', pathPattern: '/customer/passwordvalidate' });
+
+    const source = `mockOverride('POST', '**/customer/passwordvalidate', { status: 200, body: {} });`;
+    expect(findUngroundedReferences(source, gt)).toEqual({ hard: [], warn: [] });
+  });
+});
+
+describe('formatMockContent — grounds mocked-response context in real EXPLORE traffic when available (GAP-046)', () => {
+  function baseCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
+    return {
+      projectDir: '/tmp/unused',
+      baseUrl: 'http://localhost:3000',
+      provider: {} as TestModeContext['provider'],
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      ...overrides,
+    } as unknown as TestModeContext;
+  }
+
+  it('falls back to statically-inferred/AI-guessed content when nothing was observed', () => {
+    const ctx = baseCtx({
+      externalDependencies: [
+        {
+          id: 'dep1',
+          category: 'backend',
+          label: 'Customer API',
+          source: 'code',
+          mockStrategy: 'route-intercept',
+          endpoints: [
+            {
+              method: 'POST',
+              pathPattern: '/customer/passwordvalidate',
+              response: { status: 400, body: { error: 'guessed' } },
+            },
+          ],
+        },
+      ],
+    } as unknown as Partial<TestModeContext>);
+
+    const out = formatMockContent(ctx);
+    expect(out).toContain('POST /customer/passwordvalidate -> status 400');
+    expect(out).not.toContain('-> OBSERVED');
+  });
+
+  it('prefers the real observed status/body over the statically-guessed one when both exist', () => {
+    const ctx = baseCtx({
+      externalDependencies: [
+        {
+          id: 'dep1',
+          category: 'backend',
+          label: 'Customer API',
+          source: 'code',
+          mockStrategy: 'route-intercept',
+          endpoints: [
+            {
+              method: 'POST',
+              pathPattern: '/customer/passwordvalidate',
+              response: { status: 400, body: { error: 'guessed' } },
+            },
+          ],
+        },
+      ],
+      exploration: {
+        observedEndpoints: [
+          {
+            method: 'POST',
+            pathPattern: '/customer/passwordvalidate',
+            status: 200,
+            sampleResponseBody: '{"ok":true}',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    const out = formatMockContent(ctx);
+    expect(out).toContain('POST /customer/passwordvalidate -> OBSERVED status 200, body: {"ok":true}');
+    expect(out).not.toContain('guessed');
+  });
+
+  it('appends an observed endpoint that has no corresponding static dependency entry', () => {
+    const ctx = baseCtx({
+      externalDependencies: [],
+      exploration: {
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/api/session',
+            status: 200,
+            sampleResponseBody: '{"authenticated":true}',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    const out = formatMockContent(ctx);
+    expect(out).toContain('GET /api/session -> OBSERVED (not in static analysis) status 200');
+  });
+
+  it('returns an empty string when there is nothing to report from either source', () => {
+    expect(formatMockContent(baseCtx())).toBe('');
   });
 });
 
@@ -431,6 +564,7 @@ test('[REQ:REQ-1] positive: succeeds with valid input', async ({ page }) => {
                 { role: 'button', name: 'Submit', selector: 'button[data-testid="real-submit"]' },
               ],
             },
+            networkEvents: [],
           },
         ],
         visitedCount: 1,
@@ -444,6 +578,7 @@ test('[REQ:REQ-1] positive: succeeds with valid input', async ({ page }) => {
       routing: { hashRouted: false },
       loginCandidates: [],
       useful: true,
+      observedEndpoints: [],
     };
     const ctx = {
       ...makeCtx(makeProvider([FABRICATED_SPEC, CLEAN_SPEC], calls)),
@@ -594,6 +729,7 @@ function makeExploration(
                 selector: `[data-testid="act-${i}"]`,
               })),
             },
+            networkEvents: [],
           },
         ];
   return {
@@ -610,6 +746,7 @@ function makeExploration(
     routing: { hashRouted: opts.hashRouted ?? false, invariantPrefix: opts.invariantPrefix },
     loginCandidates: [],
     useful: routes.length > 0,
+    observedEndpoints: [],
   };
 }
 
@@ -716,7 +853,7 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
     await generate(ctxWith(exploration), PLAN);
     const prompt = calls[0].prompt;
     expect(prompt).toContain('generic "Moje body"');
-    expect(prompt).toContain("NOT a semantic link/button");
+    expect(prompt).toContain('NOT a semantic link/button');
   });
 
   it('states the selector-grounding hard rule and the escape hatch', async () => {

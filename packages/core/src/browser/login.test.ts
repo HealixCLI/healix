@@ -44,6 +44,9 @@ function makeFakeBrowser(config: {
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
     },
+    drainNetworkEvents() {
+      return [];
+    },
     async stop(): Promise<void> {},
   };
 }

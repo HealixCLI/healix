@@ -3,6 +3,7 @@ import { crawl, crawlWithAuth, reconcileStaticRoutePaths } from './crawler.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
+  CapturedNetworkEvent,
   DomSnapshot,
   InteractiveElement,
   Point,
@@ -11,6 +12,8 @@ import type {
 interface FakePage {
   title?: string;
   elements: InteractiveElement[];
+  /** Network traffic to hand back from drainNetworkEvents() after navigating to this page. */
+  network?: CapturedNetworkEvent[];
 }
 
 /**
@@ -36,17 +39,24 @@ function makeFakeBrowser(config: {
   log?: string[];
 }): BrowserSurface {
   let currentUrl = '';
+  let networkBuffer: CapturedNetworkEvent[] = [];
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
       config.log?.push(`goto:${url}`);
       if (config.throwFor?.has(url)) {
+        // Model a request that actually fired (and would otherwise leak into the
+        // next route's drain) even though this navigation ultimately fails.
+        const events = config.pages[url]?.network;
+        if (events) networkBuffer.push(...events);
         throw new Error(`fake nav failure for ${url}`);
       }
       if (config.delayMs) {
         await new Promise((resolve) => setTimeout(resolve, config.delayMs));
       }
       currentUrl = config.redirects?.[url] ?? url;
+      const events = config.pages[currentUrl]?.network;
+      if (events) networkBuffer.push(...events);
     },
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
@@ -74,6 +84,11 @@ function makeFakeBrowser(config: {
     async pressKey(_key: string): Promise<void> {},
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
+    },
+    drainNetworkEvents(): CapturedNetworkEvent[] {
+      const drained = networkBuffer;
+      networkBuffer = [];
+      return drained;
     },
     async stop(): Promise<void> {},
   };
@@ -700,5 +715,59 @@ describe('reconcileStaticRoutePaths()', () => {
   it('skips a path that fails to resolve against a malformed base URL rather than throwing', () => {
     expect(() => reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).not.toThrow();
     expect(reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).toEqual([]);
+  });
+});
+
+describe('crawl() network capture (GAP-046)', () => {
+  it('attaches the network events captured while a route settled to that route', async () => {
+    const homeEvents: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://a.test/api/profile', status: 200, responseBody: '{"name":"Ada"}' },
+    ];
+    const aboutEvents: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://a.test/api/about', status: 200, responseBody: '{"version":1}' },
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/about')], network: homeEvents },
+        'https://a.test/about': { elements: [], network: aboutEvents },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes).toHaveLength(2);
+    const home = result.routes.find((r) => r.url === 'https://a.test/');
+    const about = result.routes.find((r) => r.url === 'https://a.test/about');
+    expect(home?.networkEvents).toEqual(homeEvents);
+    expect(about?.networkEvents).toEqual(aboutEvents);
+  });
+
+  it('gives a route an empty networkEvents array when nothing was captured for it', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [] } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0]?.networkEvents).toEqual([]);
+  });
+
+  it('discards traffic from a failed navigation instead of attributing it to the next successful route', async () => {
+    const deadEvents: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://a.test/api/dead', status: 500 },
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/dead': { elements: [], network: deadEvents },
+        'https://a.test/ok': { elements: [] },
+      },
+      throwFor: new Set(['https://a.test/dead']),
+    });
+
+    const result = await crawl(browser, 'https://a.test/dead', { seedRoutes: ['https://a.test/ok'] });
+
+    expect(result.routes).toHaveLength(1);
+    expect(result.routes[0]?.url).toBe('https://a.test/ok');
+    expect(result.routes[0]?.networkEvents).toEqual([]);
   });
 });

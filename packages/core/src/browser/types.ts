@@ -32,6 +32,17 @@ export interface DomSnapshot {
   axTree?: unknown;
 }
 
+/** A single XHR/fetch request/response pair observed while the page was live. */
+export interface CapturedNetworkEvent {
+  method: string;
+  url: string;
+  status: number;
+  /** Best-effort, size-capped; omitted when the body couldn't be read (binary, redirect, etc). */
+  requestBody?: string;
+  /** Best-effort, size-capped; omitted when the body couldn't be read (binary, redirect, etc). */
+  responseBody?: string;
+}
+
 /**
  * Single controllable Chromium (Playwright/CDP) serving BOTH computer-use
  * (screenshots → coordinate actions) and browser-use (DOM/AX actions),
@@ -48,5 +59,7 @@ export interface BrowserSurface {
   pressKey(key: string): Promise<void>;
   /** Subscribe to a live screenshot stream for UI mirroring; returns an unsubscribe fn. */
   onFrame(cb: (png: Buffer) => void): () => void;
+  /** Return and clear the XHR/fetch traffic observed since the last drain (or since start()). */
+  drainNetworkEvents(): CapturedNetworkEvent[];
   stop(): Promise<void>;
 }

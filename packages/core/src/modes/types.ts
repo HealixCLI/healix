@@ -2,6 +2,7 @@ import type { ProviderAdapter } from '../providers/types.js';
 import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
+import type { ObservedEndpoint } from '../browser/network-capture.js';
 import type { SourceContext } from '../target/source-context.js';
 import type { ModeId, ProjectCredential, Tier, TestStatus } from '../storage/types.js';
 
@@ -13,6 +14,9 @@ export interface ExplorationArtifact {
   /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
   useful: boolean;
   uselessReason?: string;
+  /** Real endpoints observed on the wire during the crawl — see GAP-046 and
+   * `browser/network-capture.ts`'s `collectObservedEndpoints()`. */
+  observedEndpoints: ObservedEndpoint[];
 }
 
 export type ExplorationMode = 'computer-use' | 'codegen';

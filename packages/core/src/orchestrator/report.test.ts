@@ -29,8 +29,7 @@ function makeProject(): Project {
     baseUrl: 'https://app.example.test',
     createdAt: '2026-01-01T00:00:00.000Z',
     archivedAt: null,
-    testUsername: null,
-    testPassword: null,
+    credentials: [],
   };
 }
 
@@ -172,8 +171,7 @@ const project: Project = {
   repoPath: null,
   createdAt: new Date(0).toISOString(),
   archivedAt: null,
-  testUsername: null,
-  testPassword: null,
+  credentials: [],
 };
 
 const plan: TestPlan = { summary: 'One feature.', items: [] };

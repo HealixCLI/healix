@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { SuiteBundle } from '../modes/types.js';
-import { isTextFile, sanitizeContent, type ExportCredentials } from './sanitize.js';
+import { isTextFile, sanitizeContent, type ExportCredential } from './sanitize.js';
 import { zipDirectory } from './zip.js';
 
 export interface ExportOptions {
@@ -18,7 +18,7 @@ export interface ExportOptions {
    * sanitize can redact literal occurrences (e.g. a hardcoded password in a
    * generated spec) that the generic secret patterns wouldn't catch.
    */
-  credentials?: ExportCredentials;
+  credentials?: ExportCredential[];
 }
 
 /** Bundle info returned by {@link exportSuite}: a {@link SuiteBundle} plus
@@ -85,7 +85,7 @@ interface CopyContext {
   /** Strip secrets / local absolute paths from text files. */
   sanitize: boolean;
   /** The project's own test-login credentials, for literal-value redaction. */
-  credentials: ExportCredentials | undefined;
+  credentials: ExportCredential[] | undefined;
   /** Canonical directories already entered (symlink-cycle guard). */
   visited: Set<string>;
   /** Suite-relative paths skipped for safety (outward symlinks). */
@@ -199,7 +199,7 @@ async function copyFile(
   destPath: string,
   rootSrcDir: string,
   sanitize: boolean,
-  credentials: ExportCredentials | undefined,
+  credentials: ExportCredential[] | undefined,
 ): Promise<void> {
   await fs.mkdir(path.dirname(destPath), { recursive: true });
 

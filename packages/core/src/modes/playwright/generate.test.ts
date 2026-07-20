@@ -18,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../providers/types.js';
 import type { TestModeContext, TestPlan } from '../types.js';
+import type { ProjectCredential } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import { findForbiddenApis, generate, ProviderUnavailableError } from './generate.js';
 
@@ -277,6 +278,114 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(specs).toHaveLength(1);
     expect(calls).toHaveLength(2);
     expect(specs[0].contents).not.toContain('writeFileSync');
+  });
+
+  it('deterministically forces a role-matched storageState even when the model never wrote a test.use() call', async () => {
+    const DESCRIBE_SPEC = `import { test, expect } from '@playwright/test';
+
+test.describe('[REQ:REQ-1] Admin dashboard access', () => {
+  test('[REQ:REQ-1] positive: succeeds with valid input', async ({ page }) => {
+    await page.goto('/admin');
+    await expect(page.getByText('Admin')).toBeVisible();
+  });
+});
+`;
+    const ctx = {
+      ...makeCtx(makeProvider([DESCRIBE_SPEC], calls)),
+      credentials: [
+        {
+          id: 'c1',
+          username: 'admin@test.com',
+          password: 'adminpw',
+          role: 'admin',
+          authType: 'form',
+          token: null,
+          urlTemplate: null,
+          extraParams: null,
+          authCheckText: null,
+        },
+        {
+          id: 'c2',
+          username: 'user@test.com',
+          password: 'userpw',
+          role: null,
+          authType: 'form',
+          token: null,
+          urlTemplate: null,
+          extraParams: null,
+          authCheckText: null,
+        },
+      ] satisfies ProjectCredential[],
+    };
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Admin dashboard access',
+          reqTag: 'REQ-1',
+          tier: 'tierB-auth',
+          intent: 'verify admin-only dashboard controls',
+          scenarios: [{ kind: 'positive', description: 'succeeds with valid input' }],
+        },
+      ],
+    };
+
+    const specs = await generate(ctx, plan);
+
+    expect(specs).toHaveLength(1);
+    expect(specs[0].contents).toContain("test.use({ storageState: 'fixtures/.auth/user-admin.json' });");
+    // Inserted BEFORE the first test(...) call, right after test.describe's opening.
+    const useIdx = specs[0].contents.indexOf('test.use(');
+    const testIdx = specs[0].contents.indexOf("test('[REQ:REQ-1] positive");
+    expect(useIdx).toBeGreaterThan(0);
+    expect(useIdx).toBeLessThan(testIdx);
+  });
+
+  it('does not touch storageState for a tierB-auth item that matches no configured role', async () => {
+    const DESCRIBE_SPEC = `import { test, expect } from '@playwright/test';
+
+test.describe('[REQ:REQ-1] Home page', () => {
+  test('[REQ:REQ-1] positive: succeeds with valid input', async ({ page }) => {
+    await page.goto('/');
+    await expect(page).toHaveTitle(/Home/);
+  });
+});
+`;
+    const ctx = {
+      ...makeCtx(makeProvider([DESCRIBE_SPEC], calls)),
+      credentials: [
+        {
+          id: 'c1',
+          username: 'admin@test.com',
+          password: 'adminpw',
+          role: 'admin',
+          authType: 'form',
+          token: null,
+          urlTemplate: null,
+          extraParams: null,
+          authCheckText: null,
+        },
+      ] satisfies ProjectCredential[],
+    };
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Home page',
+          reqTag: 'REQ-1',
+          tier: 'tierB-auth',
+          intent: 'home page renders for a logged-in user',
+          scenarios: [{ kind: 'positive', description: 'succeeds with valid input' }],
+        },
+      ],
+    };
+
+    const specs = await generate(ctx, plan);
+
+    expect(specs).toHaveLength(1);
+    expect(specs[0].contents).not.toContain('test.use(');
   });
 });
 

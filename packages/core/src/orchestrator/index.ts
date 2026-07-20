@@ -939,8 +939,7 @@ async function runPipeline(
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
       baseUrl: effectiveBaseUrl,
-      testUsername: project.testUsername,
-      testPassword: project.testPassword,
+      credentials: project.credentials,
       provider,
       target,
       browser,
@@ -1024,13 +1023,16 @@ async function runPipeline(
         }
 
         try {
+          // EXPLORE only needs ONE representative session to find/confirm a login
+          // form — not every role. Prefer a roleless credential (the "default"
+          // session Tier B also falls back to) over a role-tagged one.
+          const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
           const exploration = await runExplorePhase({
             browser,
             baseUrl: effectiveBaseUrl,
-            credentials:
-              ctx.testUsername && ctx.testPassword
-                ? { username: ctx.testUsername, password: ctx.testPassword }
-                : undefined,
+            credentials: defaultCredential
+              ? { username: defaultCredential.username, password: defaultCredential.password }
+              : undefined,
             staticRoutePaths,
             emit,
             onFrame: hooks?.onFrame,

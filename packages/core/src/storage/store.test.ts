@@ -204,25 +204,56 @@ describe('updateProject', () => {
     const project = s.createProject({
       name: 'Auth Project',
       baseUrl: 'https://auth.test',
-      testUsername: 'tester@auth.test',
-      testPassword: 'hunter2',
+      credentials: [{ username: 'tester@auth.test', password: 'hunter2' }],
     });
-    expect(project.testUsername).toBe('tester@auth.test');
-    expect(project.testPassword).toBe('hunter2');
-    expect(s.getProject(project.id)).toMatchObject({
-      testUsername: 'tester@auth.test',
-      testPassword: 'hunter2',
-    });
+    const expected = [
+      {
+        id: expect.any(String),
+        authType: 'form',
+        username: 'tester@auth.test',
+        password: 'hunter2',
+        role: null,
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
+    ];
+    expect(project.credentials).toEqual(expected);
+    expect(s.getProject(project.id)?.credentials).toEqual(expected);
 
     const cleared = s.updateProject(project.id, {
       name: 'Auth Project',
       baseUrl: 'https://auth.test',
-      testUsername: null,
-      testPassword: null,
+      credentials: [],
     });
-    expect(cleared.testUsername).toBeNull();
-    expect(cleared.testPassword).toBeNull();
-    expect(s.getProject(project.id)).toMatchObject({ testUsername: null, testPassword: null });
+    expect(cleared.credentials).toEqual([]);
+    expect(s.getProject(project.id)?.credentials).toEqual([]);
+  });
+
+  it('supports multiple credentials with optional roles, preserving save order', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'Multi-Role Project',
+      baseUrl: 'https://auth.test',
+      credentials: [
+        { username: 'admin@auth.test', password: 'adminpw', role: 'admin' },
+        { username: 'user@auth.test', password: 'userpw' },
+      ],
+    });
+    expect(project.credentials.map((c) => ({ username: c.username, role: c.role }))).toEqual([
+      { username: 'admin@auth.test', role: 'admin' },
+      { username: 'user@auth.test', role: null },
+    ]);
+
+    // Replace-all: updating drops any credential not in the new list.
+    const updated = s.updateProject(project.id, {
+      name: 'Multi-Role Project',
+      baseUrl: 'https://auth.test',
+      credentials: [{ username: 'user@auth.test', password: 'userpw' }],
+    });
+    expect(updated.credentials).toHaveLength(1);
+    expect(updated.credentials[0]?.role).toBeNull();
   });
 
   it('throws and persists nothing when the edit would violate the invariant', async () => {

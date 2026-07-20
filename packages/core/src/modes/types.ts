@@ -3,7 +3,7 @@ import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
 import type { SourceContext } from '../target/source-context.js';
-import type { ModeId, Tier, TestStatus } from '../storage/types.js';
+import type { ModeId, ProjectCredential, Tier, TestStatus } from '../storage/types.js';
 
 /** Result of the multi-page/multi-role EXPLORE crawl, grounding GENERATE. */
 export interface ExplorationArtifact {
@@ -186,9 +186,8 @@ export interface TestModeContext {
   projectDir: string;
   repoPath?: string | null;
   baseUrl?: string | null;
-  /** Login identifier (username or email) for authenticated (tierB) flows. */
-  testUsername?: string | null;
-  testPassword?: string | null;
+  /** Test login identities for authenticated (tierB) flows — see storage's ProjectCredential. */
+  credentials?: ProjectCredential[];
   provider: ProviderAdapter;
   target: TargetAdapter;
   browser: BrowserSurface;

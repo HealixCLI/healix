@@ -113,21 +113,59 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     expect(env.Path ?? env.PATH).toBeDefined();
   });
 
-  it('injects HEALIX_TIERB_EMAIL/PASSWORD and a /login default from baseUrl when both credentials are set', () => {
+  it('injects HEALIX_TIERB_EMAIL/PASSWORD and a /login default from baseUrl when a credential is set', () => {
     const env = suiteEnv(
-      makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user@test.com', testPassword: 'hunter2' }),
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
     );
     expect(env.HEALIX_TIERB_EMAIL).toBe('user@test.com');
     expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
+    expect(JSON.parse(env.HEALIX_TIERB_CREDENTIALS_JSON ?? '[]')).toEqual([
+      {
+        username: 'user@test.com',
+        password: 'hunter2',
+        role: null,
+        authType: 'form',
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
+    ]);
   });
 
   it('prefers a discovered login candidate from EXPLORE over the naive /login default', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        testUsername: 'user@test.com',
-        testPassword: 'hunter2',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
         exploration: {
           crawl: {
             routes: [],
@@ -155,8 +193,19 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        testUsername: 'user@test.com',
-        testPassword: 'hunter2',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
         exploration: {
           crawl: {
             routes: [],
@@ -178,21 +227,71 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
   });
 
-  it('injects neither credential var when only one of username/password is set (fixture requires both)', () => {
-    const withOnlyUsername = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user' }));
-    expect(withOnlyUsername.HEALIX_TIERB_EMAIL).toBeUndefined();
-    expect(withOnlyUsername.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
-
-    const withOnlyPassword = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testPassword: 'hunter2' }));
-    expect(withOnlyPassword.HEALIX_TIERB_PASSWORD).toBeUndefined();
-    expect(withOnlyPassword.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+  it('injects no credential vars when the project has zero credentials', () => {
+    const env = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', credentials: [] }));
+    expect(env.HEALIX_TIERB_EMAIL).toBeUndefined();
+    expect(env.HEALIX_TIERB_PASSWORD).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+    expect(env.HEALIX_TIERB_CREDENTIALS_JSON).toBeUndefined();
   });
 
   it('does not inject a login URL when credentials are set but no baseUrl is configured', () => {
-    const env = suiteEnv(makeCtx({ testUsername: 'user', testPassword: 'hunter2' }));
+    const env = suiteEnv(
+      makeCtx({
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
+    );
     expect(env.HEALIX_TIERB_EMAIL).toBe('user');
     expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
     expect(env.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+  });
+
+  it('prefers the roleless credential as the default EMAIL/PASSWORD when multiple credentials are configured', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'admin@test.com',
+            password: 'adminpw',
+            role: 'admin',
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+          {
+            id: 'c2',
+            username: 'user@test.com',
+            password: 'userpw',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
+    );
+    expect(env.HEALIX_TIERB_EMAIL).toBe('user@test.com');
+    expect(env.HEALIX_TIERB_PASSWORD).toBe('userpw');
+    const parsed = JSON.parse(env.HEALIX_TIERB_CREDENTIALS_JSON ?? '[]');
+    expect(parsed).toHaveLength(2);
   });
 });
 

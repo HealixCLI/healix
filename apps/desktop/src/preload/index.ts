@@ -17,6 +17,18 @@ export type RunChannelMessage =
   // Broadcast to every window when a queued run fails to start (before it ever got its own runId).
   | { channel: 'queue:failed'; payload: { message: string } };
 
+/** Structural mirror of @healix/core's NewProjectCredential — kept local for the same "light bundle" reason as above. */
+type PreloadCredentialInput = {
+  authType?: 'form' | 'url-token';
+  username?: string;
+  password?: string;
+  role?: string | null;
+  token?: string | null;
+  urlTemplate?: string | null;
+  extraParams?: Record<string, string> | null;
+  authCheckText?: string | null;
+};
+
 const RUN_CHANNELS = [
   'run:started',
   'run:event',
@@ -44,8 +56,7 @@ const api = {
     mode?: string;
     repoPath?: string | null;
     baseUrl?: string | null;
-    testUsername?: string | null;
-    testPassword?: string | null;
+    credentials?: PreloadCredentialInput[];
   }) => ipcRenderer.invoke('projects:create', input),
   updateProject: (
     id: string,
@@ -54,8 +65,7 @@ const api = {
       mode?: string;
       repoPath?: string | null;
       baseUrl?: string | null;
-      testUsername?: string | null;
-      testPassword?: string | null;
+      credentials?: PreloadCredentialInput[];
     },
   ) => ipcRenderer.invoke('projects:update', { id, ...input }),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),

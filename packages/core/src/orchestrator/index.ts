@@ -72,6 +72,7 @@ import {
   writeCheckpoint,
   type ResumeCheckpoint,
 } from './checkpoint.js';
+import { writeRunConfigSnapshot } from './run-config.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
@@ -383,6 +384,18 @@ async function runPipeline(
     setStatus('error', { finishedAt: nowIso() });
     return { runId, status: 'error' };
   }
+
+  // Permanent record of the user-facing options this run was started with —
+  // unlike checkpoint.json (deleted once the run leaves 'paused'), this never
+  // gets removed, so the desktop app can show "what was this run configured
+  // with" even after it finishes. Rewritten identically on resume (same opts).
+  await writeRunConfigSnapshot(runDir, {
+    testingScope: opts.testingScope,
+    suiteMode: opts.suiteMode,
+    provider: opts.provider,
+    prd: opts.prd,
+    instructions: opts.instructions,
+  });
 
   if (!resumeFrom) {
     setStatus('pending', { startedAt: nowIso() });

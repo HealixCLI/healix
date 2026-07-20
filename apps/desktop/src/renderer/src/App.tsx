@@ -20,6 +20,19 @@ export default function App() {
   const [view, setView] = useState<ViewId>('projects');
   const [runProjectId, setRunProjectId] = useState<string | null>(null);
   const [dashboardProject, setDashboardProject] = useState<Project | null>(null);
+  // Whether the active view's secondary panel (project explorer / run history)
+  // is hidden — toggled by clicking the activity bar's already-active icon
+  // again, VSCode-style. Switching to a different icon always re-expands it.
+  const [panelCollapsed, setPanelCollapsed] = useState(false);
+
+  const selectView = (id: ViewId): void => {
+    if (id === view) {
+      setPanelCollapsed((v) => !v);
+      return;
+    }
+    setView(id);
+    setPanelCollapsed(false);
+  };
 
   // Lifted above the per-view conditional rendering below (App itself never
   // unmounts) so the active run's live console/plan-gate/queue state survives
@@ -35,24 +48,37 @@ export default function App() {
   const runProject = (project: Project): void => {
     setRunProjectId(project.id);
     setView('runs');
+    setPanelCollapsed(false);
   };
 
   // Opening a project's dashboard deep-links from the Projects list, mirroring runProject.
   const openDashboard = (project: Project): void => {
     setDashboardProject(project);
     setView('project-dashboard');
+    setPanelCollapsed(false);
   };
 
   return (
     <div className="flex h-full min-h-full bg-bg text-fg">
-      <Sidebar active={view} onSelect={setView} runStatus={runStatus} />
+      <Sidebar active={view} onSelect={selectView} runStatus={runStatus} />
       <main className="min-w-0 flex-1 overflow-hidden">
         {view === 'projects' && (
           <div className="h-full overflow-auto">
-            <ProjectsView onRunProject={runProject} onOpenDashboard={openDashboard} />
+            <ProjectsView
+              onRunProject={runProject}
+              onOpenDashboard={openDashboard}
+              sidebarCollapsed={panelCollapsed}
+            />
           </div>
         )}
-        {view === 'runs' && <RunsView initialProjectId={runProjectId} engine={engine} queue={queue} />}
+        {view === 'runs' && (
+          <RunsView
+            initialProjectId={runProjectId}
+            engine={engine}
+            queue={queue}
+            sidebarCollapsed={panelCollapsed}
+          />
+        )}
         {view === 'project-dashboard' && dashboardProject && (
           <ProjectDashboardView
             project={dashboardProject}

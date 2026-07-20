@@ -42,6 +42,8 @@ import {
   type Run,
   type PauseReason,
   readCheckpoint,
+  readRunConfigSnapshot,
+  type RunConfigSnapshot,
   type SuiteMode,
   type TestCase,
   type TestResult,
@@ -945,6 +947,12 @@ export interface RunDetail {
   reportHtmlPath: string | null;
   /** The plan persisted to disk at plan/plan.json, when present. */
   plan: TestPlan | null;
+  /**
+   * The user-facing options (testingScope/suiteMode/provider/prd/instructions)
+   * this run was started with, read from run-config.json — null when absent
+   * (a run from before this feature existed, or the write failed).
+   */
+  runConfig: RunConfigSnapshot | null;
 }
 
 ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<RunDetail> => {
@@ -958,6 +966,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     artifacts: [],
     reportHtmlPath: null,
     plan: null,
+    runConfig: null,
   };
   const runId = payload?.runId;
   if (!runId) return empty;
@@ -998,6 +1007,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   let artifacts: string[] = [];
   let reportHtmlPath: string | null = null;
   let plan: TestPlan | null = null;
+  let runConfig: RunConfigSnapshot | null = null;
 
   if (run) {
     const runDir = join(projectsDir(), run.projectId, 'runs', runId);
@@ -1008,9 +1018,10 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     const html = join(runDir, 'reports', 'report.html');
     if (await isFile(html)) reportHtmlPath = html;
     plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
+    runConfig = await readRunConfigSnapshot(runDir);
   }
 
-  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan };
+  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan, runConfig };
 });
 
 /** Most recent fully-passed run for a project — drives the Suite Mode toggle's enable/disable state. */

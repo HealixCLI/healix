@@ -82,6 +82,21 @@ export interface RunDetail {
    * awaiting approval in the main process.
    */
   plan: TestPlan | null;
+  /**
+   * The user-facing options (testingScope/suiteMode/provider/prd/instructions)
+   * this run was started with, read from run-config.json — null when absent
+   * (a run from before this feature existed, or the write failed).
+   */
+  runConfig: RunConfigSnapshot | null;
+}
+
+/** The options a run was started with, permanently recorded (unlike the pausable checkpoint). */
+export interface RunConfigSnapshot {
+  testingScope?: TestingScope;
+  suiteMode?: SuiteMode;
+  provider?: ProviderId;
+  prd?: string;
+  instructions?: string;
 }
 
 /**

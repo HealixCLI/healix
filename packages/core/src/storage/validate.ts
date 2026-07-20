@@ -49,10 +49,12 @@ export type NewProjectValidation = { ok: true; value: NormalizedNewProject } | {
  *  - a project must be reachable somehow — at least one of `repoPath` / `baseUrl`
  *    must be provided (this is what stops "empty" projects from being created);
  *  - if a `baseUrl` is given it must be a valid http(s) URL;
- *  - each credential needs a non-blank username AND password (role is optional —
- *    a credential with a blank username or password is dropped rather than
- *    rejecting the whole save, since a half-filled "add credential" row the
- *    user never finished is not the same as a deliberately invalid project).
+ *  - each 'form' credential needs a non-blank username AND password; each
+ *    'url-token' credential needs a non-blank token AND urlTemplate (role/
+ *    extraParams/authCheckText are always optional). A credential missing
+ *    its type's required fields is dropped rather than rejecting the whole
+ *    save, since a half-filled "add credential" row the user never finished
+ *    is not the same as a deliberately invalid project.
  *
  * On success the returned `value` is trimmed/normalized and ready to persist.
  */
@@ -63,12 +65,24 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
   const repoPath = (input.repoPath ?? '').trim() || null;
   const baseUrl = (input.baseUrl ?? '').trim() || null;
   const credentials: NewProjectCredential[] = (input.credentials ?? [])
-    .map((c) => ({
-      username: (c?.username ?? '').trim(),
-      password: (c?.password ?? '').trim(),
-      role: (c?.role ?? '').trim() || null,
-    }))
-    .filter((c) => c.username.length > 0 && c.password.length > 0);
+    .map((c) => {
+      const authType = c?.authType === 'url-token' ? ('url-token' as const) : ('form' as const);
+      return {
+        authType,
+        username: (c?.username ?? '').trim(),
+        password: (c?.password ?? '').trim(),
+        role: (c?.role ?? '').trim() || null,
+        token: (c?.token ?? '').trim() || null,
+        urlTemplate: (c?.urlTemplate ?? '').trim() || null,
+        extraParams: c?.extraParams ?? null,
+        authCheckText: (c?.authCheckText ?? '').trim() || null,
+      };
+    })
+    .filter((c) =>
+      c.authType === 'url-token'
+        ? c.token !== null && c.urlTemplate !== null
+        : c.username.length > 0 && c.password.length > 0,
+    );
 
   if (!repoPath && !baseUrl) {
     return {

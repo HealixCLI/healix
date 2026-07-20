@@ -22,11 +22,42 @@ import { Label } from '../components/ui/label';
 import { Select } from '../components/ui/select';
 import { useProjects } from '../lib/use-projects';
 
-/** One in-progress credential row in the form — role is always a string here (never null) for a controlled input. */
+/**
+ * One in-progress credential row in the form — every field is a plain string
+ * (never null) for controlled inputs; `extraParams` is edited as multiline
+ * "key=value" text and parsed into a Record on submit.
+ */
 interface CredentialFormRow {
+  /** Stable per-row identity for React's key (and for locating this row on change/remove) — the saved credential's own id, or a generated one for a new row. Never submitted. */
+  key: string;
+  authType: 'form' | 'url-token';
+  role: string;
   username: string;
   password: string;
-  role: string;
+  token: string;
+  urlTemplate: string;
+  extraParams: string;
+  authCheckText: string;
+}
+
+/** "key=value" per line -> Record, blank/malformed lines dropped. */
+function parseExtraParams(text: string): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const line of text.split('\n')) {
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/** Record -> "key=value" per line, for editing. */
+function formatExtraParams(params: Record<string, string> | null): string {
+  return Object.entries(params ?? {})
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
 }
 
 /**
@@ -343,9 +374,15 @@ function ProjectForm({
   const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
   const [credentials, setCredentials] = useState<CredentialFormRow[]>(
     (project?.credentials ?? []).map((c) => ({
+      key: c.id,
+      authType: c.authType,
+      role: c.role ?? '',
       username: c.username,
       password: c.password,
-      role: c.role ?? '',
+      token: c.token ?? '',
+      urlTemplate: c.urlTemplate ?? '',
+      extraParams: formatExtraParams(c.extraParams),
+      authCheckText: c.authCheckText ?? '',
     })),
   );
   const [submitting, setSubmitting] = useState(false);
@@ -390,9 +427,14 @@ function ProjectForm({
       // server-side (see validateNewProject) rather than rejected — submit
       // the full list as typed.
       credentials: credentials.map((c) => ({
+        authType: c.authType,
+        role: c.role.trim() || null,
         username: c.username.trim(),
         password: c.password,
-        role: c.role.trim() || null,
+        token: c.token.trim() || null,
+        urlTemplate: c.urlTemplate.trim() || null,
+        extraParams: parseExtraParams(c.extraParams),
+        authCheckText: c.authCheckText.trim() || null,
       })),
     });
     setSubmitting(false);
@@ -487,7 +529,22 @@ function ProjectForm({
                 type="button"
                 variant="outline"
                 size="sm"
-                onClick={() => setCredentials((rows) => [...rows, { username: '', password: '', role: '' }])}
+                onClick={() =>
+                  setCredentials((rows) => [
+                    ...rows,
+                    {
+                      key: crypto.randomUUID(),
+                      authType: 'form',
+                      role: '',
+                      username: '',
+                      password: '',
+                      token: '',
+                      urlTemplate: '',
+                      extraParams: '',
+                      authCheckText: '',
+                    },
+                  ])
+                }
               >
                 <Plus className="h-3.5 w-3.5" />
                 Add credential
@@ -502,13 +559,15 @@ function ProjectForm({
                   : 'No test credentials yet — add one for authenticated (Tier B) flows.'}
               </p>
             )}
-            {credentials.map((cred, i) => (
+            {credentials.map((cred) => (
               <CredentialRow
-                key={i}
+                key={cred.key}
                 credential={cred}
                 readOnly={readOnly}
-                onChange={(next) => setCredentials((rows) => rows.map((r, idx) => (idx === i ? next : r)))}
-                onRemove={() => setCredentials((rows) => rows.filter((_, idx) => idx !== i))}
+                onChange={(next) =>
+                  setCredentials((rows) => rows.map((r) => (r.key === cred.key ? next : r)))
+                }
+                onRemove={() => setCredentials((rows) => rows.filter((r) => r.key !== cred.key))}
               />
             ))}
           </div>
@@ -554,12 +613,18 @@ function ProjectForm({
 }
 
 /**
- * One row in the credentials list: username, password (masked, with its own
- * show/hide toggle), and an optional role. Role is free text, not a fixed
- * list — Healix establishes a separate authenticated session per distinct
- * role and generated tierB-auth tests can opt into one by name (see
- * generate.ts's role guidance); the first roleless credential (or simply the
- * first one) is the default session every Tier B test gets automatically.
+ * One row in the credentials list. Role is free text, not a fixed list —
+ * Healix establishes a separate authenticated session per distinct role and
+ * generated tierB-auth tests can opt into one by name (see generate.ts's role
+ * guidance); the first roleless credential (or simply the first one) is the
+ * default session every Tier B test gets automatically.
+ *
+ * Auth type picks which fields apply and how Healix establishes the session:
+ *  - 'form': the classic username/password + login-page-form flow.
+ *  - 'url-token': no login form at all — visiting a URL that already carries
+ *    a token (and optionally other params) is what authenticates. Use this
+ *    for SPAs handed a deep link (e.g. `#/token={token}&mobile={mobile}`)
+ *    instead of a sign-in page.
  */
 function CredentialRow({
   credential,
@@ -573,60 +638,140 @@ function CredentialRow({
   onRemove: () => void;
 }) {
   const [showPassword, setShowPassword] = useState(false);
+  const [showToken, setShowToken] = useState(false);
   return (
-    <div className="grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[1fr_1fr_auto_auto] sm:items-end">
-      <Field label="Username / email">
-        <Input
-          value={credential.username}
-          onChange={(e) => onChange({ ...credential, username: e.target.value })}
-          placeholder="you@example.com or a test username"
-          className="font-mono"
-          disabled={readOnly}
-        />
-      </Field>
-      <Field label="Password">
-        <div className="relative">
+    <div className="rounded-md border border-border p-3">
+      {!readOnly && (
+        <div className="mb-2 flex justify-end">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={onRemove}
+            aria-label="Remove credential"
+            title="Remove credential"
+            className="font-semibold text-fg"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Remove
+          </Button>
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <Field label="Role (optional)">
           <Input
-            type={showPassword ? 'text' : 'password'}
-            value={credential.password}
-            onChange={(e) => onChange({ ...credential, password: e.target.value })}
-            placeholder="Password"
-            className="pr-9 font-mono"
-            autoComplete="new-password"
+            value={credential.role}
+            onChange={(e) => onChange({ ...credential, role: e.target.value })}
+            placeholder="e.g. admin, seller, customer"
+            className="font-mono"
             disabled={readOnly}
           />
-          <button
-            type="button"
-            onClick={() => setShowPassword((v) => !v)}
-            className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
-            aria-label={showPassword ? 'Hide password' : 'Show password'}
-            aria-pressed={showPassword}
-            tabIndex={-1}
+        </Field>
+        <Field label="Auth Type">
+          <Select
+            value={credential.authType}
+            onChange={(e) => onChange({ ...credential, authType: e.target.value as 'form' | 'url-token' })}
+            disabled={readOnly}
           >
-            {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-          </button>
+            <option value="form">Form login (username / password)</option>
+            <option value="url-token">URL / token (no login form)</option>
+          </Select>
+        </Field>
+      </div>
+
+      {credential.authType === 'form' ? (
+        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <Field label="Username / email">
+            <Input
+              value={credential.username}
+              onChange={(e) => onChange({ ...credential, username: e.target.value })}
+              placeholder="you@example.com or a test username"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+          <Field label="Password">
+            <div className="relative">
+              <Input
+                type={showPassword ? 'text' : 'password'}
+                value={credential.password}
+                onChange={(e) => onChange({ ...credential, password: e.target.value })}
+                placeholder="Password"
+                className="pr-9 font-mono"
+                autoComplete="new-password"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                aria-pressed={showPassword}
+                tabIndex={-1}
+              >
+                {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </Field>
         </div>
-      </Field>
-      <Field label="Role (optional)" className="sm:w-40">
-        <Input
-          value={credential.role}
-          onChange={(e) => onChange({ ...credential, role: e.target.value })}
-          placeholder="e.g. admin"
-          className="font-mono"
-          disabled={readOnly}
-        />
-      </Field>
-      {!readOnly && (
-        <Button
-          type="button"
-          variant="ghost"
-          size="sm"
-          onClick={onRemove}
-          aria-label="Remove credential"
-          title="Remove credential"
-        >
-          <Trash2 className="h-3.5 w-3.5" />
-        </Button>
+      ) : (
+        <div className="mt-2 grid grid-cols-1 gap-2">
+          <Field label="Token">
+            <div className="relative">
+              <Input
+                type={showToken ? 'text' : 'password'}
+                value={credential.token}
+                onChange={(e) => onChange({ ...credential, token: e.target.value })}
+                placeholder="Paste the token"
+                className="pr-9 font-mono"
+                autoComplete="off"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                onClick={() => setShowToken((v) => !v)}
+                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+                aria-label={showToken ? 'Hide token' : 'Show token'}
+                aria-pressed={showToken}
+                tabIndex={-1}
+              >
+                {showToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </Field>
+          <Field label="URL Template">
+            <Input
+              value={credential.urlTemplate}
+              onChange={(e) => onChange({ ...credential, urlTemplate: e.target.value })}
+              placeholder="#/token={token}&mobile={mobile}&lang=ar-sa"
+              className="font-mono"
+              disabled={readOnly}
+            />
+            <p className="mt-1 text-xs text-muted">
+              Resolved against the project's base URL. {'{token}'} is always available; any key from Extra
+              Params below can be used the same way, e.g. {'{mobile}'}.
+            </p>
+          </Field>
+          <Field label="Extra Params (one per line, KEY=VALUE)">
+            <textarea
+              value={credential.extraParams}
+              onChange={(e) => onChange({ ...credential, extraParams: e.target.value })}
+              placeholder={'mobile=9660456767657\nlang=ar-sa'}
+              rows={2}
+              disabled={readOnly}
+              className="w-full rounded-md border border-border bg-panel/40 px-3 py-2 font-mono text-sm text-fg placeholder:text-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+            />
+          </Field>
+          <Field label="Auth Check — text that must disappear (optional)">
+            <Input
+              value={credential.authCheckText}
+              onChange={(e) => onChange({ ...credential, authCheckText: e.target.value })}
+              placeholder="Not found"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+        </div>
       )}
     </div>
   );

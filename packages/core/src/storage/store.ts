@@ -79,12 +79,42 @@ export class HealixStore {
     const saved: ProjectCredential[] = [];
     credentials.forEach((c, i) => {
       const credId = `cred_${nanoid(10)}`;
+      const authType = c.authType === 'url-token' ? 'url-token' : 'form';
+      const username = c.username ?? '';
+      const password = c.password ?? '';
+      const role = c.role ?? null;
+      const token = c.token ?? null;
+      const urlTemplate = c.urlTemplate ?? null;
+      const extraParams = c.extraParams ?? null;
+      const authCheckText = c.authCheckText ?? null;
       this.db
         .prepare(
-          'INSERT INTO project_credentials (id, project_id, username, password, role, sort_order) VALUES (?, ?, ?, ?, ?, ?)',
+          'INSERT INTO project_credentials (id, project_id, username, password, role, auth_type, token, url_template, extra_params, auth_check_text, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
         )
-        .run(credId, projectId, c.username, encryptSecret(c.password), c.role ?? null, i);
-      saved.push({ id: credId, username: c.username, password: c.password, role: c.role ?? null });
+        .run(
+          credId,
+          projectId,
+          username,
+          encryptSecret(password),
+          role,
+          authType,
+          encryptSecret(token),
+          urlTemplate,
+          extraParams ? JSON.stringify(extraParams) : null,
+          authCheckText,
+          i,
+        );
+      saved.push({
+        id: credId,
+        authType,
+        username,
+        password,
+        role,
+        token,
+        urlTemplate,
+        extraParams,
+        authCheckText,
+      });
     });
     return saved;
   }
@@ -512,11 +542,25 @@ function rowToProject(r: Record<string, unknown>, credentials: ProjectCredential
 }
 
 function rowToCredential(r: Record<string, unknown>): ProjectCredential {
+  const extraParamsRaw = s(r.extra_params);
+  let extraParams: Record<string, string> | null = null;
+  if (extraParamsRaw) {
+    try {
+      extraParams = JSON.parse(extraParamsRaw) as Record<string, string>;
+    } catch {
+      extraParams = null;
+    }
+  }
   return {
     id: String(r.id),
-    username: String(r.username),
+    authType: r.auth_type === 'url-token' ? 'url-token' : 'form',
+    username: String(r.username ?? ''),
     password: decryptSecret(s(r.password)) ?? '',
     role: s(r.role),
+    token: decryptSecret(s(r.token)),
+    urlTemplate: s(r.url_template),
+    extraParams,
+    authCheckText: s(r.auth_check_text),
   };
 }
 

@@ -96,7 +96,16 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     // (roleless, or first) credential is ALSO exposed as the plain
     // EMAIL/PASSWORD pair for the fixture's single-credential fallback path.
     env.HEALIX_TIERB_CREDENTIALS_JSON = JSON.stringify(
-      credentials.map((c) => ({ username: c.username, password: c.password, role: c.role })),
+      credentials.map((c) => ({
+        authType: c.authType,
+        username: c.username,
+        password: c.password,
+        role: c.role,
+        token: c.token,
+        urlTemplate: c.urlTemplate,
+        extraParams: c.extraParams,
+        authCheckText: c.authCheckText,
+      })),
     );
     const defaultCredential = credentials.find((c) => c.role === null) ?? credentials[0];
     env.HEALIX_TIERB_EMAIL = defaultCredential.username;

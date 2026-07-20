@@ -736,7 +736,13 @@ ipcMain.handle(
       outDir,
       sanitize: args.sanitize ?? true,
       zip: args.zip ?? true,
-      credentials: project?.credentials.map((c) => ({ username: c.username, password: c.password })),
+      // A url-token credential's secret lives in `token`, not `password` — pass
+      // it through the same `password` slot so sanitize's literal-value
+      // redaction (which only looks at username/password) still catches it.
+      credentials: project?.credentials.map((c) => ({
+        username: c.username,
+        password: c.authType === 'url-token' ? c.token : c.password,
+      })),
     });
     return bundle;
   },

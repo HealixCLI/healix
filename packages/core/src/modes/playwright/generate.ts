@@ -115,7 +115,10 @@ function matchRoleForItem(item: TestPlanItem, roles: string[]): string | null {
  * conflicting override.
  */
 function insertRoleStorageState(source: string, role: string): string {
-  if (/test\.use\s*\(/.test(source)) return source;
+  // Only skip if the model already set storageState itself — an unrelated
+  // test.use() (viewport, locale, etc.) must not block routing, since
+  // Playwright merges multiple test.use() calls in the same file anyway.
+  if (/test\.use\s*\(\s*\{[^}]*storageState/.test(source)) return source;
   const match = /test\.describe\([\s\S]*?=>\s*\{/.exec(source);
   if (!match) return source;
   const insertAt = match.index + match[0].length;

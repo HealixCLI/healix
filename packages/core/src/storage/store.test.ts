@@ -206,12 +206,21 @@ describe('updateProject', () => {
       baseUrl: 'https://auth.test',
       credentials: [{ username: 'tester@auth.test', password: 'hunter2' }],
     });
-    expect(project.credentials).toEqual([
-      { id: expect.any(String), username: 'tester@auth.test', password: 'hunter2', role: null },
-    ]);
-    expect(s.getProject(project.id)?.credentials).toEqual([
-      { id: expect.any(String), username: 'tester@auth.test', password: 'hunter2', role: null },
-    ]);
+    const expected = [
+      {
+        id: expect.any(String),
+        authType: 'form',
+        username: 'tester@auth.test',
+        password: 'hunter2',
+        role: null,
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
+    ];
+    expect(project.credentials).toEqual(expected);
+    expect(s.getProject(project.id)?.credentials).toEqual(expected);
 
     const cleared = s.updateProject(project.id, {
       name: 'Auth Project',

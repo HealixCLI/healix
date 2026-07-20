@@ -18,6 +18,7 @@ import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../providers/types.js';
 import type { TestModeContext, TestPlan } from '../types.js';
+import type { ProjectCredential } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import { findForbiddenApis, generate, ProviderUnavailableError } from './generate.js';
 
@@ -292,9 +293,29 @@ test.describe('[REQ:REQ-1] Admin dashboard access', () => {
     const ctx = {
       ...makeCtx(makeProvider([DESCRIBE_SPEC], calls)),
       credentials: [
-        { id: 'c1', username: 'admin@test.com', password: 'adminpw', role: 'admin' },
-        { id: 'c2', username: 'user@test.com', password: 'userpw', role: null },
-      ],
+        {
+          id: 'c1',
+          username: 'admin@test.com',
+          password: 'adminpw',
+          role: 'admin',
+          authType: 'form',
+          token: null,
+          urlTemplate: null,
+          extraParams: null,
+          authCheckText: null,
+        },
+        {
+          id: 'c2',
+          username: 'user@test.com',
+          password: 'userpw',
+          role: null,
+          authType: 'form',
+          token: null,
+          urlTemplate: null,
+          extraParams: null,
+          authCheckText: null,
+        },
+      ] satisfies ProjectCredential[],
     };
     const plan: TestPlan = {
       summary: 'one item',
@@ -333,7 +354,19 @@ test.describe('[REQ:REQ-1] Home page', () => {
 `;
     const ctx = {
       ...makeCtx(makeProvider([DESCRIBE_SPEC], calls)),
-      credentials: [{ id: 'c1', username: 'admin@test.com', password: 'adminpw', role: 'admin' }],
+      credentials: [
+        {
+          id: 'c1',
+          username: 'admin@test.com',
+          password: 'adminpw',
+          role: 'admin',
+          authType: 'form',
+          token: null,
+          urlTemplate: null,
+          extraParams: null,
+          authCheckText: null,
+        },
+      ] satisfies ProjectCredential[],
     };
     const plan: TestPlan = {
       summary: 'one item',

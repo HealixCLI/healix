@@ -178,8 +178,8 @@ function fieldLocator(page, labelRe, placeholderRe, cssFallback) {
     .or(page.locator(cssFallback));
 }
 
-/** One login attempt against \`page\`, saving storageState to \`path\` on success. Throws on failure. */
-async function login(page, email, password, loginUrl, path) {
+/** One username/password form login against \`page\`, saving storageState to \`path\` on success. Throws on failure. */
+async function loginForm(page, email, password, loginUrl, path) {
   await page.goto(loginUrl);
 
   // Locale-aware matchers (English + common Slovak forms observed in the
@@ -222,6 +222,48 @@ async function login(page, email, password, loginUrl, path) {
 }
 
 /**
+ * Substitute \`{token}\` (always available, from the credential's own token
+ * field) and every \`{<key>}\` in extraParams into urlTemplate, then visit the
+ * resulting URL against baseUrl — for apps with no login FORM at all: a
+ * token (and optionally other params, e.g. a mobile number/locale) delivered
+ * via the URL itself, persisted to cookies/localStorage on first load.
+ */
+async function loginUrlToken(page, cred, baseUrl, path) {
+  let target = cred.urlTemplate || '';
+  const params = Object.assign({ token: cred.token || '' }, cred.extraParams || {});
+  for (const [key, value] of Object.entries(params)) {
+    target = target.split(\`{\${key}}\`).join(encodeURIComponent(value));
+  }
+  const base = (baseUrl || '').replace(/\\/+$/, '');
+  const sep = target.startsWith('/') || target.startsWith('#') || target.startsWith('?') ? '' : '/';
+  await page.goto(\`\${base}\${sep}\${target}\`);
+
+  // Best-effort: wait for a transient "not found"/loading message to clear
+  // (a signal the token resolved), but never hard-fail on it — the
+  // storageState is still captured either way, since some apps never show
+  // such a message at all.
+  if (cred.authCheckText) {
+    await page
+      .getByText(cred.authCheckText, { exact: false })
+      .first()
+      .waitFor({ state: 'hidden', timeout: 15000 })
+      .catch(() => {});
+  } else {
+    await page.waitForLoadState('networkidle').catch(() => {});
+  }
+  await page.context().storageState({ path });
+}
+
+/** Dispatches to the right login mechanism for this credential's authType. */
+async function login(page, cred, loginUrl, baseUrl, path) {
+  if (cred.authType === 'url-token') {
+    await loginUrlToken(page, cred, baseUrl, path);
+  } else {
+    await loginForm(page, cred.username, cred.password, loginUrl, path);
+  }
+}
+
+/**
  * Establishes the Tier B authenticated storageState(s). By default this produces
  * an empty (anonymous) state. Wire your real login flow here, or have Healix
  * inject credentials via HEALIX_TIERB_* env vars. A DEFAULT-credential login
@@ -233,6 +275,7 @@ setup('authenticate', async ({ page, browser }) => {
   await mkdir(dirname(authFile), { recursive: true });
 
   const loginUrl = process.env.HEALIX_TIERB_LOGIN_URL;
+  const baseUrl = process.env.HEALIX_BASE_URL;
   let credentials = [];
   try {
     credentials = process.env.HEALIX_TIERB_CREDENTIALS_JSON
@@ -242,16 +285,24 @@ setup('authenticate', async ({ page, browser }) => {
     credentials = [];
   }
   if (credentials.length === 0 && process.env.HEALIX_TIERB_EMAIL && process.env.HEALIX_TIERB_PASSWORD) {
-    credentials = [{ username: process.env.HEALIX_TIERB_EMAIL, password: process.env.HEALIX_TIERB_PASSWORD, role: null }];
+    credentials = [
+      { authType: 'form', username: process.env.HEALIX_TIERB_EMAIL, password: process.env.HEALIX_TIERB_PASSWORD, role: null },
+    ];
   }
+  // A credential is actually usable only if ITS OWN mechanism has what it
+  // needs: a form credential needs loginUrl, a url-token credential needs
+  // baseUrl (to resolve its urlTemplate against) — not both, and not
+  // whichever one happens to be set globally.
+  const usable = (c) => (c.authType === 'url-token' ? !!baseUrl : !!loginUrl);
+  credentials = credentials.filter(usable);
 
-  if (credentials.length > 0 && loginUrl) {
+  if (credentials.length > 0) {
     const defaultCred = credentials.find((c) => !c.role) ?? credentials[0];
 
     // Written BEFORE the login attempt so a mid-login crash still leaves
     // performedLogin:false on disk; overwritten with true only on success.
     await writeMeta(false);
-    await login(page, defaultCred.username, defaultCred.password, loginUrl, authFile);
+    await login(page, defaultCred, loginUrl, baseUrl, authFile);
     await writeMeta(true);
 
     // Every OTHER (role-tagged) credential gets its own session, in a fresh
@@ -262,7 +313,7 @@ setup('authenticate', async ({ page, browser }) => {
       const context = await browser.newContext();
       const rolePage = await context.newPage();
       try {
-        await login(rolePage, cred.username, cred.password, loginUrl, roleStorageStatePath(cred.role));
+        await login(rolePage, cred, loginUrl, baseUrl, roleStorageStatePath(cred.role));
       } catch {
         // Best-effort: a role-specific login failure only affects specs that
         // opt into that role's storageState, not the default Tier B session.

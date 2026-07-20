@@ -73,14 +73,20 @@ describe('authSetupContents — locale-aware login fixture', () => {
   it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {
     const fixture = authSetupContents();
     const beforeIdx = fixture.indexOf('writeMeta(false)');
-    const loginCallIdx = fixture.indexOf('await login(page, defaultCred.username');
+    const loginCallIdx = fixture.indexOf('await login(page, defaultCred, loginUrl, baseUrl, authFile)');
     const storageIdx = fixture.indexOf('storageState({ path });');
     const afterIdx = fixture.indexOf('writeMeta(true)');
     expect(beforeIdx).toBeGreaterThanOrEqual(0);
     expect(beforeIdx).toBeLessThan(loginCallIdx);
     expect(loginCallIdx).toBeLessThan(afterIdx);
-    // storageState is captured inside the shared login() helper, called with authFile.
+    // storageState is captured inside the shared login()/loginForm()/loginUrlToken() helpers.
     expect(storageIdx).toBeGreaterThanOrEqual(0);
+  });
+
+  it('dispatches to url-token login when a credential is authType url-token', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain("cred.authType === 'url-token'");
+    expect(fixture).toContain('loginUrlToken(page, cred, baseUrl, path)');
   });
 
   it('logs in every additional role-tagged credential into its own storageState file without blocking the default session', () => {

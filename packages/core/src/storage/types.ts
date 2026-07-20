@@ -6,6 +6,16 @@ export type ModeId = 'playwright' | 'selenium' | (string & {});
 export type AccessKind = 'white-box' | 'black-box';
 
 /**
+ * How a credential establishes its session:
+ *  - 'form': the existing username/password + login-page-form flow.
+ *  - 'url-token': no login form at all — the app authenticates a visit whose
+ *    URL already carries a token (and optionally other params, e.g. a mobile
+ *    number/locale), persisting it to localStorage/cookies on first load.
+ *    Common in SPAs that are handed a deep link rather than a login page.
+ */
+export type CredentialAuthType = 'form' | 'url-token';
+
+/**
  * One login identity for authenticated (tierB) test flows. A project can have
  * any number of these — e.g. an "admin" and a "customer" account for an app
  * with distinct roles. `role` is optional free text (not a fixed enum): when
@@ -16,10 +26,29 @@ export type AccessKind = 'white-box' | 'black-box';
  */
 export interface ProjectCredential {
   id: string;
+  authType: CredentialAuthType;
+  role: string | null;
+  /** Used when authType is 'form'; empty string when 'url-token'. */
   username: string;
   /** Stored locally, same as repoPath/baseUrl — never sent to the AI provider. */
   password: string;
-  role: string | null;
+  /** Used when authType is 'url-token' — stored/decrypted like password. */
+  token: string | null;
+  /**
+   * The path/fragment to visit, with `{token}` and `{<extraParams key>}`
+   * placeholders substituted in — e.g. `#/token={token}&mobile={mobile}&lang=ar-sa`.
+   * Resolved against the project's baseUrl.
+   */
+  urlTemplate: string | null;
+  /** Additional named values substitutable into urlTemplate (e.g. { mobile: '9660456767657' }). */
+  extraParams: Record<string, string> | null;
+  /**
+   * Optional text Healix waits to see DISAPPEAR after navigating (e.g. a
+   * transient "Not found"/loading message the app shows before the token
+   * resolves) — a best-effort signal that authentication actually landed,
+   * not a hard gate: storageState is still captured either way.
+   */
+  authCheckText: string | null;
 }
 
 export interface Project {
@@ -123,9 +152,14 @@ export interface AgentEvent {
 
 /** Input shape for a single credential when creating/updating a project — no id yet, assigned on persist. */
 export interface NewProjectCredential {
-  username: string;
-  password: string;
+  authType?: CredentialAuthType;
+  username?: string;
+  password?: string;
   role?: string | null;
+  token?: string | null;
+  urlTemplate?: string | null;
+  extraParams?: Record<string, string> | null;
+  authCheckText?: string | null;
 }
 
 export interface NewProject {

@@ -117,14 +117,35 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        credentials: [{ id: 'c1', username: 'user@test.com', password: 'hunter2', role: null }],
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
       }),
     );
     expect(env.HEALIX_TIERB_EMAIL).toBe('user@test.com');
     expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
     expect(JSON.parse(env.HEALIX_TIERB_CREDENTIALS_JSON ?? '[]')).toEqual([
-      { username: 'user@test.com', password: 'hunter2', role: null },
+      {
+        username: 'user@test.com',
+        password: 'hunter2',
+        role: null,
+        authType: 'form',
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
     ]);
   });
 
@@ -132,7 +153,19 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        credentials: [{ id: 'c1', username: 'user@test.com', password: 'hunter2', role: null }],
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
         exploration: {
           crawl: {
             routes: [],
@@ -160,7 +193,19 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        credentials: [{ id: 'c1', username: 'user@test.com', password: 'hunter2', role: null }],
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
         exploration: {
           crawl: {
             routes: [],
@@ -192,7 +237,21 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
 
   it('does not inject a login URL when credentials are set but no baseUrl is configured', () => {
     const env = suiteEnv(
-      makeCtx({ credentials: [{ id: 'c1', username: 'user', password: 'hunter2', role: null }] }),
+      makeCtx({
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
     );
     expect(env.HEALIX_TIERB_EMAIL).toBe('user');
     expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
@@ -204,8 +263,28 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
       makeCtx({
         baseUrl: 'http://localhost:3000',
         credentials: [
-          { id: 'c1', username: 'admin@test.com', password: 'adminpw', role: 'admin' },
-          { id: 'c2', username: 'user@test.com', password: 'userpw', role: null },
+          {
+            id: 'c1',
+            username: 'admin@test.com',
+            password: 'adminpw',
+            role: 'admin',
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+          {
+            id: 'c2',
+            username: 'user@test.com',
+            password: 'userpw',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
         ],
       }),
     );

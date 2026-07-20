@@ -5,6 +5,23 @@ export type ModeId = 'playwright' | 'selenium' | (string & {});
 
 export type AccessKind = 'white-box' | 'black-box';
 
+/**
+ * One login identity for authenticated (tierB) test flows. A project can have
+ * any number of these — e.g. an "admin" and a "customer" account for an app
+ * with distinct roles. `role` is optional free text (not a fixed enum): when
+ * set, Healix establishes a SEPARATE storageState for that credential and
+ * generated tests can opt into it by name; the first credential with no role
+ * (or simply the first one, if none is roleless) is the default session Tier
+ * B tests get automatically, unchanged from today's single-credential behavior.
+ */
+export interface ProjectCredential {
+  id: string;
+  username: string;
+  /** Stored locally, same as repoPath/baseUrl — never sent to the AI provider. */
+  password: string;
+  role: string | null;
+}
+
 export interface Project {
   id: string;
   name: string;
@@ -14,10 +31,8 @@ export interface Project {
   createdAt: string;
   /** Soft-archive timestamp; null = active. Archived projects keep all data. */
   archivedAt: string | null;
-  /** Login identifier (username or email) for authenticated (tierB) test flows. */
-  testUsername: string | null;
-  /** Password paired with testUsername. Stored locally, same as repoPath/baseUrl — never sent to the AI provider. */
-  testPassword: string | null;
+  /** Test login identities for authenticated (tierB) flows — see ProjectCredential. */
+  credentials: ProjectCredential[];
 }
 
 export type RunStatus =
@@ -106,11 +121,18 @@ export interface AgentEvent {
   createdAt: string;
 }
 
+/** Input shape for a single credential when creating/updating a project — no id yet, assigned on persist. */
+export interface NewProjectCredential {
+  username: string;
+  password: string;
+  role?: string | null;
+}
+
 export interface NewProject {
   name: string;
   mode?: ModeId;
   repoPath?: string | null;
   baseUrl?: string | null;
-  testUsername?: string | null;
-  testPassword?: string | null;
+  /** Replace-all semantics: the full desired credential set, not a delta. Omitted = leave/create with none. */
+  credentials?: NewProjectCredential[];
 }

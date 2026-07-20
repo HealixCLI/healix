@@ -203,8 +203,7 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
     mode: input.mode ?? 'playwright',
     repoPath,
     baseUrl: normalizeOptional(input.baseUrl),
-    testUsername: normalizeOptional(input.testUsername),
-    testPassword: normalizeOptional(input.testPassword),
+    credentials: input.credentials,
   });
 });
 
@@ -219,8 +218,7 @@ ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProjec
     mode: input.mode ?? 'playwright',
     repoPath: normalizeOptional(input.repoPath),
     baseUrl: normalizeOptional(input.baseUrl),
-    testUsername: normalizeOptional(input.testUsername),
-    testPassword: normalizeOptional(input.testPassword),
+    credentials: input.credentials,
   });
 });
 
@@ -738,7 +736,7 @@ ipcMain.handle(
       outDir,
       sanitize: args.sanitize ?? true,
       zip: args.zip ?? true,
-      credentials: project ? { username: project.testUsername, password: project.testPassword } : undefined,
+      credentials: project?.credentials.map((c) => ({ username: c.username, password: c.password })),
     });
     return bundle;
   },

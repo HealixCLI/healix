@@ -1,5 +1,5 @@
 import { isGitRemoteUrl } from '../target/clone.js';
-import type { ModeId, NewProject } from './types.js';
+import type { ModeId, NewProject, NewProjectCredential } from './types.js';
 
 /** Upper bound on an accepted base URL; guards against pathological input. */
 const BASE_URL_MAX_LEN = 2048;
@@ -30,8 +30,7 @@ export interface NormalizedNewProject {
   mode: ModeId;
   repoPath: string | null;
   baseUrl: string | null;
-  testUsername: string | null;
-  testPassword: string | null;
+  credentials: NewProjectCredential[];
 }
 
 export type NewProjectValidation = { ok: true; value: NormalizedNewProject } | { ok: false; error: string };
@@ -49,7 +48,11 @@ export type NewProjectValidation = { ok: true; value: NormalizedNewProject } | {
  *  - `name` is required (non-blank after trim);
  *  - a project must be reachable somehow — at least one of `repoPath` / `baseUrl`
  *    must be provided (this is what stops "empty" projects from being created);
- *  - if a `baseUrl` is given it must be a valid http(s) URL.
+ *  - if a `baseUrl` is given it must be a valid http(s) URL;
+ *  - each credential needs a non-blank username AND password (role is optional —
+ *    a credential with a blank username or password is dropped rather than
+ *    rejecting the whole save, since a half-filled "add credential" row the
+ *    user never finished is not the same as a deliberately invalid project).
  *
  * On success the returned `value` is trimmed/normalized and ready to persist.
  */
@@ -59,8 +62,13 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
 
   const repoPath = (input.repoPath ?? '').trim() || null;
   const baseUrl = (input.baseUrl ?? '').trim() || null;
-  const testUsername = (input.testUsername ?? '').trim() || null;
-  const testPassword = (input.testPassword ?? '').trim() || null;
+  const credentials: NewProjectCredential[] = (input.credentials ?? [])
+    .map((c) => ({
+      username: (c?.username ?? '').trim(),
+      password: (c?.password ?? '').trim(),
+      role: (c?.role ?? '').trim() || null,
+    }))
+    .filter((c) => c.username.length > 0 && c.password.length > 0);
 
   if (!repoPath && !baseUrl) {
     return {
@@ -91,6 +99,6 @@ export function validateNewProject(input: NewProject): NewProjectValidation {
 
   return {
     ok: true,
-    value: { name, mode: input.mode ?? 'playwright', repoPath, baseUrl, testUsername, testPassword },
+    value: { name, mode: input.mode ?? 'playwright', repoPath, baseUrl, credentials },
   };
 }

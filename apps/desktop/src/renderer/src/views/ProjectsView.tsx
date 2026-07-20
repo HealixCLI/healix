@@ -22,6 +22,13 @@ import { Label } from '../components/ui/label';
 import { Select } from '../components/ui/select';
 import { useProjects } from '../lib/use-projects';
 
+/** One in-progress credential row in the form — role is always a string here (never null) for a controlled input. */
+interface CredentialFormRow {
+  username: string;
+  password: string;
+  role: string;
+}
+
 /**
  * Which form (if any) is currently shown: closed, creating a new project,
  * editing an existing one, or viewing an existing one read-only.
@@ -334,9 +341,13 @@ function ProjectForm({
   const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
   const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
   const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
-  const [testUsername, setTestUsername] = useState(project?.testUsername ?? '');
-  const [testPassword, setTestPassword] = useState(project?.testPassword ?? '');
-  const [showTestPassword, setShowTestPassword] = useState(false);
+  const [credentials, setCredentials] = useState<CredentialFormRow[]>(
+    (project?.credentials ?? []).map((c) => ({
+      username: c.username,
+      password: c.password,
+      role: c.role ?? '',
+    })),
+  );
   const [submitting, setSubmitting] = useState(false);
   const [browsingRepoPath, setBrowsingRepoPath] = useState(false);
 
@@ -375,8 +386,14 @@ function ProjectForm({
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
-      testUsername: testUsername.trim() || null,
-      testPassword: testPassword.trim() || null,
+      // Blank rows (an "Add credential" click never filled in) are dropped
+      // server-side (see validateNewProject) rather than rejected — submit
+      // the full list as typed.
+      credentials: credentials.map((c) => ({
+        username: c.username.trim(),
+        password: c.password,
+        role: c.role.trim() || null,
+      })),
     });
     setSubmitting(false);
     if (saved) {
@@ -384,8 +401,7 @@ function ProjectForm({
         setName('');
         setRepoPath('');
         setBaseUrl('');
-        setTestUsername('');
-        setTestPassword('');
+        setCredentials([]);
       }
       onDone();
     }
@@ -464,41 +480,38 @@ function ProjectForm({
               <option value="playwright">playwright</option>
             </Select>
           </Field>
-          <div className="sm:col-span-2">
-            <h3 className="mb-1.5 text-sm font-semibold text-fg">Test credentials</h3>
-          </div>
-          <Field label="Test username / email">
-            <Input
-              value={testUsername}
-              onChange={(e) => setTestUsername(e.target.value)}
-              placeholder="you@example.com or a test username"
-              className="font-mono"
-              disabled={readOnly}
-            />
-          </Field>
-          <Field label="Test password">
-            <div className="relative">
-              <Input
-                type={showTestPassword ? 'text' : 'password'}
-                value={testPassword}
-                onChange={(e) => setTestPassword(e.target.value)}
-                placeholder="Password for the credential above"
-                className="pr-9 font-mono"
-                autoComplete="new-password"
-                disabled={readOnly}
-              />
-              <button
+          <div className="flex items-center justify-between sm:col-span-2">
+            <h3 className="text-sm font-semibold text-fg">Test credentials</h3>
+            {!readOnly && (
+              <Button
                 type="button"
-                onClick={() => setShowTestPassword((v) => !v)}
-                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
-                aria-label={showTestPassword ? 'Hide test password' : 'Show test password'}
-                aria-pressed={showTestPassword}
-                tabIndex={-1}
+                variant="outline"
+                size="sm"
+                onClick={() => setCredentials((rows) => [...rows, { username: '', password: '', role: '' }])}
               >
-                {showTestPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-              </button>
-            </div>
-          </Field>
+                <Plus className="h-3.5 w-3.5" />
+                Add credential
+              </Button>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:col-span-2">
+            {credentials.length === 0 && (
+              <p className="text-xs text-muted">
+                {readOnly
+                  ? 'No test credentials configured.'
+                  : 'No test credentials yet — add one for authenticated (Tier B) flows.'}
+              </p>
+            )}
+            {credentials.map((cred, i) => (
+              <CredentialRow
+                key={i}
+                credential={cred}
+                readOnly={readOnly}
+                onChange={(next) => setCredentials((rows) => rows.map((r, idx) => (idx === i ? next : r)))}
+                onRemove={() => setCredentials((rows) => rows.filter((_, idx) => idx !== i))}
+              />
+            ))}
+          </div>
           {readOnly ? (
             <div className="flex items-center justify-end gap-2 sm:col-span-2">
               {onEdit && (
@@ -537,6 +550,85 @@ function ProjectForm({
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * One row in the credentials list: username, password (masked, with its own
+ * show/hide toggle), and an optional role. Role is free text, not a fixed
+ * list — Healix establishes a separate authenticated session per distinct
+ * role and generated tierB-auth tests can opt into one by name (see
+ * generate.ts's role guidance); the first roleless credential (or simply the
+ * first one) is the default session every Tier B test gets automatically.
+ */
+function CredentialRow({
+  credential,
+  readOnly,
+  onChange,
+  onRemove,
+}: {
+  credential: CredentialFormRow;
+  readOnly: boolean;
+  onChange: (next: CredentialFormRow) => void;
+  onRemove: () => void;
+}) {
+  const [showPassword, setShowPassword] = useState(false);
+  return (
+    <div className="grid grid-cols-1 gap-2 rounded-md border border-border p-3 sm:grid-cols-[1fr_1fr_auto_auto] sm:items-end">
+      <Field label="Username / email">
+        <Input
+          value={credential.username}
+          onChange={(e) => onChange({ ...credential, username: e.target.value })}
+          placeholder="you@example.com or a test username"
+          className="font-mono"
+          disabled={readOnly}
+        />
+      </Field>
+      <Field label="Password">
+        <div className="relative">
+          <Input
+            type={showPassword ? 'text' : 'password'}
+            value={credential.password}
+            onChange={(e) => onChange({ ...credential, password: e.target.value })}
+            placeholder="Password"
+            className="pr-9 font-mono"
+            autoComplete="new-password"
+            disabled={readOnly}
+          />
+          <button
+            type="button"
+            onClick={() => setShowPassword((v) => !v)}
+            className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+            aria-label={showPassword ? 'Hide password' : 'Show password'}
+            aria-pressed={showPassword}
+            tabIndex={-1}
+          >
+            {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+          </button>
+        </div>
+      </Field>
+      <Field label="Role (optional)" className="sm:w-40">
+        <Input
+          value={credential.role}
+          onChange={(e) => onChange({ ...credential, role: e.target.value })}
+          placeholder="e.g. admin"
+          className="font-mono"
+          disabled={readOnly}
+        />
+      </Field>
+      {!readOnly && (
+        <Button
+          type="button"
+          variant="ghost"
+          size="sm"
+          onClick={onRemove}
+          aria-label="Remove credential"
+          title="Remove credential"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </Button>
+      )}
+    </div>
   );
 }
 

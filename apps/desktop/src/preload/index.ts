@@ -44,8 +44,7 @@ const api = {
     mode?: string;
     repoPath?: string | null;
     baseUrl?: string | null;
-    testUsername?: string | null;
-    testPassword?: string | null;
+    credentials?: Array<{ username: string; password: string; role?: string | null }>;
   }) => ipcRenderer.invoke('projects:create', input),
   updateProject: (
     id: string,
@@ -54,8 +53,7 @@ const api = {
       mode?: string;
       repoPath?: string | null;
       baseUrl?: string | null;
-      testUsername?: string | null;
-      testPassword?: string | null;
+      credentials?: Array<{ username: string; password: string; role?: string | null }>;
     },
   ) => ipcRenderer.invoke('projects:update', { id, ...input }),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),

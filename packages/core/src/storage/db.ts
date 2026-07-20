@@ -1,4 +1,5 @@
 import { createRequire } from 'node:module';
+import { randomUUID } from 'node:crypto';
 import type { DatabaseSync } from 'node:sqlite';
 import { dbPath, ensureAppDataDir } from '../env/app-data.js';
 import { SCHEMA_SQL, SCHEMA_VERSION } from './schema.js';
@@ -105,6 +106,22 @@ function migrate(db: DatabaseSync): void {
     // credits-exhausted | crashed). Drives whether boot-time reconciliation
     // is allowed to auto-resume it (never for 'manual').
     ensureColumn(db, 'runs', 'pause_reason', 'TEXT');
+    // v7: multiple named test credentials per project (project_credentials
+    // table, created above via SCHEMA_SQL) replacing the single
+    // test_username/test_password pair. Copy any existing single credential
+    // forward as a roleless row so it isn't lost; the value is copied as-is
+    // (already encrypted, or legacy plaintext) since project_credentials.password
+    // is read back through the exact same decryptSecret() convention.
+    const legacyProjects = db
+      .prepare(
+        'SELECT id, test_username, test_password FROM projects WHERE test_username IS NOT NULL OR test_password IS NOT NULL',
+      )
+      .all() as Array<{ id: string; test_username: string | null; test_password: string | null }>;
+    for (const p of legacyProjects) {
+      db.prepare(
+        "INSERT INTO project_credentials (id, project_id, username, password, role, sort_order, created_at) VALUES (?, ?, ?, ?, NULL, 0, datetime('now'))",
+      ).run(`cred_${randomUUID()}`, p.id, p.test_username ?? '', p.test_password ?? '');
+    }
     db.exec(`PRAGMA user_version = ${SCHEMA_VERSION};`);
     logger.info(`Database migrated to schema v${SCHEMA_VERSION}`);
   }

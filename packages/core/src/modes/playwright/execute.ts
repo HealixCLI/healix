@@ -87,9 +87,20 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     }
   }
   if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
-  if (ctx.testUsername && ctx.testPassword) {
-    env.HEALIX_TIERB_EMAIL = ctx.testUsername;
-    env.HEALIX_TIERB_PASSWORD = ctx.testPassword;
+  const credentials = ctx.credentials ?? [];
+  if (credentials.length > 0) {
+    // Every credential, passed as one JSON blob so the auth fixture can log
+    // each one in and save its OWN storageState (see authSetupContents() in
+    // templates.ts) — this is what lets generated tests pick a specific
+    // role's session via test.use({ storageState: ... }). The default
+    // (roleless, or first) credential is ALSO exposed as the plain
+    // EMAIL/PASSWORD pair for the fixture's single-credential fallback path.
+    env.HEALIX_TIERB_CREDENTIALS_JSON = JSON.stringify(
+      credentials.map((c) => ({ username: c.username, password: c.password, role: c.role })),
+    );
+    const defaultCredential = credentials.find((c) => c.role === null) ?? credentials[0];
+    env.HEALIX_TIERB_EMAIL = defaultCredential.username;
+    env.HEALIX_TIERB_PASSWORD = defaultCredential.password;
     // The auth fixture requires all three of email/password/loginUrl to
     // attempt a real login (see authSetupContents() in templates.ts). Prefer
     // EXPLORE's discovered/scored login candidate (hash- and region-prefix

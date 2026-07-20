@@ -162,6 +162,22 @@ function roleStorageStatePath(role) {
   return \`\${authDir}/user-\${slug || 'role'}.json\`;
 }
 
+/**
+ * getByLabel() only matches a REAL accessible label (an actual <label for=...>,
+ * aria-label, or aria-labelledby) — plenty of real-world login forms show
+ * "Email"/"Password" as plain sibling text (a <p> or <span> next to the
+ * input, not an associated label) and rely on a placeholder for the
+ * accessible name instead. Falling back through placeholder, then a plain
+ * input[type=...]/name-contains selector, covers that gap without giving up
+ * the label-based match as the FIRST choice when a form does it properly.
+ */
+function fieldLocator(page, labelRe, placeholderRe, cssFallback) {
+  return page
+    .getByLabel(labelRe)
+    .or(page.getByPlaceholder(placeholderRe))
+    .or(page.locator(cssFallback));
+}
+
 /** One login attempt against \`page\`, saving storageState to \`path\` on success. Throws on failure. */
 async function login(page, email, password, loginUrl, path) {
   await page.goto(loginUrl);
@@ -169,7 +185,18 @@ async function login(page, email, password, loginUrl, path) {
   // Locale-aware matchers (English + common Slovak forms observed in the
   // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
   // i18n engine, just enough to not be English-only.
-  const emailField = page.getByLabel(/e-?mail/i);
+  const emailField = fieldLocator(
+    page,
+    /e-?mail/i,
+    /e-?mail/i,
+    'input[type="email"], input[name*="email" i], input[name*="user" i], input[id*="email" i]',
+  );
+  const passwordField = fieldLocator(
+    page,
+    /heslo|password/i,
+    /heslo|password/i,
+    'input[type="password"]',
+  );
   const loginRevealRe = /prihl|sign in|log ?in/i;
 
   // Some apps gate the login form behind a reveal button/link (e.g. a
@@ -187,8 +214,8 @@ async function login(page, email, password, loginUrl, path) {
       .catch(() => {});
   }
 
-  await page.getByLabel(/e-?mail/i).fill(email);
-  await page.getByLabel(/heslo|password/i).fill(password);
+  await emailField.first().fill(email);
+  await passwordField.first().fill(password);
   await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.context().storageState({ path });

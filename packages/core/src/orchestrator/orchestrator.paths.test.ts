@@ -517,6 +517,277 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(frontendPlan.items.map((it) => it.tier).sort()).toEqual(['tierA-public', 'tierB-auth']);
   });
 
+  it('AUTO SCOPE: a detected frontend-only white-box project defaults testingScope to frontend, dropping tierC-api', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Auto Scope Frontend Demo',
+      mode: 'playwright',
+      repoPath: join(tmpdir(), 'healix-fake-repo'),
+      baseUrl: 'https://app.example.test',
+    });
+
+    const scopedPlan = {
+      summary: 'Mixed-tier plan including a tierC-api item.',
+      items: [
+        { title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'Landing renders.' },
+        { title: 'Get profile', reqTag: 'REQ-900', tier: 'tierC-api', intent: 'Profile API responds.' },
+      ],
+    };
+    const scopedProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return {
+            provider: 'claude',
+            ok: true,
+            text: ['```json', JSON.stringify(scopedPlan), '```'].join('\n'),
+            raw: scopedPlan,
+            detail: 'OK',
+          };
+        }
+        return { provider: 'claude', ok: true, text: 'unused', raw: null, detail: 'OK' };
+      },
+    };
+
+    let detectCalls = 0;
+    const frontendTarget: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        detectCalls += 1;
+        return {
+          kind: 'frontend',
+          framework: 'react',
+          packageManager: 'npm',
+          startCommand: 'npm run dev',
+          installCommand: 'npm install',
+          installDir: '.',
+          port: null,
+          baseUrl: null,
+        };
+      },
+    };
+
+    const seenPlans: TestPlan[] = [];
+    const onPlan = async (plan: TestPlan): Promise<PlanApprovalResult> => {
+      seenPlans.push(plan);
+      return { decision: 'cancel' };
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: scopedProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => frontendTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    await orchestrator.run({ projectId: project.id, autoApprove: false }, { onPlan });
+
+    // No explicit testingScope was passed; detection found 'frontend', so the
+    // tierC-api item must already be gone by the time the approval gate sees it.
+    expect(detectCalls).toBeGreaterThanOrEqual(1);
+    expect(seenPlans).toHaveLength(1);
+    expect(seenPlans[0]?.items.map((it) => it.tier)).toEqual(['tierA-public']);
+  });
+
+  it('AUTO SCOPE: an explicit testingScope always wins over frontend-only detection', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Auto Scope Override Demo',
+      mode: 'playwright',
+      repoPath: join(tmpdir(), 'healix-fake-repo'),
+      baseUrl: 'https://app.example.test',
+    });
+
+    const scopedPlan = {
+      summary: 'Mixed-tier plan including a tierC-api item.',
+      items: [
+        { title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'Landing renders.' },
+        { title: 'Get profile', reqTag: 'REQ-900', tier: 'tierC-api', intent: 'Profile API responds.' },
+      ],
+    };
+    const scopedProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return {
+            provider: 'claude',
+            ok: true,
+            text: ['```json', JSON.stringify(scopedPlan), '```'].join('\n'),
+            raw: scopedPlan,
+            detail: 'OK',
+          };
+        }
+        return { provider: 'claude', ok: true, text: 'unused', raw: null, detail: 'OK' };
+      },
+    };
+
+    const frontendTarget: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        return {
+          kind: 'frontend',
+          framework: 'react',
+          packageManager: 'npm',
+          startCommand: 'npm run dev',
+          installCommand: 'npm install',
+          installDir: '.',
+          port: null,
+          baseUrl: null,
+        };
+      },
+    };
+
+    const seenPlans: TestPlan[] = [];
+    const onPlan = async (plan: TestPlan): Promise<PlanApprovalResult> => {
+      seenPlans.push(plan);
+      return { decision: 'cancel' };
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: scopedProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => frontendTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    // Explicit 'both' must survive detection finding 'frontend'.
+    await orchestrator.run({ projectId: project.id, autoApprove: false, testingScope: 'both' }, { onPlan });
+
+    expect(seenPlans).toHaveLength(1);
+    expect(seenPlans[0]?.items.map((it) => it.tier).sort()).toEqual(['tierA-public', 'tierC-api']);
+  });
+
+  it('AUTO SCOPE: backend/fullstack/unknown detection results leave the "both" default untouched', async () => {
+    const store = (await getStore()) as HealixStore;
+
+    const scopedPlan = {
+      summary: 'Mixed-tier plan including a tierC-api item.',
+      items: [
+        { title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'Landing renders.' },
+        { title: 'Get profile', reqTag: 'REQ-900', tier: 'tierC-api', intent: 'Profile API responds.' },
+      ],
+    };
+    const scopedProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return {
+            provider: 'claude',
+            ok: true,
+            text: ['```json', JSON.stringify(scopedPlan), '```'].join('\n'),
+            raw: scopedPlan,
+            detail: 'OK',
+          };
+        }
+        return { provider: 'claude', ok: true, text: 'unused', raw: null, detail: 'OK' };
+      },
+    };
+
+    for (const kind of ['backend', 'fullstack', 'unknown'] as const) {
+      const project = store.createProject({
+        name: `Auto Scope ${kind} Demo`,
+        mode: 'playwright',
+        repoPath: join(tmpdir(), `healix-fake-repo-${kind}`),
+        baseUrl: 'https://app.example.test',
+      });
+
+      const target: TargetAdapter = {
+        ...fakeTarget,
+        async detect(): Promise<DetectedProject> {
+          return {
+            kind,
+            framework: null,
+            packageManager: null,
+            startCommand: null,
+            installCommand: null,
+            installDir: null,
+            port: null,
+            baseUrl: null,
+          };
+        },
+      };
+
+      const seenPlans: TestPlan[] = [];
+      const onPlan = async (plan: TestPlan): Promise<PlanApprovalResult> => {
+        seenPlans.push(plan);
+        return { decision: 'cancel' };
+      };
+
+      const orchestrator = createOrchestrator({
+        provider: scopedProvider,
+        getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+        makeTarget: () => target,
+        makeBrowser: () => fakeBrowser,
+      });
+
+      await orchestrator.run({ projectId: project.id, autoApprove: false }, { onPlan });
+
+      expect(seenPlans).toHaveLength(1);
+      expect(seenPlans[0]?.items.map((it) => it.tier).sort()).toEqual(['tierA-public', 'tierC-api']);
+    }
+  });
+
+  it('AUTO SCOPE: a black-box project (no repoPath) has no detection signal and keeps the "both" default', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Auto Scope Black Box Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const scopedPlan = {
+      summary: 'Mixed-tier plan including a tierC-api item.',
+      items: [
+        { title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'Landing renders.' },
+        { title: 'Get profile', reqTag: 'REQ-900', tier: 'tierC-api', intent: 'Profile API responds.' },
+      ],
+    };
+    const scopedProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return {
+            provider: 'claude',
+            ok: true,
+            text: ['```json', JSON.stringify(scopedPlan), '```'].join('\n'),
+            raw: scopedPlan,
+            detail: 'OK',
+          };
+        }
+        return { provider: 'claude', ok: true, text: 'unused', raw: null, detail: 'OK' };
+      },
+    };
+
+    let detectCalls = 0;
+    const target: TargetAdapter = {
+      ...fakeTarget,
+      async detect(): Promise<DetectedProject> {
+        detectCalls += 1;
+        return fakeTarget.detect('unused');
+      },
+    };
+
+    const seenPlans: TestPlan[] = [];
+    const onPlan = async (plan: TestPlan): Promise<PlanApprovalResult> => {
+      seenPlans.push(plan);
+      return { decision: 'cancel' };
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: scopedProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => target,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    await orchestrator.run({ projectId: project.id, autoApprove: false }, { onPlan });
+
+    // No repoPath → no PLAN-time detect() call at all — the 'both' default survives untouched.
+    expect(detectCalls).toBe(0);
+    expect(seenPlans).toHaveLength(1);
+    expect(seenPlans[0]?.items.map((it) => it.tier).sort()).toEqual(['tierA-public', 'tierC-api']);
+  });
+
   it('PROVIDER FALLBACK: a ProviderRouter selects a ready fallback when the preferred provider is unhealthy', async () => {
     // The router fallback unit, driven purely by injected providers (the
     // orchestrator constructs its own router internally, so we exercise the

@@ -62,4 +62,40 @@ describe('authSetupContents — locale-aware login fixture', () => {
     expect(beforeIdx).toBeLessThan(gotoIdx);
     expect(storageIdx).toBeLessThan(afterIdx);
   });
+
+  it('throws immediately when credentials/login URL are not fully resolved, instead of writing an anonymous storageState', () => {
+    const fixture = authSetupContents();
+    // No env var is missing an anonymous fallback anymore: an incomplete
+    // email/password/loginUrl trio must throw, not silently produce
+    // {"cookies": [], "origins": []} — that anonymous session used to let
+    // every Tier B spec run to its own 60s timeout instead of failing fast.
+    expect(fixture).not.toContain('cookies: []');
+    expect(fixture).not.toContain('access(authFile)');
+    const guardIdx = fixture.indexOf('if (!email || !password || !loginUrl)');
+    const throwIdx = fixture.indexOf('throw new Error(');
+    expect(guardIdx).toBeGreaterThanOrEqual(0);
+    expect(throwIdx).toBeGreaterThan(guardIdx);
+    expect(fixture).toContain('Tier B auth setup skipped');
+    expect(fixture).toContain('testUsername/testPassword');
+  });
+
+  it('writes performedLogin:false before throwing on the missing-credentials path, so post-run triage can classify it as blocked', () => {
+    const fixture = authSetupContents();
+    const guardIdx = fixture.indexOf('if (!email || !password || !loginUrl)');
+    const blockStart = fixture.indexOf('{', guardIdx);
+    const blockEnd = fixture.indexOf('}', fixture.indexOf('throw new Error(', guardIdx));
+    const block = fixture.slice(blockStart, blockEnd);
+    expect(block).toContain('writeMeta(false)');
+    expect(block.indexOf('writeMeta(false)')).toBeLessThan(block.indexOf('throw new Error('));
+  });
+
+  it('never leaves the setup fixture with a no-op success path when credentials are missing', () => {
+    // Regression guard for the old shape: the function used to `return;` after
+    // the anonymous-session fallback so `setup('authenticate', ...)` resolved
+    // successfully. Now every path either performs a real login or throws.
+    const fixture = authSetupContents();
+    const setupBodyStart = fixture.indexOf("setup('authenticate'");
+    const setupBody = fixture.slice(setupBodyStart);
+    expect(setupBody).not.toMatch(/access\(authFile\)/);
+  });
 });

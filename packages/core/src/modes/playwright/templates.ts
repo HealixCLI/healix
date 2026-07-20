@@ -127,13 +127,14 @@ export default defineConfig({
 
 /**
  * Auth setup fixture. Healix injects real credentials into fixtures/.auth at
- * runtime; absent those, this writes an empty storageState so Tier B can still
- * load (specs then run as an anonymous user). A genuine login failure should
- * throw here — Healix surfaces that as a `blocked` Tier B outcome.
+ * runtime. When none are configured, or a genuine login attempt fails, this
+ * throws immediately so Playwright marks every Tier B spec `blocked` right
+ * away (via the `auth-setup` dependency) instead of each one individually
+ * running to its own timeout against an anonymous session.
  */
 export function authSetupContents(): string {
   return `import { test as setup } from '@playwright/test';
-import { mkdir, writeFile, access } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
 const authFile = 'fixtures/.auth/user.json';
@@ -151,9 +152,10 @@ async function writeMeta(performedLogin) {
 }
 
 /**
- * Establishes the Tier B authenticated storageState. By default this produces an
- * empty (anonymous) state. Wire your real login flow here, or have Healix inject
- * credentials via HEALIX_TIERB_* env vars. Throwing here marks Tier B blocked.
+ * Establishes the Tier B authenticated storageState. Requires Healix to have
+ * injected HEALIX_TIERB_EMAIL/PASSWORD/LOGIN_URL; if any are missing, or the
+ * login attempt doesn't leave an authenticated session, this throws — Tier B
+ * has no meaningful anonymous fallback, so there is nothing useful to run.
  */
 setup('authenticate', async ({ page }) => {
   await mkdir(dirname(authFile), { recursive: true });
@@ -162,48 +164,48 @@ setup('authenticate', async ({ page }) => {
   const password = process.env.HEALIX_TIERB_PASSWORD;
   const loginUrl = process.env.HEALIX_TIERB_LOGIN_URL;
 
-  if (email && password && loginUrl) {
-    // Written BEFORE the login attempt so a mid-login crash still leaves
-    // performedLogin:false on disk; overwritten with true only on success.
+  if (!email || !password || !loginUrl) {
     await writeMeta(false);
-    await page.goto(loginUrl);
-
-    // Locale-aware matchers (English + common Slovak forms observed in the
-    // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
-    // i18n engine, just enough to not be English-only.
-    const emailField = page.getByLabel(/e-?mail/i);
-    const loginRevealRe = /prihl|sign in|log ?in/i;
-
-    // Some apps gate the login form behind a reveal button/link (e.g. a
-    // "Prihlásiť sa" click before the email/password fields even render) —
-    // click through it before searching for the form.
-    const hasEmailField = await emailField
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (!hasEmailField) {
-      const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
-      await reveal
-        .first()
-        .click({ timeout: 5000 })
-        .catch(() => {});
-    }
-
-    await page.getByLabel(/e-?mail/i).fill(email);
-    await page.getByLabel(/heslo|password/i).fill(password);
-    await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
-    await page.waitForLoadState('networkidle').catch(() => {});
-    await page.context().storageState({ path: authFile });
-    await writeMeta(true);
-    return;
+    throw new Error(
+      'Tier B auth setup skipped: no test credentials configured for this project ' +
+        '(and no HEALIX_TIERB_EMAIL/PASSWORD/LOGIN_URL env vars set). ' +
+        'Set testUsername/testPassword on the project, or configure ' +
+        'HEALIX_TIERB_EMAIL/HEALIX_TIERB_PASSWORD/HEALIX_TIERB_LOGIN_URL, to run Tier B tests.',
+    );
   }
 
+  // Written BEFORE the login attempt so a mid-login crash still leaves
+  // performedLogin:false on disk; overwritten with true only on success.
   await writeMeta(false);
-  try {
-    await access(authFile);
-  } catch {
-    await writeFile(authFile, JSON.stringify({ cookies: [], origins: [] }), 'utf-8');
+  await page.goto(loginUrl);
+
+  // Locale-aware matchers (English + common Slovak forms observed in the
+  // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
+  // i18n engine, just enough to not be English-only.
+  const emailField = page.getByLabel(/e-?mail/i);
+  const loginRevealRe = /prihl|sign in|log ?in/i;
+
+  // Some apps gate the login form behind a reveal button/link (e.g. a
+  // "Prihlásiť sa" click before the email/password fields even render) —
+  // click through it before searching for the form.
+  const hasEmailField = await emailField
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (!hasEmailField) {
+    const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
+    await reveal
+      .first()
+      .click({ timeout: 5000 })
+      .catch(() => {});
   }
+
+  await page.getByLabel(/e-?mail/i).fill(email);
+  await page.getByLabel(/heslo|password/i).fill(password);
+  await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.context().storageState({ path: authFile });
+  await writeMeta(true);
 });
 `;
 }

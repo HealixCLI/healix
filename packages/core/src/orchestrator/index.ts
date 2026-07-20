@@ -511,6 +511,36 @@ async function runPipeline(
     // and LAUNCH needs it regardless of whether this is a resume.
     const target = makeTarget();
 
+    // Default (never override) testingScope to 'frontend' for a white-box
+    // project statically detected as frontend-only. Without this, every
+    // no-backend app still plans/generates tierC-api specs against a guessed
+    // base URL and guessed endpoints — structurally unable to pass. Detection
+    // is unambiguous-only: anything other than a clean 'frontend' verdict
+    // (including 'unknown') leaves the 'both' default alone, since a false
+    // narrow would silently drop real API coverage. An explicit user choice
+    // (including one restored from a resumed run's checkpoint) always wins —
+    // this only fires when opts.testingScope was never set.
+    if (opts.testingScope === undefined && project.repoPath) {
+      try {
+        const det = await target.detect(project.repoPath);
+        if (det.kind === 'frontend') {
+          opts.testingScope = 'frontend';
+          emit(
+            'plan',
+            'debug',
+            'Detected a frontend-only project (no backend found); defaulting testing scope to ' +
+              '"frontend" (skips tierC-api generation). Pass an explicit testingScope to include API tests.',
+          );
+        }
+      } catch (err) {
+        emit(
+          'plan',
+          'debug',
+          `Project-kind detection failed (testing scope defaults to 'both'): ${errMsg(err)}`,
+        );
+      }
+    }
+
     if (resumeFrom) {
       // Resuming: the plan was already finalized and approved before the
       // pause/interruption — replanning or re-showing the approval gate would

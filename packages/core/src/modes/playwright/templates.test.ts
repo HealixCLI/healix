@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { authSetupContents, playwrightConfigContents } from './templates.js';
+import { authSetupContents, mockFixtureContents, playwrightConfigContents } from './templates.js';
 
 describe('playwrightConfigContents — artifact capture policy', () => {
   it('records a screenshot AND video for every test, pass or fail', () => {
@@ -34,6 +34,24 @@ describe('playwrightConfigContents — artifact capture policy', () => {
   });
 });
 
+describe('mockFixtureContents', () => {
+  it('embeds the given routes and re-exports test/expect from @playwright/test', () => {
+    const src = mockFixtureContents([
+      { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+    ]);
+    expect(src).toContain("from '@playwright/test'");
+    expect(src).toContain('"id": "pkg:twilio"');
+    expect(src).toContain('"api.twilio.com"');
+    expect(src).toContain('page.route(');
+    expect(src).toContain('export { expect };');
+  });
+
+  it('produces a harmless no-op fixture for an empty route list', () => {
+    const src = mockFixtureContents([]);
+    expect(src).toContain('const MOCKED_ROUTES = []');
+  });
+});
+
 describe('authSetupContents — locale-aware login fixture', () => {
   it('matches email/password fields and the submit button in both English and common Slovak forms', () => {
     const fixture = authSetupContents();
@@ -55,12 +73,27 @@ describe('authSetupContents — locale-aware login fixture', () => {
   it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {
     const fixture = authSetupContents();
     const beforeIdx = fixture.indexOf('writeMeta(false)');
-    const gotoIdx = fixture.indexOf('page.goto(loginUrl)');
-    const storageIdx = fixture.indexOf('storageState({ path: authFile })');
+    const loginCallIdx = fixture.indexOf('await login(page, defaultCred, loginUrl, baseUrl, authFile)');
+    const storageIdx = fixture.indexOf('storageState({ path });');
     const afterIdx = fixture.indexOf('writeMeta(true)');
     expect(beforeIdx).toBeGreaterThanOrEqual(0);
-    expect(beforeIdx).toBeLessThan(gotoIdx);
-    expect(storageIdx).toBeLessThan(afterIdx);
+    expect(beforeIdx).toBeLessThan(loginCallIdx);
+    expect(loginCallIdx).toBeLessThan(afterIdx);
+    // storageState is captured inside the shared login()/loginForm()/loginUrlToken() helpers.
+    expect(storageIdx).toBeGreaterThanOrEqual(0);
+  });
+
+  it('dispatches to url-token login when a credential is authType url-token', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain("cred.authType === 'url-token'");
+    expect(fixture).toContain('loginUrlToken(page, cred, baseUrl, path)');
+  });
+
+  it('logs in every additional role-tagged credential into its own storageState file without blocking the default session', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('HEALIX_TIERB_CREDENTIALS_JSON');
+    expect(fixture).toContain('roleStorageStatePath');
+    expect(fixture).toContain('browser.newContext()');
   });
 
   it('throws immediately when credentials/login URL are not fully resolved, instead of writing an anonymous storageState', () => {

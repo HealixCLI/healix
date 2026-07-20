@@ -204,25 +204,56 @@ describe('updateProject', () => {
     const project = s.createProject({
       name: 'Auth Project',
       baseUrl: 'https://auth.test',
-      testUsername: 'tester@auth.test',
-      testPassword: 'hunter2',
+      credentials: [{ username: 'tester@auth.test', password: 'hunter2' }],
     });
-    expect(project.testUsername).toBe('tester@auth.test');
-    expect(project.testPassword).toBe('hunter2');
-    expect(s.getProject(project.id)).toMatchObject({
-      testUsername: 'tester@auth.test',
-      testPassword: 'hunter2',
-    });
+    const expected = [
+      {
+        id: expect.any(String),
+        authType: 'form',
+        username: 'tester@auth.test',
+        password: 'hunter2',
+        role: null,
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
+    ];
+    expect(project.credentials).toEqual(expected);
+    expect(s.getProject(project.id)?.credentials).toEqual(expected);
 
     const cleared = s.updateProject(project.id, {
       name: 'Auth Project',
       baseUrl: 'https://auth.test',
-      testUsername: null,
-      testPassword: null,
+      credentials: [],
     });
-    expect(cleared.testUsername).toBeNull();
-    expect(cleared.testPassword).toBeNull();
-    expect(s.getProject(project.id)).toMatchObject({ testUsername: null, testPassword: null });
+    expect(cleared.credentials).toEqual([]);
+    expect(s.getProject(project.id)?.credentials).toEqual([]);
+  });
+
+  it('supports multiple credentials with optional roles, preserving save order', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'Multi-Role Project',
+      baseUrl: 'https://auth.test',
+      credentials: [
+        { username: 'admin@auth.test', password: 'adminpw', role: 'admin' },
+        { username: 'user@auth.test', password: 'userpw' },
+      ],
+    });
+    expect(project.credentials.map((c) => ({ username: c.username, role: c.role }))).toEqual([
+      { username: 'admin@auth.test', role: 'admin' },
+      { username: 'user@auth.test', role: null },
+    ]);
+
+    // Replace-all: updating drops any credential not in the new list.
+    const updated = s.updateProject(project.id, {
+      name: 'Multi-Role Project',
+      baseUrl: 'https://auth.test',
+      credentials: [{ username: 'user@auth.test', password: 'userpw' }],
+    });
+    expect(updated.credentials).toHaveLength(1);
+    expect(updated.credentials[0]?.role).toBeNull();
   });
 
   it('throws and persists nothing when the edit would violate the invariant', async () => {
@@ -334,6 +365,27 @@ describe('deleteRun cascade', () => {
     expect(await countRows('tests')).toBe(N);
     expect(await countRows('results')).toBe(N);
     expect(await countRows('agent_events')).toBe(N);
+  });
+});
+
+describe('insertResult', () => {
+  it('DUPLICATE-RESULT GUARD: re-persisting a result for the same testId replaces the prior row instead of adding a second one', async () => {
+    // Simulates a tier re-executed after a resume that raced the checkpoint
+    // write (see insertResult's doc comment) — the orchestrator calls
+    // insertResult again for a test that already has a result row from the
+    // earlier, unacknowledged attempt.
+    const s = await store();
+    const project = s.createProject({ name: 'result-upsert', baseUrl: 'https://result-upsert.test' });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({ runId: run.id, title: 't0', reqTag: null, tier: null, status: 'pending' });
+
+    s.insertResult({ testId: t.id, status: 'failed', durationMs: 10, error: 'boom', artifactsJson: null });
+    s.insertResult({ testId: t.id, status: 'passed', durationMs: 12, error: null, artifactsJson: null });
+
+    const results = s.listResults(run.id);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ testId: t.id, status: 'passed', durationMs: 12 });
+    expect(await countRows('results')).toBe(1);
   });
 });
 

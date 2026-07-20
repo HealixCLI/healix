@@ -42,12 +42,26 @@ import {
   type Run,
   type PauseReason,
   readCheckpoint,
+  readRunConfigSnapshot,
+  type RunConfigSnapshot,
   type SuiteMode,
   type TestCase,
   type TestResult,
   type AgentEvent,
   type HealthResult,
 } from '@healix/core';
+
+// Last-resort net: every ipcMain handler already catches its own errors and
+// reports them as run/queue failures, but an error escaping that net (a bug
+// in the catch path itself, a rejection with no attached .catch, an error
+// thrown outside any handler) would otherwise crash the whole Electron main
+// process and take the app down with it. Log and keep running instead.
+process.on('uncaughtException', (err) => {
+  console.error('[healix:uncaughtException]', err);
+});
+process.on('unhandledRejection', (reason) => {
+  console.error('[healix:unhandledRejection]', reason);
+});
 
 /**
  * Custom scheme that serves run artifacts (screenshots / videos / traces) into
@@ -191,8 +205,7 @@ ipcMain.handle('projects:create', async (_e, input: NewProject): Promise<Project
     mode: input.mode ?? 'playwright',
     repoPath,
     baseUrl: normalizeOptional(input.baseUrl),
-    testUsername: normalizeOptional(input.testUsername),
-    testPassword: normalizeOptional(input.testPassword),
+    credentials: input.credentials,
   });
 });
 
@@ -207,8 +220,7 @@ ipcMain.handle('projects:update', async (_e, payload: { id: string } & NewProjec
     mode: input.mode ?? 'playwright',
     repoPath: normalizeOptional(input.repoPath),
     baseUrl: normalizeOptional(input.baseUrl),
-    testUsername: normalizeOptional(input.testUsername),
-    testPassword: normalizeOptional(input.testPassword),
+    credentials: input.credentials,
   });
 });
 
@@ -336,6 +348,12 @@ export interface StartRunArgs {
   provider?: ProviderId;
   autoApprove?: boolean;
   prd?: string;
+  /**
+   * Freeform additional instructions from the user, steering HOW the plan is
+   * built (e.g. "focus on accessibility", "prefer data-testid selectors") —
+   * distinct from the PRD, which describes WHAT the app does.
+   */
+  instructions?: string;
   /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
@@ -365,6 +383,7 @@ async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunS
         testingScope: args.testingScope,
         autoApprove: args.autoApprove ?? false,
         prd: args.prd,
+        instructions: args.instructions,
         suiteMode: args.suiteMode,
         baseRunId: args.baseRunId,
         signal: controller.signal,
@@ -703,14 +722,29 @@ ipcMain.handle(
 
 ipcMain.handle(
   'export:suite',
-  async (_e, args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) => {
+  async (
+    _e,
+    args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean; projectId?: string },
+  ) => {
     if (!args?.suiteDir) throw new Error('suiteDir is required to export a suite.');
     const outDir = args.outDir ?? join(projectsDir(), 'exports');
+    // Thread the project's own test-login credentials through so sanitize can
+    // redact literal occurrences of them (e.g. a hardcoded password in a
+    // generated spec) — the generic KEY=value secret patterns don't catch that.
+    const store = await getStore();
+    const project = args.projectId ? store?.getProject(args.projectId) : undefined;
     const bundle = await exportSuite({
       suiteDir: args.suiteDir,
       outDir,
       sanitize: args.sanitize ?? true,
       zip: args.zip ?? true,
+      // A url-token credential's secret lives in `token`, not `password` — pass
+      // it through the same `password` slot so sanitize's literal-value
+      // redaction (which only looks at username/password) still catches it.
+      credentials: project?.credentials.map((c) => ({
+        username: c.username,
+        password: c.authType === 'url-token' ? c.token : c.password,
+      })),
     });
     return bundle;
   },
@@ -913,6 +947,12 @@ export interface RunDetail {
   reportHtmlPath: string | null;
   /** The plan persisted to disk at plan/plan.json, when present. */
   plan: TestPlan | null;
+  /**
+   * The user-facing options (testingScope/suiteMode/provider/prd/instructions)
+   * this run was started with, read from run-config.json — null when absent
+   * (a run from before this feature existed, or the write failed).
+   */
+  runConfig: RunConfigSnapshot | null;
 }
 
 ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<RunDetail> => {
@@ -926,6 +966,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     artifacts: [],
     reportHtmlPath: null,
     plan: null,
+    runConfig: null,
   };
   const runId = payload?.runId;
   if (!runId) return empty;
@@ -966,6 +1007,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   let artifacts: string[] = [];
   let reportHtmlPath: string | null = null;
   let plan: TestPlan | null = null;
+  let runConfig: RunConfigSnapshot | null = null;
 
   if (run) {
     const runDir = join(projectsDir(), run.projectId, 'runs', runId);
@@ -976,9 +1018,10 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     const html = join(runDir, 'reports', 'report.html');
     if (await isFile(html)) reportHtmlPath = html;
     plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
+    runConfig = await readRunConfigSnapshot(runDir);
   }
 
-  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan };
+  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan, runConfig };
 });
 
 /** Most recent fully-passed run for a project — drives the Suite Mode toggle's enable/disable state. */

@@ -21,8 +21,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     baseUrl: 'https://example.test',
     createdAt: '2026-01-01T00:00:00.000Z',
     archivedAt: null,
-    testUsername: null,
-    testPassword: null,
+    credentials: [],
     ...overrides,
   };
 }
@@ -408,6 +407,47 @@ describe('buildPlanPrompt (repo context)', () => {
     expect(prompt).toContain('[endpoint] GET /health (unitKey: "endpoint:GET /health")');
     expect(prompt).toContain('one item per distinct route/endpoint');
     expect(prompt).toContain('"unitKey"');
+  });
+});
+
+describe('buildPlanPrompt (PRD + interactive instructions)', () => {
+  it('omits both the PRD and instructions sections when neither is provided', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test' });
+    expect(prompt).not.toContain('PRD / acceptance criteria');
+    expect(prompt).not.toContain('Additional instructions from the user');
+  });
+
+  it('includes the PRD text verbatim when provided', () => {
+    const prompt = buildPlanPrompt(makeProject(), {
+      projectId: 'prj_test',
+      prd: 'Users must be able to reset their password via email.',
+    });
+    expect(prompt).toContain('PRD / acceptance criteria to ground the plan:');
+    expect(prompt).toContain('Users must be able to reset their password via email.');
+  });
+
+  it("includes the user's additional instructions verbatim, separate from the PRD section", () => {
+    const prompt = buildPlanPrompt(makeProject(), {
+      projectId: 'prj_test',
+      instructions: 'Focus on accessibility; prefer data-testid selectors; skip mobile viewports.',
+    });
+    expect(prompt).toContain('Additional instructions from the user');
+    expect(prompt).toContain('Focus on accessibility; prefer data-testid selectors; skip mobile viewports.');
+  });
+
+  it('includes both PRD and instructions together when both are provided', () => {
+    const prompt = buildPlanPrompt(makeProject(), {
+      projectId: 'prj_test',
+      prd: 'Checkout must support three payment methods.',
+      instructions: 'Only plan tierA-public scenarios for now.',
+    });
+    expect(prompt).toContain('Checkout must support three payment methods.');
+    expect(prompt).toContain('Only plan tierA-public scenarios for now.');
+  });
+
+  it('ignores whitespace-only instructions (same as whitespace-only PRD)', () => {
+    const prompt = buildPlanPrompt(makeProject(), { projectId: 'prj_test', instructions: '   \n  ' });
+    expect(prompt).not.toContain('Additional instructions from the user');
   });
 });
 

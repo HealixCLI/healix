@@ -28,6 +28,10 @@ import type {
 import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
+import { detectExternalDependencies } from '../target/dependencies.js';
+import { generateMockResponses } from '../target/mock-responses.js';
+import { mockDependencyUrl, startMockServer } from '../target/mock-server.js';
+import type { ExternalDependency, MockResponse, MockServerHandle } from '../target/types.js';
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
@@ -68,6 +72,7 @@ import {
   writeCheckpoint,
   type ResumeCheckpoint,
 } from './checkpoint.js';
+import { writeRunConfigSnapshot } from './run-config.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
@@ -180,6 +185,7 @@ async function resumePipeline(
     provider: checkpoint.runOptions.provider,
     autoApprove: true,
     prd: checkpoint.runOptions.prd,
+    instructions: checkpoint.runOptions.instructions,
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
@@ -238,15 +244,23 @@ async function runPipeline(
       return { runId: '', status: 'error' };
     }
   }
-  // Every base-run test with a known spec file — the only thing that gates
-  // carrying a test forward is having a physical file to copy, not its
-  // previous status.
-  const baseTestsWithSpec: TestCase[] = baseRun ? store.listTests(baseRun.id).filter((t) => t.specPath) : [];
-  // TOP-UP only carries forward proven-good (passing) tests — a failing/
-  // blocked test is left for the fresh exploration to decide whether it's
-  // still worth testing (and, if so, regenerate) rather than silently
-  // re-including a known-bad test unchanged.
-  const basePassingTests: TestCase[] = baseTestsWithSpec.filter((t) => t.status === 'passed');
+  // Every base-run test, carried forward regardless of status — reuse/top-up
+  // must reproduce the base run's exact test count, not a subset of it.
+  // Carrying a test forward needs its spec FILE, not just its own DB row: a
+  // row can lack `specPath` (e.g. persistResults' fallback-insert path, hit
+  // when a resumed/re-executed tier's result didn't positionally match its
+  // pre-registered row) while a SIBLING row for the same reqTag still has it
+  // — same underlying .spec.ts file, so the file (and this scenario inside
+  // it) is already known and must not be silently dropped. Resolve a missing
+  // specPath from any sibling sharing the same reqTag before filtering.
+  const baseTests: TestCase[] = baseRun ? store.listTests(baseRun.id) : [];
+  const specPathByReqTag = new Map<string, string>();
+  for (const t of baseTests) {
+    if (t.specPath && t.reqTag && !specPathByReqTag.has(t.reqTag)) specPathByReqTag.set(t.reqTag, t.specPath);
+  }
+  const baseTestsWithSpec: TestCase[] = baseTests
+    .map((t) => (t.specPath || !t.reqTag ? t : { ...t, specPath: specPathByReqTag.get(t.reqTag) ?? null }))
+    .filter((t) => t.specPath);
 
   let run: Run;
   let runId: string;
@@ -371,6 +385,18 @@ async function runPipeline(
     return { runId, status: 'error' };
   }
 
+  // Permanent record of the user-facing options this run was started with —
+  // unlike checkpoint.json (deleted once the run leaves 'paused'), this never
+  // gets removed, so the desktop app can show "what was this run configured
+  // with" even after it finishes. Rewritten identically on resume (same opts).
+  await writeRunConfigSnapshot(runDir, {
+    testingScope: opts.testingScope,
+    suiteMode: opts.suiteMode,
+    provider: opts.provider,
+    prd: opts.prd,
+    instructions: opts.instructions,
+  });
+
   if (!resumeFrom) {
     setStatus('pending', { startedAt: nowIso() });
   }
@@ -393,6 +419,14 @@ async function runPipeline(
   // Set during PLAN (white-box only); reused after EXECUTE by the coverage-feedback
   // loop, which needs the same functionality inventory the initial plan was grounded on.
   let repoIndex: PlanRepoContext | undefined;
+  // Detected automatically during PLAN for every white-box project (no opt-in
+  // needed — see the DEPENDENCIES sub-phase below); mockResponses holds the
+  // resolved canned content per dependency id. mockServerHandle
+  // is only non-null once LAUNCH has started the local server for env-override/both
+  // dependencies, and is always stopped in the run's cleanup alongside launchHandle.
+  let externalDependencies: ExternalDependency[] = [];
+  let mockResponses: Map<string, MockResponse> = new Map();
+  let mockServerHandle: MockServerHandle | null = null;
   // Full white-box static-analysis result (routes/endpoints + forms/auth-patterns/selector
   // hints), set alongside repoIndex during PLAN. repoIndex.functionality is a projection of
   // sourceContext.units for backward compatibility; sourceContext itself is what GENERATE and
@@ -449,6 +483,7 @@ async function runPipeline(
         provider: opts.provider,
         autoApprove: opts.autoApprove,
         prd: opts.prd,
+        instructions: opts.instructions,
       },
       plan: effectivePlan,
       generatedItemIds: effectivePlan.items
@@ -556,6 +591,32 @@ async function runPipeline(
       plan = resumeFrom.checkpoint.plan;
       await writeJson(join(runDir, 'plan', 'plan.json'), plan);
       emit('plan', 'info', `Resumed plan: ${plan.items.length} item(s).`);
+      // DEPENDENCIES detection also doesn't re-run on resume (it's part of the
+      // same skipped PLAN pass) — reload what was already detected/resolved
+      // from plan/dependencies.json so LAUNCH can still restart the mock
+      // server and GENERATE/report still see the same dependencies. Best
+      // effort: an unreadable/missing file (e.g. a black-box project, which
+      // never had one to begin with) just means no mocking on resume, same
+      // as if detection had found nothing.
+      try {
+        const raw = await readFile(join(runDir, 'plan', 'dependencies.json'), 'utf-8');
+        const saved = JSON.parse(raw) as Array<ExternalDependency & { mockResponse: MockResponse | null }>;
+        externalDependencies = saved.map(({ mockResponse: _mockResponse, ...dep }) => dep);
+        mockResponses = new Map(
+          saved.filter((d) => d.mockResponse !== null).map((d) => [d.id, d.mockResponse as MockResponse]),
+        );
+        emit(
+          'plan',
+          'debug',
+          `Resumed ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'} for mocking.`,
+        );
+      } catch (err) {
+        emit(
+          'plan',
+          'debug',
+          `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`,
+        );
+      }
       setStatus('awaiting-approval');
       if (checkCancelled()) return await pauseOrCancel('approve');
       planForGeneration = { ...plan, items: plan.items.filter(isPlanItemIncluded) };
@@ -621,6 +682,47 @@ async function runPipeline(
               `Functionality indexing failed (planning without route context): ${errMsg(err)}`,
             );
           }
+
+          // ---- 3b. DEPENDENCIES (white-box, automatic) ----
+          // Detect external dependencies (backend APIs the frontend calls, third-party
+          // SMS/email/OTP/payment SDKs) and resolve mock content for them BEFORE launch,
+          // so LAUNCH can redirect env-override dependencies and GENERATE can scaffold
+          // the route-intercept fixture with real content already in hand. Always runs
+          // for a white-box project — no opt-in needed; a project with nothing to mock
+          // just gets an empty list here, which is harmless downstream.
+          try {
+            externalDependencies = await detectExternalDependencies(project.repoPath);
+            emit(
+              'dependencies',
+              'info',
+              `Detected ${externalDependencies.length} external dependenc${externalDependencies.length === 1 ? 'y' : 'ies'}.`,
+              { dependencies: externalDependencies },
+            );
+          } catch (err) {
+            emit(
+              'dependencies',
+              'warn',
+              `Dependency detection failed (continuing without mocks): ${errMsg(err)}`,
+            );
+          }
+          if (externalDependencies.length > 0) {
+            try {
+              mockResponses = await generateMockResponses(externalDependencies, provider, {
+                repoPath: project.repoPath,
+                signal,
+              });
+            } catch (err) {
+              emit(
+                'dependencies',
+                'debug',
+                `Mock response generation failed (using static fallbacks): ${errMsg(err)}`,
+              );
+            }
+          }
+          await writeJson(
+            join(runDir, 'plan', 'dependencies.json'),
+            externalDependencies.map((d) => ({ ...d, mockResponse: mockResponses.get(d.id) ?? null })),
+          );
         }
 
         plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
@@ -682,10 +784,13 @@ async function runPipeline(
         // runs:detail, and the report all read from here on.
         await writeJson(join(runDir, 'plan', 'plan.json'), plan);
         const includedItems = plan.items.filter(isPlanItemIncluded);
-        if (includedItems.length === 0) {
+        if (includedItems.length === 0 && plan.planSource !== 'reuse') {
           // Every item was rejected — a deliberate empty plan, not a pipeline
           // failure, so this reads as a cancellation rather than falling into
-          // the "verified nothing" error path further down.
+          // the "verified nothing" error path further down. Reuse plans are
+          // exempt: they never had AI-generated items to approve in the first
+          // place (see suiteMode === 'reuse' above), so an empty items array
+          // there is the expected shape, not a rejection.
           emit('approve', 'info', 'All plan items were rejected; cancelling run.');
           setStatus('cancelled', { finishedAt: nowIso() });
           return { runId, status: 'cancelled' };
@@ -741,6 +846,40 @@ async function runPipeline(
             { detectedPort: det.port, port },
           );
         }
+        // Mock env-override/both dependencies: start the local mock server once
+        // and point each dependency's own env var at it, so the spawned app's
+        // outbound calls hit the mock instead of the real (unreachable) service.
+        // Best-effort — a failure here must not block the launch, it just means
+        // those dependencies won't be mocked for this run.
+        const mockableEnvDeps = externalDependencies.filter(
+          (d) => d.envVar && (d.mockStrategy === 'env-override' || d.mockStrategy === 'both'),
+        );
+        let launchEnv: Record<string, string> | undefined;
+        if (mockableEnvDeps.length > 0) {
+          try {
+            mockServerHandle = await startMockServer(externalDependencies, mockResponses);
+            launchEnv = {};
+            for (const dep of mockableEnvDeps) {
+              if (!dep.envVar) continue;
+              launchEnv[dep.envVar] = mockDependencyUrl(mockServerHandle.baseUrl, dep.id);
+            }
+            emit(
+              'launch',
+              'info',
+              `[launch] Mock server started at ${mockServerHandle.baseUrl} for ${mockableEnvDeps.length} dependenc${mockableEnvDeps.length === 1 ? 'y' : 'ies'}.`,
+              { env: Object.keys(launchEnv) },
+            );
+          } catch (err) {
+            emit(
+              'launch',
+              'warn',
+              `[launch] Failed to start mock server (continuing without it): ${errMsg(err)}`,
+            );
+            mockServerHandle = null;
+            launchEnv = undefined;
+          }
+        }
+
         const doLaunch = async (): Promise<void> => {
           const handle = await target.launch({
             repoPath,
@@ -760,6 +899,7 @@ async function runPipeline(
             baseUrl: port === det.port ? (det.baseUrl ?? undefined) : undefined,
             port,
             readyTimeoutMs: 120000,
+            ...(launchEnv ? { env: launchEnv } : {}),
           });
           launchHandle = handle;
           effectiveBaseUrl = handle.baseUrl;
@@ -829,6 +969,8 @@ async function runPipeline(
           outcome,
           triageEntries,
           artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
           noteStoreOk,
           noteStoreFailure,
         );
@@ -840,8 +982,7 @@ async function runPipeline(
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
       baseUrl: effectiveBaseUrl,
-      testUsername: project.testUsername,
-      testPassword: project.testPassword,
+      credentials: project.credentials,
       provider,
       target,
       browser,
@@ -853,6 +994,13 @@ async function runPipeline(
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
       signal,
+      ...(externalDependencies.length > 0
+        ? {
+            mockExternalDependencies: true,
+            externalDependencies,
+            mockResponses: Object.fromEntries(mockResponses),
+          }
+        : {}),
     };
     const mode = getMode(project.mode);
 
@@ -918,13 +1066,16 @@ async function runPipeline(
         }
 
         try {
+          // EXPLORE only needs ONE representative session to find/confirm a login
+          // form — not every role. Prefer a roleless credential (the "default"
+          // session Tier B also falls back to) over a role-tagged one.
+          const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
           const exploration = await runExplorePhase({
             browser,
             baseUrl: effectiveBaseUrl,
-            credentials:
-              ctx.testUsername && ctx.testPassword
-                ? { username: ctx.testUsername, password: ctx.testPassword }
-                : undefined,
+            credentials: defaultCredential
+              ? { username: defaultCredential.username, password: defaultCredential.password }
+              : undefined,
             staticRoutePaths,
             emit,
             onFrame: hooks?.onFrame,
@@ -987,6 +1138,8 @@ async function runPipeline(
           outcome,
           triageEntries,
           artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary },
@@ -1009,7 +1162,7 @@ async function runPipeline(
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
         } else if (suiteMode === 'topup') {
-          const diff = diffAgainstBase(planForGeneration.items, basePassingTests);
+          const diff = diffAgainstBase(planForGeneration.items, baseTestsWithSpec);
           emit(
             'generate',
             'info',
@@ -1045,12 +1198,21 @@ async function runPipeline(
             { quarantined: validation.quarantined.map((q) => ({ title: q.spec.title, reason: q.reason })) },
           );
         }
-        const validatedByPath = new Map([...validation.ok, ...validation.repaired].map((s) => [s.path, s]));
+        // Only `contents` legitimately flows out of validation (a bracket-repair
+        // rewrite — see validate.ts's `{ ...spec, contents: fixed }`); title/
+        // reqTag/tier must stay whatever the ORIGINAL entry carried. Keying a
+        // Map by `path` alone and swapping in its whole value would collapse
+        // every entry sharing that path onto a single winner's identity —
+        // exactly what happens for a multi-scenario carried-forward file,
+        // where one physical spec legitimately backs several distinct rows.
+        const contentsByPath = new Map(
+          [...validation.ok, ...validation.repaired].map((s) => [s.path, s.contents]),
+        );
         newSpecs = newSpecs.flatMap((s) =>
-          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+          contentsByPath.has(s.path) ? [{ ...s, contents: contentsByPath.get(s.path)! }] : [],
         );
         carriedSpecs = carriedSpecs.flatMap((s) =>
-          validatedByPath.has(s.path) ? [validatedByPath.get(s.path)!] : [],
+          contentsByPath.has(s.path) ? [{ ...s, contents: contentsByPath.get(s.path)! }] : [],
         );
 
         specs = [...newSpecs, ...carriedSpecs];
@@ -1094,6 +1256,8 @@ async function runPipeline(
           outcome,
           triageEntries,
           artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary },
@@ -1164,6 +1328,8 @@ async function runPipeline(
         outcome,
         triageEntries,
         artifactFiles,
+        externalDependencies,
+        computeMockedRequestCounts(mockServerHandle),
         noteStoreOk,
         noteStoreFailure,
         { generationStats, coverage: coverageSummary },
@@ -1450,6 +1616,8 @@ async function runPipeline(
         outcome,
         triageEntries,
         artifactFiles,
+        externalDependencies,
+        computeMockedRequestCounts(mockServerHandle),
         noteStoreOk,
         noteStoreFailure,
         { generationStats, coverage: coverageSummary },
@@ -1527,6 +1695,8 @@ async function runPipeline(
           outcome,
           triageEntries,
           artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary },
@@ -1545,6 +1715,16 @@ async function runPipeline(
         emit('launch', 'debug', '[launch] App stopped.');
       } catch (err) {
         emit('launch', 'warn', `[launch] Failed to stop app: ${errMsg(err)}`, { stack: errStack(err) });
+      }
+    }
+    if (mockServerHandle) {
+      try {
+        await mockServerHandle.stop();
+        emit('launch', 'debug', '[launch] Mock server stopped.');
+      } catch (err) {
+        emit('launch', 'warn', `[launch] Failed to stop mock server: ${errMsg(err)}`, {
+          stack: errStack(err),
+        });
       }
     }
     // A checkpoint is only meaningful while the run is 'paused' — once it
@@ -2070,6 +2250,8 @@ async function finalizeReport(
   outcome: ExecOutcome | null,
   triage: ReportTriageEntry[],
   artifacts: string[],
+  dependencies: ExternalDependency[],
+  mockedRequestCounts: Record<string, number>,
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
   degradation?: {
@@ -2085,6 +2267,8 @@ async function finalizeReport(
     outcome,
     triage,
     artifacts,
+    dependencies,
+    mockedRequestCounts,
     generation: degradation?.generationStats,
     coverage: degradation?.coverage ?? null,
   });
@@ -2194,6 +2378,14 @@ export function looksLikeMissingDeps(message: string): boolean {
 
 function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+/** Tally the mock server's request log by dependency id, for the report. */
+function computeMockedRequestCounts(handle: MockServerHandle | null): Record<string, number> {
+  if (!handle) return {};
+  const counts: Record<string, number> = {};
+  for (const r of handle.requestLog) counts[r.dependencyId] = (counts[r.dependencyId] ?? 0) + 1;
+  return counts;
 }
 
 function errMsg(err: unknown): string {

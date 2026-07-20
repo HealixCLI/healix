@@ -1,9 +1,9 @@
 import type { ProviderAdapter } from '../providers/types.js';
-import type { TargetAdapter } from '../target/types.js';
+import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
 import type { SourceContext } from '../target/source-context.js';
-import type { ModeId, Tier, TestStatus } from '../storage/types.js';
+import type { ModeId, ProjectCredential, Tier, TestStatus } from '../storage/types.js';
 
 /** Result of the multi-page/multi-role EXPLORE crawl, grounding GENERATE. */
 export interface ExplorationArtifact {
@@ -186,9 +186,8 @@ export interface TestModeContext {
   projectDir: string;
   repoPath?: string | null;
   baseUrl?: string | null;
-  /** Login identifier (username or email) for authenticated (tierB) flows. */
-  testUsername?: string | null;
-  testPassword?: string | null;
+  /** Test login identities for authenticated (tierB) flows — see storage's ProjectCredential. */
+  credentials?: ProjectCredential[];
   provider: ProviderAdapter;
   target: TargetAdapter;
   browser: BrowserSurface;
@@ -202,6 +201,19 @@ export interface TestModeContext {
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
+  /**
+   * True whenever PLAN's automatic dependency detection found at least one
+   * external dependency for this (white-box) project — scaffold() writes a
+   * page.route() fixture for 'route-intercept'/'both' dependencies, and
+   * generate() directs specs to import test/expect from it instead of
+   * '@playwright/test' directly. Always false for black-box projects (no
+   * source to scan) or when detection found nothing to mock.
+   */
+  mockExternalDependencies?: boolean;
+  /** Dependencies detected for this run (only set when mockExternalDependencies is true). */
+  externalDependencies?: ExternalDependency[];
+  /** Resolved canned response per dependency id (see externalDependencies), keyed by ExternalDependency.id. */
+  mockResponses?: Record<string, MockResponse>;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

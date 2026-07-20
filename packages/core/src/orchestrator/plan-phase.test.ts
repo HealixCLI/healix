@@ -32,8 +32,7 @@ function makeProject(overrides: Partial<Project> = {}): Project {
     baseUrl: null,
     createdAt: '2026-01-01T00:00:00.000Z',
     archivedAt: null,
-    testUsername: null,
-    testPassword: null,
+    credentials: [],
     ...overrides,
   };
 }

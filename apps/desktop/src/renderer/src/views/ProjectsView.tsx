@@ -1,16 +1,19 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import type { FormEvent, ReactNode } from 'react';
 import type { NewProject, Project } from '@healix/core';
 import {
   Archive,
   ArchiveRestore,
+  ChevronDown,
+  ChevronRight,
   Eye,
   EyeOff,
   FolderGit2,
-  Globe,
   LayoutDashboard,
   Pencil,
+  Play,
   Plus,
+  RefreshCw,
   Trash2,
 } from 'lucide-react';
 import { Button } from '../components/ui/button';
@@ -21,10 +24,51 @@ import { Input } from '../components/ui/input';
 import { Label } from '../components/ui/label';
 import { Select } from '../components/ui/select';
 import { useProjects } from '../lib/use-projects';
+import { cn } from '../lib/utils';
 
 /**
- * Which form (if any) is currently shown: closed, creating a new project,
- * editing an existing one, or viewing an existing one read-only.
+ * One in-progress credential row in the form — every field is a plain string
+ * (never null) for controlled inputs; `extraParams` is edited as multiline
+ * "key=value" text and parsed into a Record on submit.
+ */
+interface CredentialFormRow {
+  /** Stable per-row identity for React's key (and for locating this row on change/remove) — the saved credential's own id, or a generated one for a new row. Never submitted. */
+  key: string;
+  authType: 'form' | 'url-token';
+  role: string;
+  username: string;
+  password: string;
+  token: string;
+  urlTemplate: string;
+  extraParams: string;
+  authCheckText: string;
+}
+
+/** "key=value" per line -> Record, blank/malformed lines dropped. */
+function parseExtraParams(text: string): Record<string, string> | null {
+  const out: Record<string, string> = {};
+  for (const line of text.split('\n')) {
+    const idx = line.indexOf('=');
+    if (idx <= 0) continue;
+    const key = line.slice(0, idx).trim();
+    const value = line.slice(idx + 1).trim();
+    if (key) out[key] = value;
+  }
+  return Object.keys(out).length > 0 ? out : null;
+}
+
+/** Record -> "key=value" per line, for editing. */
+function formatExtraParams(params: Record<string, string> | null): string {
+  return Object.entries(params ?? {})
+    .map(([k, v]) => `${k}=${v}`)
+    .join('\n');
+}
+
+/**
+ * Which form (if any) is currently shown in the main pane: nothing selected,
+ * creating a new project, editing an existing one, or viewing an existing one
+ * read-only. Selecting a project in the explorer panel always lands on 'view'
+ * first — 'edit' is only reached from the view page's own Edit button.
  */
 type FormState =
   | { kind: 'closed' }
@@ -32,112 +76,112 @@ type FormState =
   | { kind: 'edit'; project: Project }
   | { kind: 'view'; project: Project };
 
+/**
+ * VSCode-Explorer-style two-pane layout: a slim list of project names on the
+ * left (this file's ProjectExplorerPanel), and the selected project's detail
+ * page (view/edit) or the create form in the main pane to its right.
+ */
 export function ProjectsView({
   onRunProject,
   onOpenDashboard,
+  sidebarCollapsed = false,
 }: {
   onRunProject?: (project: Project) => void;
   onOpenDashboard?: (project: Project) => void;
+  /** Hides the explorer panel entirely — toggled from the activity bar by re-clicking the Projects icon. */
+  sidebarCollapsed?: boolean;
 }) {
-  const { projects, loading, error, create, update, remove, archive } = useProjects();
+  const { projects, loading, error, create, update, remove, archive, refresh } = useProjects();
   const [formState, setFormState] = useState<FormState>({ kind: 'closed' });
 
   const active = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
-  const archived = useMemo(() => projects.filter((p) => p.archivedAt), [projects]);
 
   const closeForm = () => setFormState({ kind: 'closed' });
-  const toggleCreate = () =>
-    setFormState((s) => (s.kind === 'create' ? { kind: 'closed' } : { kind: 'create' }));
+
+  // Keep the open detail page in sync with the underlying project list (e.g.
+  // after an edit's refresh() resolves) — otherwise 'view'/'edit' would keep
+  // showing the stale project object captured at selection time.
+  useEffect(() => {
+    setFormState((s) => {
+      if (s.kind !== 'view' && s.kind !== 'edit') return s;
+      const fresh = projects.find((p) => p.id === s.project.id);
+      if (!fresh) return { kind: 'closed' };
+      return fresh === s.project ? s : { ...s, project: fresh };
+    });
+  }, [projects]);
+
+  const selectedProjectId =
+    formState.kind === 'view' || formState.kind === 'edit' ? formState.project.id : null;
 
   return (
-    <div className="mx-auto max-w-4xl px-8 pb-16 pt-8">
-      <header className="flex items-end justify-between border-b border-border pb-5">
-        <div>
-          <h1 className="font-mono text-xl font-semibold tracking-tight">Projects</h1>
-          <p className="mt-1 text-sm text-muted">
-            Targets healix can plan, generate, and run suites against.
-          </p>
-        </div>
-        <Button variant={formState.kind === 'create' ? 'outline' : 'default'} onClick={toggleCreate}>
-          <Plus className="h-4 w-4" />
-          {formState.kind === 'create' ? 'Close' : 'New project'}
-        </Button>
-      </header>
-
-      {error && (
-        <p className="mt-4 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">{error}</p>
-      )}
-
-      {formState.kind === 'create' && (
-        <ProjectForm onSubmit={create} onDone={closeForm} existingActiveProjects={active} />
-      )}
-      {formState.kind === 'edit' && (
-        <ProjectForm
-          project={formState.project}
-          onSubmit={(input) => update(formState.project.id, input)}
-          onDone={closeForm}
-          existingActiveProjects={active}
-        />
-      )}
-      {formState.kind === 'view' && (
-        <ProjectForm
-          project={formState.project}
-          readOnly
-          onEdit={() => setFormState({ kind: 'edit', project: formState.project })}
-          onDone={closeForm}
+    <div className="flex h-full min-h-0">
+      {!sidebarCollapsed && (
+        <ProjectExplorerPanel
+          projects={projects}
+          loading={loading}
+          selectedProjectId={selectedProjectId}
+          onSelect={(p) => setFormState({ kind: 'view', project: p })}
+          onNewProject={() =>
+            setFormState((s) => (s.kind === 'create' ? { kind: 'closed' } : { kind: 'create' }))
+          }
+          creating={formState.kind === 'create'}
+          onRefresh={() => void refresh()}
         />
       )}
 
-      <section className="mt-6 flex flex-col gap-2">
-        {loading && <p className="text-sm text-muted">Loading projects…</p>}
-        {!loading && projects.length === 0 && (
-          <Card>
-            <CardContent className="py-8 text-center text-sm text-muted">
-              No projects yet. Create one to start a run.
-            </CardContent>
-          </Card>
+      <div className="min-w-0 flex-1 overflow-y-auto px-8 pb-16 pt-8">
+        {error && (
+          <p className="mb-4 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">{error}</p>
         )}
-        {active.map((p) => (
-          <ProjectRow
-            key={p.id}
-            project={p}
-            onView={() => setFormState({ kind: 'view', project: p })}
-            onEdit={() => setFormState({ kind: 'edit', project: p })}
-            onDelete={() => void remove(p.id)}
-            onArchive={() => void archive(p.id, true)}
-            onRun={onRunProject ? () => onRunProject(p) : undefined}
-            onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(p) : undefined}
-          />
-        ))}
-      </section>
 
-      {archived.length > 0 && (
-        <section className="mt-8">
-          <h2 className="mb-3 flex items-center gap-2 text-sm font-semibold text-muted">
-            <Archive className="h-3.5 w-3.5" />
-            Archived
-            <span className="font-normal">· {archived.length}</span>
-          </h2>
-          <div className="flex flex-col gap-2">
-            {archived.map((p) => (
-              <ProjectRow
-                key={p.id}
-                project={p}
-                onView={() => setFormState({ kind: 'view', project: p })}
-                onEdit={() => setFormState({ kind: 'edit', project: p })}
-                onDelete={() => void remove(p.id)}
-                onUnarchive={() => void archive(p.id, false)}
-                onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(p) : undefined}
-              />
-            ))}
+        {formState.kind === 'closed' && (
+          <div className="flex h-full flex-col items-center justify-center gap-3 text-center text-sm text-muted">
+            <FolderGit2 className="h-16 w-16 text-muted/20" />
+            <p>Select a project from the list, or create a new one.</p>
           </div>
-        </section>
-      )}
+        )}
+
+        {formState.kind === 'create' && (
+          <ProjectForm key="create" onSubmit={create} onDone={closeForm} existingActiveProjects={active} />
+        )}
+
+        {formState.kind === 'edit' && (
+          <ProjectForm
+            key={`edit-${formState.project.id}`}
+            project={formState.project}
+            onSubmit={(input) => update(formState.project.id, input)}
+            onDone={() => setFormState({ kind: 'view', project: formState.project })}
+            existingActiveProjects={active}
+          />
+        )}
+
+        {formState.kind === 'view' && (
+          <ProjectForm
+            key={`view-${formState.project.id}`}
+            project={formState.project}
+            readOnly
+            onEdit={() => setFormState({ kind: 'edit', project: formState.project })}
+            onDone={closeForm}
+            onDelete={() => {
+              closeForm();
+              void remove(formState.project.id);
+            }}
+            onArchive={
+              !formState.project.archivedAt ? () => void archive(formState.project.id, true) : undefined
+            }
+            onUnarchive={
+              formState.project.archivedAt ? () => void archive(formState.project.id, false) : undefined
+            }
+            onRun={onRunProject ? () => onRunProject(formState.project) : undefined}
+            onOpenDashboard={onOpenDashboard ? () => onOpenDashboard(formState.project) : undefined}
+          />
+        )}
+      </div>
     </div>
   );
 }
 
-/** Shorten a long absolute path to its trailing segments (…/a/b) for compact display. */
+/** Shorten a long absolute path to its trailing segments (…/a/b) for a compact title attribute. */
 function shortenPath(p: string, segments = 2): string {
   const parts = p
     .replace(/[/\\]+$/, '')
@@ -147,133 +191,136 @@ function shortenPath(p: string, segments = 2): string {
   return `…/${parts.slice(-segments).join('/')}`;
 }
 
-function ProjectRow({
-  project,
-  onView,
-  onEdit,
-  onDelete,
-  onArchive,
-  onUnarchive,
-  onRun,
-  onOpenDashboard,
+/**
+ * Slim, name-only project list (VSCode Explorer style) — no inline row
+ * actions; every action (Run, Edit, Archive, Delete, Dashboard) lives on the
+ * detail page a row opens, not on the row itself.
+ */
+function ProjectExplorerPanel({
+  projects,
+  loading,
+  selectedProjectId,
+  onSelect,
+  onNewProject,
+  creating,
+  onRefresh,
 }: {
-  project: Project;
-  onView: () => void;
-  onEdit: () => void;
-  onDelete: () => void;
-  onArchive?: () => void;
-  onUnarchive?: () => void;
-  onRun?: () => void;
-  onOpenDashboard?: () => void;
+  projects: Project[];
+  loading: boolean;
+  selectedProjectId: string | null;
+  onSelect: (project: Project) => void;
+  onNewProject: () => void;
+  creating: boolean;
+  onRefresh: () => void;
 }) {
-  const isArchived = Boolean(project.archivedAt);
+  const [archivedOpen, setArchivedOpen] = useState(false);
+  const active = useMemo(() => projects.filter((p) => !p.archivedAt), [projects]);
+  const archived = useMemo(() => projects.filter((p) => p.archivedAt), [projects]);
+
   return (
-    <Card className={isArchived ? 'opacity-70' : undefined}>
-      <CardContent className="flex items-center justify-between gap-3 px-4 py-2.5">
-        <button
-          type="button"
-          onClick={onView}
-          className="min-w-0 flex-1 rounded-md text-left focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-          title="View project details"
-        >
-          <div className="flex items-center gap-2">
-            <span className="truncate text-sm font-medium text-fg hover:underline">{project.name}</span>
-            <Badge tone="muted">{project.mode}</Badge>
-            {isArchived && <Badge tone="muted">archived</Badge>}
-          </div>
-          {/* One-line target: trailing path segments (full path on hover) keep the row sleek. */}
-          <div className="mt-0.5 flex min-w-0 items-center gap-3 text-xs text-muted">
-            {project.repoPath && (
-              <span className="flex min-w-0 items-center gap-1 font-mono" title={project.repoPath}>
-                <FolderGit2 className="h-3 w-3 shrink-0" />
-                <span className="truncate">{shortenPath(project.repoPath)}</span>
-              </span>
-            )}
-            {project.baseUrl && (
-              <span className="flex min-w-0 items-center gap-1 font-mono" title={project.baseUrl}>
-                <Globe className="h-3 w-3 shrink-0" />
-                <span className="truncate">{project.baseUrl}</span>
-              </span>
-            )}
-            {!project.repoPath && !project.baseUrl && <span>No repo or URL set</span>}
-          </div>
-        </button>
-        <div className="flex shrink-0 items-center gap-1">
-          {onOpenDashboard && (
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={onOpenDashboard}
-              aria-label="Open project dashboard"
-              title="Open project dashboard"
-            >
-              <LayoutDashboard className="h-4 w-4" />
-            </Button>
-          )}
-          {onRun && (
-            <Button size="sm" variant="outline" onClick={onRun}>
-              Run
-            </Button>
-          )}
-          <Button size="icon" variant="ghost" onClick={onEdit} aria-label="Edit project" title="Edit project">
-            <Pencil className="h-4 w-4" />
+    <div className="flex w-64 shrink-0 flex-col border-r border-border pb-6 pt-8 pl-4 pr-2">
+      <div className="mb-1.5 flex items-center justify-between pr-2">
+        <span className="text-xs font-medium text-muted">Projects</span>
+        <div className="flex items-center gap-1">
+          <Button
+            size="icon"
+            variant={creating ? 'outline' : 'ghost'}
+            onClick={onNewProject}
+            aria-label="New project"
+            title="New project"
+          >
+            <Plus className="h-3.5 w-3.5" />
           </Button>
-          {onArchive && (
-            <Button
-              size="icon"
-              variant="ghost"
-              onClick={onArchive}
-              aria-label="Archive project"
-              title="Archive (keeps all runs and media)"
-            >
-              <Archive className="h-4 w-4" />
-            </Button>
-          )}
-          {onUnarchive && (
-            <Button size="sm" variant="ghost" onClick={onUnarchive}>
-              <ArchiveRestore className="h-4 w-4" />
-              Restore
-            </Button>
-          )}
-          <DeleteButton projectName={project.name} onDelete={onDelete} />
+          <Button
+            size="icon"
+            variant="ghost"
+            onClick={onRefresh}
+            aria-label="Refresh projects"
+            disabled={loading}
+          >
+            <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
+          </Button>
         </div>
-      </CardContent>
-    </Card>
+      </div>
+
+      <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-panel/40">
+        {loading && projects.length === 0 && <p className="px-3 py-4 text-xs text-muted">Loading…</p>}
+        {!loading && projects.length === 0 && (
+          <p className="px-3 py-4 text-xs text-muted">No projects yet. Create one to start.</p>
+        )}
+        <ul className="divide-y divide-border/50">
+          {active.map((p) => (
+            <ProjectRow
+              key={p.id}
+              project={p}
+              selected={p.id === selectedProjectId}
+              onSelect={() => onSelect(p)}
+            />
+          ))}
+        </ul>
+
+        {archived.length > 0 && (
+          <div className="border-t border-border/50">
+            <button
+              type="button"
+              onClick={() => setArchivedOpen((v) => !v)}
+              className="flex w-full items-center gap-1.5 px-3 py-2 text-left text-xs font-medium text-muted hover:text-fg"
+            >
+              {archivedOpen ? (
+                <ChevronDown className="h-3 w-3 shrink-0" />
+              ) : (
+                <ChevronRight className="h-3 w-3 shrink-0" />
+              )}
+              <Archive className="h-3 w-3 shrink-0" />
+              Archived
+              <span className="font-normal">· {archived.length}</span>
+            </button>
+            {archivedOpen && (
+              <ul className="divide-y divide-border/50">
+                {archived.map((p) => (
+                  <ProjectRow
+                    key={p.id}
+                    project={p}
+                    selected={p.id === selectedProjectId}
+                    onSelect={() => onSelect(p)}
+                  />
+                ))}
+              </ul>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
   );
 }
 
-/**
- * Delete requires an explicit confirmation in a modal dialog before anything
- * is removed — the click that opens the dialog never itself deletes.
- */
-function DeleteButton({ projectName, onDelete }: { projectName: string; onDelete: () => void }) {
-  const [confirming, setConfirming] = useState(false);
-
+function ProjectRow({
+  project,
+  selected,
+  onSelect,
+}: {
+  project: Project;
+  selected: boolean;
+  onSelect: () => void;
+}) {
+  const isArchived = Boolean(project.archivedAt);
   return (
-    <>
-      <Button
-        size="icon"
-        variant="ghost"
-        onClick={() => setConfirming(true)}
-        aria-label="Delete project"
-        title="Delete project"
+    <li>
+      <button
+        type="button"
+        onClick={onSelect}
+        title={project.repoPath ? shortenPath(project.repoPath, 3) : (project.baseUrl ?? project.name)}
+        className={cn(
+          'flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors',
+          selected ? 'bg-accent/10' : 'hover:bg-panel',
+          isArchived && 'opacity-60',
+        )}
       >
-        <Trash2 className="h-4 w-4" />
-      </Button>
-      {confirming && (
-        <ConfirmDialog
-          title={`Delete "${projectName}"?`}
-          description="This permanently removes the project along with all of its runs, generated suites, screenshots, and recordings. This cannot be undone."
-          confirmLabel="Delete"
-          destructive
-          onConfirm={() => {
-            setConfirming(false);
-            onDelete();
-          }}
-          onCancel={() => setConfirming(false)}
-        />
-      )}
-    </>
+        <FolderGit2 className="h-3.5 w-3.5 shrink-0 text-muted" />
+        <span className="min-w-0 flex-1 truncate">{project.name}</span>
+        {isArchived && <Badge tone="muted">archived</Badge>}
+      </button>
+    </li>
   );
 }
 
@@ -309,15 +356,20 @@ function isGitRemoteUrl(raw: string): boolean {
  * all still freely editable, and submitting calls the same onSubmit with the
  * full (possibly unchanged) NewProject shape — the caller decides whether that
  * means create() or update(project.id, ...). In `readOnly` mode (always paired
- * with a `project`) every field is shown but disabled, there is no submit —
- * just an Edit button (if `onEdit` is given) and a Close button — so it's
- * purely a details view with a way to switch into editing the same project.
+ * with a `project`) every field is shown but disabled — this is the detail
+ * page opened from the explorer panel, so it also carries every project-level
+ * action (Run, Open dashboard, Edit, Archive/Restore, Delete) alongside Close.
  */
 function ProjectForm({
   project,
   onSubmit,
   onEdit,
   onDone,
+  onDelete,
+  onArchive,
+  onUnarchive,
+  onRun,
+  onOpenDashboard,
   readOnly = false,
   existingActiveProjects = [],
 }: {
@@ -325,6 +377,11 @@ function ProjectForm({
   onSubmit?: (input: NewProject) => Promise<Project | null>;
   onEdit?: () => void;
   onDone: () => void;
+  onDelete?: () => void;
+  onArchive?: () => void;
+  onUnarchive?: () => void;
+  onRun?: () => void;
+  onOpenDashboard?: () => void;
   readOnly?: boolean;
   /** Active (non-archived) projects, for inline duplicate-name feedback. */
   existingActiveProjects?: Project[];
@@ -334,9 +391,19 @@ function ProjectForm({
   const [repoPath, setRepoPath] = useState(project?.repoPath ?? '');
   const [baseUrl, setBaseUrl] = useState(project?.baseUrl ?? '');
   const [mode, setMode] = useState<'playwright'>((project?.mode as 'playwright') ?? 'playwright');
-  const [testUsername, setTestUsername] = useState(project?.testUsername ?? '');
-  const [testPassword, setTestPassword] = useState(project?.testPassword ?? '');
-  const [showTestPassword, setShowTestPassword] = useState(false);
+  const [credentials, setCredentials] = useState<CredentialFormRow[]>(
+    (project?.credentials ?? []).map((c) => ({
+      key: c.id,
+      authType: c.authType,
+      role: c.role ?? '',
+      username: c.username,
+      password: c.password,
+      token: c.token ?? '',
+      urlTemplate: c.urlTemplate ?? '',
+      extraParams: formatExtraParams(c.extraParams),
+      authCheckText: c.authCheckText ?? '',
+    })),
+  );
   const [submitting, setSubmitting] = useState(false);
   const [browsingRepoPath, setBrowsingRepoPath] = useState(false);
 
@@ -375,8 +442,19 @@ function ProjectForm({
       mode,
       repoPath: repoPath.trim() || null,
       baseUrl: baseUrl.trim() || null,
-      testUsername: testUsername.trim() || null,
-      testPassword: testPassword.trim() || null,
+      // Blank rows (an "Add credential" click never filled in) are dropped
+      // server-side (see validateNewProject) rather than rejected — submit
+      // the full list as typed.
+      credentials: credentials.map((c) => ({
+        authType: c.authType,
+        role: c.role.trim() || null,
+        username: c.username.trim(),
+        password: c.password,
+        token: c.token.trim() || null,
+        urlTemplate: c.urlTemplate.trim() || null,
+        extraParams: parseExtraParams(c.extraParams),
+        authCheckText: c.authCheckText.trim() || null,
+      })),
     });
     setSubmitting(false);
     if (saved) {
@@ -384,8 +462,7 @@ function ProjectForm({
         setName('');
         setRepoPath('');
         setBaseUrl('');
-        setTestUsername('');
-        setTestPassword('');
+        setCredentials([]);
       }
       onDone();
     }
@@ -395,8 +472,47 @@ function ProjectForm({
 
   return (
     <Card className="mt-5">
-      <CardHeader>
+      <CardHeader className="flex flex-row items-center justify-between">
         <CardTitle>{title}</CardTitle>
+        {readOnly && (
+          <div className="flex shrink-0 items-center gap-1">
+            {onOpenDashboard && (
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={onOpenDashboard}
+                aria-label="Open project dashboard"
+                title="Open project dashboard"
+              >
+                <LayoutDashboard className="h-4 w-4" />
+              </Button>
+            )}
+            {onRun && (
+              <Button size="sm" variant="outline" onClick={onRun}>
+                <Play className="h-4 w-4" />
+                Run
+              </Button>
+            )}
+            {onArchive && (
+              <Button
+                size="icon"
+                variant="ghost"
+                onClick={onArchive}
+                aria-label="Archive project"
+                title="Archive (keeps all runs and media)"
+              >
+                <Archive className="h-4 w-4" />
+              </Button>
+            )}
+            {onUnarchive && (
+              <Button size="sm" variant="ghost" onClick={onUnarchive}>
+                <ArchiveRestore className="h-4 w-4" />
+                Restore
+              </Button>
+            )}
+            {onDelete && <DeleteButton projectName={project?.name ?? ''} onDelete={onDelete} />}
+          </div>
+        )}
       </CardHeader>
       <CardContent>
         <form className="grid grid-cols-1 gap-4 sm:grid-cols-2" onSubmit={submit}>
@@ -464,41 +580,55 @@ function ProjectForm({
               <option value="playwright">playwright</option>
             </Select>
           </Field>
-          <div className="sm:col-span-2">
-            <h3 className="mb-1.5 text-sm font-semibold text-fg">Test credentials</h3>
-          </div>
-          <Field label="Test username / email">
-            <Input
-              value={testUsername}
-              onChange={(e) => setTestUsername(e.target.value)}
-              placeholder="you@example.com or a test username"
-              className="font-mono"
-              disabled={readOnly}
-            />
-          </Field>
-          <Field label="Test password">
-            <div className="relative">
-              <Input
-                type={showTestPassword ? 'text' : 'password'}
-                value={testPassword}
-                onChange={(e) => setTestPassword(e.target.value)}
-                placeholder="Password for the credential above"
-                className="pr-9 font-mono"
-                autoComplete="new-password"
-                disabled={readOnly}
-              />
-              <button
+          <div className="flex items-center justify-between sm:col-span-2">
+            <h3 className="text-sm font-semibold text-fg">Test credentials</h3>
+            {!readOnly && (
+              <Button
                 type="button"
-                onClick={() => setShowTestPassword((v) => !v)}
-                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
-                aria-label={showTestPassword ? 'Hide test password' : 'Show test password'}
-                aria-pressed={showTestPassword}
-                tabIndex={-1}
+                variant="outline"
+                size="sm"
+                onClick={() =>
+                  setCredentials((rows) => [
+                    ...rows,
+                    {
+                      key: crypto.randomUUID(),
+                      authType: 'form',
+                      role: '',
+                      username: '',
+                      password: '',
+                      token: '',
+                      urlTemplate: '',
+                      extraParams: '',
+                      authCheckText: '',
+                    },
+                  ])
+                }
               >
-                {showTestPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
-              </button>
-            </div>
-          </Field>
+                <Plus className="h-3.5 w-3.5" />
+                Add credential
+              </Button>
+            )}
+          </div>
+          <div className="grid grid-cols-1 gap-3 sm:col-span-2">
+            {credentials.length === 0 && (
+              <p className="text-xs text-muted">
+                {readOnly
+                  ? 'No test credentials configured.'
+                  : 'No test credentials yet — add one for authenticated (Tier B) flows.'}
+              </p>
+            )}
+            {credentials.map((cred) => (
+              <CredentialRow
+                key={cred.key}
+                credential={cred}
+                readOnly={readOnly}
+                onChange={(next) =>
+                  setCredentials((rows) => rows.map((r) => (r.key === cred.key ? next : r)))
+                }
+                onRemove={() => setCredentials((rows) => rows.filter((r) => r.key !== cred.key))}
+              />
+            ))}
+          </div>
           {readOnly ? (
             <div className="flex items-center justify-end gap-2 sm:col-span-2">
               {onEdit && (
@@ -537,6 +667,206 @@ function ProjectForm({
         </form>
       </CardContent>
     </Card>
+  );
+}
+
+/**
+ * Delete requires an explicit confirmation in a modal dialog before anything
+ * is removed — the click that opens the dialog never itself deletes.
+ */
+function DeleteButton({ projectName, onDelete }: { projectName: string; onDelete: () => void }) {
+  const [confirming, setConfirming] = useState(false);
+
+  return (
+    <>
+      <Button
+        size="icon"
+        variant="ghost"
+        onClick={() => setConfirming(true)}
+        aria-label="Delete project"
+        title="Delete project"
+      >
+        <Trash2 className="h-4 w-4" />
+      </Button>
+      {confirming && (
+        <ConfirmDialog
+          title={`Delete "${projectName}"?`}
+          description="This permanently removes the project along with all of its runs, generated suites, screenshots, and recordings. This cannot be undone."
+          confirmLabel="Delete"
+          destructive
+          onConfirm={() => {
+            setConfirming(false);
+            onDelete();
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </>
+  );
+}
+
+/**
+ * One row in the credentials list. Role is free text, not a fixed list —
+ * Healix establishes a separate authenticated session per distinct role and
+ * generated tierB-auth tests can opt into one by name (see generate.ts's role
+ * guidance); the first roleless credential (or simply the first one) is the
+ * default session every Tier B test gets automatically.
+ *
+ * Auth type picks which fields apply and how Healix establishes the session:
+ *  - 'form': the classic username/password + login-page-form flow.
+ *  - 'url-token': no login form at all — visiting a URL that already carries
+ *    a token (and optionally other params) is what authenticates. Use this
+ *    for SPAs handed a deep link (e.g. `#/token={token}&mobile={mobile}`)
+ *    instead of a sign-in page.
+ */
+function CredentialRow({
+  credential,
+  readOnly,
+  onChange,
+  onRemove,
+}: {
+  credential: CredentialFormRow;
+  readOnly: boolean;
+  onChange: (next: CredentialFormRow) => void;
+  onRemove: () => void;
+}) {
+  const [showPassword, setShowPassword] = useState(false);
+  const [showToken, setShowToken] = useState(false);
+  return (
+    <div className="rounded-md border border-border p-3">
+      {!readOnly && (
+        <div className="mb-2 flex justify-end">
+          <Button
+            type="button"
+            variant="ghost"
+            size="sm"
+            onClick={onRemove}
+            aria-label="Remove credential"
+            title="Remove credential"
+            className="font-semibold text-fg"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Remove
+          </Button>
+        </div>
+      )}
+      <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+        <Field label="Role (optional)">
+          <Input
+            value={credential.role}
+            onChange={(e) => onChange({ ...credential, role: e.target.value })}
+            placeholder="e.g. admin, seller, customer"
+            className="font-mono"
+            disabled={readOnly}
+          />
+        </Field>
+        <Field label="Auth Type">
+          <Select
+            value={credential.authType}
+            onChange={(e) => onChange({ ...credential, authType: e.target.value as 'form' | 'url-token' })}
+            disabled={readOnly}
+          >
+            <option value="form">Form login (username / password)</option>
+            <option value="url-token">URL / token (no login form)</option>
+          </Select>
+        </Field>
+      </div>
+
+      {credential.authType === 'form' ? (
+        <div className="mt-2 grid grid-cols-1 gap-2 sm:grid-cols-2">
+          <Field label="Username / email">
+            <Input
+              value={credential.username}
+              onChange={(e) => onChange({ ...credential, username: e.target.value })}
+              placeholder="you@example.com or a test username"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+          <Field label="Password">
+            <div className="relative">
+              <Input
+                type={showPassword ? 'text' : 'password'}
+                value={credential.password}
+                onChange={(e) => onChange({ ...credential, password: e.target.value })}
+                placeholder="Password"
+                className="pr-9 font-mono"
+                autoComplete="new-password"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                onClick={() => setShowPassword((v) => !v)}
+                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+                aria-label={showPassword ? 'Hide password' : 'Show password'}
+                aria-pressed={showPassword}
+                tabIndex={-1}
+              >
+                {showPassword ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </Field>
+        </div>
+      ) : (
+        <div className="mt-2 grid grid-cols-1 gap-2">
+          <Field label="Token">
+            <div className="relative">
+              <Input
+                type={showToken ? 'text' : 'password'}
+                value={credential.token}
+                onChange={(e) => onChange({ ...credential, token: e.target.value })}
+                placeholder="Paste the token"
+                className="pr-9 font-mono"
+                autoComplete="off"
+                disabled={readOnly}
+              />
+              <button
+                type="button"
+                onClick={() => setShowToken((v) => !v)}
+                className="absolute inset-y-0 right-0 flex w-9 items-center justify-center text-muted hover:text-fg"
+                aria-label={showToken ? 'Hide token' : 'Show token'}
+                aria-pressed={showToken}
+                tabIndex={-1}
+              >
+                {showToken ? <EyeOff className="h-3.5 w-3.5" /> : <Eye className="h-3.5 w-3.5" />}
+              </button>
+            </div>
+          </Field>
+          <Field label="URL Template">
+            <Input
+              value={credential.urlTemplate}
+              onChange={(e) => onChange({ ...credential, urlTemplate: e.target.value })}
+              placeholder="#/token={token}&mobile={mobile}&lang=ar-sa"
+              className="font-mono"
+              disabled={readOnly}
+            />
+            <p className="mt-1 text-xs text-muted">
+              Resolved against the project's base URL. {'{token}'} is always available; any key from Extra
+              Params below can be used the same way, e.g. {'{mobile}'}.
+            </p>
+          </Field>
+          <Field label="Extra Params (one per line, KEY=VALUE)">
+            <textarea
+              value={credential.extraParams}
+              onChange={(e) => onChange({ ...credential, extraParams: e.target.value })}
+              placeholder={'mobile=9660456767657\nlang=ar-sa'}
+              rows={2}
+              disabled={readOnly}
+              className="w-full rounded-md border border-border bg-panel/40 px-3 py-2 font-mono text-sm text-fg placeholder:text-muted focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent disabled:opacity-50"
+            />
+          </Field>
+          <Field label="Auth Check — text that must disappear (optional)">
+            <Input
+              value={credential.authCheckText}
+              onChange={(e) => onChange({ ...credential, authCheckText: e.target.value })}
+              placeholder="Not found"
+              className="font-mono"
+              disabled={readOnly}
+            />
+          </Field>
+        </div>
+      )}
+    </div>
   );
 }
 

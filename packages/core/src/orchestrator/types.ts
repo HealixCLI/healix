@@ -44,12 +44,19 @@ export interface RunOptions {
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
   /**
+   * Freeform additional instructions from the user, steering HOW the plan is
+   * built rather than describing WHAT the app does (that's the PRD's job) —
+   * e.g. "focus on accessibility", "skip mobile viewport checks", "prefer
+   * data-testid selectors". Passed to the planning provider verbatim.
+   */
+  instructions?: string;
+  /**
    * Suite lifecycle strategy: 'fresh' regenerates everything (default, current
    * behavior, byte-identical when omitted); 'topup' plans as normal but skips
    * AI-generating any item that matches (by reqTag, else normalized title) a
-   * still-passing test from the base run, copying that test's spec file forward
-   * instead; 'reuse' skips planning/generation entirely and re-executes the base
-   * run's passing tests as-is.
+   * test from the base run — regardless of that test's prior status — copying
+   * its spec file forward instead; 'reuse' skips planning/generation entirely
+   * and re-executes every test from the base run as-is.
    */
   suiteMode?: SuiteMode;
   /**

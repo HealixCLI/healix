@@ -1,6 +1,6 @@
 import { useMemo, useState } from 'react';
 import type { Project, Run, RunStatus } from '@healix/core';
-import { ChevronLeft, ChevronRight, RefreshCw, Trash2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
 import { ConfirmDialog } from './ui/confirm-dialog';
@@ -21,8 +21,9 @@ export function RunHistory({
   onSelect,
   onRefresh,
   onDelete,
+  onNewRun,
   projectsById,
-  collapsed,
+  collapsed = false,
   onToggleCollapse,
 }: {
   runs: Run[];
@@ -33,9 +34,13 @@ export function RunHistory({
   onRefresh: () => void;
   /** Delete a single run (DB rows + on-disk assets). Omit to hide the delete action entirely. */
   onDelete?: (runId: string) => void;
+  /** Reset the compose form to a fresh, editable "Start a run" state. Omit to hide the action. */
+  onNewRun?: () => void;
   projectsById: Map<string, Project>;
-  collapsed: boolean;
-  onToggleCollapse: () => void;
+  /** Mini icon-only collapsed state, with its own toggle button. Omit `onToggleCollapse` (e.g.
+   * when a parent shows/hides this whole component externally instead) to hide that toggle entirely. */
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }) {
   // Kept local (rather than lifted to RunsView) so the filter stays applied
   // across refreshes/re-renders without the caller needing to know about it.
@@ -59,6 +64,11 @@ export function RunHistory({
       <div className="mb-1.5 flex items-center justify-between">
         <span className="text-xs font-medium text-muted">History</span>
         <div className="flex items-center gap-1">
+          {onNewRun && (
+            <Button size="icon" variant="ghost" onClick={onNewRun} aria-label="New run" title="New run">
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          )}
           <Button
             size="icon"
             variant="ghost"
@@ -68,9 +78,11 @@ export function RunHistory({
           >
             <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
           </Button>
-          <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Collapse history">
-            <ChevronLeft className="h-3.5 w-3.5" />
-          </Button>
+          {onToggleCollapse && (
+            <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Collapse history">
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </Button>
+          )}
         </div>
       </div>
 

@@ -2,7 +2,7 @@ import { writeFile, mkdir, rename } from 'node:fs/promises';
 import { basename, join, relative, sep } from 'node:path';
 
 import type { GeneratedSpec, QuarantinedSpec, TestModeContext, ValidationResult } from '../types.js';
-import { hasExpect, looksLikePlaywrightSpec } from './generate.js';
+import { hasExpect, looksLikePlaywrightSpec, MOCK_FIXTURE_IMPORT_PATH } from './generate.js';
 import { ensureSuiteDeps, runCommand } from './execute.js';
 
 const LIST_TIMEOUT_MS = 60_000;
@@ -202,8 +202,13 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
       break;
     }
 
+    // Mocking-enabled specs import test/expect from the Healix-authored mock
+    // fixture instead of '@playwright/test' directly (see generate.ts) — the
+    // repaired-spec sanity check needs to accept that import too, or a
+    // genuinely-fixed mocked spec would be wrongly quarantined here.
+    const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : undefined;
     const fixed = attemptBracketRepair(spec.contents);
-    if (fixed && looksLikePlaywrightSpec(fixed) && hasExpect(fixed)) {
+    if (fixed && looksLikePlaywrightSpec(fixed, extraAllowedImport) && hasExpect(fixed)) {
       await writeFile(spec.path, fixed, 'utf-8');
       const second = await parseCheck(ctx, relPath);
       if (second.ok) {

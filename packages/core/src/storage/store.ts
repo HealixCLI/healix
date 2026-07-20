@@ -1,13 +1,16 @@
 import { nanoid } from 'nanoid';
 import type { DatabaseSync } from 'node:sqlite';
 import { openDb, resetDbForTests } from './db.js';
+import { decryptSecret, encryptSecret } from './crypto.js';
 import { validateNewProject } from './validate.js';
 import type {
   AgentEvent,
   EventLevel,
   NewProject,
+  NewProjectCredential,
   PauseReason,
   Project,
+  ProjectCredential,
   Run,
   RunStatus,
   SuiteMode,
@@ -30,34 +33,17 @@ export class HealixStore {
     // single source of truth for the invariant; the UI mirrors it for feedback.
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
-    const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
+    const { name, mode, repoPath, baseUrl, credentials } = validation.value;
     this.assertNameAvailable(name);
-    const project: Project = {
-      id: `prj_${nanoid(10)}`,
-      name,
-      mode,
-      repoPath,
-      baseUrl,
-      createdAt: new Date().toISOString(),
-      archivedAt: null,
-      testUsername,
-      testPassword,
-    };
+    const id = `prj_${nanoid(10)}`;
+    const createdAt = new Date().toISOString();
     this.db
       .prepare(
-        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at, test_username, test_password) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO projects (id, name, mode, repo_path, base_url, created_at) VALUES (?, ?, ?, ?, ?, ?)',
       )
-      .run(
-        project.id,
-        project.name,
-        project.mode,
-        project.repoPath,
-        project.baseUrl,
-        project.createdAt,
-        project.testUsername,
-        project.testPassword,
-      );
-    return project;
+      .run(id, name, mode, repoPath, baseUrl, createdAt);
+    const savedCredentials = this.replaceCredentials(id, credentials);
+    return { id, name, mode, repoPath, baseUrl, createdAt, archivedAt: null, credentials: savedCredentials };
   }
 
   /**
@@ -71,14 +57,75 @@ export class HealixStore {
     if (!existing) throw new Error(`Project not found: ${id}`);
     const validation = validateNewProject(input);
     if (!validation.ok) throw new Error(validation.error);
-    const { name, mode, repoPath, baseUrl, testUsername, testPassword } = validation.value;
+    const { name, mode, repoPath, baseUrl, credentials } = validation.value;
     this.assertNameAvailable(name, id);
     this.db
-      .prepare(
-        'UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ?, test_username = ?, test_password = ? WHERE id = ?',
-      )
-      .run(name, mode, repoPath, baseUrl, testUsername, testPassword, id);
-    return { ...existing, name, mode, repoPath, baseUrl, testUsername, testPassword };
+      .prepare('UPDATE projects SET name = ?, mode = ?, repo_path = ?, base_url = ? WHERE id = ?')
+      .run(name, mode, repoPath, baseUrl, id);
+    const savedCredentials = this.replaceCredentials(id, credentials);
+    return { ...existing, name, mode, repoPath, baseUrl, credentials: savedCredentials };
+  }
+
+  /**
+   * Replace-all: delete every existing credential row for the project and
+   * insert the given set fresh. Simple, correct semantics for a form that
+   * always submits its full desired credential list rather than a delta —
+   * the alternative (diffing old vs. new rows) buys nothing here since the
+   * UI has no concept of "this row's identity persisted across edits" to
+   * diff against anyway.
+   */
+  private replaceCredentials(projectId: string, credentials: NewProjectCredential[]): ProjectCredential[] {
+    this.db.prepare('DELETE FROM project_credentials WHERE project_id = ?').run(projectId);
+    const saved: ProjectCredential[] = [];
+    credentials.forEach((c, i) => {
+      const credId = `cred_${nanoid(10)}`;
+      const authType = c.authType === 'url-token' ? 'url-token' : 'form';
+      const username = c.username ?? '';
+      const password = c.password ?? '';
+      const role = c.role ?? null;
+      const token = c.token ?? null;
+      const urlTemplate = c.urlTemplate ?? null;
+      const extraParams = c.extraParams ?? null;
+      const authCheckText = c.authCheckText ?? null;
+      this.db
+        .prepare(
+          'INSERT INTO project_credentials (id, project_id, username, password, role, auth_type, token, url_template, extra_params, auth_check_text, sort_order) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          credId,
+          projectId,
+          username,
+          encryptSecret(password),
+          role,
+          authType,
+          encryptSecret(token),
+          urlTemplate,
+          extraParams ? JSON.stringify(extraParams) : null,
+          authCheckText,
+          i,
+        );
+      saved.push({
+        id: credId,
+        authType,
+        username,
+        password,
+        role,
+        token,
+        urlTemplate,
+        extraParams,
+        authCheckText,
+      });
+    });
+    return saved;
+  }
+
+  /** Every credential for a project, in save order, passwords decrypted. */
+  private getCredentials(projectId: string): ProjectCredential[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM project_credentials WHERE project_id = ? ORDER BY sort_order ASC')
+        .all(projectId) as Array<Record<string, unknown>>
+    ).map(rowToCredential);
   }
 
   /**
@@ -108,14 +155,14 @@ export class HealixStore {
       this.db.prepare('SELECT * FROM projects ORDER BY created_at DESC').all() as Array<
         Record<string, unknown>
       >
-    ).map(rowToProject);
+    ).map((row) => rowToProject(row, this.getCredentials(String(row.id))));
   }
 
   getProject(id: string): Project | null {
     const row = this.db.prepare('SELECT * FROM projects WHERE id = ?').get(id) as
       | Record<string, unknown>
       | undefined;
-    return row ? rowToProject(row) : null;
+    return row ? rowToProject(row, this.getCredentials(id)) : null;
   }
 
   deleteProject(id: string): void {
@@ -135,7 +182,9 @@ export class HealixStore {
       this.db.prepare('DELETE FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
       // 4. runs of this project
       this.db.prepare('DELETE FROM runs WHERE project_id = ?').run(id);
-      // 5. the project row itself
+      // 5. this project's credentials
+      this.db.prepare('DELETE FROM project_credentials WHERE project_id = ?').run(id);
+      // 6. the project row itself
       this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
       this.db.exec('COMMIT');
     } catch (err) {
@@ -196,8 +245,9 @@ export class HealixStore {
    * top-up/reuse base — 'passed', 'failed', or 'blocked' (it produced a real
    * verdict over real tests), but NOT 'error' (verified nothing — no runnable
    * specs) or 'cancelled' (aborted mid-run, unreliable). Deliberately NOT
-   * restricted to 'passed' only: a run with some failures still has plenty of
-   * passing tests worth carrying forward — that's the whole point of top-up.
+   * restricted to 'passed' only: a run with some failures still has its whole
+   * suite worth carrying forward (regardless of each test's own status) —
+   * that's the whole point of top-up.
    */
   getLastSuccessfulRun(projectId: string): Run | null {
     const row = this.db
@@ -357,8 +407,18 @@ export class HealixStore {
     this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
   }
 
+  /**
+   * Upsert-by-test: a test row maps to exactly one result (see updateTestStatus's
+   * doc comment), so any prior result for this testId is deleted before the new
+   * one is inserted. Without this, re-persisting a test's outcome — e.g. a
+   * resumed run re-executing a tier whose results already made it to the DB
+   * before the checkpoint recorded that tier as done — leaves a stale row
+   * behind, silently inflating any count that sums `results` rather than
+   * joining through one-row-per-test.
+   */
   insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
     const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
+    this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
         'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)',
@@ -468,7 +528,7 @@ function n(v: unknown): number | null {
   return v === null || v === undefined ? null : Number(v);
 }
 
-function rowToProject(r: Record<string, unknown>): Project {
+function rowToProject(r: Record<string, unknown>, credentials: ProjectCredential[]): Project {
   return {
     id: String(r.id),
     name: String(r.name),
@@ -477,8 +537,30 @@ function rowToProject(r: Record<string, unknown>): Project {
     baseUrl: s(r.base_url),
     createdAt: String(r.created_at),
     archivedAt: s(r.archived_at),
-    testUsername: s(r.test_username),
-    testPassword: s(r.test_password),
+    credentials,
+  };
+}
+
+function rowToCredential(r: Record<string, unknown>): ProjectCredential {
+  const extraParamsRaw = s(r.extra_params);
+  let extraParams: Record<string, string> | null = null;
+  if (extraParamsRaw) {
+    try {
+      extraParams = JSON.parse(extraParamsRaw) as Record<string, string>;
+    } catch {
+      extraParams = null;
+    }
+  }
+  return {
+    id: String(r.id),
+    authType: r.auth_type === 'url-token' ? 'url-token' : 'form',
+    username: String(r.username ?? ''),
+    password: decryptSecret(s(r.password)) ?? '',
+    role: s(r.role),
+    token: decryptSecret(s(r.token)),
+    urlTemplate: s(r.url_template),
+    extraParams,
+    authCheckText: s(r.auth_check_text),
   };
 }
 

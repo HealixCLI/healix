@@ -9,6 +9,8 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
 
 /** Upper bound on how long goto() waits for the page to settle post-navigation. */
 const SETTLE_TIMEOUT_MS = 8000;
+/** Poll interval for the same-document content-settle check below. */
+const SAME_DOC_POLL_MS = 150;
 
 /** Throw a uniform error when the surface is used before {@link start}. */
 function requireStarted<T>(value: T | undefined, what: string): T {
@@ -16,6 +18,33 @@ function requireStarted<T>(value: T | undefined, what: string): T {
     throw new Error(`[healix] BrowserSurface.${what} called before start(); call start() first.`);
   }
   return value;
+}
+
+/** True when `from` and `to` are the same document (origin + pathname), e.g. only the hash or
+ * query differs — the shape of a client-side SPA route change rather than a real page load. */
+function isSameDocumentNav(from: string, to: string): boolean {
+  try {
+    const a = new URL(from);
+    const b = new URL(to);
+    return a.origin === b.origin && a.pathname === b.pathname;
+  } catch {
+    return false;
+  }
+}
+
+/** Cheap per-page signature (title + interactive-element count) used to detect that a
+ * same-document navigation actually swapped in new content, rather than leaving stale elements
+ * from the previous route still in the DOM. Deliberately cheaper than a full
+ * `collectInteractiveElements` pass since it's polled. */
+async function contentSignature(p: Page): Promise<string> {
+  return p.evaluate((selector) => {
+    const doc = (
+      globalThis as unknown as {
+        document: { title: string; querySelectorAll(s: string): ArrayLike<unknown> };
+      }
+    ).document;
+    return `${doc.title}#${doc.querySelectorAll(selector).length}`;
+  }, INTERACTIVE_ELEMENT_SELECTOR);
 }
 
 /**
@@ -112,7 +141,15 @@ export function createBrowserSurface(): BrowserSurface {
 
     async goto(url: string): Promise<void> {
       const p = requireStarted(page, 'goto');
-      await p.goto(resolveUrl(url), { waitUntil: 'domcontentloaded' });
+      const target = resolveUrl(url);
+      const fromUrl = p.url();
+      const sameDocument = isSameDocumentNav(fromUrl, target);
+      let before: string | undefined;
+      if (sameDocument) {
+        before = await contentSignature(p).catch(() => undefined);
+      }
+
+      await p.goto(target, { waitUntil: 'domcontentloaded' });
       // SPAs (esp. hash-routed) often finish DOMContentLoaded before client-side
       // hydration renders real content, so a snapshot taken immediately after
       // goto() can see 0 interactive elements on an otherwise content-rich page.
@@ -134,6 +171,23 @@ export function createBrowserSurface(): BrowserSurface {
           .catch(() => {}),
         p.waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS }).catch(() => {}),
       ]);
+
+      // A same-document navigation (only the hash/query changed — a client-side SPA route
+      // change) never unloads the page, so the race above can resolve instantly on the PREVIOUS
+      // route's still-present elements rather than waiting for the new (possibly lazy-loaded)
+      // route component to actually mount. Poll until the page's content signature changes from
+      // its pre-nav value, bounded by the same settle timeout, so a snapshot taken right after
+      // goto() reflects the destination route instead of a stale or momentarily-empty frame.
+      if (sameDocument && before !== undefined) {
+        const deadline = Date.now() + SETTLE_TIMEOUT_MS;
+        for (;;) {
+          const after: string = await contentSignature(p).catch(() => before as string);
+          if (after !== before || Date.now() >= deadline) {
+            break;
+          }
+          await new Promise((resolve) => setTimeout(resolve, SAME_DOC_POLL_MS));
+        }
+      }
     },
 
     async screenshot(): Promise<Buffer> {

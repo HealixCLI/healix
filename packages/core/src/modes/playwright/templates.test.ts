@@ -66,8 +66,19 @@ describe('authSetupContents — locale-aware login fixture', () => {
   it('clicks through a login-reveal control before searching for the form when no email field is visible', () => {
     const fixture = authSetupContents();
     expect(fixture).toContain('hasEmailField');
-    expect(fixture).toContain("getByRole('button', { name: loginRevealRe })");
-    expect(fixture).toContain("getByRole('link', { name: loginRevealRe })");
+    expect(fixture).toContain('submitButtonLocator(page, loginRevealRe)');
+  });
+
+  it('prefers native submit semantics and test-hint attributes over localized button text when finding the submit button', () => {
+    const fixture = authSetupContents();
+    // A button's visible text is locale-dependent (e.g. a Slovak app's submit
+    // button reads "Pokračovať", not "continue"/"prihl") — native type="submit"
+    // and data-testid/name/id hints must be tried first, with the text regex
+    // only as a last-resort fallback.
+    expect(fixture).toContain('function submitButtonLocator(page, textRe)');
+    expect(fixture).toContain('button[type="submit"], input[type="submit"]');
+    expect(fixture).toContain('[data-testid*="submit" i]');
+    expect(fixture).toContain('submitButtonLocator(page, /prihl|sign in|log ?in|continue/i)');
   });
 
   it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {

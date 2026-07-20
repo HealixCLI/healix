@@ -182,6 +182,34 @@ function fieldLocator(page, labelRe, placeholderRe, cssFallback) {
     .or(page.locator(cssFallback));
 }
 
+/**
+ * A button's visible TEXT is the least reliable way to find it — it's
+ * whatever the app is localized to (e.g. a Slovak app's submit button reads
+ * "Pokračovať", which no English/Slovak text regex will anticipate). Native
+ * submit semantics (type="submit") and test-hint attributes (data-testid/
+ * name/id containing submit-like tokens) are locale-independent and take
+ * priority; the text regex is kept only as a last-resort fallback for apps
+ * with neither.
+ *
+ * Tiers are checked in order via .count() rather than chained with .or() —
+ * .or() unions matches and .first() then picks whichever is FIRST IN DOM
+ * ORDER, not first-matching-tier, so a hint selector broad enough to also
+ * catch the email/password inputs (e.g. \`[data-testid*="login" i]\`) would
+ * win over the real submit button simply for appearing earlier in the DOM.
+ * Explicit per-tier existence checks keep priority correct.
+ */
+async function submitButtonLocator(page, textRe) {
+  const native = page.locator('button[type="submit"], input[type="submit"]');
+  if (await native.count()) return native.first();
+
+  const hinted = page.locator(
+    'button[data-testid*="submit" i], button[data-testid*="login" i], button[data-testid*="signin" i], button[data-testid*="continue" i], button[name*="submit" i], button[id*="submit" i], a[data-testid*="submit" i], a[data-testid*="login" i], a[data-testid*="signin" i], a[data-testid*="continue" i]',
+  );
+  if (await hinted.count()) return hinted.first();
+
+  return page.getByRole('button', { name: textRe }).or(page.getByRole('link', { name: textRe })).first();
+}
+
 /** One username/password form login against \`page\`, saving storageState to \`path\` on success. Throws on failure. */
 async function loginForm(page, email, password, loginUrl, path) {
   await page.goto(loginUrl);
@@ -211,16 +239,14 @@ async function loginForm(page, email, password, loginUrl, path) {
     .isVisible()
     .catch(() => false);
   if (!hasEmailField) {
-    const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
-    await reveal
-      .first()
-      .click({ timeout: 5000 })
-      .catch(() => {});
+    const reveal = await submitButtonLocator(page, loginRevealRe);
+    await reveal.click({ timeout: 5000 }).catch(() => {});
   }
 
   await emailField.first().fill(email);
   await passwordField.first().fill(password);
-  await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
+  const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue/i);
+  await submitButton.click();
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.context().storageState({ path });
 }

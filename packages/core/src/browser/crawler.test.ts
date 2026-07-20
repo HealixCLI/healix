@@ -351,16 +351,41 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toContain(safeButton.selector);
   });
 
-  it('never click-probes a control inside a <form>, even with a safe-sounding name', async () => {
-    const inFormButton: InteractiveElement = {
+  it('does click-probe a non-submit control inside a <form> (e.g. a login/register view toggle)', async () => {
+    // Some apps put their login<->register view toggle inside the
+    // registration <form> (a "Log in instead" button that isn't itself a
+    // submit control). Excluding every in-form button meant the crawler
+    // could discover the registration route but never the login route
+    // behind that toggle. A non-submit in-form button can't mutate/submit
+    // the form, so it's no riskier than any other click-probe candidate.
+    const inFormToggle: InteractiveElement = {
       role: 'button',
-      name: 'Continue',
-      selector: '#continue-btn',
+      name: 'Log in instead',
+      selector: '#toggle-login-btn',
       inForm: true,
     };
     const recordClicks: string[] = [];
     const browser = makeFakeBrowser({
-      pages: { 'https://a.test/': { elements: [inFormButton] } },
+      pages: { 'https://a.test/': { elements: [inFormToggle] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toEqual(['#toggle-login-btn']);
+  });
+
+  it('never click-probes a submit-type control inside a <form>', async () => {
+    const inFormSubmit: InteractiveElement = {
+      role: 'button',
+      name: 'Continue',
+      selector: '#continue-btn',
+      inForm: true,
+      buttonType: 'submit',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [inFormSubmit] } },
       recordClicks,
     });
 
@@ -594,6 +619,33 @@ describe('crawlWithAuth()', () => {
 
     const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
     expect(authUrls.sort()).toEqual(['https://a.test/dashboard', 'https://a.test/dashboard/settings']);
+  });
+
+  it('prefers a /login-hinted route over a /register-hinted route when both have a password field', async () => {
+    // Both routes carry a password field (a common shape: registration also
+    // collects a password), but only /login is the actual login page. Wiring
+    // /register's form with the login credentials would fail (missing
+    // required registration fields) even though a password field was found.
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/register'), link('https://a.test/login')],
+        },
+        'https://a.test/register': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/dashboard': { elements: [{ role: 'heading', name: 'Dashboard', selector: 'h1' }] },
+      },
+      onClickGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/', {
+      credentials: { username: 'user@a.test', password: 'correct-pw' },
+    });
+
+    expect(result.authAttempted).toBe(true);
+    expect(result.authVerified).toBe(true);
+    const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
+    expect(authUrls).toEqual(['https://a.test/dashboard']);
   });
 
   it('degrades to anonymous-only when login cannot be verified (wrong credentials)', async () => {

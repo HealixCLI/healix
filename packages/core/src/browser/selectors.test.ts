@@ -72,6 +72,32 @@ function clamp(value: string): string {
 /** A node global with no `CSS` defined — the real shape under the node test env. */
 const NO_CSS: CssGlobal = {};
 
+/**
+ * `buttonType` inference, copied verbatim from the `page.evaluate` callback's
+ * per-element loop. An untyped `<button>` inside a `<form>` implicitly
+ * submits per HTML spec — this must be reflected as `buttonType: 'submit'`
+ * even when no literal `type` attribute is present, or `findLoginSubmitButton`
+ * (login.ts) silently loses its most reliable, locale-agnostic detection tier.
+ */
+function inferButtonType(rawType: string, inForm: boolean): string {
+  return rawType || (inForm ? 'submit' : '');
+}
+
+describe('selectors.buttonType inference (implicit HTML submit semantics)', () => {
+  it('treats an untyped <button> inside a <form> as submit', () => {
+    expect(inferButtonType('', true)).toBe('submit');
+  });
+
+  it('leaves an untyped <button> with no enclosing <form> as non-submit', () => {
+    expect(inferButtonType('', false)).toBe('');
+  });
+
+  it('never overrides an explicit type attribute, in or out of a form', () => {
+    expect(inferButtonType('button', true)).toBe('button');
+    expect(inferButtonType('reset', false)).toBe('reset');
+  });
+});
+
 describe('selectors.cssEscape (fallback escaper)', () => {
   it('escapes an id beginning with a digit into a VALID CSS selector', () => {
     // `#123abc` is NOT a valid selector. The first digit must be written as a

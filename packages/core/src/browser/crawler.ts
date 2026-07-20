@@ -88,10 +88,17 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
 /**
  * Elements a click-probe may safely try: a real `<button>` (or a non-anchor
  * `role="link"` element, e.g. a `<span role="link">` that extractLinks() can't
- * see), visible, enabled, NOT inside a `<form>` (never touch an in-progress
- * form), not a submit control, and whose accessible name doesn't read as a
- * destructive/mutating action. This is what makes it safe to click things on
- * a real, possibly-production app unattended.
+ * see), visible, enabled, not a submit control, and whose accessible name
+ * doesn't read as a destructive/mutating action. A non-submit button *inside*
+ * a `<form>` is still allowed — it can't submit/mutate the form's data (that's
+ * `buttonType === 'submit'`'s job, already excluded below), so it's no riskier
+ * than any other click-probe candidate. This matters in practice: some SPAs
+ * put their register<->login view toggle inside the register `<form>` (e.g. a
+ * "Log in instead" button), and excluding all in-form buttons meant the
+ * crawler could discover the register route but never the login route behind
+ * that toggle — every login attempt then wrongly filled in the registration
+ * form. This is what makes it safe to click things on a real, possibly-
+ * production app unattended.
  */
 const UNSAFE_CLICK_TEXT_RE =
   /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|register|sign up|add to cart|clear|cancel/i;
@@ -107,7 +114,6 @@ const LINK_QUEUE_THIN_THRESHOLD = 3;
 function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
   return snapshot.interactiveElements
     .filter((el) => el.role === 'button' || (el.role === 'link' && !el.href))
-    .filter((el) => !el.inForm)
     .filter((el) => !el.disabled)
     .filter((el) => el.buttonType !== 'submit')
     .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
@@ -360,11 +366,37 @@ export interface CrawlWithAuthResult extends CrawlResult {
   authReason?: string;
 }
 
+/** Matches a URL that reads as a login page — checked before the signup/register hint so a
+ * route matching both (unlikely, but possible on an odd path) is still treated as login. */
+const LOGIN_URL_HINT_RE = /\blogin\b|\bsign-?in\b/i;
+/** Matches a URL that reads as registration — many apps expose a password field on both a
+ * signup and a login page, so a route hinting at signup is a weaker login candidate than one
+ * with no hint either way. */
+const SIGNUP_URL_HINT_RE = /\bregister\b|\bsign-?up\b/i;
+
+/**
+ * Picks the best login candidate among password-bearing routes: a route whose
+ * URL reads as login wins outright; otherwise the first route that doesn't
+ * read as registration/signup; otherwise (every candidate looks like
+ * signup, or none has a URL hint at all) the first one found, same as before.
+ * Login and registration pages commonly both carry a password field, so
+ * "has a password field" alone can't disambiguate them — the URL hint
+ * exists precisely for cases like `#/login` vs `#/register` on the same app.
+ */
+function pickLoginCandidate(routes: CrawledRoute[]): CrawledRoute | undefined {
+  const passwordBearing = routes.filter((r) => r.hasPasswordField);
+  return (
+    passwordBearing.find((r) => LOGIN_URL_HINT_RE.test(r.url)) ??
+    passwordBearing.find((r) => !SIGNUP_URL_HINT_RE.test(r.url)) ??
+    passwordBearing[0]
+  );
+}
+
 /**
  * Anonymous-only routes can never reach pages gated behind login, which are
  * exactly the pages Tier B generation needs grounded. Runs the anonymous
- * `crawl()` first (also how a login candidate route is found — any visited
- * route with a password field), then, only if credentials are supplied and a
+ * `crawl()` first (also how a login candidate route is found — see
+ * `pickLoginCandidate`), then, only if credentials are supplied and a
  * candidate was found, attempts a verified login and crawls again from the
  * post-login landing page. A failed or unverifiable login degrades to the
  * anonymous-only result plus a reason — it never blocks or throws.
@@ -381,7 +413,7 @@ export async function crawlWithAuth(
     return { ...anonymous, authAttempted: false, authVerified: false };
   }
 
-  const candidate = anonymous.routes.find((r) => r.hasPasswordField);
+  const candidate = pickLoginCandidate(anonymous.routes);
   if (!candidate) {
     return {
       ...anonymous,

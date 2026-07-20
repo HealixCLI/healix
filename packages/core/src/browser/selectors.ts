@@ -257,14 +257,17 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       }
       seen.add(el);
       const tag = el.tagName.toLowerCase();
+      const inForm = isInForm(el);
+      const rawButtonType = tag === 'button' ? (el.getAttribute('type') ?? '').toLowerCase() : undefined;
       out.push({
         role: roleFor(el),
         name: accessibleName(el),
         selector: selectorFor(el),
         href: tag === 'a' ? (el.getAttribute('href') ?? undefined) : undefined,
         inputType: tag === 'input' ? (el.getAttribute('type') ?? 'text').toLowerCase() : undefined,
-        buttonType: tag === 'button' ? (el.getAttribute('type') ?? '').toLowerCase() : undefined,
-        inForm: isInForm(el),
+        // An untyped <button> inside a <form> implicitly submits per HTML spec.
+        buttonType: tag === 'button' ? rawButtonType || (inForm ? 'submit' : '') : undefined,
+        inForm,
         disabled: isDisabled(el),
       });
     }

@@ -210,7 +210,39 @@ async function submitButtonLocator(page, textRe) {
   return page.getByRole('button', { name: textRe }).or(page.getByRole('link', { name: textRe })).first();
 }
 
-/** One username/password form login against \`page\`, saving storageState to \`path\` on success. Throws on failure. */
+/**
+ * Polls until the page navigates away from \`loginUrl\` or the password field
+ * disappears, or 10s elapse. A real login is rarely a single synchronous
+ * action — chained async calls (token generate -> password validate ->
+ * profile lookup -> redirect) can easily outlast a single \`networkidle\`
+ * check, so snapshotting immediately after the click can read the
+ * pre-redirect state as success even when the submit click did nothing.
+ */
+async function waitForLoginOutcome(page, beforeUrl) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const stillHasPasswordField = await page
+      .locator('input[type="password"]')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const navigatedAway = page.url() !== beforeUrl;
+    if (navigatedAway || !stillHasPasswordField || Date.now() >= deadline) {
+      return { navigatedAway, stillHasPasswordField };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+/**
+ * One username/password form login against \`page\`, saving storageState to
+ * \`path\` on success. Throws on failure — including when the submit click
+ * "succeeded" (no exception) but the page never actually left the login
+ * form, e.g. a wrong-password submit that just re-renders the same form
+ * with an inline error. Without this check that would be indistinguishable
+ * from a real login and would silently capture an anonymous storageState
+ * that every downstream Tier B spec then fails against individually.
+ */
 async function loginForm(page, email, password, loginUrl, path) {
   await page.goto(loginUrl);
 
@@ -245,8 +277,17 @@ async function loginForm(page, email, password, loginUrl, path) {
 
   await emailField.first().fill(email);
   await passwordField.first().fill(password);
+  const beforeUrl = page.url();
   const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue/i);
   await submitButton.click();
+
+  const { navigatedAway, stillHasPasswordField } = await waitForLoginOutcome(page, beforeUrl);
+  if (stillHasPasswordField && !navigatedAway) {
+    throw new Error(
+      \`Login did not navigate away from the login page after submitting — still on \${page.url()} with a visible password field. Check credentials or selectors.\`,
+    );
+  }
+
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.context().storageState({ path });
 }
@@ -281,7 +322,13 @@ async function loginUrlToken(page, cred, baseUrl, path) {
   } else {
     await page.waitForLoadState('networkidle').catch(() => {});
   }
-  await page.context().storageState({ path });
+
+  const state = await page.context().storageState({ path });
+  if (state.cookies.length === 0 && state.origins.length === 0) {
+    throw new Error(
+      \`URL-token login produced an empty session (no cookies, no localStorage) at \${page.url()} — the token likely didn't resolve. Check the credential's urlTemplate/token.\`,
+    );
+  }
 }
 
 /** Dispatches to the right login mechanism for this credential's authType. */

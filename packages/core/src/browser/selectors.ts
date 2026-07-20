@@ -78,8 +78,16 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       return result;
     }
 
+    // Framework-generated ids are reassigned per render tree, not persisted
+    // across page loads, so a selector built from one will resolve against a
+    // completely different element (or nothing) the next time the page
+    // loads — e.g. React's useId() (`_r_4_`, `:r4:`) or MUI's `mui-3`.
+    // Matches these known shapes so selectorFor() falls through to a stable
+    // attribute instead of trusting the id.
+    const UNSTABLE_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+
     function selectorFor(el: DomElement): string {
-      if (el.id) {
+      if (el.id && !UNSTABLE_ID_RE.test(el.id)) {
         return `#${cssEscape(el.id)}`;
       }
 
@@ -113,7 +121,7 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           }
         }
         parts.unshift(part);
-        if (current.id) {
+        if (current.id && !UNSTABLE_ID_RE.test(current.id)) {
           parts[0] = `#${cssEscape(current.id)}`;
           break;
         }

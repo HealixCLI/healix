@@ -116,7 +116,7 @@ describe('authSetupContents — locale-aware login fixture', () => {
     expect(fixture).not.toContain('cookies: []');
     expect(fixture).not.toContain('access(authFile)');
     const guardIdx = fixture.indexOf('if (!email || !password || !loginUrl)');
-    const throwIdx = fixture.indexOf('throw new Error(');
+    const throwIdx = fixture.indexOf('throw new Error(', guardIdx);
     expect(guardIdx).toBeGreaterThanOrEqual(0);
     expect(throwIdx).toBeGreaterThan(guardIdx);
     expect(fixture).toContain('Tier B auth setup skipped');
@@ -131,6 +131,27 @@ describe('authSetupContents — locale-aware login fixture', () => {
     const block = fixture.slice(blockStart, blockEnd);
     expect(block).toContain('writeMeta(false)');
     expect(block.indexOf('writeMeta(false)')).toBeLessThan(block.indexOf('throw new Error('));
+  });
+
+  it('verifies the login form actually navigated away before capturing storageState, instead of trusting a networkidle wait', () => {
+    const fixture = authSetupContents();
+    // GAP-017-style regression guard: a click that "succeeds" without ever
+    // authenticating (wrong credentials, async login chain still pending)
+    // must not be captured as a real session.
+    expect(fixture).toContain('function waitForLoginOutcome(page, beforeUrl)');
+    expect(fixture).toContain('stillHasPasswordField && !navigatedAway');
+    const verifyIdx = fixture.indexOf(
+      'waitForLoginOutcome(page, beforeUrl)',
+      fixture.indexOf('async function loginForm'),
+    );
+    const storageIdx = fixture.indexOf('storageState({ path })', fixture.indexOf('async function loginForm'));
+    expect(verifyIdx).toBeGreaterThan(0);
+    expect(verifyIdx).toBeLessThan(storageIdx);
+  });
+
+  it('throws on an empty captured session for url-token logins instead of silently succeeding', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('state.cookies.length === 0 && state.origins.length === 0');
   });
 
   it('never leaves the setup fixture with a no-op success path when credentials are missing', () => {

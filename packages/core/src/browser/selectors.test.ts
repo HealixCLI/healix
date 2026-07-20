@@ -83,6 +83,35 @@ function inferButtonType(rawType: string, inForm: boolean): string {
   return rawType || (inForm ? 'submit' : '');
 }
 
+/**
+ * Framework-generated-id filter, copied verbatim from `selectorFor`'s
+ * `UNSTABLE_ID_RE` in selectors.ts. These id shapes are reassigned per
+ * render tree (React's useId(), MUI's mui-N) rather than persisted across
+ * page loads, so a selector built from one resolves against a different
+ * element (or nothing) on the next load.
+ */
+const UNSTABLE_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+
+describe('selectors.UNSTABLE_ID_RE (framework-generated id detection)', () => {
+  it('flags React useId() shapes as unstable', () => {
+    expect(UNSTABLE_ID_RE.test('_r_4_')).toBe(true);
+    expect(UNSTABLE_ID_RE.test('_r_6_')).toBe(true);
+    expect(UNSTABLE_ID_RE.test(':r4:')).toBe(true);
+    expect(UNSTABLE_ID_RE.test(':r4h:')).toBe(true);
+  });
+
+  it('flags MUI-style generated ids as unstable', () => {
+    expect(UNSTABLE_ID_RE.test('mui-3')).toBe(true);
+    expect(UNSTABLE_ID_RE.test('mui-42')).toBe(true);
+  });
+
+  it('does not flag stable, developer-authored ids', () => {
+    expect(UNSTABLE_ID_RE.test('login-email')).toBe(false);
+    expect(UNSTABLE_ID_RE.test('submit-btn_1')).toBe(false);
+    expect(UNSTABLE_ID_RE.test('password')).toBe(false);
+  });
+});
+
 describe('selectors.buttonType inference (implicit HTML submit semantics)', () => {
   it('treats an untyped <button> inside a <form> as submit', () => {
     expect(inferButtonType('', true)).toBe('submit');

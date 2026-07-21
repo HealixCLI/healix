@@ -68,22 +68,23 @@ async function waitForLoginOutcome(browser: BrowserSurface, beforeUrl: string): 
 }
 
 /**
- * Fill and submit a login form at `loginUrl`, then VERIFY the session
- * actually left the login page — a real regression test for the mistake
- * flagged in GAP-017 ("verified" without confirming login succeeded): a
- * wrong-password submit that just re-renders the same form with an inline
- * error would "not throw" and could be mistaken for success if the only
- * check were "did the click succeed". Success requires the URL to have
- * changed away from the login page, or the password field to be gone —
- * ideally both.
+ * Fill and submit the login form on the CURRENT page, then VERIFY the
+ * session actually left the login page — a real regression test for the
+ * mistake flagged in GAP-017 ("verified" without confirming login
+ * succeeded): a wrong-password submit that just re-renders the same form
+ * with an inline error would "not throw" and could be mistaken for success
+ * if the only check were "did the click succeed". Success requires the URL
+ * to have changed away from the login page, or the password field to be
+ * gone — ideally both. Shared by `attemptLogin` (navigates to a dedicated
+ * login URL first) and `attemptLoginViaToggle` (reveals an in-page login
+ * view first) — everything past "the login form is now on screen" is
+ * identical for both.
  */
-export async function attemptLogin(
+async function submitLoginAttempt(
   browser: BrowserSurface,
-  loginUrl: string,
   username: string,
   password: string,
 ): Promise<LoginAttemptResult> {
-  await browser.goto(loginUrl);
   const before = await browser.snapshot();
 
   const passwordEl = before.interactiveElements.find((el) => el.inputType === 'password');
@@ -125,4 +126,42 @@ export async function attemptLogin(
   }
 
   return { ok: true, landingUrl: after.url };
+}
+
+/** Fill and submit a login form at a dedicated `loginUrl`. See `submitLoginAttempt`. */
+export async function attemptLogin(
+  browser: BrowserSurface,
+  loginUrl: string,
+  username: string,
+  password: string,
+): Promise<LoginAttemptResult> {
+  await browser.goto(loginUrl);
+  return submitLoginAttempt(browser, username, password);
+}
+
+/**
+ * Same as `attemptLogin`, but for a login view that only exists as a
+ * same-URL client-side toggle (no distinct route) discovered during
+ * click-probing — see `CrawledRoute.loginToggleSelector` in crawler.ts. A
+ * fresh `goto()` alone can't reproduce a toggled-in view (client-side state
+ * doesn't survive a reload), so this replays the discovered toggle click
+ * in-place, on the same page, immediately before filling the form.
+ */
+export async function attemptLoginViaToggle(
+  browser: BrowserSurface,
+  pageUrl: string,
+  toggleSelector: string,
+  username: string,
+  password: string,
+): Promise<LoginAttemptResult> {
+  await browser.goto(pageUrl);
+  try {
+    await browser.click(toggleSelector);
+  } catch (err) {
+    return {
+      ok: false,
+      reason: `failed to activate login toggle: ${err instanceof Error ? err.message : String(err)}`,
+    };
+  }
+  return submitLoginAttempt(browser, username, password);
 }

@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 8;
+export const SCHEMA_VERSION = 9;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -43,13 +43,15 @@ CREATE TABLE IF NOT EXISTS runs (
 );
 
 CREATE TABLE IF NOT EXISTS tests (
-  id        TEXT PRIMARY KEY,
-  run_id    TEXT NOT NULL REFERENCES runs(id),
-  title     TEXT NOT NULL,
-  req_tag   TEXT,
-  tier      TEXT,
-  status    TEXT,
-  spec_path TEXT
+  id          TEXT PRIMARY KEY,
+  run_id      TEXT NOT NULL REFERENCES runs(id),
+  title       TEXT NOT NULL,
+  req_tag     TEXT,
+  tier        TEXT,
+  status      TEXT,
+  spec_path   TEXT,
+  description TEXT,
+  details     TEXT
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -58,7 +60,9 @@ CREATE TABLE IF NOT EXISTS results (
   status         TEXT NOT NULL,
   duration_ms    INTEGER,
   error          TEXT,
-  artifacts_json TEXT
+  artifacts_json TEXT,
+  description    TEXT,
+  details        TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_events (

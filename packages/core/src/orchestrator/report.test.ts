@@ -1,6 +1,6 @@
 import { describe, expect, it } from 'vitest';
 import { buildReport, degradationNotes, renderReportHtml, type RunReport } from './report.js';
-import type { Project, Run } from '../storage/types.js';
+import type { Project, Run, TestCase } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 
 function makeRun(overrides: Partial<Run> = {}): Run {
@@ -354,6 +354,49 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     const html = renderReportHtml(report);
     expect(html).not.toContain('>coverage<');
     expect(html).not.toContain('<h2>Coverage</h2>');
+  });
+
+  it("joins a matched TestCase's description/details into the Results table", () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: 'Login — positive: user submits valid credentials', status: 'passed', durationMs: 5 },
+      ],
+    };
+    const tests: TestCase[] = [
+      {
+        id: 'tst_1',
+        runId: run.id,
+        title: 'Login — positive: user submits valid credentials',
+        reqTag: 'REQ-1',
+        tier: 'tierA-public',
+        status: 'passed',
+        specPath: null,
+        description: 'user submits valid credentials',
+        details: 'Verify the login flow authenticates a user and redirects to the dashboard.',
+      },
+    ];
+    const report = buildReport({ run, project, plan, outcome, triage: [], tests });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<th>Description</th>');
+    expect(html).toContain('user submits valid credentials');
+    expect(html).toContain('Verify the login flow authenticates a user and redirects to the dashboard.');
+  });
+
+  it('renders an empty description cell (no crash) when no TestCase row matches the result title', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: 'Untracked scenario', status: 'passed', durationMs: 5 }],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<td></td><td></td></tr>');
   });
 
   it('surfaces the coverage ratio and lists uncovered functionality units when present', () => {

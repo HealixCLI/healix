@@ -1,4 +1,4 @@
-import type { Project, Run } from '../storage/types.js';
+import type { Project, Run, TestCase } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
 import type { ExternalDependency } from '../target/types.js';
@@ -37,6 +37,8 @@ export interface RunReport {
   plan: TestPlan;
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
+  /** Persisted TestCase rows for this run, used to enrich the Results table with description/details. */
+  tests: TestCase[];
   /** Artifact files collected from the mode after execution (relative paths). */
   artifacts: string[];
   /** External dependencies detected/mocked for this run (empty when mocking wasn't enabled). */
@@ -56,6 +58,7 @@ export function buildReport(input: {
   plan: TestPlan;
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
+  tests?: TestCase[];
   artifacts?: string[];
   dependencies?: ExternalDependency[];
   mockedRequestCounts?: Record<string, number>;
@@ -68,6 +71,7 @@ export function buildReport(input: {
     plan: input.plan,
     outcome: input.outcome,
     triage: input.triage,
+    tests: input.tests ?? [],
     artifacts: input.artifacts ?? [],
     dependencies: input.dependencies ?? [],
     mockedRequestCounts: input.mockedRequestCounts ?? {},
@@ -193,7 +197,7 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
 
 /** Render a self-contained, dependency-free HTML report. */
 export function renderReportHtml(report: RunReport): string {
-  const { run, project, plan, outcome, triage, dependencies, mockedRequestCounts, coverage } = report;
+  const { run, project, plan, outcome, triage, tests, dependencies, mockedRequestCounts, coverage } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
@@ -241,6 +245,10 @@ export function renderReportHtml(report: RunReport): string {
   // Triage is keyed by title so a failed row can show its verdict/rationale
   // inline instead of forcing readers to cross-reference a separate table.
   const triageByTitle = new Map<string, ReportTriageEntry>(triage.map((t) => [t.title, t]));
+  // Persisted TestCase rows are also keyed by title (the same title a result
+  // row carries once updateTestTitle has run) so the Results table can show
+  // the scenario's description/intent without needing testId on ExecResultItem.
+  const testByTitle = new Map<string, TestCase>(tests.map((t) => [t.title, t]));
 
   const resultRows = (outcome?.results ?? [])
     .map((r) => {
@@ -248,9 +256,16 @@ export function renderReportHtml(report: RunReport): string {
         r.artifacts && r.artifacts.length > 0
           ? `<div class="hist">${r.artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`
           : '';
+      const matchedTest = testByTitle.get(r.title);
+      const descriptionCell =
+        [matchedTest?.description, matchedTest?.details].filter(Boolean).length > 0
+          ? `${matchedTest?.description ? esc(matchedTest.description) : ''}${
+              matchedTest?.details ? `<div class="hist">${esc(matchedTest.details)}</div>` : ''
+            }`
+          : '';
       return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
         formatDuration(r.durationMs),
-      )}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
+      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
     })
     .join('');
 
@@ -361,8 +376,8 @@ export function renderReportHtml(report: RunReport): string {
   <section>
     <h2>Results</h2>
     <table>
-      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
-      <tbody>${resultRows || '<tr><td colspan="4"><em>No results.</em></td></tr>'}</tbody>
+      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Description</th><th>Error</th></tr></thead>
+      <tbody>${resultRows || '<tr><td colspan="5"><em>No results.</em></td></tr>'}</tbody>
     </table>
   </section>
 

@@ -116,6 +116,13 @@ function migrate(db: DatabaseSync): void {
     ensureColumn(db, 'project_credentials', 'url_template', 'TEXT');
     ensureColumn(db, 'project_credentials', 'extra_params', 'TEXT');
     ensureColumn(db, 'project_credentials', 'auth_check_text', 'TEXT');
+    // v9: description/details — plan-time scenario description and feature intent,
+    // persisted onto the test case (and mirrored onto its result) so a reviewer
+    // can see what a test verifies without cross-referencing the original plan.
+    ensureColumn(db, 'tests', 'description', 'TEXT');
+    ensureColumn(db, 'tests', 'details', 'TEXT');
+    ensureColumn(db, 'results', 'description', 'TEXT');
+    ensureColumn(db, 'results', 'details', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

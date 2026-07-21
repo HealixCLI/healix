@@ -311,6 +311,8 @@ interface JoinedRow {
   status: TestResult['status'] | TestCase['status'];
   durationMs: number | null;
   error: string | null;
+  description: string | null;
+  details: string | null;
 }
 
 function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
@@ -327,6 +329,8 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
         status: r?.status ?? t.status,
         durationMs: r?.durationMs ?? null,
         error: r?.error ?? null,
+        description: t.description,
+        details: t.details,
       };
     });
   }
@@ -339,6 +343,8 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
     status: r.status,
     durationMs: r.durationMs,
     error: r.error,
+    description: null,
+    details: null,
   }));
 }
 
@@ -554,6 +560,8 @@ function ResultsTable({
                         <span>Tier: {r.tier ?? '—'}</span>
                         <span>Duration: {formatDuration(r.durationMs)}</span>
                       </div>
+                      {r.description && <p className="text-xs text-fg">{r.description}</p>}
+                      {r.details && <p className="text-xs text-muted">{r.details}</p>}
                       {r.error && (
                         <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-bg p-3 font-mono text-[11px] leading-relaxed text-err/90">
                           {r.error}

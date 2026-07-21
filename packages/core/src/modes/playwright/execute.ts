@@ -1,7 +1,8 @@
-import { spawn, type ChildProcess } from 'node:child_process';
+import type { ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { access, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
+import spawn from 'cross-spawn';
 
 import type { Tier, TestStatus } from '../../storage/types.js';
 import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestingScope, TestModeContext } from '../types.js';
@@ -179,11 +180,13 @@ function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawComman
 
     let child: ChildProcess;
     try {
+      // cross-spawn resolves npx.cmd on Windows without cmd.exe shell:true
+      // string-concatenation (the args+shell:true combo Node's DEP0190 warns
+      // about — see run-cli.ts for the full rationale).
       child = spawn('npx', args, {
         cwd: ctx.projectDir,
         env,
         detached: process.platform !== 'win32',
-        shell: process.platform === 'win32', // npx resolves to npx.cmd on Windows
       });
     } catch (err) {
       // A synchronous spawn failure (e.g. ENOENT) is NOT a timeout; reserve
@@ -318,12 +321,13 @@ export function runCommand(
 
     let child: ChildProcess;
     try {
+      // cross-spawn resolves npm/npx .cmd shims on Windows without shell:true
+      // (see runPlaywright above / run-cli.ts for the DEP0190 rationale).
       child = spawn(command, args, {
         cwd: ctx.projectDir,
         // Allowlisted env only — same rationale as runPlaywright: install
         // scripts run arbitrary code and must not inherit host secrets.
         env: suiteEnv(ctx),
-        shell: process.platform === 'win32', // npm/npx resolve to .cmd on Windows
       });
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: String(err), aborted: false });

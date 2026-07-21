@@ -11,12 +11,14 @@ import { describe, it, expect, vi, afterEach } from 'vitest';
 
 // Spy on spawn so the pre-abort test can prove NOTHING was executed. The
 // actual implementation is preserved for any test that legitimately spawns.
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
-  return { ...actual, spawn: vi.fn(actual.spawn) };
+// execute.ts spawns via cross-spawn (not node:child_process directly) so
+// Windows .cmd shims resolve without a shell:true + args DEP0190 warning.
+vi.mock('cross-spawn', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('cross-spawn')>();
+  return { ...actual, default: vi.fn(actual.default) };
 });
 
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import type { GeneratedSpec, TestModeContext } from '../types.js';
 import {
   execute,

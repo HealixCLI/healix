@@ -291,6 +291,15 @@ export function RunsView({
       const key = `${engine.runId}:${engine.phase}`;
       if (lastSettledKey === key) return;
       lastSettledKey = key;
+      // The [isActive] effect above only fires on an active->inactive
+      // TRANSITION, so it misses a settle that starts and ends inactive (e.g.
+      // cancelling an already-paused run — 'paused' and 'cancelled' are both
+      // outside isActive, so it never changes and that effect never re-runs),
+      // which left "Cancelling…"/"Pausing…" stuck forever. This effect already
+      // fires on every distinct runId+phase settle, repeats included, so reset
+      // here too.
+      setCancelling(false);
+      setPausing(false);
       const settledId = engine.runId;
       void refreshRuns().then(() => {
         // Stale by the time this resolves: the user already moved on (e.g.
@@ -784,7 +793,11 @@ export function RunsView({
                           className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
                           onClick={cancel}
                           // No runId yet means there is nothing to abort (still 'starting').
-                          disabled={cancelling || !engine.runId}
+                          // Also blocked while a pause is already in flight — the abort
+                          // signal only carries ONE reason (AbortController.abort() is a
+                          // no-op once already aborted), so racing both actions
+                          // wouldn't reliably act as either a cancel or a pause.
+                          disabled={cancelling || pausing || !engine.runId}
                         >
                           <Square className="h-4 w-4" />
                           {cancelling ? 'Cancelling…' : 'Cancel'}

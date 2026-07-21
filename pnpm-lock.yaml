@@ -163,6 +163,9 @@ importers:
       archiver:
         specifier: ^7.0.1
         version: 7.0.1
+      cross-spawn:
+        specifier: ^7.0.6
+        version: 7.0.6
       js-yaml:
         specifier: ^4.1.0
         version: 4.2.0
@@ -179,6 +182,9 @@ importers:
       '@types/babel__traverse':
         specifier: ^7.20.6
         version: 7.28.0
+      '@types/cross-spawn':
+        specifier: ^6.0.6
+        version: 6.0.6
       '@types/js-yaml':
         specifier: ^4.0.9
         version: 4.0.9
@@ -761,6 +767,9 @@ packages:
 
   '@types/cacheable-request@6.0.3':
     resolution: {integrity: sha512-IQ3EbTzGxIigb1I3qPZc1rWJnH0BmSKv5QYTalEwweFvyBDLSAe24zP0le/hyi7ecGfZVlIVAg4BZqb8WBwKqw==}
+
+  '@types/cross-spawn@6.0.6':
+    resolution: {integrity: sha512-fXRhhUkG4H3TQk5dBhQ7m/JDdSNHKwR2BBia62lhwEIq9xGiQKLxd6LymNhn47SjXhsUEPmxi+PKw2OkW4LLjA==}
 
   '@types/debug@4.1.13':
     resolution: {integrity: sha512-KSVgmQmzMwPlmtljOomayoR89W4FynCAi3E8PPs7vmDVPe84hT+vGPKkJfThkmXs0x0jAaa9U8uW8bbfyS2fWw==}
@@ -3485,6 +3494,10 @@ snapshots:
       '@types/keyv': 3.1.4
       '@types/node': 24.13.2
       '@types/responselike': 1.0.3
+
+  '@types/cross-spawn@6.0.6':
+    dependencies:
+      '@types/node': 24.13.2
 
   '@types/debug@4.1.13':
     dependencies:

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Project, SuiteMode, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, ListPlus, Pause, Play, Plus, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
@@ -62,13 +62,59 @@ const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['paused', 'done', 'cancelled', 
 // honored across navigation instead of only within a single mount.
 let persistedSelectedRunId: string | null | undefined;
 
+// Same reasoning as persistedSelectedRunId above: RunsView fully unmounts on
+// navigating away, so a useRef here would reset to the prop's own value on
+// every remount (it'd not equal to itself) and the "did this actually
+// change" check below would never fire. Module state survives the unmount,
+// so a genuine bump from a Run click is still detectable as different from
+// whatever this was last observed as. Starts at 0 to match App.tsx's counter,
+// which also starts at 0 and only ever increments — so a plain sidebar nav
+// into Runs before any Run click ever happened (prop still 0) correctly
+// never fires this on the very first mount.
+let lastSeenRunRequestSeq = 0;
+
+// Same reasoning again, for the "run just settled, auto-select it" effect
+// below: engine.phase/engine.runId are lifted to App.tsx and stay at their
+// settled values indefinitely (until a new run actually starts), so a
+// useRef-based "have I already handled this settle" guard would reset blank
+// on every single remount and re-fire for the SAME stale settled run every
+// time RunsView remounts — e.g. clicking Run for a totally different project
+// right after a previous run was cancelled would still get its async
+// refreshRuns().then() callback firing again and yanking the fresh compose
+// form back to that old cancelled run. Module state remembers it was already
+// handled across the remount.
+let lastSettledKey: string | null = null;
+
+// Closes a further gap the module state above doesn't: it only stops a
+// settle already handled in a PREVIOUS mount from re-firing. It does nothing
+// for a settle that fires for the FIRST time while the user is already
+// looking at a fresh compose screen for a different project — e.g. Cancel a
+// run, then immediately click Run elsewhere before the cancellation's
+// run:done confirmation actually arrives. That confirmation still lands
+// (engine.phase/runId are lifted to App.tsx and don't care which view is
+// mounted) and would hijack the compose screen the instant it does. True
+// from the moment the user explicitly asks for a blank compose screen (Run
+// button or New run) until a new run actually starts or they explicitly pick
+// a different history row — while true, the settle effect must not
+// auto-select anything.
+let awaitingFreshRunConfig = false;
+
 export function RunsView({
   initialProjectId,
+  runRequestSeq,
   engine,
   queue,
   sidebarCollapsed = false,
 }: {
   initialProjectId?: string | null;
+  /**
+   * Bumped by App.tsx on every "Run" click from the Projects list (even for
+   * the same project — initialProjectId alone can't signal that). Landing
+   * here should always show the editable compose form pre-selected to that
+   * project, the same as clicking "New run", never a leftover historical
+   * run's read-only detail.
+   */
+  runRequestSeq?: number;
   /** Lifted to App.tsx so the live run survives navigating away from and back to this view. */
   engine: RunEngine;
   queue: RunQueue;
@@ -187,6 +233,13 @@ export function RunsView({
     engine.phase === 'plan-streaming' ||
     engine.phase === 'awaiting-approval';
 
+  // Mirrors `engine` for the settle effect below, whose refreshRuns().then()
+  // callback needs to read the LATEST engine state at the time it resolves,
+  // not the stale snapshot closed over when the effect fired — see that
+  // effect's own comment for why.
+  const engineRef = useRef(engine);
+  engineRef.current = engine;
+
   // Re-attach to a run that's still genuinely parked awaiting approval in the
   // main process — its approval promise only dies on app restart, not on
   // navigating away from this view — but whose live engine state was lost
@@ -233,12 +286,11 @@ export function RunsView({
   // (paused -> resumed -> paused again, or paused -> cancelled) — a runId-only
   // guard would fire once on the first settle and then never again for that
   // run, leaving history/detail stuck showing the earlier status forever.
-  const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
     if (SETTLED_PHASES.includes(engine.phase) && engine.runId) {
       const key = `${engine.runId}:${engine.phase}`;
-      if (lastSettledRef.current === key) return;
-      lastSettledRef.current = key;
+      if (lastSettledKey === key) return;
+      lastSettledKey = key;
       // The [isActive] effect above only fires on an active->inactive
       // TRANSITION, so it misses a settle that starts and ends inactive (e.g.
       // cancelling an already-paused run — 'paused' and 'cancelled' are both
@@ -250,12 +302,24 @@ export function RunsView({
       setPausing(false);
       const settledId = engine.runId;
       void refreshRuns().then(() => {
+        // Stale by the time this resolves: the user already moved on (e.g.
+        // cancelled this run, then immediately started a different one
+        // before this refresh came back) — engine.runId no longer points at
+        // the run this callback was about. Selecting it now would yank the
+        // view away from whatever the user is already looking at.
+        if (engineRef.current.runId !== settledId) return;
+        // The user explicitly asked for a blank compose screen (Run/New run)
+        // and no new run has started yet to supersede that intent — this
+        // settle confirmation (e.g. for the run they just cancelled to get
+        // here) arriving late must not hijack that screen back to it.
+        if (awaitingFreshRunConfig) return;
         setSelectedRunId(settledId);
         void reloadDetail();
       });
     }
     if (engine.phase === 'idle' || engine.phase === 'starting') {
-      lastSettledRef.current = null;
+      lastSettledKey = null;
+      awaitingFreshRunConfig = false;
     }
   }, [engine.phase, engine.runId, refreshRuns, reloadDetail]);
 
@@ -420,6 +484,28 @@ export function RunsView({
   const showLiveSurface =
     engine.runId != null ? selectedRunId === engine.runId && isActive : isActive && selectedRunId == null;
 
+  // A run just started/queued-in this session begins with engine.runId still
+  // null (see startOrQueue, which clears selectedRunId first) — showLiveSurface
+  // falls back to the "nothing else selected" branch above and the console
+  // shows. But the instant run:started arrives, engine.runId flips to a real
+  // id while selectedRunId is still null, so the runId-based branch above no
+  // longer matches and the console would vanish again right away. Adopt the
+  // freshly-assigned runId as the selection so the live console keeps showing.
+  // Skipped for a hydrated re-attach: selectedRunId is already set to that
+  // run's id by the effect that triggers hydrate() in the first place.
+  //
+  // Also gated on the run actually being live (not settled): engine.runId
+  // stays set to the LAST run indefinitely — it's only ever cleared back to
+  // null at the very start of a fresh start()/resume(), never when a run
+  // finishes/cancels/errors. Without the settled check, resetting
+  // selectedRunId to null to open a fresh compose screen (Run/New run) would
+  // immediately get overwritten right back to that old, already-settled run
+  // by this same effect.
+  useEffect(() => {
+    if (!engine.runId || engine.hydrated || SETTLED_PHASES.includes(engine.phase)) return;
+    if (selectedRunId === null) setSelectedRunId(engine.runId);
+  }, [engine.runId, engine.hydrated, engine.phase, selectedRunId]);
+
   // Viewing a selected run that isn't the live-tracked one — i.e. a genuinely
   // historical (already-run) row picked from the sidebar. The "Start a run"
   // card switches from the editable compose form into a read-only "what was
@@ -437,8 +523,19 @@ export function RunsView({
   const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
   const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
 
-  /** Clears the historical-run view and resets the compose form to defaults, ready for a fresh run. */
-  const startNewRunConfig = (): void => {
+  /**
+   * Clears the historical-run view and resets the compose form to defaults,
+   * ready for a fresh run. Also marks the run-history auto-select as already
+   * decided: on the very first-ever visit to Runs this app session (before
+   * `runs` has finished loading), that effect is still armed and would
+   * otherwise fire once history loads and stomp this reset right back to the
+   * latest run — see its own comment above. Sets awaitingFreshRunConfig so a
+   * late-arriving settle confirmation for a DIFFERENT, already-abandoned run
+   * (see that effect's own comment) can't hijack this screen either.
+   */
+  const startNewRunConfig = useCallback((): void => {
+    autoSelectedOnce.current = true;
+    awaitingFreshRunConfig = true;
     setSelectedRunId(null);
     setPrd('');
     setPrdFileName(null);
@@ -447,7 +544,20 @@ export function RunsView({
     setTestingScope('both');
     setSuiteMode('fresh');
     setFormCollapsed(false);
-  };
+  }, []);
+
+  // "Run" clicked on the Projects list — always land on the editable compose
+  // form for that project, exactly like "New run", never a leftover selected
+  // historical run's read-only detail. See lastSeenRunRequestSeq above for
+  // why this compares against module state rather than a useRef.
+  useEffect(() => {
+    if (runRequestSeq === undefined) return;
+    if (runRequestSeq !== lastSeenRunRequestSeq) {
+      startNewRunConfig();
+      if (initialProjectId) setProjectId(initialProjectId);
+    }
+    lastSeenRunRequestSeq = runRequestSeq;
+  }, [runRequestSeq, initialProjectId, startNewRunConfig]);
 
   return (
     <div className="flex h-full min-h-0">
@@ -461,6 +571,9 @@ export function RunsView({
             error={runsError}
             selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
             onSelect={(id) => {
+              // An explicit history pick overrides any still-pending "show me
+              // a blank compose screen" intent from a recent Run/New run click.
+              awaitingFreshRunConfig = false;
               setSelectedRunId(id);
             }}
             onRefresh={() => void refreshRuns()}
@@ -586,7 +699,10 @@ export function RunsView({
                       }}
                       placeholder="Paste requirements to ground test generation…"
                       className={viewingHistoricalRun ? undefined : 'pr-9'}
-                      disabled={viewingHistoricalRun}
+                      // readOnly (not disabled) for a historical run: prevents edits
+                      // while keeping the textarea scrollable — disabled:pointer-events-none
+                      // blocks wheel-scrolling over the field entirely.
+                      readOnly={viewingHistoricalRun}
                     />
                     {!viewingHistoricalRun && (
                       <button
@@ -632,7 +748,7 @@ export function RunsView({
                     value={effectiveInstructions}
                     onChange={(e) => setInstructions(e.target.value)}
                     placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
-                    disabled={viewingHistoricalRun}
+                    readOnly={viewingHistoricalRun}
                   />
                   <p className="mt-1 text-[11px] text-muted">
                     Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for

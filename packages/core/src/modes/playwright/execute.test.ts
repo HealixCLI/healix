@@ -534,7 +534,7 @@ describe('parseReport — drops blank-recording videos, keeps everything else', 
     rmSync(tmpDir, { recursive: true, force: true });
   });
 
-  it('excludes an implausibly small .webm from a result\'s artifacts, keeps the rest', () => {
+  it("excludes an implausibly small .webm from a result's artifacts, keeps the rest", () => {
     const r: PwReportArg = {
       suites: [
         {
@@ -618,7 +618,11 @@ describe('parseReport — drops blank-recording videos, keeps everything else', 
                   status: 'passed',
                   projectName: 'tierA-public',
                   results: [
-                    { status: 'passed', duration: 1000, attachments: [{ name: 'video', path: missingVideo }] },
+                    {
+                      status: 'passed',
+                      duration: 1000,
+                      attachments: [{ name: 'video', path: missingVideo }],
+                    },
                   ],
                 },
               ],

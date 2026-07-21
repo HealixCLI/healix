@@ -212,9 +212,7 @@ function renderArtifacts(artifacts: string[] | undefined, reportDir: string | un
   const videoHtml = videos
     .map((i) => `<video controls preload="metadata" class="ev-video" src="${esc(i.href)}"></video>`)
     .join('');
-  const otherHtml = other
-    .map((i) => `<a class="ev-file" href="${esc(i.href)}">${esc(i.name)}</a>`)
-    .join('');
+  const otherHtml = other.map((i) => `<a class="ev-file" href="${esc(i.href)}">${esc(i.name)}</a>`).join('');
   return `<div class="evidence">${imgHtml}${videoHtml}${otherHtml}</div>`;
 }
 

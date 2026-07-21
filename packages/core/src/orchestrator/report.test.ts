@@ -205,7 +205,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).not.toContain('C:\\runs\\r1');
   });
 
-  it('given a reportDir, links a UI test\'s evidence (screenshot + video) relative to it', () => {
+  it("given a reportDir, links a UI test's evidence (screenshot + video) relative to it", () => {
     const runRoot = join('runs', 'r1');
     const reportDir = join(runRoot, 'reports');
     const testResultsDir = join(runRoot, 'suite', 'test-results', 'foo');

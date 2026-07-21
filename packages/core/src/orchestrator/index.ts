@@ -2413,7 +2413,11 @@ async function finalizeReport(
   const reportPath = join(reportsDir, 'report.json');
   try {
     await writeJson(reportPath, report);
-    await writeFile(join(reportsDir, 'report.html'), renderReportHtml(report, { reportDir: reportsDir }), 'utf8');
+    await writeFile(
+      join(reportsDir, 'report.html'),
+      renderReportHtml(report, { reportDir: reportsDir }),
+      'utf8',
+    );
     noteStoreOk();
     return { reportPath };
   } catch (err) {

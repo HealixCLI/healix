@@ -38,6 +38,32 @@ function findLoginSubmitButton(elements: InteractiveElement[]): InteractiveEleme
   );
 }
 
+/**
+ * The username/email field for a login form is the non-password textbox
+ * CLOSEST to the password field in DOM order — not just the first textbox
+ * anywhere on the page. A real page can have unrelated textboxes ahead of
+ * the actual login field (a header search box, a newsletter/promo-code
+ * signup elsewhere on the page); picking the first one blind would type the
+ * username into the wrong element, fill the password correctly, and then
+ * fail submit — indistinguishable from a genuine wrong-credentials failure.
+ */
+function findNearestUsernameField(
+  elements: InteractiveElement[],
+  passwordIndex: number,
+): InteractiveElement | undefined {
+  let best: InteractiveElement | undefined;
+  let bestDistance = Infinity;
+  elements.forEach((el, i) => {
+    if (el.role !== 'textbox' || el.inputType === 'password') return;
+    const distance = Math.abs(i - passwordIndex);
+    if (distance < bestDistance) {
+      bestDistance = distance;
+      best = el;
+    }
+  });
+  return best;
+}
+
 /** Upper bound on how long to wait for a real login's async API chain (token generate, password
  * validate, profile lookup, ...) to redirect away from the login page before giving up. */
 const LOGIN_SETTLE_TIMEOUT_MS = 10_000;
@@ -86,13 +112,12 @@ export async function attemptLogin(
   await browser.goto(loginUrl);
   const before = await browser.snapshot();
 
-  const passwordEl = before.interactiveElements.find((el) => el.inputType === 'password');
+  const passwordIndex = before.interactiveElements.findIndex((el) => el.inputType === 'password');
+  const passwordEl = before.interactiveElements[passwordIndex];
   if (!passwordEl) {
     return { ok: false, reason: 'no password field found on candidate login page' };
   }
-  const usernameEl = before.interactiveElements.find(
-    (el) => el.role === 'textbox' && el.inputType !== 'password',
-  );
+  const usernameEl = findNearestUsernameField(before.interactiveElements, passwordIndex);
   if (!usernameEl) {
     return { ok: false, reason: 'no username/email field found alongside the password field' };
   }

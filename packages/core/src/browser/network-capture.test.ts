@@ -44,8 +44,8 @@ describe('collectObservedEndpoints()', () => {
 
     // The two numeric-id calls collapse to a single deduped endpoint.
     expect(result).toEqual([
-      { method: 'GET', pathPattern: '/api/customer/:param/profile', status: 200 },
-      { method: 'GET', pathPattern: '/api/orders/:param', status: 200 },
+      { method: 'GET', pathPattern: '/api/customer/:param/profile', status: 200, host: 'a.test' },
+      { method: 'GET', pathPattern: '/api/orders/:param', status: 200, host: 'a.test' },
     ]);
   });
 
@@ -62,7 +62,13 @@ describe('collectObservedEndpoints()', () => {
     );
 
     expect(result).toEqual([
-      { method: 'GET', pathPattern: '/api/status', status: 200, sampleResponseBody: '{"ok":true}' },
+      {
+        method: 'GET',
+        pathPattern: '/api/status',
+        status: 200,
+        sampleResponseBody: '{"ok":true}',
+        host: 'a.test',
+      },
     ]);
   });
 
@@ -103,5 +109,17 @@ describe('collectObservedEndpoints()', () => {
 
   it('returns an empty list for a crawl with no network activity', () => {
     expect(collectObservedEndpoints(crawlResult([route([])]))).toEqual([]);
+  });
+
+  it("records each observed endpoint's real hostname, distinguishing calls to different dependencies", () => {
+    const events: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://api.one.test/customer/coupons', status: 200 },
+      { method: 'GET', url: 'https://api.two.test/customer/profile', status: 200 },
+    ];
+
+    const result = collectObservedEndpoints(crawlResult([route(events)]));
+
+    expect(result.find((e) => e.pathPattern === '/customer/coupons')?.host).toBe('api.one.test');
+    expect(result.find((e) => e.pathPattern === '/customer/profile')?.host).toBe('api.two.test');
   });
 });

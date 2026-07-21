@@ -22,6 +22,7 @@ import type { ProjectCredential } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import {
   collectGroundTruth,
+  demoteEscapeHatchBlocks,
   findForbiddenApis,
   findUngroundedReferences,
   formatMockContent,
@@ -201,6 +202,81 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
   it('does not flag a getByRole call whose role matches the observed role', () => {
     const source = `page.getByRole('generic', { name: 'Moje kupóny' }).click();`;
     expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  it('accepts a getByText string literal that matches an observed accessible name', () => {
+    const source = `await page.getByText('Moje kupóny').click();`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  it('accepts a getByText regex where at least one alternative matches an observed name', () => {
+    const source = `await page.getByText(/nonexistent phrase|moje kupóny/i).click();`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  it('hard-fails a getByText regex when every alternative misses the observed-name inventory', () => {
+    const source = `await page.getByText(/zabudli ste heslo|forgot password/i).click();`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard.some((h) => h.includes('zabudli ste heslo'))).toBe(true);
+    expect(warn).toEqual([]);
+  });
+
+  it('downgrades an unmatched getByText to a warning when the escape-hatch marker is present', () => {
+    const source = `// TODO: unobserved element\nawait page.getByText(/zabudli ste heslo|forgot password/i).click();`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('zabudli ste heslo'))).toBe(true);
+  });
+
+  it('downgrades an unmatched getByText to a warning when the inventory was truncated', () => {
+    const source = `await page.getByText('completely unobserved text').click();`;
+    const { hard, warn } = findUngroundedReferences(source, gt({ inventoryTruncated: true }));
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('completely unobserved text'))).toBe(true);
+  });
+});
+
+describe('demoteEscapeHatchBlocks — ships an admitted guess as needs-review, not a real failure', () => {
+  it('leaves a spec with no escape-hatch marker untouched', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+`;
+    expect(demoteEscapeHatchBlocks(source)).toBe(source);
+  });
+
+  it('converts only the test block containing the escape-hatch marker to test.fixme', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+
+test('[REQ:REQ-1] edge: guessed consent checkbox', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('input[type="checkbox"]').check();
+  await expect(page).toHaveURL(/dashboard/);
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain("test('[REQ:REQ-1] positive: succeeds'");
+    expect(result).toContain("test.fixme('[REQ:REQ-1] edge: guessed consent checkbox'");
+    expect(result).not.toMatch(/^test\('\[REQ:REQ-1\] edge: guessed consent checkbox'/m);
+  });
+
+  it('demotes test.only/test.skip the same way as a plain test call', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test.only('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(demoteEscapeHatchBlocks(source)).toContain("test.fixme('[REQ:REQ-1] guessed'");
   });
 });
 

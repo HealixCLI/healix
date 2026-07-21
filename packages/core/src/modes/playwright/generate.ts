@@ -6,6 +6,7 @@ import type { ObservedEndpoint } from '../../browser/network-capture.js';
 import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import { ProviderUnavailableError } from '../types.js';
 import { TIERS, tierLabel } from './templates.js';
+import { splitTestBlocks } from './quality-audit.js';
 
 const GEN_TIMEOUT_MS = 180_000;
 
@@ -353,6 +354,36 @@ function retryNoteForbidden(violations: string[], allowedImport: string): string
 /** A marker the model can use (per formatSnapshotInventory's ESCAPE HATCH) to acknowledge an intentionally-unobserved element instead of inventing one — findUngroundedReferences downgrades hard failures to warnings when it's present. */
 const ESCAPE_HATCH_MARKER = '// TODO: unobserved element';
 
+/** Matches a test-block opening call (`test(`, `test.only(`, `test.skip(`) at an exact source offset — used to rewrite it to `test.fixme(` in place without disturbing anything else in the block. */
+const TEST_OPEN_AT_RE = /test(?:\.(?:only|skip|fixme))?\(/y;
+
+/**
+ * A test the model itself flagged as built on a guess (the escape-hatch marker anywhere in
+ * its body) still passes every other gate and, until now, shipped to execute as an ordinary
+ * `test(...)` — indistinguishable in the report from a fully-grounded test, and reliably
+ * failing/hanging when the guess is wrong (see docs/fix-backlog.md P1 item 7,
+ * "self-healing selectors" — no closed-loop repair exists yet to make good on the guess).
+ * Downgrade just that block to `test.fixme(...)` so Playwright reports it as
+ * needs-review/skipped rather than a hard failure, while every other test in the same spec
+ * (with no marker) ships and runs normally.
+ */
+export function demoteEscapeHatchBlocks(source: string): string {
+  const targets = splitTestBlocks(source).filter((b) => b.body.includes(ESCAPE_HATCH_MARKER));
+  if (targets.length === 0) return source;
+
+  let result = source;
+  for (const block of [...targets].sort((a, b) => b.start - a.start)) {
+    TEST_OPEN_AT_RE.lastIndex = block.start;
+    const m = TEST_OPEN_AT_RE.exec(result);
+    if (!m || m.index !== block.start) continue;
+    result =
+      result.slice(0, block.start) +
+      '/* healix: unobserved element — needs review */ test.fixme(' +
+      result.slice(block.start + m[0].length);
+  }
+  return result;
+}
+
 export interface GroundTruth {
   testids: Set<string>;
   selectors: Set<string>;
@@ -433,6 +464,42 @@ const TESTID_ATTR_RE = /data-test(?:id)?=["']([^"']+)["']/g;
 const ROLE_CALL_RE =
   /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
 const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
+/** Matches `getByText('literal')` or `getByText(/regex/flags)` — the two forms generation actually produces. */
+const TEXT_CALL_RE = /getByText\(\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]*)['"])/g;
+
+/** Collapse whitespace/case so a `getByText` argument compares fairly against the observed accessible-name corpus. */
+function normalizeText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * A regex-literal `getByText` argument is often an alternation of a few
+ * candidate phrases (`/zabudli ste heslo|forgot password/i`) rather than a
+ * single string — split on top-level `|` so each alternative is checked
+ * against the observed-name corpus independently. Not a real regex parser
+ * (doesn't handle nested groups/escapes precisely), just enough to catch the
+ * common flat-alternation shape generation actually produces.
+ */
+function splitTextAlternatives(source: string): string[] {
+  return source
+    .split('|')
+    .map((alt) => normalizeText(alt.replace(/\\(.)/g, '$1')))
+    .filter(Boolean);
+}
+
+/**
+ * Forgiving (substring, either direction) match against every accessible
+ * name observed in the selected inventory (`gt.names` — link/button/input
+ * text, already lowercased/whitespace-collapsed by selectorFor()'s clamp()).
+ * Only covers text that lives on an INTERACTIVE element (the inventory's own
+ * scope) — a `getByText` targeting plain static copy (a banner, a profile
+ * field) isn't checked here and falls through as unproven, same as any
+ * selector against a page EXPLORE never visited.
+ */
+function textMatchesInventory(alt: string, gt: GroundTruth): boolean {
+  if (!alt) return true;
+  return gt.names.some((name) => name.includes(alt) || alt.includes(name));
+}
 
 /** Normalize an endpoint path pattern (glob wildcards, `:param` placeholders) for a forgiving substring comparison. */
 function normalizeEndpointPath(path: string): string {
@@ -488,6 +555,11 @@ function findObservedEndpoint(
  *   - getByRole(role, {name}) vs. the name's observed role: WARN always — accessible-role
  *     computation is fuzzy enough (implicit ARIA semantics, nested content) that a hard-fail
  *     here risks real false positives.
+ *   - getByText(literal-or-regex) with every alternative missing from the observed
+ *     accessible-name corpus (link/button/input text — see textMatchesInventory): same
+ *     HARD/WARN split as data-testid. Only covers text that lives on an interactive element;
+ *     free-standing copy (banners, profile fields) isn't in the inventory at all and so never
+ *     produces a HARD finding here — it's unproven, not confirmed grounded.
  * A `// TODO: unobserved element` marker anywhere in the source (the sanctioned ESCAPE HATCH,
  * see formatSnapshotInventory) downgrades every hard finding in this spec to a warning — an
  * acknowledged, intentional gap isn't the same defect as a silent fabrication.
@@ -522,6 +594,17 @@ export function findUngroundedReferences(
     );
   }
 
+  for (const m of source.matchAll(TEXT_CALL_RE)) {
+    const alternatives = m[1] ? splitTextAlternatives(m[1]) : [normalizeText(m[2] ?? '')];
+    const unmatched = alternatives.filter((alt) => alt && !textMatchesInventory(alt, gt));
+    // Every alternative must miss — `/zabudli ste heslo|forgot password/i` still legitimately
+    // matches an English-language build even if the Slovak alternative never fires.
+    if (unmatched.length === 0 || unmatched.length !== alternatives.filter(Boolean).length) continue;
+    const label = `getByText("${unmatched.join('|')}") not found in the observed accessible-name inventory`;
+    if (inventoryKnown && !gt.inventoryTruncated && !hasEscapeHatch) hard.push(label);
+    else warn.push(label);
+  }
+
   for (const m of source.matchAll(MOCK_OVERRIDE_RE)) {
     const method = m[1];
     const path = m[2];
@@ -538,9 +621,11 @@ export function findUngroundedReferences(
 function retryNoteUngrounded(hard: string[], gt: GroundTruth): string {
   const sampleSelectors = [...gt.testids].slice(0, 8).map((t) => `data-testid="${t}"`);
   const sampleEndpoints = gt.endpoints.slice(0, 8).map((e) => `${e.method} ${e.pathPattern}`);
+  const sampleNames = gt.names.slice(0, 8).map((n) => `"${n}"`);
   const available = [
     sampleSelectors.length > 0 ? `Real testids available: ${sampleSelectors.join(', ')}.` : '',
     sampleEndpoints.length > 0 ? `Real endpoints available: ${sampleEndpoints.join(', ')}.` : '',
+    sampleNames.length > 0 ? `Real observed link/button/input text: ${sampleNames.join(', ')}.` : '',
   ]
     .filter(Boolean)
     .join(' ');
@@ -764,6 +849,11 @@ Requirements:
   This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
+- For a negative/invalid-input scenario, do NOT fill invalid data and then click a submit-like
+  control assuming the click succeeds and a validation message appears afterward — many real apps
+  correctly disable that control on invalid input, and clicking a disabled control hangs until
+  timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
+  assert the inline validation message directly without depending on a successful click.
 - Be self-contained and runnable; do not import any other local helpers beyond the one import above.
 - ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
 
@@ -961,6 +1051,7 @@ async function generateOne(
     }
 
     source = ensureReqTag(source, reqTag);
+    source = demoteEscapeHatchBlocks(source);
     if (tier === 'tierB-auth') {
       const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
       const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;

@@ -174,7 +174,8 @@ export type QualityFindingCode =
   | 'useless-wildcard-assertion'
   | 'hardcoded-credential-literal'
   | 'absolute-url-assertion'
-  | 'disabled-button-race-risk';
+  | 'disabled-button-race-risk'
+  | 'disabled-button-click-race';
 
 export interface QualityFinding {
   code: QualityFindingCode;

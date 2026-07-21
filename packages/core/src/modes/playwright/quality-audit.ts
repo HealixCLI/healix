@@ -190,11 +190,18 @@ const HAS_EXPECT_RE = /\bexpect\s*\(/;
 const WILDCARD_ASSERTION_RE = /to(?:HaveURL|HaveTitle)\(\s*\/\.\*\/[a-z]*\s*\)/;
 const ABSOLUTE_URL_ASSERTION_RE = /toHaveURL\(\s*['"]https?:\/\/[^'"]+['"]\s*\)/;
 const FILL_LITERAL_RE = /\.fill\(\s*['"]([^'"]*)['"]\s*\)/g;
+/** Non-global existence check for "does this block fill anything at all" — kept separate from FILL_LITERAL_RE so `.test()` here never disturbs that regex's shared `lastIndex` (it's iterated via matchAll elsewhere in this same function). */
+const HAS_FILL_RE = /\.fill\(/;
 const EMAIL_LITERAL_RE = /^[^\s@'"]+@[^\s@'"]+\.[^\s@'"]+$/;
 /** Obviously-fake placeholder domains a model is expected to use for invented test data — not a real, potentially-sensitive credential. */
 const PLACEHOLDER_EMAIL_RE = /@(example\.(com|org|net)|test\.(com|dev)|invalid|localhost)$/i;
 const NEGATIVE_TITLE_HINT_RE = /\b(invalid|error|unauthoriz|denied|fails?|incorrect|wrong)\b/i;
 const ENABLED_ASSERTION_RE = /\.(?:not\.toBeDisabled|toBeEnabled)\(\s*\)/;
+/** Asserts a control STAYS disabled — the correct pattern for a negative/invalid-input scenario, so its presence rules out the click-race check below. */
+const DISABLED_ASSERTION_RE = /(?<!\.not)\.toBeDisabled\(\s*\)/;
+/** A `.click(...)` call whose own line/statement mentions a submit-ish hint (testid, name, role, or button label) — English + a few observed Slovak equivalents. Not a full parser; matches the shape actual generated specs use (`locator('button[data-testid="login-submit"]').click()`). */
+const SUBMIT_CLICK_RE =
+  /[^\n;]*(?:submit|login|log-in|sign-?in|register|continue|confirm|save|pokra[cč]ova|odosla|prihl[aá]s|zaregistruj)[^\n;]*\.click\(\s*\)/i;
 
 /**
  * Audit a single spec's parse-clean source for quality findings. Returns
@@ -256,6 +263,26 @@ export function auditSpecQuality(source: string): QualityFinding[] {
         code: 'disabled-button-race-risk',
         severity: 'warn',
         message: `Test "${block.title}" reads as a negative-path scenario but asserts a control becomes enabled — if the app correctly keeps it disabled on invalid input, this assertion will time out. Consider asserting it stays disabled instead.`,
+        testTitle: block.title,
+        blockRange: [block.start, block.end],
+      });
+    } else if (
+      NEGATIVE_TITLE_HINT_RE.test(block.title) &&
+      HAS_FILL_RE.test(block.body) &&
+      SUBMIT_CLICK_RE.test(block.body) &&
+      !DISABLED_ASSERTION_RE.test(block.body)
+    ) {
+      // The dominant real-world failure shape: fill invalid data, then click a submit-like
+      // control assuming the click succeeds and a validation message appears — with no
+      // assertion anywhere that the control is (or stays) disabled. If the app correctly
+      // disables the control on invalid input, the click itself hangs until the Playwright
+      // timeout instead of ever reaching an assertion. HARD (not the narrower WARN case
+      // above) because this is provable from the block's own text: a negative scenario that
+      // clicks a submit control with zero disabled/enabled awareness anywhere in the block.
+      findings.push({
+        code: 'disabled-button-click-race',
+        severity: 'hard',
+        message: `Test "${block.title}" fills invalid input then clicks a submit-like control with no assertion of its disabled/enabled state anywhere in the test — if the app correctly disables the control on invalid input, this click will hang until timeout. Assert the control stays disabled (\`toBeDisabled()\`), or assert the inline validation message without depending on the click succeeding.`,
         testTitle: block.title,
         blockRange: [block.start, block.end],
       });

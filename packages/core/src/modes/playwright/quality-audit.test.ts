@@ -108,6 +108,41 @@ describe('auditSpecQuality', () => {
     expect(auditSpecQuality(source)).toEqual([]);
   });
 
+  it('hard-fails a negative-path test that fills invalid input then clicks a submit control with no disabled/enabled assertion at all', () => {
+    const source = block(
+      'shows validation error for invalid email',
+      `  await page.getByLabel('Email').fill('not-an-email');\n  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page.getByText('Invalid email')).toBeVisible();`,
+    );
+    const findings = auditSpecQuality(source);
+    expect(findings).toEqual([
+      expect.objectContaining({ code: 'disabled-button-click-race', severity: 'hard' }),
+    ]);
+  });
+
+  it('does not hard-fail the click-race shape when the block asserts the control stays disabled', () => {
+    const source = block(
+      'shows validation error for invalid email',
+      `  await page.getByLabel('Email').fill('not-an-email');\n  await expect(page.locator('button[data-testid="login-submit"]')).toBeDisabled();`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('does not hard-fail a negative-path test whose click target has no submit-like hint', () => {
+    const source = block(
+      'shows an error toast for an invalid coupon code',
+      `  await page.getByLabel('Coupon code').fill('not-a-code');\n  await page.getByRole('button', { name: 'Apply' }).click();\n  await expect(page.getByText('Invalid code')).toBeVisible();`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('does not hard-fail a positive-path test that fills and clicks a submit control', () => {
+    const source = block(
+      'submits successfully',
+      `  await page.getByLabel('Email').fill('test@example.com');\n  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
   it('audits each block independently across a multi-test file', () => {
     const source = `${HEADER}test('good', async ({ page }) => {\n  await expect(page).toHaveTitle(/Home/);\n});\n\ntest('bad', async ({ page }) => {\n  await page.click('button');\n});\n`;
     const findings = auditSpecQuality(source);

@@ -12,6 +12,10 @@ export interface ObservedEndpoint {
   pathPattern: string;
   status: number;
   sampleResponseBody?: string;
+  /** The request's real hostname (`URL.host`, includes port when non-default) — lets a
+   * multi-dependency run attribute an observed call to the specific dependency it belongs
+   * to, instead of collapsing to one dependency-wide mock (see scaffold.ts's mockRouteEntries). */
+  host?: string;
 }
 
 /** Mirrors `target/dependencies.ts`'s MAX_ENDPOINTS_PER_DEP — same order of magnitude,
@@ -30,18 +34,18 @@ const DYNAMIC_SEGMENT_RE =
  * strip origin/query/hash, collapse dynamic segments, then run the result through
  * `normalizeEndpointPath` for parity with the static-analysis side (harmless no-op
  * here since real URLs never contain `${...}` template syntax). */
-function normalizeObservedUrl(rawUrl: string): string | undefined {
-  let pathname: string;
+function normalizeObservedUrl(rawUrl: string): { pathPattern: string; host: string } | undefined {
+  let parsed: URL;
   try {
-    pathname = new URL(rawUrl).pathname;
+    parsed = new URL(rawUrl);
   } catch {
     return undefined;
   }
-  const normalized = pathname
+  const normalized = parsed.pathname
     .split('/')
     .map((segment) => (DYNAMIC_SEGMENT_RE.test(segment) ? ':param' : segment))
     .join('/');
-  return normalizeEndpointPath(normalized);
+  return { pathPattern: normalizeEndpointPath(normalized), host: parsed.host };
 }
 
 /**
@@ -58,8 +62,9 @@ export function collectObservedEndpoints(crawl: CrawlWithAuthResult): ObservedEn
 
   outer: for (const route of crawl.routes) {
     for (const event of route.networkEvents) {
-      const pathPattern = normalizeObservedUrl(event.url);
-      if (!pathPattern) continue;
+      const normalized = normalizeObservedUrl(event.url);
+      if (!normalized) continue;
+      const { pathPattern, host } = normalized;
       const method = event.method.toUpperCase();
       const key = `${method} ${pathPattern}`;
       if (seen.has(key)) continue;
@@ -69,6 +74,7 @@ export function collectObservedEndpoints(crawl: CrawlWithAuthResult): ObservedEn
         pathPattern,
         status: event.status,
         sampleResponseBody: event.responseBody ? redactSecrets(event.responseBody) : undefined,
+        host,
       });
       if (observed.length >= MAX_OBSERVED_ENDPOINTS) break outer;
     }

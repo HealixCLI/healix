@@ -127,6 +127,10 @@ export interface TestCase {
   status: TestStatus | null;
   /** Relative path of this test's generated spec file within its own run's suite dir (e.g. 'tests/tierA-public/login.spec.ts'). Null for legacy rows. */
   specPath: string | null;
+  /** The specific scenario's plan-time text (PlanScenario.description) — what this test verifies. Null when no scenario data was available. */
+  description: string | null;
+  /** The broader feature intent (TestPlanItem.intent) this test belongs to — why it exists. Null when no plan item was matched. */
+  details: string | null;
 }
 
 export interface TestResult {
@@ -136,6 +140,10 @@ export interface TestResult {
   durationMs: number | null;
   error: string | null;
   artifactsJson: string | null;
+  /** Mirrors the parent TestCase's description at result-persist time. */
+  description: string | null;
+  /** Mirrors the parent TestCase's details at result-persist time. */
+  details: string | null;
 }
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error';

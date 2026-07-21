@@ -120,6 +120,8 @@ export function registerReport(program: Command): void {
           const tier = t.tier ? pc.dim(` [${t.tier}]`) : '';
           const tag = t.reqTag ? pc.dim(` (${t.reqTag})`) : '';
           console.log(`    ${color(statusSymbol(t.status))} ${t.title}${tier}${tag}`);
+          if (t.description) console.log(pc.dim(`        ${t.description}`));
+          if (t.details) console.log(pc.dim(`        ${t.details}`));
         }
         console.log('');
         const summaryParts = Object.entries(counts).map(([k, v]) =>

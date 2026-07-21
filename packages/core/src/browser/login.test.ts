@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from 'vitest';
-import { attemptLogin } from './login.js';
+import { attemptLogin, attemptLoginViaToggle } from './login.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
@@ -17,7 +17,14 @@ function makeFakeBrowser(config: {
   pages: Record<string, FakePage>;
   /** Maps a submit-button click's source URL to the URL it lands on. */
   onSubmitGoTo?: Record<string, string>;
+  /** Maps a specific clicked selector to a destination page key, regardless of
+   * currentUrl — used to model a login-toggle click swapping in a different
+   * (same-URL, in real terms) view without going through onSubmitGoTo's
+   * per-URL lookup. */
+  onClickSelectorGoTo?: Record<string, string>;
   throwOnClick?: boolean;
+  /** Selectors whose click() call throws, instead of every click (throwOnClick). */
+  throwOnSelector?: Set<string>;
 }): BrowserSurface {
   let currentUrl = '';
   return {
@@ -33,8 +40,15 @@ function makeFakeBrowser(config: {
       if (!page) throw new Error(`no fake page configured for ${currentUrl}`);
       return { url: currentUrl, title: currentUrl, interactiveElements: page.elements };
     },
-    async click(_selector: string): Promise<void> {
-      if (config.throwOnClick) throw new Error('click failed');
+    async click(selector: string): Promise<void> {
+      if (config.throwOnClick || config.throwOnSelector?.has(selector)) {
+        throw new Error('click failed');
+      }
+      const bySelector = config.onClickSelectorGoTo?.[selector];
+      if (bySelector) {
+        currentUrl = bySelector;
+        return;
+      }
       const next = config.onSubmitGoTo?.[currentUrl];
       if (next) currentUrl = next;
     },
@@ -159,6 +173,76 @@ describe('attemptLogin()', () => {
 
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/login form interaction failed/i);
+  });
+
+  describe('username field selection (via attemptLogin, selector recorded per type() call)', () => {
+    it('picks the textbox closest to the password field, not the first textbox on the page', async () => {
+      // A header search box appears well before the real login form in DOM
+      // order — the naive "first non-password textbox" heuristic would type
+      // the username into it instead of the real email field.
+      const searchBox: InteractiveElement = { role: 'textbox', name: 'Search', selector: '#search' };
+      const realEmailField: InteractiveElement = {
+        role: 'textbox',
+        name: 'Email',
+        selector: '#real-email',
+        inputType: 'email',
+      };
+      const typed: Array<{ selector: string; text: string }> = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': {
+            elements: [searchBox, realEmailField, PASSWORD_FIELD, SUBMIT_BUTTON],
+          },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalType = browser.type.bind(browser);
+      browser.type = async (selector: string, text: string) => {
+        typed.push({ selector, text });
+        return originalType(selector, text);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(typed).toContainEqual({ selector: '#real-email', text: 'user@a.test' });
+      expect(typed).not.toContainEqual({ selector: '#search', text: 'user@a.test' });
+    });
+
+    it('prefers a textbox that comes AFTER the password field when it is strictly nearer than one before it', async () => {
+      // Some forms render password before username (uncommon but real) —
+      // proximity must work in both directions, not just "look backward".
+      const farBefore: InteractiveElement = { role: 'textbox', name: 'Newsletter', selector: '#newsletter' };
+      const distractor1: InteractiveElement = { role: 'button', name: 'Menu', selector: '#menu' };
+      const distractor2: InteractiveElement = { role: 'link', name: 'Help', selector: '#help' };
+      const nearAfter: InteractiveElement = {
+        role: 'textbox',
+        name: 'Username',
+        selector: '#near-username',
+        inputType: 'text',
+      };
+      const typed: Array<{ selector: string; text: string }> = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': {
+            elements: [farBefore, distractor1, distractor2, PASSWORD_FIELD, nearAfter, SUBMIT_BUTTON],
+          },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalType = browser.type.bind(browser);
+      browser.type = async (selector: string, text: string) => {
+        typed.push({ selector, text });
+        return originalType(selector, text);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(typed).toContainEqual({ selector: '#near-username', text: 'user@a.test' });
+    });
   });
 
   describe('findLoginSubmitButton() tiers (via attemptLogin, selector recorded per click)', () => {
@@ -293,5 +377,88 @@ describe('attemptLogin()', () => {
       expect(result.ok).toBe(true);
       expect(clicked).toEqual(['#enabled-fallback']);
     });
+  });
+});
+
+describe('attemptLoginViaToggle()', () => {
+  it('replays the toggle click before filling the form, then succeeds like attemptLogin', async () => {
+    // Models a same-URL client-side toggle (e.g. a register page's "Log in
+    // instead" button): goto() lands on the register-shaped page, the toggle
+    // click swaps in the login-shaped fields (mapped to a distinct page key
+    // here since this fake has no separate reveal layer), and submitting
+    // that revealed form succeeds.
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/register': { elements: [{ role: 'heading', name: 'Register', selector: 'h1' }] },
+        'https://a.test/register#toggled-login': {
+          elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON],
+        },
+        'https://a.test/dashboard': { elements: [{ role: 'heading', name: 'Dashboard', selector: 'h1' }] },
+      },
+      onClickSelectorGoTo: { '#toggle-login-btn': 'https://a.test/register#toggled-login' },
+      onSubmitGoTo: { 'https://a.test/register#toggled-login': 'https://a.test/dashboard' },
+    });
+
+    const result = await attemptLoginViaToggle(
+      browser,
+      'https://a.test/register',
+      '#toggle-login-btn',
+      'user@a.test',
+      'correct-pw',
+    );
+
+    expect(result.ok).toBe(true);
+    expect(result.landingUrl).toBe('https://a.test/dashboard');
+  });
+
+  it('reports a reason and does not throw when the toggle click itself fails', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/register': { elements: [{ role: 'heading', name: 'Register', selector: 'h1' }] },
+      },
+      throwOnSelector: new Set(['#toggle-login-btn']),
+    });
+
+    const result = await attemptLoginViaToggle(
+      browser,
+      'https://a.test/register',
+      '#toggle-login-btn',
+      'user@a.test',
+      'pw',
+    );
+
+    expect(result.ok).toBe(false);
+    expect(result.reason).toMatch(/failed to activate login toggle/i);
+  });
+
+  it('fails the same way as attemptLogin when the toggled-in view still has a password field after submit', async () => {
+    vi.useFakeTimers();
+    try {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/register': { elements: [{ role: 'heading', name: 'Register', selector: 'h1' }] },
+          'https://a.test/register#toggled-login': {
+            elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON],
+          },
+        },
+        onClickSelectorGoTo: { '#toggle-login-btn': 'https://a.test/register#toggled-login' },
+        // No onSubmitGoTo entry: submitting leaves the session on the toggled-in view.
+      });
+
+      const resultPromise = attemptLoginViaToggle(
+        browser,
+        'https://a.test/register',
+        '#toggle-login-btn',
+        'user@a.test',
+        'wrong-pw',
+      );
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/still on a page with a password field/i);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

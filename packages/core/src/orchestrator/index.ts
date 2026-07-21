@@ -969,6 +969,7 @@ async function runPipeline(
         );
         setStatus('error', { finishedAt: nowIso() });
         const summary = await finalizeReport(
+          store,
           runDir,
           run,
           project,
@@ -1138,6 +1139,7 @@ async function runPipeline(
         });
         setStatus('error', { finishedAt: nowIso() });
         const summary = await finalizeReport(
+          store,
           runDir,
           run,
           project,
@@ -1289,6 +1291,7 @@ async function runPipeline(
         emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
         setStatus('error', { finishedAt: nowIso() });
         const summary = await finalizeReport(
+          store,
           runDir,
           run,
           project,
@@ -1361,6 +1364,7 @@ async function runPipeline(
       emit('execute', 'error', `Execution failed: ${errMsg(err)}`, { stack: errStack(err) });
       setStatus('error', { finishedAt: nowIso() });
       const summary = await finalizeReport(
+        store,
         runDir,
         run,
         project,
@@ -1649,6 +1653,7 @@ async function runPipeline(
     emit('report', 'info', 'Writing report.');
     const reportPath = (
       await finalizeReport(
+        store,
         runDir,
         run,
         project,
@@ -1728,6 +1733,7 @@ async function runPipeline(
     try {
       reportPath = (
         await finalizeReport(
+          store,
           runDir,
           run,
           project,
@@ -2166,6 +2172,8 @@ function registerSpecRows(
       tier: (spec.tier ?? null) as Tier | null,
       status: 'pending',
       specPath,
+      description: null,
+      details: item?.intent ?? null,
     });
     // `base` ignores title when reqTag is set (see stableKey), so repeated calls
     // for the same reqTag — as happens once per scenario when carrying a
@@ -2188,6 +2196,8 @@ function registerSpecRows(
       tier: (spec.tier ?? null) as Tier | null,
       status: 'pending',
       specPath,
+      description: s.description,
+      details: item.intent,
     });
     testIdByKey.set(`${base}#${i}`, test.id);
   });
@@ -2256,12 +2266,18 @@ function persistResults(
     }
 
     try {
+      // Copy the parent test row's description/details onto its result — results
+      // have no independent source for this content, so it just mirrors the
+      // TestCase registered for it in GENERATE.
+      const parentTest = store.getTest(testId);
       store.insertResult({
         testId,
         status: r.status as TestStatus,
         durationMs: r.durationMs ?? null,
         error: r.error ?? null,
         artifactsJson: r.artifacts && r.artifacts.length > 0 ? JSON.stringify(r.artifacts) : null,
+        description: parentTest?.description ?? null,
+        details: parentTest?.details ?? null,
       });
       noteStoreOk();
     } catch (err) {
@@ -2379,6 +2395,7 @@ async function hydrateCheckpointedSpecs(
 
 /** Build + write report.json and report.html. Returns the report path (best-effort). */
 async function finalizeReport(
+  store: HealixStore,
   runDir: string,
   run: Run,
   project: Project,
@@ -2403,6 +2420,7 @@ async function finalizeReport(
     plan: effectivePlan,
     outcome,
     triage,
+    tests: store.listTests(run.id),
     artifacts,
     dependencies,
     mockedRequestCounts,

@@ -24,9 +24,15 @@ interface FakePage {
  * simulating a login form's submit button navigating on success.
  * `onClickSelectorGoTo` maps a specific clicked selector to a destination URL
  * (regardless of the current URL) — used to give two candidates on the same
- * page distinct destinations for click-probing tests. `log`, when provided,
- * records every `goto`/`click` call (as `goto:<url>` / `click:<selector>`) in
- * order, so tests can assert reset-after-click sequencing.
+ * page distinct destinations for click-probing tests. `onClickSelectorReveal`
+ * maps a specific clicked selector to a replacement element list shown on the
+ * SAME URL (no navigation) — models a client-side view toggle (e.g. a
+ * register<->login switch that doesn't change the route); `pressKey('Escape')`
+ * reverts back to the page's original elements, and any `goto()` also clears
+ * the reveal (client-side toggle state doesn't survive a fresh navigation).
+ * `log`, when provided, records every `goto`/`click` call (as `goto:<url>` /
+ * `click:<selector>`) in order, so tests can assert reset-after-click
+ * sequencing.
  */
 function makeFakeBrowser(config: {
   pages: Record<string, FakePage>;
@@ -35,15 +41,18 @@ function makeFakeBrowser(config: {
   delayMs?: number;
   onClickGoTo?: Record<string, string>;
   onClickSelectorGoTo?: Record<string, string>;
+  onClickSelectorReveal?: Record<string, InteractiveElement[]>;
   recordClicks?: string[];
   log?: string[];
 }): BrowserSurface {
   let currentUrl = '';
   let networkBuffer: CapturedNetworkEvent[] = [];
+  let revealedElements: InteractiveElement[] | undefined;
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
       config.log?.push(`goto:${url}`);
+      revealedElements = undefined;
       if (config.throwFor?.has(url)) {
         // Model a request that actually fired (and would otherwise leak into the
         // next route's drain) even though this navigation ultimately fails.
@@ -66,22 +75,37 @@ function makeFakeBrowser(config: {
       if (!page) {
         throw new Error(`no fake page configured for ${currentUrl}`);
       }
-      return { url: currentUrl, title: page.title ?? currentUrl, interactiveElements: page.elements };
+      return {
+        url: currentUrl,
+        title: page.title ?? currentUrl,
+        interactiveElements: revealedElements ?? page.elements,
+      };
     },
     async click(selector: string): Promise<void> {
       config.recordClicks?.push(selector);
       config.log?.push(`click:${selector}`);
+      const reveal = config.onClickSelectorReveal?.[selector];
+      if (reveal) {
+        revealedElements = reveal;
+        return;
+      }
       const bySelector = config.onClickSelectorGoTo?.[selector];
       if (bySelector) {
         currentUrl = bySelector;
+        revealedElements = undefined;
         return;
       }
       const next = config.onClickGoTo?.[currentUrl];
-      if (next) currentUrl = next;
+      if (next) {
+        currentUrl = next;
+        revealedElements = undefined;
+      }
     },
     async clickAt(_point: Point): Promise<void> {},
     async type(_selector: string, _text: string): Promise<void> {},
-    async pressKey(_key: string): Promise<void> {},
+    async pressKey(key: string): Promise<void> {
+      if (key === 'Escape') revealedElements = undefined;
+    },
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
     },
@@ -390,6 +414,54 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toEqual(['#toggle-login-btn']);
   });
 
+  it('records a same-URL login-toggle reveal as loginToggleSelector on the route', async () => {
+    // The exact bug scenario: a register-only page (no dedicated /login
+    // route) whose in-form "Log in instead" toggle flips to a login view via
+    // client-side state, without changing the URL. Naively, this would fall
+    // into the generic "menu/dropdown" branch and be discarded — leaving no
+    // trace that a real login view was ever reachable.
+    const inFormToggle: InteractiveElement = {
+      role: 'button',
+      name: 'Log in instead',
+      selector: '#toggle-login-btn',
+      inForm: true,
+    };
+    const registerElements = [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON, inFormToggle];
+    const loginElements = [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/register': { elements: registerElements } },
+      onClickSelectorReveal: { '#toggle-login-btn': loginElements },
+    });
+
+    const result = await crawl(browser, 'https://a.test/register');
+
+    expect(result.routes).toHaveLength(1);
+    expect(result.routes[0]?.loginToggleSelector).toBe('#toggle-login-btn');
+  });
+
+  it('does not record loginToggleSelector for an ordinary same-URL toggle (menu/dropdown) whose name does not read as login', async () => {
+    const menuToggle: InteractiveElement = {
+      role: 'button',
+      name: 'Options',
+      selector: '#menu-toggle',
+      inForm: true,
+    };
+    const revealedMenu = [{ role: 'link', name: 'Help', selector: 'a#help', href: 'https://a.test/help' }];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [menuToggle] },
+        'https://a.test/help': { elements: [] },
+      },
+      onClickSelectorReveal: { '#menu-toggle': revealedMenu },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0]?.loginToggleSelector).toBeUndefined();
+    // The regular reveal-then-Escape behavior (extract links, close menu) is unaffected.
+    expect(result.routes.map((r) => r.url).sort()).toEqual(['https://a.test/', 'https://a.test/help']);
+  });
+
   it('never click-probes a submit-type control inside a <form>', async () => {
     const inFormSubmit: InteractiveElement = {
       role: 'button',
@@ -659,6 +731,54 @@ describe('crawlWithAuth()', () => {
 
     expect(result.authAttempted).toBe(true);
     expect(result.authVerified).toBe(true);
+    const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
+    expect(authUrls).toEqual(['https://a.test/dashboard']);
+  });
+
+  it('verifies login via a discovered same-URL login toggle when no dedicated login route exists (regression: register-only app)', async () => {
+    // Reproduces the reported bug end-to-end: the only password-bearing
+    // route is /register (no /login route at all), reachable via an in-form
+    // "Log in instead" toggle that flips view state without changing the
+    // URL. Before this fix, pickLoginCandidate would fall back to /register
+    // itself and attemptLogin's fresh goto() would always reload the
+    // default register view, submitting login creds into the registration
+    // form and reporting a false "login likely failed".
+    //
+    // The login view's fields use DISTINCT selectors from the register
+    // view's — this is what makes the test fail against the pre-fix code:
+    // a plain attemptLogin() (fresh goto, no toggle replay) would fill and
+    // submit the register view's fields, which have no route to /dashboard
+    // wired up, so it would stay on a page with a password field and be
+    // reported as a failed login — exactly the reported bug.
+    const inFormToggle: InteractiveElement = {
+      role: 'button',
+      name: 'Log in instead',
+      selector: '#toggle-login-btn',
+      inForm: true,
+    };
+    const registerElements = [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON, inFormToggle];
+    const loginEmailField: InteractiveElement = { ...EMAIL_FIELD, selector: '#login-email' };
+    const loginPasswordField: InteractiveElement = { ...PASSWORD_FIELD, selector: '#login-password' };
+    const loginSubmitButton: InteractiveElement = { ...SUBMIT_BUTTON, selector: '#login-submit' };
+    const loginElements = [loginEmailField, loginPasswordField, loginSubmitButton];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/register': { elements: registerElements },
+        'https://a.test/dashboard': { elements: [{ role: 'heading', name: 'Dashboard', selector: 'h1' }] },
+      },
+      onClickSelectorReveal: { '#toggle-login-btn': loginElements },
+      // Only the toggled-in login view's submit button leads anywhere —
+      // submitting the register form's own submit button goes nowhere.
+      onClickSelectorGoTo: { '#login-submit': 'https://a.test/dashboard' },
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/register', {
+      credentials: { username: 'user@a.test', password: 'correct-pw' },
+    });
+
+    expect(result.authAttempted).toBe(true);
+    expect(result.authVerified).toBe(true);
+    expect(result.authReason).toBeUndefined();
     const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
     expect(authUrls).toEqual(['https://a.test/dashboard']);
   });

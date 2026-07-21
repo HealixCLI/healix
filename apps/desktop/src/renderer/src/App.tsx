@@ -19,6 +19,12 @@ function runStatusBadgeFor(phase: string, queueLength: number): RunStatusBadge |
 export default function App() {
   const [view, setView] = useState<ViewId>('projects');
   const [runProjectId, setRunProjectId] = useState<string | null>(null);
+  // Bumped on every "Run" click from the Projects list, even re-clicking the
+  // same project — RunsView can't tell that apart from just re-rendering with
+  // the same initialProjectId, so this is a distinct signal (not the id
+  // itself) telling it to drop any selected historical run and show the
+  // compose form, exactly like clicking "New run" would.
+  const [runRequestSeq, setRunRequestSeq] = useState(0);
   const [dashboardProject, setDashboardProject] = useState<Project | null>(null);
   // Whether the active view's secondary panel (project explorer / run history)
   // is hidden — toggled by clicking the activity bar's already-active icon
@@ -47,6 +53,7 @@ export default function App() {
   // 'Run' from the Projects list deep-links into the Runs view, pre-selected.
   const runProject = (project: Project): void => {
     setRunProjectId(project.id);
+    setRunRequestSeq((s) => s + 1);
     setView('runs');
     setPanelCollapsed(false);
   };
@@ -74,6 +81,7 @@ export default function App() {
         {view === 'runs' && (
           <RunsView
             initialProjectId={runProjectId}
+            runRequestSeq={runRequestSeq}
             engine={engine}
             queue={queue}
             sidebarCollapsed={panelCollapsed}

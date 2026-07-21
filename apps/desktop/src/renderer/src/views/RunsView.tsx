@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Project, SuiteMode, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, ListPlus, Pause, Play, Plus, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
@@ -62,13 +62,33 @@ const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['paused', 'done', 'cancelled', 
 // honored across navigation instead of only within a single mount.
 let persistedSelectedRunId: string | null | undefined;
 
+// Same reasoning as persistedSelectedRunId above: RunsView fully unmounts on
+// navigating away, so a useRef here would reset to the prop's own value on
+// every remount (it'd not equal to itself) and the "did this actually
+// change" check below would never fire. Module state survives the unmount,
+// so a genuine bump from a Run click is still detectable as different from
+// whatever this was last observed as. Starts at 0 to match App.tsx's counter,
+// which also starts at 0 and only ever increments — so a plain sidebar nav
+// into Runs before any Run click ever happened (prop still 0) correctly
+// never fires this on the very first mount.
+let lastSeenRunRequestSeq = 0;
+
 export function RunsView({
   initialProjectId,
+  runRequestSeq,
   engine,
   queue,
   sidebarCollapsed = false,
 }: {
   initialProjectId?: string | null;
+  /**
+   * Bumped by App.tsx on every "Run" click from the Projects list (even for
+   * the same project — initialProjectId alone can't signal that). Landing
+   * here should always show the editable compose form pre-selected to that
+   * project, the same as clicking "New run", never a leftover historical
+   * run's read-only detail.
+   */
+  runRequestSeq?: number;
   /** Lifted to App.tsx so the live run survives navigating away from and back to this view. */
   engine: RunEngine;
   queue: RunQueue;
@@ -442,8 +462,16 @@ export function RunsView({
   const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
   const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
 
-  /** Clears the historical-run view and resets the compose form to defaults, ready for a fresh run. */
-  const startNewRunConfig = (): void => {
+  /**
+   * Clears the historical-run view and resets the compose form to defaults,
+   * ready for a fresh run. Also marks the run-history auto-select as already
+   * decided: on the very first-ever visit to Runs this app session (before
+   * `runs` has finished loading), that effect is still armed and would
+   * otherwise fire once history loads and stomp this reset right back to the
+   * latest run — see its own comment above.
+   */
+  const startNewRunConfig = useCallback((): void => {
+    autoSelectedOnce.current = true;
     setSelectedRunId(null);
     setPrd('');
     setPrdFileName(null);
@@ -452,7 +480,20 @@ export function RunsView({
     setTestingScope('both');
     setSuiteMode('fresh');
     setFormCollapsed(false);
-  };
+  }, []);
+
+  // "Run" clicked on the Projects list — always land on the editable compose
+  // form for that project, exactly like "New run", never a leftover selected
+  // historical run's read-only detail. See lastSeenRunRequestSeq above for
+  // why this compares against module state rather than a useRef.
+  useEffect(() => {
+    if (runRequestSeq === undefined) return;
+    if (runRequestSeq !== lastSeenRunRequestSeq) {
+      startNewRunConfig();
+      if (initialProjectId) setProjectId(initialProjectId);
+    }
+    lastSeenRunRequestSeq = runRequestSeq;
+  }, [runRequestSeq, initialProjectId, startNewRunConfig]);
 
   return (
     <div className="flex h-full min-h-0">

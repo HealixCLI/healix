@@ -411,6 +411,20 @@ export function RunsView({
   const showLiveSurface =
     engine.runId != null ? selectedRunId === engine.runId && isActive : isActive && selectedRunId == null;
 
+  // A run just started/queued-in this session begins with engine.runId still
+  // null (see startOrQueue, which clears selectedRunId first) — showLiveSurface
+  // falls back to the "nothing else selected" branch above and the console
+  // shows. But the instant run:started arrives, engine.runId flips to a real
+  // id while selectedRunId is still null, so the runId-based branch above no
+  // longer matches and the console would vanish again right away. Adopt the
+  // freshly-assigned runId as the selection so the live console keeps showing.
+  // Skipped for a hydrated re-attach: selectedRunId is already set to that
+  // run's id by the effect that triggers hydrate() in the first place.
+  useEffect(() => {
+    if (!engine.runId || engine.hydrated) return;
+    if (selectedRunId === null) setSelectedRunId(engine.runId);
+  }, [engine.runId, engine.hydrated, selectedRunId]);
+
   // Viewing a selected run that isn't the live-tracked one — i.e. a genuinely
   // historical (already-run) row picked from the sidebar. The "Start a run"
   // card switches from the editable compose form into a read-only "what was
@@ -577,7 +591,10 @@ export function RunsView({
                       }}
                       placeholder="Paste requirements to ground test generation…"
                       className={viewingHistoricalRun ? undefined : 'pr-9'}
-                      disabled={viewingHistoricalRun}
+                      // readOnly (not disabled) for a historical run: prevents edits
+                      // while keeping the textarea scrollable — disabled:pointer-events-none
+                      // blocks wheel-scrolling over the field entirely.
+                      readOnly={viewingHistoricalRun}
                     />
                     {!viewingHistoricalRun && (
                       <button
@@ -623,7 +640,7 @@ export function RunsView({
                     value={effectiveInstructions}
                     onChange={(e) => setInstructions(e.target.value)}
                     placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
-                    disabled={viewingHistoricalRun}
+                    readOnly={viewingHistoricalRun}
                   />
                   <p className="mt-1 text-[11px] text-muted">
                     Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for

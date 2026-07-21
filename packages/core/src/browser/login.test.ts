@@ -161,6 +161,76 @@ describe('attemptLogin()', () => {
     expect(result.reason).toMatch(/login form interaction failed/i);
   });
 
+  describe('username field selection (via attemptLogin, selector recorded per type() call)', () => {
+    it('picks the textbox closest to the password field, not the first textbox on the page', async () => {
+      // A header search box appears well before the real login form in DOM
+      // order — the naive "first non-password textbox" heuristic would type
+      // the username into it instead of the real email field.
+      const searchBox: InteractiveElement = { role: 'textbox', name: 'Search', selector: '#search' };
+      const realEmailField: InteractiveElement = {
+        role: 'textbox',
+        name: 'Email',
+        selector: '#real-email',
+        inputType: 'email',
+      };
+      const typed: Array<{ selector: string; text: string }> = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': {
+            elements: [searchBox, realEmailField, PASSWORD_FIELD, SUBMIT_BUTTON],
+          },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalType = browser.type.bind(browser);
+      browser.type = async (selector: string, text: string) => {
+        typed.push({ selector, text });
+        return originalType(selector, text);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(typed).toContainEqual({ selector: '#real-email', text: 'user@a.test' });
+      expect(typed).not.toContainEqual({ selector: '#search', text: 'user@a.test' });
+    });
+
+    it('prefers a textbox that comes AFTER the password field when it is strictly nearer than one before it', async () => {
+      // Some forms render password before username (uncommon but real) —
+      // proximity must work in both directions, not just "look backward".
+      const farBefore: InteractiveElement = { role: 'textbox', name: 'Newsletter', selector: '#newsletter' };
+      const distractor1: InteractiveElement = { role: 'button', name: 'Menu', selector: '#menu' };
+      const distractor2: InteractiveElement = { role: 'link', name: 'Help', selector: '#help' };
+      const nearAfter: InteractiveElement = {
+        role: 'textbox',
+        name: 'Username',
+        selector: '#near-username',
+        inputType: 'text',
+      };
+      const typed: Array<{ selector: string; text: string }> = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': {
+            elements: [farBefore, distractor1, distractor2, PASSWORD_FIELD, nearAfter, SUBMIT_BUTTON],
+          },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalType = browser.type.bind(browser);
+      browser.type = async (selector: string, text: string) => {
+        typed.push({ selector, text });
+        return originalType(selector, text);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(typed).toContainEqual({ selector: '#near-username', text: 'user@a.test' });
+    });
+  });
+
   describe('findLoginSubmitButton() tiers (via attemptLogin, selector recorded per click)', () => {
     it('picks the in-form submit-type button over a same-page name-matching decoy (tier 1 wins)', async () => {
       // The exact C&A shape: the real submit button's visible name is

@@ -1,11 +1,21 @@
 import { writeFile, mkdir, rename } from 'node:fs/promises';
 import { basename, join, relative, sep } from 'node:path';
 
-import type { GeneratedSpec, QuarantinedSpec, TestModeContext, ValidationResult } from '../types.js';
+import type {
+  GeneratedSpec,
+  QualityWarning,
+  QuarantinedSpec,
+  TestModeContext,
+  ValidationResult,
+} from '../types.js';
 import { hasExpect, looksLikePlaywrightSpec, MOCK_FIXTURE_IMPORT_PATH } from './generate.js';
 import { ensureSuiteDeps, runCommand } from './execute.js';
+import { auditSpecQuality, pruneHardFindings } from './quality-audit.js';
 
 const LIST_TIMEOUT_MS = 60_000;
+
+/** A `// [SRC:file]` citation anywhere in the source marks this spec as generated directly from a real, already-indexed source file (see generate.ts's formatSourceGrounding) — a parse failure there is a codegen bug, not an ordinary model slip. */
+const SRC_CITATION_RE = /\[SRC:[^\]]+\]/;
 
 /**
  * Same intent as orchestrator's looksLikeMissingDeps (not imported directly —
@@ -140,16 +150,83 @@ async function quarantine(ctx: TestModeContext, spec: GeneratedSpec): Promise<vo
   }
 }
 
+/** A parse failure on a source-grounded spec is a codegen defect, not routine per-spec noise — see SRC_CITATION_RE. */
+function quarantineCategoryForParseFailure(spec: GeneratedSpec): 'parse' | 'codegen-defect' {
+  return SRC_CITATION_RE.test(spec.contents) ? 'codegen-defect' : 'parse';
+}
+
+/**
+ * Run the static quality audit on parse-clean `contents` and decide what
+ * happens to `spec`:
+ *  - no hard findings: ship as-is, soft findings (if any) reported as warnings.
+ *  - hard findings, but pruning the offending block(s) still leaves at least
+ *    one test AND the pruned file re-passes the parse-check: ship the pruned
+ *    content, soft findings on the SURVIVING blocks reported as warnings
+ *    (Phase B's net-benefit check — pruning that doesn't leave anything
+ *    runnable, or that doesn't actually re-parse, isn't worth it).
+ *  - otherwise: quarantine the original (unpruned) content.
+ */
+async function auditAndMaybePrune(
+  ctx: TestModeContext,
+  spec: GeneratedSpec,
+  relPath: string,
+  contents: string,
+): Promise<
+  | { outcome: 'ok'; spec: GeneratedSpec; warnings: QualityWarning[] }
+  | { outcome: 'quarantine'; reason: string }
+> {
+  const findings = auditSpecQuality(contents);
+  const hard = findings.filter((f) => f.severity === 'hard');
+  const soft = findings.filter((f) => f.severity === 'warn');
+
+  if (hard.length === 0) {
+    return {
+      outcome: 'ok',
+      spec: { ...spec, contents },
+      warnings: soft.length > 0 ? [{ spec: { ...spec, contents }, findings: soft }] : [],
+    };
+  }
+
+  const pruned = pruneHardFindings(contents, hard);
+  const prunedHasTests = pruned !== null && /\btest(?:\.(?:only|skip|fixme))?\s*\(/.test(pruned);
+  if (pruned && prunedHasTests) {
+    await writeFile(spec.path, pruned, 'utf-8');
+    const reparse = await parseCheck(ctx, relPath);
+    if (reparse.ok) {
+      const remaining = auditSpecQuality(pruned).filter((f) => f.severity === 'warn');
+      ctx.emit?.(
+        'generate',
+        `[validate] Pruned ${hard.length} low-quality test block(s) from "${spec.title}" and kept the rest`,
+        { path: spec.path, findings: hard.map((f) => f.message) },
+      );
+      return {
+        outcome: 'ok',
+        spec: { ...spec, contents: pruned },
+        warnings: remaining.length > 0 ? [{ spec: { ...spec, contents: pruned }, findings: remaining }] : [],
+      };
+    }
+    // Pruning didn't net-improve things (the trimmed file doesn't even parse) — roll back.
+    await writeFile(spec.path, contents, 'utf-8');
+  }
+
+  return {
+    outcome: 'quarantine',
+    reason: `Quality audit: ${hard.map((f) => f.message).join(' | ')}`,
+  };
+}
+
 /**
  * Pre-execution gate: parse-check every generated spec (via `playwright test
  * --list`, which imports/collects but never runs a test) BEFORE any of them
- * reach `execute()`. A spec that fails gets one mechanical repair attempt
- * (attemptBracketRepair); if the repair re-passes both the parse-check and
- * generate.ts's own content gates, it's accepted as `repaired`. A spec still
- * broken after that is moved out of its tier directory into
- * tests/_quarantine (so Playwright's testDir glob never sees it) rather than
- * silently shipped into a run whose first sign of trouble would otherwise be
- * a raw exception mid-suite.
+ * reach `execute()`, then run the static quality audit (quality-audit.ts) on
+ * every spec that parses cleanly. A parse failure gets one mechanical repair
+ * attempt (attemptBracketRepair); if the repair re-passes both the
+ * parse-check and generate.ts's own content gates, it's accepted as
+ * `repaired`. A spec still broken after that — or one whose quality-audit
+ * hard findings survive block-level pruning — is moved out of its tier
+ * directory into tests/_quarantine (so Playwright's testDir glob never sees
+ * it) rather than silently shipped into a run whose first sign of trouble
+ * would otherwise be a raw exception mid-suite or a silently useless test.
  *
  * Never blocks the run on cancellation: an already-aborted signal returns
  * every spec as `ok` unvalidated (matches execute()'s own "ship as before"
@@ -158,7 +235,7 @@ async function quarantine(ctx: TestModeContext, spec: GeneratedSpec): Promise<vo
  */
 export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult> {
   if (specs.length === 0 || ctx.signal?.aborted) {
-    return { ok: [...specs], repaired: [], quarantined: [] };
+    return { ok: [...specs], repaired: [], quarantined: [], warnings: [] };
   }
 
   // The parse-check below runs `npx playwright test --list`, which requires
@@ -170,6 +247,7 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
   const ok: GeneratedSpec[] = [];
   const repaired: GeneratedSpec[] = [];
   const quarantined: QuarantinedSpec[] = [];
+  const warnings: QualityWarning[] = [];
 
   for (let i = 0; i < specs.length; i += 1) {
     if (ctx.signal?.aborted) {
@@ -183,7 +261,18 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
     const relPath = toPosixRelative(ctx.projectDir, spec.path);
     const first = await parseCheck(ctx, relPath);
     if (first.ok) {
-      ok.push(spec);
+      const audited = await auditAndMaybePrune(ctx, spec, relPath, spec.contents);
+      if (audited.outcome === 'ok') {
+        if (audited.spec.contents === spec.contents) ok.push(audited.spec);
+        else repaired.push(audited.spec);
+        warnings.push(...audited.warnings);
+      } else {
+        await quarantine(ctx, spec);
+        quarantined.push({ spec, reason: audited.reason, category: 'quality' });
+        ctx.emit?.('generate', `[validate] Quarantined "${spec.title}": ${audited.reason}`, {
+          path: spec.path,
+        });
+      }
       continue;
     }
 
@@ -212,9 +301,21 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
       await writeFile(spec.path, fixed, 'utf-8');
       const second = await parseCheck(ctx, relPath);
       if (second.ok) {
-        const repairedSpec = { ...spec, contents: fixed };
-        repaired.push(repairedSpec);
-        ctx.emit?.('generate', `[validate] Repaired a syntax defect in "${spec.title}"`, { path: spec.path });
+        const audited = await auditAndMaybePrune(ctx, spec, relPath, fixed);
+        if (audited.outcome === 'ok') {
+          repaired.push(audited.spec);
+          warnings.push(...audited.warnings);
+          ctx.emit?.('generate', `[validate] Repaired a syntax defect in "${spec.title}"`, {
+            path: spec.path,
+          });
+        } else {
+          await writeFile(spec.path, spec.contents, 'utf-8');
+          await quarantine(ctx, spec);
+          quarantined.push({ spec, reason: audited.reason, category: 'quality' });
+          ctx.emit?.('generate', `[validate] Quarantined "${spec.title}": ${audited.reason}`, {
+            path: spec.path,
+          });
+        }
         continue;
       }
       // The repair didn't actually fix it — restore the original content on
@@ -222,14 +323,17 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
       await writeFile(spec.path, spec.contents, 'utf-8');
     }
 
+    const category = quarantineCategoryForParseFailure(spec);
     await quarantine(ctx, spec);
     const reason = first.tail || 'failed `playwright test --list` parse check';
-    quarantined.push({ spec, reason });
-    ctx.emit?.('generate', `[validate] Quarantined "${spec.title}": fails to parse`, {
+    quarantined.push({ spec, reason, category });
+    const label = category === 'codegen-defect' ? 'CODEGEN DEFECT' : 'fails to parse';
+    ctx.emit?.('generate', `[validate] Quarantined "${spec.title}": ${label}`, {
       path: spec.path,
       reason,
+      category,
     });
   }
 
-  return { ok, repaired, quarantined };
+  return { ok, repaired, quarantined, warnings };
 }

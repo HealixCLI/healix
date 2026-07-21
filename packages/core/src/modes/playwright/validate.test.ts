@@ -289,4 +289,119 @@ describe('validateSuite', () => {
     // Only one probe was made before recognizing the missing-deps signal and bailing out.
     expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
   });
+
+  // ---- Phase A/B: static quality audit + block-level pruning -----------------
+
+  const SOURCE_WITH_ONE_BAD_BLOCK = `import { test, expect } from '@playwright/test';\n\ntest('[REQ:REQ-1] good', async ({ page }) => {\n  await page.goto('/');\n  await expect(page).toHaveTitle(/Home/);\n});\n\ntest('[REQ:REQ-1] bad', async ({ page }) => {\n  await page.click('button');\n});\n`;
+
+  it('ships a spec untouched when the quality audit finds nothing (no extra --list call)', async () => {
+    const spec = await writeSpec('tests/tierA-public/clean.spec.ts', CLEAN_SPEC_SOURCE);
+    queueSpawnResults([{ code: 0 }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.ok).toEqual([spec]);
+    expect(result.repaired).toEqual([]);
+    expect(result.quarantined).toEqual([]);
+    expect(result.warnings).toEqual([]);
+    expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
+  });
+
+  it('prunes only the block(s) with a hard quality finding and ships the rest as repaired', async () => {
+    const spec = await writeSpec('tests/tierA-public/mixed.spec.ts', SOURCE_WITH_ONE_BAD_BLOCK);
+    // First --list call: the original parses fine. Second --list call: the
+    // pruned (post-audit) file re-parses fine too.
+    queueSpawnResults([{ code: 0 }, { code: 0 }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.ok).toEqual([]);
+    expect(result.quarantined).toEqual([]);
+    expect(result.repaired).toHaveLength(1);
+    expect(result.repaired[0].contents).toContain("'[REQ:REQ-1] good'");
+    expect(result.repaired[0].contents).not.toContain("'[REQ:REQ-1] bad'");
+    // The pruned content was actually written to disk.
+    expect(await readFile(spec.path, 'utf-8')).toBe(result.repaired[0].contents);
+    expect(vi.mocked(spawn)).toHaveBeenCalledTimes(2);
+  });
+
+  it('quarantines the whole spec (not just a block) when pruning would leave nothing runnable', async () => {
+    const allBadSource = `import { test, expect } from '@playwright/test';\n\ntest('[REQ:REQ-1] bad', async ({ page }) => {\n  await page.click('button');\n});\n`;
+    const spec = await writeSpec('tests/tierA-public/all-bad.spec.ts', allBadSource);
+    queueSpawnResults([{ code: 0 }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.ok).toEqual([]);
+    expect(result.repaired).toEqual([]);
+    expect(result.quarantined).toHaveLength(1);
+    expect(result.quarantined[0].category).toBe('quality');
+    expect(result.quarantined[0].reason).toContain('Quality audit');
+    // Original content preserved in quarantine (not silently mutated).
+    const quarantinedContents = await readFile(
+      join(projectDir, 'tests', '_quarantine', 'all-bad.spec.ts'),
+      'utf-8',
+    );
+    expect(quarantinedContents).toBe(allBadSource);
+    // Only the original --list call — pruning to zero tests is never re-probed.
+    expect(vi.mocked(spawn)).toHaveBeenCalledTimes(1);
+  });
+
+  it('rolls back pruning and quarantines the ORIGINAL content when the pruned file fails to re-parse', async () => {
+    const spec = await writeSpec('tests/tierA-public/mixed2.spec.ts', SOURCE_WITH_ONE_BAD_BLOCK);
+    // Original parses fine; the pruned version (second --list call) fails for
+    // some unrelated reason — pruning must not be trusted blindly.
+    queueSpawnResults([{ code: 0 }, { code: 1, stderr: 'SyntaxError: unexpected after prune' }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.ok).toEqual([]);
+    expect(result.repaired).toEqual([]);
+    expect(result.quarantined).toHaveLength(1);
+    expect(result.quarantined[0].category).toBe('quality');
+    // Disk reflects the quarantine move of the ORIGINAL (pre-prune) content.
+    const quarantinedContents = await readFile(
+      join(projectDir, 'tests', '_quarantine', 'mixed2.spec.ts'),
+      'utf-8',
+    );
+    expect(quarantinedContents).toBe(SOURCE_WITH_ONE_BAD_BLOCK);
+  });
+
+  it('ships a spec with soft findings as ok, surfaced via result.warnings, without blocking it', async () => {
+    const source = `import { test, expect } from '@playwright/test';\n\ntest('[REQ:REQ-1] nav', async ({ page }) => {\n  await expect(page).toHaveURL('http://localhost:4202/home');\n});\n`;
+    const spec = await writeSpec('tests/tierA-public/soft.spec.ts', source);
+    queueSpawnResults([{ code: 0 }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.ok).toEqual([spec]);
+    expect(result.quarantined).toEqual([]);
+    expect(result.warnings).toHaveLength(1);
+    expect(result.warnings[0].findings[0].code).toBe('absolute-url-assertion');
+  });
+
+  // ---- Phase C: codegen-defect classification for source-grounded specs -----
+
+  it('classifies an unrepairable parse failure on a [SRC:...]-cited spec as a codegen-defect', async () => {
+    // Brackets are already balanced (attemptBracketRepair returns null, nothing to fix),
+    // so this goes straight to quarantine on the first parse failure.
+    const balancedButBadSource = `import { test, expect } from '@playwright/test';\n// [SRC:src/routes/login.ts]\ntest('[REQ:REQ-1] works', async ({ page }) => {\n  await expect(page).toHaveTitle(/Home/);\n});\n`;
+    const spec = await writeSpec('tests/tierA-public/src-cited.spec.ts', balancedButBadSource);
+    queueSpawnResults([{ code: 1, stderr: 'SyntaxError: something structurally wrong' }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.quarantined).toHaveLength(1);
+    expect(result.quarantined[0].category).toBe('codegen-defect');
+  });
+
+  it('classifies an unrepairable parse failure on a spec without [SRC:...] as an ordinary parse failure', async () => {
+    const spec = await writeSpec('tests/tierA-public/no-src.spec.ts', CLEAN_SPEC_SOURCE);
+    queueSpawnResults([{ code: 1, stderr: 'SyntaxError: something structurally wrong' }]);
+
+    const result = await validateSuite(makeCtx(), [spec]);
+
+    expect(result.quarantined).toHaveLength(1);
+    expect(result.quarantined[0].category).toBe('parse');
+  });
 });

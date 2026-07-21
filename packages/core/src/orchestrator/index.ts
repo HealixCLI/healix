@@ -1189,13 +1189,46 @@ async function runPipeline(
         // treated as always-valid.
         const validation = mode.validate
           ? await mode.validate(ctx, [...newSpecs, ...carriedSpecs])
-          : { ok: [...newSpecs, ...carriedSpecs], repaired: [], quarantined: [] };
+          : { ok: [...newSpecs, ...carriedSpecs], repaired: [], quarantined: [], warnings: [] };
         if (validation.quarantined.length > 0) {
+          const codegenDefects = validation.quarantined.filter((q) => q.category === 'codegen-defect');
+          // Codegen defects (a parse failure on a spec generated FROM a real,
+          // already-indexed source file — see validate.ts's SRC_CITATION_RE)
+          // indicate a bug in generation itself, not an ordinary model slip —
+          // surface them louder/separately so they don't get lost among
+          // routine per-spec quarantine noise.
+          if (codegenDefects.length > 0) {
+            emit(
+              'generate',
+              'error',
+              `${codegenDefects.length} source-grounded spec(s) failed to parse — likely a codegen defect, not a routine quality issue.`,
+              { codegenDefects: codegenDefects.map((q) => ({ title: q.spec.title, reason: q.reason })) },
+            );
+          }
           emit(
             'generate',
             'warn',
-            `${validation.quarantined.length} spec(s) quarantined after failing to parse (one repair attempt each).`,
-            { quarantined: validation.quarantined.map((q) => ({ title: q.spec.title, reason: q.reason })) },
+            `${validation.quarantined.length} spec(s) quarantined after failing validation.`,
+            {
+              quarantined: validation.quarantined.map((q) => ({
+                title: q.spec.title,
+                reason: q.reason,
+                category: q.category,
+              })),
+            },
+          );
+        }
+        if (validation.warnings.length > 0) {
+          emit(
+            'generate',
+            'warn',
+            `${validation.warnings.length} spec(s) shipped with non-blocking quality findings.`,
+            {
+              warnings: validation.warnings.map((w) => ({
+                title: w.spec.title,
+                findings: w.findings.map((f) => f.message),
+              })),
+            },
           );
         }
         // Only `contents` legitimately flows out of validation (a bracket-repair

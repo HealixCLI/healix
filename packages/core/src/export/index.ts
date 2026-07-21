@@ -1,7 +1,7 @@
 import fs from 'node:fs/promises';
 import path from 'node:path';
 import type { SuiteBundle } from '../modes/types.js';
-import { isTextFile, sanitizeContent } from './sanitize.js';
+import { isTextFile, sanitizeContent, type ExportCredential } from './sanitize.js';
 import { zipDirectory } from './zip.js';
 
 export interface ExportOptions {
@@ -13,6 +13,12 @@ export interface ExportOptions {
   sanitize?: boolean;
   /** Also produce a .zip (default true). */
   zip?: boolean;
+  /**
+   * The project's own test-login credentials, if any — passed through so
+   * sanitize can redact literal occurrences (e.g. a hardcoded password in a
+   * generated spec) that the generic secret patterns wouldn't catch.
+   */
+  credentials?: ExportCredential[];
 }
 
 /** Bundle info returned by {@link exportSuite}: a {@link SuiteBundle} plus
@@ -78,6 +84,8 @@ interface CopyContext {
   realRootDir: string;
   /** Strip secrets / local absolute paths from text files. */
   sanitize: boolean;
+  /** The project's own test-login credentials, for literal-value redaction. */
+  credentials: ExportCredential[] | undefined;
   /** Canonical directories already entered (symlink-cycle guard). */
   visited: Set<string>;
   /** Suite-relative paths skipped for safety (outward symlinks). */
@@ -173,7 +181,7 @@ async function copyTree(srcDir: string, destDir: string, ctx: CopyContext): Prom
       continue;
     }
 
-    await copyFile(srcPath, destPath, ctx.rootSrcDir, ctx.sanitize);
+    await copyFile(srcPath, destPath, ctx.rootSrcDir, ctx.sanitize, ctx.credentials);
   }
 }
 
@@ -191,6 +199,7 @@ async function copyFile(
   destPath: string,
   rootSrcDir: string,
   sanitize: boolean,
+  credentials: ExportCredential[] | undefined,
 ): Promise<void> {
   await fs.mkdir(path.dirname(destPath), { recursive: true });
 
@@ -203,7 +212,7 @@ async function copyFile(
       await fs.copyFile(srcPath, destPath);
       return;
     }
-    const cleaned = sanitizeContent(raw, rootSrcDir);
+    const cleaned = sanitizeContent(raw, rootSrcDir, credentials);
     await fs.writeFile(destPath, cleaned, 'utf8');
     return;
   }
@@ -277,6 +286,7 @@ export async function exportSuite(opts: ExportOptions): Promise<ExportedSuiteBun
     rootDestDir: outDir,
     realRootDir,
     sanitize,
+    credentials: opts.credentials,
     visited: new Set<string>(),
     skipped,
   });

@@ -1,8 +1,9 @@
 import { useMemo, useState } from 'react';
 import type { Project, Run, RunStatus } from '@healix/core';
-import { ChevronLeft, ChevronRight, RefreshCw } from 'lucide-react';
+import { ChevronLeft, ChevronRight, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { Badge } from './ui/badge';
 import { Button } from './ui/button';
+import { ConfirmDialog } from './ui/confirm-dialog';
 import { Select } from './ui/select';
 import { cn } from '../lib/utils';
 import { ALL_RUN_STATUSES, formatCreatedAt, formatRunStatus, runStatusTone } from '../lib/run-format';
@@ -19,8 +20,10 @@ export function RunHistory({
   selectedRunId,
   onSelect,
   onRefresh,
+  onDelete,
+  onNewRun,
   projectsById,
-  collapsed,
+  collapsed = false,
   onToggleCollapse,
 }: {
   runs: Run[];
@@ -29,9 +32,15 @@ export function RunHistory({
   selectedRunId: string | null;
   onSelect: (runId: string) => void;
   onRefresh: () => void;
+  /** Delete a single run (DB rows + on-disk assets). Omit to hide the delete action entirely. */
+  onDelete?: (runId: string) => void;
+  /** Reset the compose form to a fresh, editable "Start a run" state. Omit to hide the action. */
+  onNewRun?: () => void;
   projectsById: Map<string, Project>;
-  collapsed: boolean;
-  onToggleCollapse: () => void;
+  /** Mini icon-only collapsed state, with its own toggle button. Omit `onToggleCollapse` (e.g.
+   * when a parent shows/hides this whole component externally instead) to hide that toggle entirely. */
+  collapsed?: boolean;
+  onToggleCollapse?: () => void;
 }) {
   // Kept local (rather than lifted to RunsView) so the filter stays applied
   // across refreshes/re-renders without the caller needing to know about it.
@@ -55,6 +64,11 @@ export function RunHistory({
       <div className="mb-1.5 flex items-center justify-between">
         <span className="text-xs font-medium text-muted">History</span>
         <div className="flex items-center gap-1">
+          {onNewRun && (
+            <Button size="icon" variant="ghost" onClick={onNewRun} aria-label="New run" title="New run">
+              <Plus className="h-3.5 w-3.5" />
+            </Button>
+          )}
           <Button
             size="icon"
             variant="ghost"
@@ -64,9 +78,11 @@ export function RunHistory({
           >
             <RefreshCw className={cn('h-3.5 w-3.5', loading && 'animate-spin')} />
           </Button>
-          <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Collapse history">
-            <ChevronLeft className="h-3.5 w-3.5" />
-          </Button>
+          {onToggleCollapse && (
+            <Button size="icon" variant="ghost" onClick={onToggleCollapse} aria-label="Collapse history">
+              <ChevronLeft className="h-3.5 w-3.5" />
+            </Button>
+          )}
         </div>
       </div>
 
@@ -102,35 +118,87 @@ export function RunHistory({
           <p className="px-3 py-4 text-xs text-muted">No test runs found.</p>
         )}
         <ul className="divide-y divide-border/50">
-          {filteredRuns.map((run) => {
-            const selected = run.id === selectedRunId;
-            const project = projectsById.get(run.projectId);
-            return (
-              <li key={run.id}>
-                <button
-                  type="button"
-                  onClick={() => onSelect(run.id)}
-                  className={cn(
-                    'flex w-full flex-col gap-1 px-3 py-2.5 text-left transition-colors',
-                    selected ? 'bg-accent/10' : 'hover:bg-panel',
-                  )}
-                >
-                  <div className="flex items-center justify-between gap-2">
-                    <Badge tone={runStatusTone(run.status)}>{run.status}</Badge>
-                    <span className="font-mono text-[11px] text-muted">{formatCreatedAt(run.createdAt)}</span>
-                  </div>
-                  <div className="flex items-center justify-between gap-2 text-xs">
-                    <span className="min-w-0 truncate text-fg">{project?.name ?? run.projectId}</span>
-                    {run.mode && (
-                      <span className="shrink-0 font-mono text-[11px] text-muted">{run.mode}</span>
-                    )}
-                  </div>
-                </button>
-              </li>
-            );
-          })}
+          {filteredRuns.map((run) => (
+            <RunRow
+              key={run.id}
+              run={run}
+              selected={run.id === selectedRunId}
+              projectName={projectsById.get(run.projectId)?.name}
+              onSelect={() => onSelect(run.id)}
+              onDelete={onDelete ? () => onDelete(run.id) : undefined}
+            />
+          ))}
         </ul>
       </div>
     </div>
+  );
+}
+
+/**
+ * One history row: the selectable run button, plus a delete action (when
+ * `onDelete` is given) gated behind an explicit confirmation dialog — the
+ * click that opens it never itself deletes anything.
+ */
+function RunRow({
+  run,
+  selected,
+  projectName,
+  onSelect,
+  onDelete,
+}: {
+  run: Run;
+  selected: boolean;
+  projectName: string | undefined;
+  onSelect: () => void;
+  onDelete?: () => void;
+}) {
+  const [confirming, setConfirming] = useState(false);
+
+  return (
+    <li className="group relative">
+      <button
+        type="button"
+        onClick={onSelect}
+        className={cn(
+          'flex w-full flex-col gap-1 px-3 py-2.5 text-left transition-colors',
+          onDelete && 'pr-8',
+          selected ? 'bg-accent/10' : 'hover:bg-panel',
+        )}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <Badge tone={runStatusTone(run.status)}>{run.status}</Badge>
+          <span className="font-mono text-[11px] text-muted">{formatCreatedAt(run.createdAt)}</span>
+        </div>
+        <div className="flex items-center justify-between gap-2 text-xs">
+          <span className="min-w-0 truncate text-fg">{projectName ?? run.projectId}</span>
+          {run.mode && <span className="shrink-0 font-mono text-[11px] text-muted">{run.mode}</span>}
+        </div>
+      </button>
+      {onDelete && (
+        <Button
+          size="icon"
+          variant="ghost"
+          onClick={() => setConfirming(true)}
+          aria-label="Delete run"
+          title="Delete run"
+          className="absolute right-1 top-1/2 h-6 w-6 -translate-y-1/2 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+        >
+          <Trash2 className="h-3.5 w-3.5" />
+        </Button>
+      )}
+      {confirming && (
+        <ConfirmDialog
+          title="Delete this run?"
+          description="This permanently removes the run's history, generated suite, and any screenshots/recordings. This cannot be undone."
+          confirmLabel="Delete"
+          destructive
+          onConfirm={() => {
+            setConfirming(false);
+            onDelete?.();
+          }}
+          onCancel={() => setConfirming(false)}
+        />
+      )}
+    </li>
   );
 }

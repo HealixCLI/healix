@@ -7,7 +7,10 @@
  *     spawning any subprocess (spawn is spied via a module mock) and without
  *     throwing.
  */
-import { describe, it, expect, vi, afterEach } from 'vitest';
+import { describe, it, expect, vi, afterEach, afterAll } from 'vitest';
+import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
 
 // Spy on spawn so the pre-abort test can prove NOTHING was executed. The
 // actual implementation is preserved for any test that legitimately spawns.
@@ -113,21 +116,59 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     expect(env.Path ?? env.PATH).toBeDefined();
   });
 
-  it('injects HEALIX_TIERB_EMAIL/PASSWORD and a /login default from baseUrl when both credentials are set', () => {
+  it('injects HEALIX_TIERB_EMAIL/PASSWORD and a /login default from baseUrl when a credential is set', () => {
     const env = suiteEnv(
-      makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user@test.com', testPassword: 'hunter2' }),
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
     );
     expect(env.HEALIX_TIERB_EMAIL).toBe('user@test.com');
     expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
+    expect(JSON.parse(env.HEALIX_TIERB_CREDENTIALS_JSON ?? '[]')).toEqual([
+      {
+        username: 'user@test.com',
+        password: 'hunter2',
+        role: null,
+        authType: 'form',
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
+    ]);
   });
 
   it('prefers a discovered login candidate from EXPLORE over the naive /login default', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        testUsername: 'user@test.com',
-        testPassword: 'hunter2',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
         exploration: {
           crawl: {
             routes: [],
@@ -145,6 +186,7 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
             { url: 'http://localhost:3000/login', score: 1, source: 'common-path' },
           ],
           useful: true,
+          observedEndpoints: [],
         },
       }),
     );
@@ -155,8 +197,19 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     const env = suiteEnv(
       makeCtx({
         baseUrl: 'http://localhost:3000',
-        testUsername: 'user@test.com',
-        testPassword: 'hunter2',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
         exploration: {
           crawl: {
             routes: [],
@@ -172,27 +225,78 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
           loginCandidates: [],
           useful: false,
           uselessReason: 'exploration crawled zero routes',
+          observedEndpoints: [],
         },
       }),
     );
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/login');
   });
 
-  it('injects neither credential var when only one of username/password is set (fixture requires both)', () => {
-    const withOnlyUsername = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testUsername: 'user' }));
-    expect(withOnlyUsername.HEALIX_TIERB_EMAIL).toBeUndefined();
-    expect(withOnlyUsername.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
-
-    const withOnlyPassword = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', testPassword: 'hunter2' }));
-    expect(withOnlyPassword.HEALIX_TIERB_PASSWORD).toBeUndefined();
-    expect(withOnlyPassword.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+  it('injects no credential vars when the project has zero credentials', () => {
+    const env = suiteEnv(makeCtx({ baseUrl: 'http://localhost:3000', credentials: [] }));
+    expect(env.HEALIX_TIERB_EMAIL).toBeUndefined();
+    expect(env.HEALIX_TIERB_PASSWORD).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+    expect(env.HEALIX_TIERB_CREDENTIALS_JSON).toBeUndefined();
   });
 
   it('does not inject a login URL when credentials are set but no baseUrl is configured', () => {
-    const env = suiteEnv(makeCtx({ testUsername: 'user', testPassword: 'hunter2' }));
+    const env = suiteEnv(
+      makeCtx({
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
+    );
     expect(env.HEALIX_TIERB_EMAIL).toBe('user');
     expect(env.HEALIX_TIERB_PASSWORD).toBe('hunter2');
     expect(env.HEALIX_TIERB_LOGIN_URL).toBeUndefined();
+  });
+
+  it('prefers the roleless credential as the default EMAIL/PASSWORD when multiple credentials are configured', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'admin@test.com',
+            password: 'adminpw',
+            role: 'admin',
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+          {
+            id: 'c2',
+            username: 'user@test.com',
+            password: 'userpw',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+      }),
+    );
+    expect(env.HEALIX_TIERB_EMAIL).toBe('user@test.com');
+    expect(env.HEALIX_TIERB_PASSWORD).toBe('userpw');
+    const parsed = JSON.parse(env.HEALIX_TIERB_CREDENTIALS_JSON ?? '[]');
+    expect(parsed).toHaveLength(2);
   });
 });
 
@@ -412,6 +516,123 @@ describe('parseReport — structural Tier B classification', () => {
     const parsed = parseReport(r, auth);
     expect(parsed.results[0]?.status).toBe('failed');
     expect(parsed.blocked).toBe(0);
+  });
+});
+
+describe('parseReport — drops blank-recording videos, keeps everything else', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'healix-video-test-'));
+  const blankVideo = join(tmpDir, 'blank-video.webm');
+  const realVideo = join(tmpDir, 'real-video.webm');
+  const screenshot = join(tmpDir, 'test-failed-1.png');
+  const trace = join(tmpDir, 'trace.zip');
+  writeFileSync(blankVideo, Buffer.alloc(1024)); // well under the 8KB floor — Playwright's "nothing painted" case
+  writeFileSync(realVideo, Buffer.alloc(20 * 1024)); // comfortably real recorded content
+  writeFileSync(screenshot, Buffer.alloc(512)); // screenshots are never size-filtered, however small
+  writeFileSync(trace, Buffer.alloc(256));
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it("excludes an implausibly small .webm from a result's artifacts, keeps the rest", () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'fails fast, nothing ever painted',
+              file: 'tests/tierA-public/fast.spec.ts',
+              tests: [
+                {
+                  status: 'failed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'failed',
+                      duration: 300,
+                      attachments: [
+                        { name: 'screenshot', path: screenshot },
+                        { name: 'video', path: blankVideo },
+                        { name: 'trace', path: trace },
+                      ],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    const artifacts = parsed.results[0]?.artifacts ?? [];
+    expect(artifacts).toContain(screenshot);
+    expect(artifacts).toContain(trace);
+    expect(artifacts).not.toContain(blankVideo);
+  });
+
+  it('keeps a video large enough to plausibly contain real recorded frames', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'real interaction',
+              file: 'tests/tierA-public/real.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'passed',
+                      duration: 5000,
+                      attachments: [{ name: 'video', path: realVideo }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.artifacts).toContain(realVideo);
+  });
+
+  it('keeps a video referenced by a nonexistent path rather than silently dropping evidence', () => {
+    const missingVideo = join(tmpDir, 'already-cleaned-up.webm');
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'video path no longer on disk',
+              file: 'tests/tierA-public/gone.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'passed',
+                      duration: 1000,
+                      attachments: [{ name: 'video', path: missingVideo }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.artifacts).toContain(missingVideo);
   });
 });
 

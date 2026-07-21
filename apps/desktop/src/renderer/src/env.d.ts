@@ -14,6 +14,7 @@ import type {
 import type {
   ActiveRunSnapshot,
   PickPrdFileResult,
+  PickRepoPathResult,
   ProviderLoginResult,
   ProviderSummary,
   QueuedRunSummary,
@@ -62,12 +63,16 @@ export interface HealixBridge {
     outDir?: string;
     sanitize?: boolean;
     zip?: boolean;
+    projectId?: string;
   }) => Promise<SuiteBundle>;
   revealPath: (target: string) => Promise<{ ok: boolean }>;
   showItemInFolder: (target: string) => Promise<{ ok: boolean }>;
 
   // ---- PRD file upload ----
   pickPrdFile: () => Promise<PickPrdFileResult>;
+
+  // ---- repo path folder picker ----
+  pickRepoPath: () => Promise<PickRepoPathResult>;
 
   // ---- provider connect / live health ----
   providerLogin: (id: ProviderId) => Promise<ProviderLoginResult>;
@@ -76,6 +81,7 @@ export interface HealixBridge {
   // ---- run history ----
   listRuns: (projectId?: string) => Promise<Run[]>;
   runDetail: (runId: string) => Promise<RunDetail>;
+  deleteRun: (runId: string) => Promise<{ ok: true; assetsRemoved: boolean }>;
   lastSuccessfulRun: (projectId: string) => Promise<Run | null>;
   suiteDiff: (runId: string) => Promise<SuiteDiffSummary | null>;
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) => Promise<TestCaseHistory>;

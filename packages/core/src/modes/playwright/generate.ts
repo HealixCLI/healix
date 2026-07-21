@@ -2,9 +2,11 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
+import type { ObservedEndpoint } from '../../browser/network-capture.js';
 import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import { ProviderUnavailableError } from '../types.js';
 import { TIERS, tierLabel } from './templates.js';
+import { splitTestBlocks } from './quality-audit.js';
 
 const GEN_TIMEOUT_MS = 180_000;
 
@@ -15,6 +17,140 @@ export { ProviderUnavailableError } from '../types.js';
 
 function emit(ctx: TestModeContext, message: string, data?: unknown): void {
   ctx.emit?.('generate', message, data);
+}
+
+const MAX_MOCK_CONTENT_LINES = 20;
+const MAX_MOCK_BODY_CHARS = 400;
+
+/**
+ * Ground assertions in the ACTUAL resolved mock content, not a guess. Without
+ * this, GENERATE only knows mocking is active (see mockNote below) but not
+ * what a mocked call actually returns — a model can write a perfectly
+ * plausible assertion (e.g. a specific balance/name) that simply doesn't
+ * match what the mock server/fixture will serve, failing for a reason
+ * that has nothing to do with the app under test.
+ */
+export function formatMockContent(ctx: TestModeContext): string {
+  const deps = ctx.externalDependencies ?? [];
+  const lines: string[] = [];
+  // Endpoints EXPLORE actually observed on the wire (see GAP-046) — higher-trust ground
+  // truth than a statically-inferred/AI-guessed body. Tracked so anything matched here is
+  // skipped from the "observed but not in static analysis" pass below.
+  const matchedObserved = new Set<ObservedEndpoint>();
+  for (const dep of deps) {
+    if (dep.mockStrategy === 'undeterminable') continue;
+    if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+    if (dep.endpoints && dep.endpoints.length > 0) {
+      for (const e of dep.endpoints) {
+        if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+        const observed = findObservedEndpoint(ctx, e.method, e.pathPattern);
+        if (observed) {
+          matchedObserved.add(observed);
+          const body = (observed.sampleResponseBody ?? '').slice(0, MAX_MOCK_BODY_CHARS);
+          lines.push(`- ${e.method} ${e.pathPattern} -> OBSERVED status ${observed.status}, body: ${body}`);
+          continue;
+        }
+        if (!e.response) continue;
+        const body = JSON.stringify(e.response.body).slice(0, MAX_MOCK_BODY_CHARS);
+        lines.push(`- ${e.method} ${e.pathPattern} -> status ${e.response.status}, body: ${body}`);
+      }
+    } else {
+      const fallback = ctx.mockResponses?.[dep.id];
+      if (!fallback) continue;
+      const body = JSON.stringify(fallback.body).slice(0, MAX_MOCK_BODY_CHARS);
+      lines.push(`- ${dep.label} (any call to this dependency) -> status ${fallback.status}, body: ${body}`);
+    }
+  }
+  // Real traffic EXPLORE observed that no statically-detected dependency accounts for —
+  // additive ground truth the static scan alone can't provide (see GAP-046).
+  for (const observed of ctx.exploration?.observedEndpoints ?? []) {
+    if (lines.length >= MAX_MOCK_CONTENT_LINES) break;
+    if (matchedObserved.has(observed)) continue;
+    const body = (observed.sampleResponseBody ?? '').slice(0, MAX_MOCK_BODY_CHARS);
+    lines.push(
+      `- ${observed.method} ${observed.pathPattern} -> OBSERVED (not in static analysis) status ${observed.status}, body: ${body}`,
+    );
+  }
+  if (lines.length === 0) return '';
+  return (
+    '\n\nMocked response content — assert against this EXACT data (do not invent plausible-sounding ' +
+    'values that differ from it). RULE: mockOverride() may only target the endpoints listed here; do not ' +
+    'invent an endpoint path. Lines marked OBSERVED were captured from real traffic during exploration; ' +
+    'unmarked lines are statically detected and may be INCOMPLETE for dynamic endpoints — if a scenario ' +
+    'genuinely needs an endpoint not listed here, follow the ESCAPE HATCH rule instead of guessing a ' +
+    'plausible-looking path:\n' +
+    lines.join('\n')
+  );
+}
+
+/** Same slug transform as templates.ts's roleStorageStatePath — must stay in sync so a role name always resolves to the same file. */
+function roleStorageStateFilename(role: string): string {
+  const slug = role
+    .trim()
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '');
+  return `fixtures/.auth/user-${slug || 'role'}.json`;
+}
+
+/**
+ * When the project has more than one test credential, tell tierB-auth
+ * generation about the available roles so a test that's clearly ABOUT one
+ * role's behavior (an admin-only page, a specific account type) can opt into
+ * that role's own session — everything else silently keeps using the
+ * default storageState, unchanged from the single-credential case. This is a
+ * best-effort HINT to the model; matchRoleForItem()/insertRoleStorageState()
+ * below are what actually GUARANTEE the routing happens, deterministically,
+ * regardless of whether the model itself added a test.use() call.
+ */
+function formatRoleGuidance(ctx: TestModeContext, tier: Tier): string {
+  if (tier !== 'tierB-auth') return '';
+  const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
+  if (roles.length === 0) return '';
+  const lines = roles.map((r) => `- "${r}" -> test.use({ storageState: '${roleStorageStateFilename(r)}' })`);
+  return (
+    '\n\nThis project has multiple test accounts with distinct roles. The default session (no action needed) ' +
+    "is a generic/roleless account. ONLY when this specific test is clearly about one of these roles' own " +
+    "behavior, add the matching test.use(...) INSIDE this file's test.describe(...) block, before any test(...) calls:\n" +
+    lines.join('\n')
+  );
+}
+
+/**
+ * Deterministic role routing: does this plan item's title/intent name one of
+ * the project's configured roles (e.g. a plan item literally titled "Admin
+ * dashboard access control")? Whole-word, case-insensitive match against
+ * EVERY configured role; the first match wins. Returns null when nothing
+ * matches — the item keeps using the default (roleless) session, exactly
+ * like a single-credential project always has.
+ */
+function matchRoleForItem(item: TestPlanItem, roles: string[]): string | null {
+  const haystack = `${item.title} ${item.intent}`.toLowerCase();
+  for (const role of roles) {
+    const escaped = role.toLowerCase().replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    if (new RegExp(`\\b${escaped}\\b`).test(haystack)) return role;
+  }
+  return null;
+}
+
+/**
+ * Force the matched role's storageState onto this spec — inserted right
+ * after the test.describe(...) opening, ahead of every test(...) call — so
+ * role routing is guaranteed by the orchestrator, not left to the model's
+ * discretion. A no-op if the model already added its own test.use() (per
+ * formatRoleGuidance's hint above): never insert a second, possibly
+ * conflicting override.
+ */
+function insertRoleStorageState(source: string, role: string): string {
+  // Only skip if the model already set storageState itself — an unrelated
+  // test.use() (viewport, locale, etc.) must not block routing, since
+  // Playwright merges multiple test.use() calls in the same file anyway.
+  if (/test\.use\s*\(\s*\{[^}]*storageState/.test(source)) return source;
+  const match = /test\.describe\([\s\S]*?=>\s*\{/.exec(source);
+  if (!match) return source;
+  const insertAt = match.index + match[0].length;
+  const line = `\n  test.use({ storageState: '${roleStorageStateFilename(role)}' });`;
+  return source.slice(0, insertAt) + line + source.slice(insertAt);
 }
 
 /** Coerce an arbitrary plan-item tier into one of the three known tiers. */
@@ -91,14 +227,25 @@ function collectModuleSpecifiers(source: string): string[] {
  * This is a tripwire against a compromised/hallucinating model, not a sandbox:
  * a determined adversary can evade static analysis. Defense in depth continues
  * at execution time (env allowlist in execute.ts).
+ *
+ * `extraAllowedImport` widens the allowlist by exactly one additional module
+ * specifier — used only when mocking is enabled for the run, to permit specs
+ * to import test/expect from the Healix-authored (not model-authored) mock
+ * fixture instead of '@playwright/test' directly. That fixture file's own
+ * contents are never model output, so this doesn't reopen the untrusted-import
+ * surface the gate exists to close.
  */
-export function findForbiddenApis(source: string): string[] {
+export function findForbiddenApis(source: string, extraAllowedImport?: string): string[] {
   const violations = new Set<string>();
 
-  // Import allowlist: exactly '@playwright/test'. Everything else is flagged.
+  // Import allowlist: '@playwright/test', plus exactly one extra module when
+  // mocking is enabled for this run. Everything else is flagged.
   for (const mod of collectModuleSpecifiers(source)) {
-    if (mod !== '@playwright/test') {
-      violations.add(`import/require of '${mod}' (only '@playwright/test' is allowed)`);
+    if (mod !== '@playwright/test' && mod !== extraAllowedImport) {
+      const allowed = extraAllowedImport
+        ? `'@playwright/test' or '${extraAllowedImport}'`
+        : "'@playwright/test'";
+      violations.add(`import/require of '${mod}' (only ${allowed} is allowed)`);
     }
   }
 
@@ -130,8 +277,19 @@ export function findForbiddenApis(source: string): string[] {
   return [...violations];
 }
 
-export function looksLikePlaywrightSpec(source: string): boolean {
-  return /@playwright\/test/.test(source) && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
+/**
+ * Relative import path (constant across all specs, which always land two
+ * directories deep at tests/<tier>/<slug>.spec.ts) to the Healix-authored mock
+ * fixture — see scaffold.ts's mockFixtureContents(). Used in place of
+ * '@playwright/test' when mocking is enabled for the run.
+ */
+export const MOCK_FIXTURE_IMPORT_PATH = '../../fixtures/mock.fixture';
+
+export function looksLikePlaywrightSpec(source: string, extraAllowedImport?: string): boolean {
+  const importsTest =
+    /@playwright\/test/.test(source) ||
+    (extraAllowedImport !== undefined && source.includes(extraAllowedImport));
+  return importsTest && /\btest\s*(?:\.\w+)?\s*\(/.test(source);
 }
 
 /** Matches bare `test(...)` and `test.only/skip/fixme(...)` calls — deliberately excludes `test.describe(...)`. */
@@ -187,59 +345,392 @@ function hasSrcCitation(source: string, file: string): boolean {
 }
 
 /** Retry note when the previous attempt used forbidden APIs (deny-list gate). */
-function retryNoteForbidden(violations: string[]): string {
-  return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '@playwright/test'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
+function retryNoteForbidden(violations: string[], allowedImport: string): string {
+  return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '${allowedImport}'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
 }
 
-/** Cap on interactive elements injected into a prompt (keeps it bounded). */
-const MAX_SNAPSHOT_ELEMENTS = 40;
-/** Truncate an accessible name so one pathological element can't bloat the prompt. */
-const MAX_ELEMENT_NAME_LEN = 80;
+// ---- Grounding-validation gate ------------------------------------------------
+
+/** A marker the model can use (per formatSnapshotInventory's ESCAPE HATCH) to acknowledge an intentionally-unobserved element instead of inventing one — findUngroundedReferences downgrades hard failures to warnings when it's present. */
+const ESCAPE_HATCH_MARKER = '// TODO: unobserved element';
+
+/** Matches a test-block opening call (`test(`, `test.only(`, `test.skip(`) at an exact source offset — used to rewrite it to `test.fixme(` in place without disturbing anything else in the block. */
+const TEST_OPEN_AT_RE = /test(?:\.(?:only|skip|fixme))?\(/y;
 
 /**
- * Render the interactive-element inventory captured during the multi-page
- * EXPLORE crawl (ctx.exploration) as a compact list, so generation targets
- * REAL selectors instead of guessing. Returns '' when there is nothing to
- * add:
- *   - no exploration artifact (no live URL to explore, or exploration failed) or no elements observed;
- *   - an API tier (tierC-api), which must not drive a browser page at all.
- * Elements from every crawled route are included (not just the entry page),
- * each tagged with its route URL and role so a tierB-auth item knows which
- * elements require the authenticated session. Tier-aware ordering surfaces
- * the most relevant role first: authenticated routes for tierB-auth items,
- * anonymous routes otherwise. The combined list is capped at
- * MAX_SNAPSHOT_ELEMENTS with an explicit "+N more" note so a huge crawl can't
- * blow up the prompt (and the omission isn't silent).
+ * A test the model itself flagged as built on a guess (the escape-hatch marker anywhere in
+ * its body) still passes every other gate and, until now, shipped to execute as an ordinary
+ * `test(...)` — indistinguishable in the report from a fully-grounded test, and reliably
+ * failing/hanging when the guess is wrong (see docs/fix-backlog.md P1 item 7,
+ * "self-healing selectors" — no closed-loop repair exists yet to make good on the guess).
+ * Downgrade just that block to `test.fixme(...)` so Playwright reports it as
+ * needs-review/skipped rather than a hard failure, while every other test in the same spec
+ * (with no marker) ships and runs normally.
  */
-function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
-  if (tier === 'tierC-api') return '';
+export function demoteEscapeHatchBlocks(source: string): string {
+  const targets = splitTestBlocks(source).filter((b) => b.body.includes(ESCAPE_HATCH_MARKER));
+  if (targets.length === 0) return source;
+
+  let result = source;
+  for (const block of [...targets].sort((a, b) => b.start - a.start)) {
+    TEST_OPEN_AT_RE.lastIndex = block.start;
+    const m = TEST_OPEN_AT_RE.exec(result);
+    if (!m || m.index !== block.start) continue;
+    result =
+      result.slice(0, block.start) +
+      '/* healix: unobserved element — needs review */ test.fixme(' +
+      result.slice(block.start + m[0].length);
+  }
+  return result;
+}
+
+export interface GroundTruth {
+  testids: Set<string>;
+  selectors: Set<string>;
+  /** lowercased accessible names observed anywhere in the selected inventory */
+  names: string[];
+  /** lowercased accessible name -> observed role(s) for that name */
+  roleByName: Map<string, Set<string>>;
+  endpoints: Array<{ method: string; pathPattern: string }>;
+  /** true when at least one ExternalDependency carries statically-detected (method, path) endpoints — makes an unmatched mockOverride() provable, not just unproven */
+  hasEndpointLevelMocks: boolean;
+  /** true when selectInventoryElements() had to omit elements for length — can't prove a selector's absence against an incomplete inventory */
+  inventoryTruncated: boolean;
+}
+
+/** Pull a `data-testid="..."` (or `data-test="..."`) value out of a selectorFor()-style CSS selector string, if present. */
+function extractTestidFromSelector(selector: string): string | null {
+  const m = /data-test(?:id)?=["']([^"']+)["']/.exec(selector);
+  return m ? m[1] : null;
+}
+
+/**
+ * Build the ground-truth the grounding-validation gate checks a generated spec against.
+ * MUST read from the same selectInventoryElements() the model was actually shown (see that
+ * function's doc comment) — otherwise this gate could reject a selector the model never had
+ * the option to use. Endpoint ground truth is separate: dependency-level (endpoint-less)
+ * mocks don't produce a comparable (method, path) pair, so `hasEndpointLevelMocks` tracks
+ * whether a real comparison is even possible for this run.
+ */
+export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTruth {
+  const { selected, truncated } = selectInventoryElements(ctx, tier);
+
+  const testids = new Set<string>();
+  const selectors = new Set<string>();
+  const names: string[] = [];
+  const roleByName = new Map<string, Set<string>>();
+  for (const { el } of selected) {
+    selectors.add(el.selector);
+    const testid = extractTestidFromSelector(el.selector);
+    if (testid) testids.add(testid);
+    const lname = el.name.trim().toLowerCase();
+    if (lname) {
+      names.push(lname);
+      const roles = roleByName.get(lname) ?? new Set<string>();
+      roles.add(el.role);
+      roleByName.set(lname, roles);
+    }
+  }
+
+  const endpoints: Array<{ method: string; pathPattern: string }> = [];
+  let hasEndpointLevelMocks = false;
+  for (const dep of ctx.externalDependencies ?? []) {
+    if (dep.endpoints && dep.endpoints.length > 0) {
+      hasEndpointLevelMocks = true;
+      for (const e of dep.endpoints) endpoints.push({ method: e.method, pathPattern: e.pathPattern });
+    }
+  }
+  // Real traffic observed during EXPLORE (see GAP-046) is just as provable a ground truth
+  // as a statically-detected endpoint — include it, and let it make the comparison provable
+  // even on a run with no endpoint-level static dependency.
+  for (const o of ctx.exploration?.observedEndpoints ?? []) {
+    hasEndpointLevelMocks = true;
+    endpoints.push({ method: o.method, pathPattern: o.pathPattern });
+  }
+
+  return {
+    testids,
+    selectors,
+    names,
+    roleByName,
+    endpoints,
+    hasEndpointLevelMocks,
+    inventoryTruncated: truncated,
+  };
+}
+
+const TESTID_CALL_RE = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
+const TESTID_ATTR_RE = /data-test(?:id)?=["']([^"']+)["']/g;
+const ROLE_CALL_RE =
+  /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
+const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
+/** Matches `getByText('literal')` or `getByText(/regex/flags)` — the two forms generation actually produces. */
+const TEXT_CALL_RE = /getByText\(\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]*)['"])/g;
+
+/** Collapse whitespace/case so a `getByText` argument compares fairly against the observed accessible-name corpus. */
+function normalizeText(value: string): string {
+  return value.trim().toLowerCase().replace(/\s+/g, ' ');
+}
+
+/**
+ * A regex-literal `getByText` argument is often an alternation of a few
+ * candidate phrases (`/zabudli ste heslo|forgot password/i`) rather than a
+ * single string — split on top-level `|` so each alternative is checked
+ * against the observed-name corpus independently. Not a real regex parser
+ * (doesn't handle nested groups/escapes precisely), just enough to catch the
+ * common flat-alternation shape generation actually produces.
+ */
+function splitTextAlternatives(source: string): string[] {
+  return source
+    .split('|')
+    .map((alt) => normalizeText(alt.replace(/\\(.)/g, '$1')))
+    .filter(Boolean);
+}
+
+/**
+ * Forgiving (substring, either direction) match against every accessible
+ * name observed in the selected inventory (`gt.names` — link/button/input
+ * text, already lowercased/whitespace-collapsed by selectorFor()'s clamp()).
+ * Only covers text that lives on an INTERACTIVE element (the inventory's own
+ * scope) — a `getByText` targeting plain static copy (a banner, a profile
+ * field) isn't checked here and falls through as unproven, same as any
+ * selector against a page EXPLORE never visited.
+ */
+function textMatchesInventory(alt: string, gt: GroundTruth): boolean {
+  if (!alt) return true;
+  return gt.names.some((name) => name.includes(alt) || alt.includes(name));
+}
+
+/** Normalize an endpoint path pattern (glob wildcards, `:param` placeholders) for a forgiving substring comparison. */
+function normalizeEndpointPath(path: string): string {
+  return path
+    .toLowerCase()
+    .replace(/\*\*/g, '')
+    .replace(/\*/g, '')
+    .replace(/:[a-zA-Z0-9_]+/g, ':param')
+    .replace(/^\/+|\/+$/g, '');
+}
+
+/** Forgiving (substring, either direction) match — exact glob/path-template reproduction isn't required, just genuine overlap. */
+function endpointMatches(calledPath: string, method: string, gt: GroundTruth): boolean {
+  const normCalled = normalizeEndpointPath(calledPath);
+  if (!normCalled) return true;
+  return gt.endpoints.some((e) => {
+    if (e.method.toUpperCase() !== method.toUpperCase()) return false;
+    const normKnown = normalizeEndpointPath(e.pathPattern);
+    return normKnown.length > 0 && (normCalled.includes(normKnown) || normKnown.includes(normCalled));
+  });
+}
+
+/** Same forgiving comparison as endpointMatches(), but returns the matching ObservedEndpoint
+ * (rather than a boolean) so formatMockContent() can surface its real captured status/body
+ * in place of a statically-guessed one. */
+function findObservedEndpoint(
+  ctx: TestModeContext,
+  method: string,
+  pathPattern: string,
+): ObservedEndpoint | undefined {
+  const normStatic = normalizeEndpointPath(pathPattern);
+  if (!normStatic) return undefined;
+  return (ctx.exploration?.observedEndpoints ?? []).find((o) => {
+    if (o.method.toUpperCase() !== method.toUpperCase()) return false;
+    const normObserved = normalizeEndpointPath(o.pathPattern);
+    return (
+      normObserved.length > 0 && (normStatic.includes(normObserved) || normObserved.includes(normStatic))
+    );
+  });
+}
+
+/**
+ * Scan a generated spec's source for selector/role/mock-endpoint references and check each
+ * against ground truth actually observed during EXPLORE (or statically detected for mocks).
+ * Severity is deliberately split so this can't become a false-positive machine that blocks
+ * legitimate generation:
+ *   - unrecognized data-testid: HARD only when the inventory was NOT truncated and is
+ *     non-empty (i.e. absence is actually provable); otherwise WARN, since we can't prove a
+ *     selector doesn't exist against an inventory we know is incomplete.
+ *   - unmatched mockOverride endpoint: HARD only when this dependency has endpoint-level
+ *     (not just dependency-level) mocks, so there's a real (method, path) list to compare
+ *     against; otherwise WARN.
+ *   - getByRole(role, {name}) vs. the name's observed role: WARN always — accessible-role
+ *     computation is fuzzy enough (implicit ARIA semantics, nested content) that a hard-fail
+ *     here risks real false positives.
+ *   - getByText(literal-or-regex) with every alternative missing from the observed
+ *     accessible-name corpus (link/button/input text — see textMatchesInventory): same
+ *     HARD/WARN split as data-testid. Only covers text that lives on an interactive element;
+ *     free-standing copy (banners, profile fields) isn't in the inventory at all and so never
+ *     produces a HARD finding here — it's unproven, not confirmed grounded.
+ * A `// TODO: unobserved element` marker anywhere in the source (the sanctioned ESCAPE HATCH,
+ * see formatSnapshotInventory) downgrades every hard finding in this spec to a warning — an
+ * acknowledged, intentional gap isn't the same defect as a silent fabrication.
+ */
+export function findUngroundedReferences(
+  source: string,
+  gt: GroundTruth,
+): { hard: string[]; warn: string[] } {
+  const hard: string[] = [];
+  const warn: string[] = [];
+  const hasEscapeHatch = source.includes(ESCAPE_HATCH_MARKER);
+  const inventoryKnown = gt.testids.size > 0 || gt.selectors.size > 0;
+
+  const seenTestids = new Set<string>();
+  for (const m of source.matchAll(TESTID_CALL_RE)) seenTestids.add(m[1]);
+  for (const m of source.matchAll(TESTID_ATTR_RE)) seenTestids.add(m[1]);
+  for (const testid of seenTestids) {
+    if (gt.testids.has(testid)) continue;
+    const label = `data-testid "${testid}" not found in the observed element inventory`;
+    if (inventoryKnown && !gt.inventoryTruncated && !hasEscapeHatch) hard.push(label);
+    else warn.push(label);
+  }
+
+  for (const m of source.matchAll(ROLE_CALL_RE)) {
+    const role = m[1];
+    const name = (m[2] ?? m[3] ?? '').trim().toLowerCase();
+    if (!name) continue;
+    const observedRoles = gt.roleByName.get(name);
+    if (!observedRoles || observedRoles.has(role)) continue;
+    warn.push(
+      `getByRole('${role}', { name: "${name}" }) but the observed role was ${[...observedRoles].join('/')}`,
+    );
+  }
+
+  for (const m of source.matchAll(TEXT_CALL_RE)) {
+    const alternatives = m[1] ? splitTextAlternatives(m[1]) : [normalizeText(m[2] ?? '')];
+    const unmatched = alternatives.filter((alt) => alt && !textMatchesInventory(alt, gt));
+    // Every alternative must miss — `/zabudli ste heslo|forgot password/i` still legitimately
+    // matches an English-language build even if the Slovak alternative never fires.
+    if (unmatched.length === 0 || unmatched.length !== alternatives.filter(Boolean).length) continue;
+    const label = `getByText("${unmatched.join('|')}") not found in the observed accessible-name inventory`;
+    if (inventoryKnown && !gt.inventoryTruncated && !hasEscapeHatch) hard.push(label);
+    else warn.push(label);
+  }
+
+  for (const m of source.matchAll(MOCK_OVERRIDE_RE)) {
+    const method = m[1];
+    const path = m[2];
+    if (endpointMatches(path, method, gt)) continue;
+    const label = `mockOverride('${method}', '${path}') doesn't match any statically-detected endpoint`;
+    if (gt.hasEndpointLevelMocks && !hasEscapeHatch) hard.push(label);
+    else warn.push(label);
+  }
+
+  return { hard, warn };
+}
+
+/** Retry note when the grounding-validation gate finds hallucinated selectors/endpoints — lists the specific violations plus a sample of real, available ones so the retry can self-correct. */
+function retryNoteUngrounded(hard: string[], gt: GroundTruth): string {
+  const sampleSelectors = [...gt.testids].slice(0, 8).map((t) => `data-testid="${t}"`);
+  const sampleEndpoints = gt.endpoints.slice(0, 8).map((e) => `${e.method} ${e.pathPattern}`);
+  const sampleNames = gt.names.slice(0, 8).map((n) => `"${n}"`);
+  const available = [
+    sampleSelectors.length > 0 ? `Real testids available: ${sampleSelectors.join(', ')}.` : '',
+    sampleEndpoints.length > 0 ? `Real endpoints available: ${sampleEndpoints.join(', ')}.` : '',
+    sampleNames.length > 0 ? `Real observed link/button/input text: ${sampleNames.join(', ')}.` : '',
+  ]
+    .filter(Boolean)
+    .join(' ');
+  return `Your previous output was rejected because it referenced selectors/endpoints that were never observed: ${hard.join('; ')}. Use ONLY the real selectors/endpoints provided in the prompt context, or the ESCAPE HATCH rule (a text-based locator, or a "${ESCAPE_HATCH_MARKER}" comment) for anything genuinely unobserved — never invent a plausible-sounding data-testid or endpoint path. ${available}`;
+}
+
+/** Per-route cap — keeps one busy page (header+footer+nav+form) from starving every other route's budget. */
+const MAX_ELEMENTS_PER_ROUTE = 30;
+/** Overall ceiling across the whole crawl (keeps the prompt bounded even with many routes). */
+const MAX_SNAPSHOT_ELEMENTS = 120;
+/** Truncate an accessible name so one pathological element can't bloat the prompt. */
+const MAX_ELEMENT_NAME_LEN = 80;
+/**
+ * Roles the DOM doesn't natively expose as `link`/`button` even though the element is
+ * clickable (e.g. a `<div>` with a click handler and no `role` attribute) — the single
+ * biggest source of `getByRole('link'/'button', ...)` hallucination in production.
+ */
+const NON_SEMANTIC_ROLES = new Set(['generic']);
+
+type CrawledRouteLike = NonNullable<TestModeContext['exploration']>['crawl']['routes'][number];
+interface SelectedElement {
+  route: CrawledRouteLike;
+  el: CrawledRouteLike['snapshot']['interactiveElements'][number];
+}
+interface InventorySelection {
+  ordered: CrawledRouteLike[];
+  selected: SelectedElement[];
+  totalCount: number;
+  truncated: boolean;
+}
+
+/**
+ * Select the interactive-element inventory shown to the model AND checked by the
+ * grounding-validation gate (findUngroundedReferences) — the two MUST read from this same
+ * function, or the gate could reject a selector the model was never even shown. Applies a
+ * per-route cap (MAX_ELEMENTS_PER_ROUTE) so one busy page can't starve every other route's
+ * budget, plus an overall ceiling (MAX_SNAPSHOT_ELEMENTS) so a huge crawl can't blow up the
+ * prompt. Tier-aware ordering surfaces the most relevant role first: authenticated routes
+ * for tierB-auth items, anonymous routes otherwise. Returns an empty selection for the
+ * tierC-api tier (must not drive a browser page at all) or when there's no exploration data.
+ */
+function selectInventoryElements(ctx: TestModeContext, tier: Tier): InventorySelection {
+  if (tier === 'tierC-api') return { ordered: [], selected: [], totalCount: 0, truncated: false };
   const routes = ctx.exploration?.crawl.routes ?? [];
-  if (routes.length === 0) return '';
+  if (routes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
 
   const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
   const ordered = [...routes].sort(
     (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
   );
 
-  const lines: string[] = [];
+  const selected: SelectedElement[] = [];
   let totalCount = 0;
   for (const route of ordered) {
+    let perRouteCount = 0;
     for (const el of route.snapshot.interactiveElements) {
       totalCount += 1;
-      if (lines.length >= MAX_SNAPSHOT_ELEMENTS) continue;
-      const name =
-        el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
-      lines.push(`- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}`);
+      if (perRouteCount >= MAX_ELEMENTS_PER_ROUTE || selected.length >= MAX_SNAPSHOT_ELEMENTS) continue;
+      selected.push({ route, el });
+      perRouteCount += 1;
     }
   }
-  if (lines.length === 0) return '';
+  return { ordered, selected, totalCount, truncated: totalCount > selected.length };
+}
 
-  const omitted = totalCount - lines.length;
-  const more = omitted > 0 ? `\n(+${omitted} more not shown)` : '';
+/**
+ * Render the interactive-element inventory captured during the multi-page EXPLORE crawl
+ * (ctx.exploration) as a compact list, so generation targets REAL selectors instead of
+ * guessing. Returns '' when selectInventoryElements() has nothing to show.
+ *
+ * The wording here is a HARD rule, not a preference — a softer "prefer these real
+ * selectors" framing was found (via production runs against a real app) to be routinely
+ * ignored by the model, which fabricated its own data-testids/roles instead. Non-semantic
+ * elements (role: 'generic' — a clickable <div> with no ARIA role) are annotated inline,
+ * since `getByRole('link'/'button', ...)` against one of these is the single biggest
+ * observed hallucination pattern. An ESCAPE HATCH is included so a scenario that
+ * legitimately targets a state EXPLORE never visited (e.g. content behind a mocked error
+ * response) has a sanctioned way out that isn't "invent a selector" — this same marker is
+ * recognized by findUngroundedReferences() to avoid penalizing an acknowledged gap.
+ */
+function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
+  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier);
+  if (selected.length === 0) return '';
+
+  const lines = selected.map(({ route, el }) => {
+    const name =
+      el.name.length > MAX_ELEMENT_NAME_LEN ? `${el.name.slice(0, MAX_ELEMENT_NAME_LEN)}…` : el.name;
+    const genericNote = NON_SEMANTIC_ROLES.has(el.role)
+      ? " (NOT a semantic link/button — use text or the selector shown, never getByRole('link'/'button'))"
+      : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}`;
+  });
+
+  const omitted = totalCount - selected.length;
+  const more =
+    omitted > 0
+      ? `\n(+${omitted} more not shown — do not invent selectors for them; use the ESCAPE HATCH rule if you need one)`
+      : '';
+  const completeness = truncated
+    ? 'This is a PARTIAL inventory (some elements were omitted for length)'
+    : 'This is the AUTHORITATIVE, COMPLETE inventory of elements observed for the routes shown';
 
   return `
 
-Interactive elements observed during exploration across ${ordered.length} route(s) — PREFER these real selectors over guessing. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies):
+Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
 ${lines.join('\n')}${more}`;
 }
 
@@ -336,8 +827,13 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
     tier === 'tierC-api'
       ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page.'
       : tier === 'tierB-auth'
-        ? 'This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.'
+        ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
+
+  const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : '@playwright/test';
+  const mockNote = ctx.mockExternalDependencies
+    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario.${formatMockContent(ctx)}`
+    : '';
 
   return `You are generating ONE Playwright test spec file in TypeScript covering ONE feature with
 multiple test cases (positive/negative/edge), not just a single check.
@@ -345,7 +841,7 @@ multiple test cases (positive/negative/edge), not just a single check.
 Output ONLY the TypeScript source for the spec. No markdown, no code fences, no explanation.
 
 Requirements:
-- Begin with: import { test, expect } from '@playwright/test';
+- Begin with: import { test, expect } from '${importSource}';
 - Wrap all cases in: test.describe('[REQ:${reqTag}] ${item.title}', () => { ... });
 - Output exactly one test(...) per scenario listed below, IN THE SAME ORDER.
 - EVERY test(...) title MUST itself start with "[REQ:${reqTag}]" too (not just the describe title),
@@ -353,8 +849,13 @@ Requirements:
   This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
-- Be self-contained and runnable; do not import local helpers.
-- ${tierGuidance}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
+- For a negative/invalid-input scenario, do NOT fill invalid data and then click a submit-like
+  control assuming the click succeeds and a validation message appears afterward — many real apps
+  correctly disable that control on invalid input, and clicking a disabled control hangs until
+  timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
+  assert the inline validation message directly without depending on a successful click.
+- Be self-contained and runnable; do not import any other local helpers beyond the one import above.
+- ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -405,6 +906,7 @@ async function generateOne(
   const tier = resolveTier(item.tier);
   const reqTag = item.reqTag ?? item.id;
   const slug = slugify(item.title || item.id);
+  const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : undefined;
 
   // Carried across attempts: the note explaining WHY the last output was
   // rejected (fed back into the retry prompt) and the last violation list
@@ -450,7 +952,7 @@ async function generateOne(
     if (!source) {
       continue;
     }
-    if (!looksLikePlaywrightSpec(source)) {
+    if (!looksLikePlaywrightSpec(source, extraAllowedImport)) {
       emit(
         ctx,
         `Output for "${item.title}" did not look like a Playwright spec (attempt ${attempt + 1}); retrying`,
@@ -511,7 +1013,7 @@ async function generateOne(
     // Deny-list gate: same retry-once-then-skip treatment as the zero-expect
     // case, but the stricter note lists the concrete violations so the retry
     // can actually fix them.
-    const violations = findForbiddenApis(source);
+    const violations = findForbiddenApis(source, extraAllowedImport);
     if (violations.length > 0) {
       emit(
         ctx,
@@ -520,13 +1022,41 @@ async function generateOne(
           violations,
         },
       );
-      retryNote = retryNoteForbidden(violations);
+      retryNote = retryNoteForbidden(violations, extraAllowedImport ?? '@playwright/test');
       lastReason = `forbidden APIs in generated spec: ${violations.join('; ')}`;
       lastViolations = violations;
       continue;
     }
 
+    // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
+    // correspond to anything actually observed during EXPLORE (or statically detected for
+    // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
+    const groundTruth = collectGroundTruth(ctx, tier);
+    const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
+    if (ungroundedWarn.length > 0) {
+      emit(
+        ctx,
+        `Output for "${item.title}" has unverifiable selector/endpoint references (attempt ${attempt + 1}, not blocking): ${ungroundedWarn.join('; ')}`,
+      );
+    }
+    if (ungroundedHard.length > 0) {
+      emit(
+        ctx,
+        `Output for "${item.title}" referenced hallucinated selectors/endpoints (attempt ${attempt + 1}): ${ungroundedHard.join('; ')}`,
+        { ungrounded: ungroundedHard },
+      );
+      retryNote = retryNoteUngrounded(ungroundedHard, groundTruth);
+      lastReason = `hallucinated selector/endpoint references: ${ungroundedHard.join('; ')}`;
+      continue;
+    }
+
     source = ensureReqTag(source, reqTag);
+    source = demoteEscapeHatchBlocks(source);
+    if (tier === 'tierB-auth') {
+      const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
+      const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;
+      if (matchedRole) source = insertRoleStorageState(source, matchedRole);
+    }
     if (!source.endsWith('\n')) source += '\n';
 
     // Resolve a unique path BEFORE writing so same-tier slug collisions don't

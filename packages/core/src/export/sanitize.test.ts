@@ -1,7 +1,7 @@
 import os from 'node:os';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { sanitizeContent } from './sanitize.js';
+import { redactSecrets, sanitizeContent } from './sanitize.js';
 
 /** A redacted line keeps its key but drops the secret value. */
 const REDACTED = '<REDACTED>';
@@ -97,5 +97,30 @@ describe('sanitizeContent — path rewriting', () => {
 
     expect(out).not.toContain(home);
     expect(out).toContain('<HOME>');
+  });
+});
+
+describe('redactSecrets — standalone helper (no suite dir / home dir / credential context)', () => {
+  it('redacts a well-known provider key shape embedded in arbitrary text', () => {
+    const out = redactSecrets('{"token":"sk-live-abcdefghijklmnop1234567890","name":"Ada"}');
+    expect(out).not.toContain('sk-live-abcdefghijklmnop1234567890');
+    expect(out).toContain('Ada');
+  });
+
+  it('redacts a Bearer token', () => {
+    const out = redactSecrets('Authorization: Bearer abc123.def456-ghi789');
+    expect(out).not.toContain('abc123.def456-ghi789');
+    expect(out).toContain('Bearer <REDACTED>');
+  });
+
+  it('leaves text with no secret-shaped content unchanged', () => {
+    const text = '{"name":"Ada","status":"ok"}';
+    expect(redactSecrets(text)).toBe(text);
+  });
+
+  it('is the same redaction sanitizeContent applies for its SECRET_PATTERNS pass', () => {
+    const suiteDir = path.join(os.tmpdir(), 'healix-redact-secrets-parity');
+    const line = 'MY_API_KEY=secret123';
+    expect(redactSecrets(line)).toBe(sanitizeContent(line, suiteDir));
   });
 });

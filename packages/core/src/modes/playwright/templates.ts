@@ -1,4 +1,5 @@
 import type { Tier } from '../../storage/types.js';
+import type { MockResponse } from '../../target/types.js';
 
 /** The three tiers a scaffolded suite always provisions, in execution order. */
 export const TIERS: Tier[] = ['tierA-public', 'tierB-auth', 'tierC-api'];
@@ -52,11 +53,12 @@ export interface ConfigOptions {
 
 /**
  * playwright.config.ts wiring the three Healix tiers as Playwright projects,
- * a JSON + HTML reporter, and the artifact policy: every test records a
- * screenshot + video (so the run detail can always show what happened), while
- * traces are kept only for failures. Tier B depends on an auth storageState
- * produced by fixtures/auth.setup.ts; when no credentials are wired the setup
- * is a no-op and Tier B specs simply run unauthenticated.
+ * a JSON + HTML reporter, and the artifact policy: every test — passed or
+ * failed — records a screenshot, video, and trace, so the run detail can
+ * always show full evidence and not just what happened on failures. Tier B
+ * depends on an auth storageState produced by fixtures/auth.setup.ts; when no
+ * credentials are wired the setup is a no-op and Tier B specs simply run
+ * unauthenticated.
  */
 export function playwrightConfigContents(opts: ConfigOptions = {}): string {
   const baseUrl = (opts.baseUrl ?? '').trim();
@@ -91,7 +93,7 @@ export default defineConfig({
     baseURL: ${baseUrlLiteral},
     screenshot: 'on',
     video: 'on',
-    trace: 'retain-on-failure',
+    trace: 'on',
   },
   projects: [
     {
@@ -126,21 +128,31 @@ export default defineConfig({
 }
 
 /**
- * Auth setup fixture. Healix injects real credentials into fixtures/.auth at
- * runtime; absent those, this writes an empty storageState so Tier B can still
- * load (specs then run as an anonymous user). A genuine login failure should
- * throw here — Healix surfaces that as a `blocked` Tier B outcome.
+ * Auth setup fixture. Requires Healix to have injected test credentials for
+ * this project (single or multiple, via HEALIX_TIERB_* env vars); when none
+ * are configured, or the DEFAULT credential's login attempt fails, this
+ * throws immediately so Playwright marks every Tier B spec `blocked` right
+ * away (via the `auth-setup` dependency) instead of each one individually
+ * running to its own timeout against an anonymous session — Tier B has no
+ * meaningful anonymous fallback. Additional (role-tagged) credentials each
+ * get their own storageState file (fixtures/.auth/user-<role>.json); a
+ * generated spec opts into one via test.use({ storageState: ... }) — see
+ * generate.ts's role guidance — while everything else keeps using the
+ * default session unchanged. A role credential's own login failure is
+ * best-effort and never blocks the run; only specs that opt into that role
+ * are affected.
  */
 export function authSetupContents(): string {
   return `import { test as setup } from '@playwright/test';
-import { mkdir, writeFile, access } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
-const authFile = 'fixtures/.auth/user.json';
+const authDir = 'fixtures/.auth';
+const authFile = \`\${authDir}/user.json\`;
 // Sidecar read by Healix after the run: records whether a REAL login was
-// performed, so Tier B failures can be classified structurally (blocked vs
-// genuine) instead of by matching error text.
-const metaFile = 'fixtures/.auth/setup-meta.json';
+// performed (for the DEFAULT credential), so Tier B failures can be
+// classified structurally (blocked vs genuine) instead of by matching error text.
+const metaFile = \`\${authDir}/setup-meta.json\`;
 
 async function writeMeta(performedLogin) {
   await writeFile(
@@ -150,61 +162,423 @@ async function writeMeta(performedLogin) {
   );
 }
 
+function roleStorageStatePath(role) {
+  const slug = role.trim().toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '');
+  return \`\${authDir}/user-\${slug || 'role'}.json\`;
+}
+
 /**
- * Establishes the Tier B authenticated storageState. By default this produces an
- * empty (anonymous) state. Wire your real login flow here, or have Healix inject
- * credentials via HEALIX_TIERB_* env vars. Throwing here marks Tier B blocked.
+ * getByLabel() only matches a REAL accessible label (an actual <label for=...>,
+ * aria-label, or aria-labelledby) — plenty of real-world login forms show
+ * "Email"/"Password" as plain sibling text (a <p> or <span> next to the
+ * input, not an associated label) and rely on a placeholder for the
+ * accessible name instead. Falling back through placeholder, then a plain
+ * input[type=...]/name-contains selector, covers that gap without giving up
+ * the label-based match as the FIRST choice when a form does it properly.
  */
-setup('authenticate', async ({ page }) => {
+function fieldLocator(page, labelRe, placeholderRe, cssFallback) {
+  return page
+    .getByLabel(labelRe)
+    .or(page.getByPlaceholder(placeholderRe))
+    .or(page.locator(cssFallback));
+}
+
+/**
+ * A button's visible TEXT is the least reliable way to find it — it's
+ * whatever the app is localized to (e.g. a Slovak app's submit button reads
+ * "Pokračovať", which no English/Slovak text regex will anticipate). Native
+ * submit semantics (type="submit") and test-hint attributes (data-testid/
+ * name/id containing submit-like tokens) are locale-independent and take
+ * priority; the text regex is kept only as a last-resort fallback for apps
+ * with neither.
+ *
+ * Tiers are checked in order via .count() rather than chained with .or() —
+ * .or() unions matches and .first() then picks whichever is FIRST IN DOM
+ * ORDER, not first-matching-tier, so a hint selector broad enough to also
+ * catch the email/password inputs (e.g. \`[data-testid*="login" i]\`) would
+ * win over the real submit button simply for appearing earlier in the DOM.
+ * Explicit per-tier existence checks keep priority correct.
+ */
+async function submitButtonLocator(page, textRe) {
+  const native = page.locator('button[type="submit"], input[type="submit"]');
+  if (await native.count()) return native.first();
+
+  const hinted = page.locator(
+    'button[data-testid*="submit" i], button[data-testid*="login" i], button[data-testid*="signin" i], button[data-testid*="continue" i], button[name*="submit" i], button[id*="submit" i], a[data-testid*="submit" i], a[data-testid*="login" i], a[data-testid*="signin" i], a[data-testid*="continue" i]',
+  );
+  if (await hinted.count()) return hinted.first();
+
+  return page.getByRole('button', { name: textRe }).or(page.getByRole('link', { name: textRe })).first();
+}
+
+/**
+ * Polls until the page navigates away from \`loginUrl\` or the password field
+ * disappears, or 10s elapse. A real login is rarely a single synchronous
+ * action — chained async calls (token generate -> password validate ->
+ * profile lookup -> redirect) can easily outlast a single \`networkidle\`
+ * check, so snapshotting immediately after the click can read the
+ * pre-redirect state as success even when the submit click did nothing.
+ */
+async function waitForLoginOutcome(page, beforeUrl) {
+  const deadline = Date.now() + 10_000;
+  for (;;) {
+    const stillHasPasswordField = await page
+      .locator('input[type="password"]')
+      .first()
+      .isVisible()
+      .catch(() => false);
+    const navigatedAway = page.url() !== beforeUrl;
+    if (navigatedAway || !stillHasPasswordField || Date.now() >= deadline) {
+      return { navigatedAway, stillHasPasswordField };
+    }
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
+}
+
+/**
+ * One username/password form login against \`page\`, saving storageState to
+ * \`path\` on success. Throws on failure — including when the submit click
+ * "succeeded" (no exception) but the page never actually left the login
+ * form, e.g. a wrong-password submit that just re-renders the same form
+ * with an inline error. Without this check that would be indistinguishable
+ * from a real login and would silently capture an anonymous storageState
+ * that every downstream Tier B spec then fails against individually.
+ */
+async function loginForm(page, email, password, loginUrl, path) {
+  await page.goto(loginUrl);
+
+  // Locale-aware matchers (English + common Slovak forms observed in the
+  // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
+  // i18n engine, just enough to not be English-only.
+  const emailField = fieldLocator(
+    page,
+    /e-?mail/i,
+    /e-?mail/i,
+    'input[type="email"], input[name*="email" i], input[name*="user" i], input[id*="email" i]',
+  );
+  const passwordField = fieldLocator(
+    page,
+    /heslo|password/i,
+    /heslo|password/i,
+    'input[type="password"]',
+  );
+  const loginRevealRe = /prihl|sign in|log ?in/i;
+
+  // Some apps gate the login form behind a reveal button/link (e.g. a
+  // "Prihlásiť sa" click before the email/password fields even render) —
+  // click through it before searching for the form.
+  const hasEmailField = await emailField
+    .first()
+    .isVisible()
+    .catch(() => false);
+  if (!hasEmailField) {
+    const reveal = await submitButtonLocator(page, loginRevealRe);
+    await reveal.click({ timeout: 5000 }).catch(() => {});
+  }
+
+  await emailField.first().fill(email);
+  await passwordField.first().fill(password);
+  const beforeUrl = page.url();
+  const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue/i);
+  await submitButton.click();
+
+  const { navigatedAway, stillHasPasswordField } = await waitForLoginOutcome(page, beforeUrl);
+  if (stillHasPasswordField && !navigatedAway) {
+    throw new Error(
+      \`Login did not navigate away from the login page after submitting — still on \${page.url()} with a visible password field. Check credentials or selectors.\`,
+    );
+  }
+
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.context().storageState({ path });
+}
+
+/**
+ * Substitute \`{token}\` (always available, from the credential's own token
+ * field) and every \`{<key>}\` in extraParams into urlTemplate, then visit the
+ * resulting URL against baseUrl — for apps with no login FORM at all: a
+ * token (and optionally other params, e.g. a mobile number/locale) delivered
+ * via the URL itself, persisted to cookies/localStorage on first load.
+ */
+async function loginUrlToken(page, cred, baseUrl, path) {
+  let target = cred.urlTemplate || '';
+  const params = Object.assign({ token: cred.token || '' }, cred.extraParams || {});
+  for (const [key, value] of Object.entries(params)) {
+    target = target.split(\`{\${key}}\`).join(encodeURIComponent(value));
+  }
+  const base = (baseUrl || '').replace(/\\/+$/, '');
+  const sep = target.startsWith('/') || target.startsWith('#') || target.startsWith('?') ? '' : '/';
+  await page.goto(\`\${base}\${sep}\${target}\`);
+
+  // Best-effort: wait for a transient "not found"/loading message to clear
+  // (a signal the token resolved), but never hard-fail on it — the
+  // storageState is still captured either way, since some apps never show
+  // such a message at all.
+  if (cred.authCheckText) {
+    await page
+      .getByText(cred.authCheckText, { exact: false })
+      .first()
+      .waitFor({ state: 'hidden', timeout: 15000 })
+      .catch(() => {});
+  } else {
+    await page.waitForLoadState('networkidle').catch(() => {});
+  }
+
+  const state = await page.context().storageState({ path });
+  if (state.cookies.length === 0 && state.origins.length === 0) {
+    throw new Error(
+      \`URL-token login produced an empty session (no cookies, no localStorage) at \${page.url()} — the token likely didn't resolve. Check the credential's urlTemplate/token.\`,
+    );
+  }
+}
+
+/** Dispatches to the right login mechanism for this credential's authType. */
+async function login(page, cred, loginUrl, baseUrl, path) {
+  if (cred.authType === 'url-token') {
+    await loginUrlToken(page, cred, baseUrl, path);
+  } else {
+    await loginForm(page, cred.username, cred.password, loginUrl, path);
+  }
+}
+
+setup('authenticate', async ({ page, browser }) => {
   await mkdir(dirname(authFile), { recursive: true });
 
   const email = process.env.HEALIX_TIERB_EMAIL;
   const password = process.env.HEALIX_TIERB_PASSWORD;
   const loginUrl = process.env.HEALIX_TIERB_LOGIN_URL;
+  const baseUrl = process.env.HEALIX_BASE_URL;
 
-  if (email && password && loginUrl) {
-    // Written BEFORE the login attempt so a mid-login crash still leaves
-    // performedLogin:false on disk; overwritten with true only on success.
+  if (!email || !password || !loginUrl) {
     await writeMeta(false);
-    await page.goto(loginUrl);
-
-    // Locale-aware matchers (English + common Slovak forms observed in the
-    // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
-    // i18n engine, just enough to not be English-only.
-    const emailField = page.getByLabel(/e-?mail/i);
-    const loginRevealRe = /prihl|sign in|log ?in/i;
-
-    // Some apps gate the login form behind a reveal button/link (e.g. a
-    // "Prihlásiť sa" click before the email/password fields even render) —
-    // click through it before searching for the form.
-    const hasEmailField = await emailField
-      .first()
-      .isVisible()
-      .catch(() => false);
-    if (!hasEmailField) {
-      const reveal = page.getByRole('button', { name: loginRevealRe }).or(page.getByRole('link', { name: loginRevealRe }));
-      await reveal
-        .first()
-        .click({ timeout: 5000 })
-        .catch(() => {});
-    }
-
-    await page.getByLabel(/e-?mail/i).fill(email);
-    await page.getByLabel(/heslo|password/i).fill(password);
-    await page.getByRole('button', { name: /prihl|sign in|log ?in|continue/i }).click();
-    await page.waitForLoadState('networkidle').catch(() => {});
-    await page.context().storageState({ path: authFile });
-    await writeMeta(true);
-    return;
+    throw new Error(
+      'Tier B auth setup skipped: no test credentials configured for this project ' +
+        '(and no HEALIX_TIERB_EMAIL/PASSWORD/LOGIN_URL env vars set). ' +
+        'Set testUsername/testPassword on the project, or configure ' +
+        'HEALIX_TIERB_EMAIL/HEALIX_TIERB_PASSWORD/HEALIX_TIERB_LOGIN_URL, to run Tier B tests.',
+    );
   }
 
+  const defaultCred = { authType: 'form', username: email, password, role: null };
+
+  // Written BEFORE the login attempt so a mid-login crash still leaves
+  // performedLogin:false on disk; overwritten with true only on success.
   await writeMeta(false);
+  await login(page, defaultCred, loginUrl, baseUrl, authFile);
+  await writeMeta(true);
+
+  // Additional (role-tagged) credentials, via HEALIX_TIERB_CREDENTIALS_JSON —
+  // each gets its own session, in a fresh browser context. Best-effort: one
+  // credential's login failure doesn't stop the rest, and never blocks the
+  // default Tier B session established above.
+  let extraCredentials = [];
   try {
-    await access(authFile);
+    extraCredentials = process.env.HEALIX_TIERB_CREDENTIALS_JSON
+      ? JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON)
+      : [];
   } catch {
-    await writeFile(authFile, JSON.stringify({ cookies: [], origins: [] }), 'utf-8');
+    extraCredentials = [];
+  }
+  // A credential is actually usable only if ITS OWN mechanism has what it
+  // needs: a form credential needs loginUrl, a url-token credential needs
+  // baseUrl (to resolve its urlTemplate against) — not both, and not
+  // whichever one happens to be set globally.
+  const usable = (c) => (c.authType === 'url-token' ? !!baseUrl : !!loginUrl);
+
+  for (const cred of extraCredentials) {
+    if (!cred.role || !usable(cred)) continue;
+    const context = await browser.newContext();
+    const rolePage = await context.newPage();
+    try {
+      await login(rolePage, cred, loginUrl, baseUrl, roleStorageStatePath(cred.role));
+    } catch {
+      // Best-effort: a role-specific login failure only affects specs that
+      // opt into that role's storageState, not the default Tier B session.
+    } finally {
+      await context.close();
+    }
   }
 });
+`;
+}
+
+export interface MockRouteEntry {
+  id: string;
+  hostnames: string[];
+  response: MockResponse;
+  /** Statically-detected (method, path) call sites, when found — see EndpointMock. */
+  endpoints?: Array<{ method: string; pathPattern: string; response?: MockResponse }>;
+}
+
+/**
+ * Fixture wrapping @playwright/test's `test`/`page` with automatic page.route()
+ * interception for every 'route-intercept'/'both' external dependency, fulfilling
+ * with the (AI-generated or static-fallback) canned response resolved before
+ * generation. Generated specs import { test, expect } from this file instead of
+ * '@playwright/test' directly whenever mocking is enabled for the run — see
+ * generate.ts's conditional import allowlist carve-out.
+ *
+ * Always written when mocking is enabled, even with an empty route list (a
+ * harmless no-op passthrough), so generate.ts's import path always resolves
+ * regardless of what was actually detected.
+ */
+export function mockFixtureContents(routes: MockRouteEntry[]): string {
+  const serialized = JSON.stringify(routes, null, 2);
+  return `import { test as base, expect } from '@playwright/test';
+
+/**
+ * Healix-generated mock fixture — intercepts network requests to detected
+ * external dependencies (backend APIs, third-party SMS/email/OTP/payment SDKs)
+ * and fulfills them with a canned response, so tests run without those
+ * services being reachable.
+ */
+
+const MOCKED_ROUTES = ${serialized};
+
+function hostMatches(url, pattern) {
+  let parsed;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (pattern.includes(':')) return parsed.host === pattern;
+  return parsed.hostname === pattern || parsed.hostname.endsWith('.' + pattern);
+}
+
+// \`:param\` segments (e.g. "/reward/:param") match any single path segment —
+// see dependencies.ts's normalizeEndpointPath for how these are produced.
+// Case-insensitive: a detected "/API/Foo" and a real request to "/api/foo"
+// are the same endpoint to any real HTTP router.
+function pathMatches(pattern, requestPath) {
+  const patternSegs = pattern.split('/').filter(Boolean);
+  const pathSegs = requestPath.split('/').filter(Boolean);
+  if (patternSegs.length !== pathSegs.length) return false;
+  return patternSegs.every(
+    (seg, i) => seg === ':param' || seg.toLowerCase() === pathSegs[i].toLowerCase(),
+  );
+}
+
+// Serialize a response body per its declared content-type — JSON.stringify
+// only when the type is (or defaults to) JSON, so a deliberately non-JSON
+// mocked response (text/xml/etc, body given as a raw string) isn't
+// double-encoded.
+function serializeBody(response) {
+  const contentType = (response.headers && response.headers['content-type']) || 'application/json';
+  if (!/json/i.test(contentType) && typeof response.body === 'string') {
+    return { contentType, text: response.body };
+  }
+  return { contentType, text: JSON.stringify(response.body ?? {}) };
+}
+
+// Per-test runtime overrides set via the \`mockOverride\` fixture below — always
+// checked FIRST, so a negative/error-path test (e.g. "simulate a 500") can
+// force a specific status/body for one call without touching any other test
+// or the shared static defaults. Reset after each test.
+let overrides = [];
+
+function resolveResponse(route, method, requestPath) {
+  const override = overrides.find(
+    (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
+  );
+  if (override) return override.response;
+  const endpoint = route.endpoints?.find(
+    (e) => e.method.toUpperCase() === method.toUpperCase() && pathMatches(e.pathPattern, requestPath),
+  );
+  if (endpoint?.response) return endpoint.response;
+  return route.response;
+}
+
+export const test = base.extend({
+  // Lets a spec force a specific status/body for one (method, path) call,
+  // scoped to just that test — e.g.
+  //   mockOverride('GET', '/customer_lookup', { status: 500, body: {} })
+  // Use this for negative/error-simulation tests (500/401/403/timeout-style
+  // scenarios); everything else keeps using the resolved default response.
+  // Malformed calls (wrong arg types) are ignored with a console.warn rather
+  // than throwing, so a mistaken call degrades to "no override" instead of
+  // crashing the whole test.
+  mockOverride: async ({}, use) => {
+    const fn = (method, pathPattern, response) => {
+      if (typeof method !== 'string' || typeof pathPattern !== 'string' || !response || typeof response !== 'object') {
+        console.warn('[mockOverride] ignored invalid call:', { method, pathPattern, response });
+        return;
+      }
+      overrides.push({ method, pathPattern, response });
+    };
+    await use(fn);
+    overrides = [];
+  },
+  page: async ({ page, mockOverride }, use) => {
+    void mockOverride; // ensures overrides reset alongside this test via the fixture above
+    for (const route of MOCKED_ROUTES) {
+      await page.route(
+        (url) => route.hostnames.some((h) => hostMatches(url.toString(), h)),
+        async (r) => {
+          let requestPath = '/';
+          try {
+            requestPath = new URL(r.request().url()).pathname;
+          } catch {
+            // keep default '/'
+          }
+          const response = resolveResponse(route, r.request().method(), requestPath);
+          const { contentType, text } = serializeBody(response);
+          await r.fulfill({
+            status: response.status,
+            headers: { 'content-type': contentType, ...(response.headers || {}) },
+            body: text,
+          });
+        },
+      );
+    }
+    await use(page);
+  },
+  // Playwright's page.route() only intercepts requests a BROWSER makes — it
+  // cannot see calls made through the standalone \`request\` fixture (used by
+  // API-contract-style specs), since that's a raw HTTP client with no
+  // interception hooks at all. Fake it directly instead, matching by (method,
+  // path) against the same route.endpoints/overrides resolution page uses
+  // above. Only the first mocked dependency is served this way — request-
+  // fixture calls use relative paths with no hostname to disambiguate between
+  // multiple dependencies.
+  request: async ({ request, mockOverride }, use) => {
+    void mockOverride;
+    if (MOCKED_ROUTES.length === 0) {
+      await use(request);
+      return;
+    }
+    const route = MOCKED_ROUTES[0];
+    const respond = (method, requestPath) => {
+      const canned = resolveResponse(route, method, (requestPath || '/').split('?')[0]);
+      const { contentType, text } = serializeBody(canned);
+      return {
+        ok: () => canned.status >= 200 && canned.status < 300,
+        status: () => canned.status,
+        statusText: () => '',
+        headers: () => ({ 'content-type': contentType, ...(canned.headers || {}) }),
+        json: async () => canned.body ?? {},
+        text: async () => text,
+        body: async () => Buffer.from(text),
+        url: () => requestPath || '',
+        dispose: async () => undefined,
+      };
+    };
+    const fakeRequest = {
+      get: async (url) => respond('GET', url),
+      post: async (url) => respond('POST', url),
+      put: async (url) => respond('PUT', url),
+      patch: async (url) => respond('PATCH', url),
+      delete: async (url) => respond('DELETE', url),
+      head: async (url) => respond('HEAD', url),
+      options: async (url) => respond('OPTIONS', url),
+      fetch: async (url, opts) => respond(opts?.method ?? 'GET', url),
+      dispose: async () => undefined,
+    };
+    await use(fakeRequest);
+  },
+});
+
+export { expect };
 `;
 }
 

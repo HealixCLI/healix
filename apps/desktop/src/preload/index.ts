@@ -17,6 +17,18 @@ export type RunChannelMessage =
   // Broadcast to every window when a queued run fails to start (before it ever got its own runId).
   | { channel: 'queue:failed'; payload: { message: string } };
 
+/** Structural mirror of @healix/core's NewProjectCredential — kept local for the same "light bundle" reason as above. */
+type PreloadCredentialInput = {
+  authType?: 'form' | 'url-token';
+  username?: string;
+  password?: string;
+  role?: string | null;
+  token?: string | null;
+  urlTemplate?: string | null;
+  extraParams?: Record<string, string> | null;
+  authCheckText?: string | null;
+};
+
 const RUN_CHANNELS = [
   'run:started',
   'run:event',
@@ -44,8 +56,7 @@ const api = {
     mode?: string;
     repoPath?: string | null;
     baseUrl?: string | null;
-    testUsername?: string | null;
-    testPassword?: string | null;
+    credentials?: PreloadCredentialInput[];
   }) => ipcRenderer.invoke('projects:create', input),
   updateProject: (
     id: string,
@@ -54,8 +65,7 @@ const api = {
       mode?: string;
       repoPath?: string | null;
       baseUrl?: string | null;
-      testUsername?: string | null;
-      testPassword?: string | null;
+      credentials?: PreloadCredentialInput[];
     },
   ) => ipcRenderer.invoke('projects:update', { id, ...input }),
   deleteProject: (id: string) => ipcRenderer.invoke('projects:delete', id),
@@ -68,6 +78,7 @@ const api = {
     provider?: string;
     autoApprove?: boolean;
     prd?: string;
+    instructions?: string;
     suiteMode?: string;
     baseRunId?: string;
   }) => ipcRenderer.invoke('run:start', args),
@@ -84,6 +95,7 @@ const api = {
 
   listRuns: (projectId?: string) => ipcRenderer.invoke('runs:list', { projectId }),
   runDetail: (runId: string) => ipcRenderer.invoke('runs:detail', { runId }),
+  deleteRun: (runId: string) => ipcRenderer.invoke('runs:delete', { runId }),
   lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),
   suiteDiff: (runId: string) => ipcRenderer.invoke('runs:suiteDiff', { runId }),
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
@@ -95,13 +107,21 @@ const api = {
     ipcRenderer.invoke('plan:reviseItem', args),
 
   // export / shell
-  exportSuite: (args: { suiteDir: string; outDir?: string; sanitize?: boolean; zip?: boolean }) =>
-    ipcRenderer.invoke('export:suite', args),
+  exportSuite: (args: {
+    suiteDir: string;
+    outDir?: string;
+    sanitize?: boolean;
+    zip?: boolean;
+    projectId?: string;
+  }) => ipcRenderer.invoke('export:suite', args),
   revealPath: (target: string) => ipcRenderer.invoke('shell:reveal', target),
   showItemInFolder: (target: string) => ipcRenderer.invoke('shell:showItem', target),
 
   // PRD file upload (native picker + text extraction, main-process side)
   pickPrdFile: () => ipcRenderer.invoke('dialog:pickPrdFile'),
+
+  // Repo path folder picker (Project create/edit form)
+  pickRepoPath: () => ipcRenderer.invoke('dialog:pickRepoPath'),
 
   /**
    * Subscribe to the full run lifecycle. The callback receives a discriminated

@@ -9,6 +9,7 @@ import { registerRun } from './commands/run.js';
 import { registerRuns } from './commands/runs.js';
 import { registerReport } from './commands/report.js';
 import { registerExport } from './commands/export.js';
+import { registerMockLaunch } from './commands/mock-launch.js';
 
 // Resolve the real package version (this file runs from dist/, next to package.json).
 const pkg = createRequire(import.meta.url)('../package.json') as { version: string };
@@ -28,6 +29,7 @@ registerRun(program);
 registerRuns(program);
 registerReport(program);
 registerExport(program);
+registerMockLaunch(program);
 
 program.parseAsync(process.argv).catch((err) => {
   console.error(err);

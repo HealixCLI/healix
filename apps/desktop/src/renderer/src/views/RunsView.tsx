@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Project, SuiteMode, TestingScope } from '@healix/core';
 import { ChevronDown, ChevronUp, Loader2, ListPlus, Pause, Play, Plus, Square, X } from 'lucide-react';
 import { Button } from '../components/ui/button';
@@ -62,15 +62,64 @@ const SETTLED_PHASES: ReadonlyArray<RunPhase> = ['paused', 'done', 'cancelled', 
 // honored across navigation instead of only within a single mount.
 let persistedSelectedRunId: string | null | undefined;
 
+// Same reasoning as persistedSelectedRunId above: RunsView fully unmounts on
+// navigating away, so a useRef here would reset to the prop's own value on
+// every remount (it'd not equal to itself) and the "did this actually
+// change" check below would never fire. Module state survives the unmount,
+// so a genuine bump from a Run click is still detectable as different from
+// whatever this was last observed as. Starts at 0 to match App.tsx's counter,
+// which also starts at 0 and only ever increments — so a plain sidebar nav
+// into Runs before any Run click ever happened (prop still 0) correctly
+// never fires this on the very first mount.
+let lastSeenRunRequestSeq = 0;
+
+// Same reasoning again, for the "run just settled, auto-select it" effect
+// below: engine.phase/engine.runId are lifted to App.tsx and stay at their
+// settled values indefinitely (until a new run actually starts), so a
+// useRef-based "have I already handled this settle" guard would reset blank
+// on every single remount and re-fire for the SAME stale settled run every
+// time RunsView remounts — e.g. clicking Run for a totally different project
+// right after a previous run was cancelled would still get its async
+// refreshRuns().then() callback firing again and yanking the fresh compose
+// form back to that old cancelled run. Module state remembers it was already
+// handled across the remount.
+let lastSettledKey: string | null = null;
+
+// Closes a further gap the module state above doesn't: it only stops a
+// settle already handled in a PREVIOUS mount from re-firing. It does nothing
+// for a settle that fires for the FIRST time while the user is already
+// looking at a fresh compose screen for a different project — e.g. Cancel a
+// run, then immediately click Run elsewhere before the cancellation's
+// run:done confirmation actually arrives. That confirmation still lands
+// (engine.phase/runId are lifted to App.tsx and don't care which view is
+// mounted) and would hijack the compose screen the instant it does. True
+// from the moment the user explicitly asks for a blank compose screen (Run
+// button or New run) until a new run actually starts or they explicitly pick
+// a different history row — while true, the settle effect must not
+// auto-select anything.
+let awaitingFreshRunConfig = false;
+
 export function RunsView({
   initialProjectId,
+  runRequestSeq,
   engine,
   queue,
+  sidebarCollapsed = false,
 }: {
   initialProjectId?: string | null;
+  /**
+   * Bumped by App.tsx on every "Run" click from the Projects list (even for
+   * the same project — initialProjectId alone can't signal that). Landing
+   * here should always show the editable compose form pre-selected to that
+   * project, the same as clicking "New run", never a leftover historical
+   * run's read-only detail.
+   */
+  runRequestSeq?: number;
   /** Lifted to App.tsx so the live run survives navigating away from and back to this view. */
   engine: RunEngine;
   queue: RunQueue;
+  /** Hides the history rail entirely — toggled from the activity bar by re-clicking the Runs icon. */
+  sidebarCollapsed?: boolean;
 }) {
   const { projects, loading: projectsLoading } = useProjects();
   // History spans all projects so the user can review past runs across targets.
@@ -85,6 +134,10 @@ export function RunsView({
   const [prdFileName, setPrdFileName] = useState<string | null>(null);
   const [prdFileBusy, setPrdFileBusy] = useState(false);
   const [prdFileError, setPrdFileError] = useState<string | null>(null);
+  // Interactive prompting: freeform steering instructions ("how to test"),
+  // distinct from the PRD ("what the app does") — sent to the planning
+  // provider verbatim alongside it (see RunOptions.instructions).
+  const [instructions, setInstructions] = useState('');
   const [selectedRunId, setSelectedRunIdState] = useState<string | null>(
     () => persistedSelectedRunId ?? null,
   );
@@ -102,8 +155,8 @@ export function RunsView({
   // project was deleted in another window) — distinct from engine.error,
   // which is scoped to the run the engine is actively tracking, not this button.
   const [queueError, setQueueError] = useState<string | null>(null);
-  // Session-only: resets to expanded on next launch.
-  const [historyCollapsed, setHistoryCollapsed] = useState(false);
+  // Set when a run-delete IPC call itself failed (e.g. the run was already gone).
+  const [runDeleteError, setRunDeleteError] = useState<string | null>(null);
   // Collapsing "Start a run" frees most of the column for the report/timeline
   // section below it — toggled via the centered chevron divider. Always
   // starts expanded so the run controls are immediately visible; collapsing
@@ -180,6 +233,13 @@ export function RunsView({
     engine.phase === 'plan-streaming' ||
     engine.phase === 'awaiting-approval';
 
+  // Mirrors `engine` for the settle effect below, whose refreshRuns().then()
+  // callback needs to read the LATEST engine state at the time it resolves,
+  // not the stale snapshot closed over when the effect fired — see that
+  // effect's own comment for why.
+  const engineRef = useRef(engine);
+  engineRef.current = engine;
+
   // Re-attach to a run that's still genuinely parked awaiting approval in the
   // main process — its approval promise only dies on app restart, not on
   // navigating away from this view — but whose live engine state was lost
@@ -226,20 +286,40 @@ export function RunsView({
   // (paused -> resumed -> paused again, or paused -> cancelled) — a runId-only
   // guard would fire once on the first settle and then never again for that
   // run, leaving history/detail stuck showing the earlier status forever.
-  const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
     if (SETTLED_PHASES.includes(engine.phase) && engine.runId) {
       const key = `${engine.runId}:${engine.phase}`;
-      if (lastSettledRef.current === key) return;
-      lastSettledRef.current = key;
+      if (lastSettledKey === key) return;
+      lastSettledKey = key;
+      // The [isActive] effect above only fires on an active->inactive
+      // TRANSITION, so it misses a settle that starts and ends inactive (e.g.
+      // cancelling an already-paused run — 'paused' and 'cancelled' are both
+      // outside isActive, so it never changes and that effect never re-runs),
+      // which left "Cancelling…"/"Pausing…" stuck forever. This effect already
+      // fires on every distinct runId+phase settle, repeats included, so reset
+      // here too.
+      setCancelling(false);
+      setPausing(false);
       const settledId = engine.runId;
       void refreshRuns().then(() => {
+        // Stale by the time this resolves: the user already moved on (e.g.
+        // cancelled this run, then immediately started a different one
+        // before this refresh came back) — engine.runId no longer points at
+        // the run this callback was about. Selecting it now would yank the
+        // view away from whatever the user is already looking at.
+        if (engineRef.current.runId !== settledId) return;
+        // The user explicitly asked for a blank compose screen (Run/New run)
+        // and no new run has started yet to supersede that intent — this
+        // settle confirmation (e.g. for the run they just cancelled to get
+        // here) arriving late must not hijack that screen back to it.
+        if (awaitingFreshRunConfig) return;
         setSelectedRunId(settledId);
         void reloadDetail();
       });
     }
     if (engine.phase === 'idle' || engine.phase === 'starting') {
-      lastSettledRef.current = null;
+      lastSettledKey = null;
+      awaitingFreshRunConfig = false;
     }
   }, [engine.phase, engine.runId, refreshRuns, reloadDetail]);
 
@@ -292,9 +372,38 @@ export function RunsView({
     return () => clearTimeout(id);
   }, [queueError]);
 
+  useEffect(() => {
+    if (!runDeleteError) return;
+    const id = setTimeout(() => setRunDeleteError(null), 8000);
+    return () => clearTimeout(id);
+  }, [runDeleteError]);
+
+  /**
+   * Delete a single historical run (DB rows + on-disk assets). Refuses (via
+   * the main-process handler) while that run is still executing. Clears the
+   * selection when the deleted run was the one on screen, so RunDetailPanel
+   * doesn't keep showing detail for a run that no longer exists.
+   */
+  const deleteRun = async (runId: string): Promise<void> => {
+    setRunDeleteError(null);
+    try {
+      await window.healix.deleteRun(runId);
+      if (selectedRunId === runId) setSelectedRunId(null);
+      await refreshRuns();
+    } catch (err) {
+      setRunDeleteError(err instanceof Error ? err.message : String(err));
+    }
+  };
+
   const startOrQueue = (): void => {
     if (!projectId) return;
-    const args = { projectId, testingScope, suiteMode, prd: prd.trim() || undefined };
+    const args = {
+      projectId,
+      testingScope,
+      suiteMode,
+      prd: prd.trim() || undefined,
+      instructions: instructions.trim() || undefined,
+    };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
       // active — this never silently supersedes the run currently on screen.
@@ -306,6 +415,9 @@ export function RunsView({
     }
     // Showing live run UI rather than a historical detail.
     setSelectedRunId(null);
+    // Auto-collapse "Start a run" so the live console gets the column's full
+    // height immediately, instead of making the user click the chevron themselves.
+    setFormCollapsed(true);
     void engine.start(args);
   };
 
@@ -372,29 +484,105 @@ export function RunsView({
   const showLiveSurface =
     engine.runId != null ? selectedRunId === engine.runId && isActive : isActive && selectedRunId == null;
 
+  // A run just started/queued-in this session begins with engine.runId still
+  // null (see startOrQueue, which clears selectedRunId first) — showLiveSurface
+  // falls back to the "nothing else selected" branch above and the console
+  // shows. But the instant run:started arrives, engine.runId flips to a real
+  // id while selectedRunId is still null, so the runId-based branch above no
+  // longer matches and the console would vanish again right away. Adopt the
+  // freshly-assigned runId as the selection so the live console keeps showing.
+  // Skipped for a hydrated re-attach: selectedRunId is already set to that
+  // run's id by the effect that triggers hydrate() in the first place.
+  //
+  // Also gated on the run actually being live (not settled): engine.runId
+  // stays set to the LAST run indefinitely — it's only ever cleared back to
+  // null at the very start of a fresh start()/resume(), never when a run
+  // finishes/cancels/errors. Without the settled check, resetting
+  // selectedRunId to null to open a fresh compose screen (Run/New run) would
+  // immediately get overwritten right back to that old, already-settled run
+  // by this same effect.
+  useEffect(() => {
+    if (!engine.runId || engine.hydrated || SETTLED_PHASES.includes(engine.phase)) return;
+    if (selectedRunId === null) setSelectedRunId(engine.runId);
+  }, [engine.runId, engine.hydrated, engine.phase, selectedRunId]);
+
+  // Viewing a selected run that isn't the live-tracked one — i.e. a genuinely
+  // historical (already-run) row picked from the sidebar. The "Start a run"
+  // card switches from the editable compose form into a read-only "what was
+  // this configured with" summary for it, sourced from run-config.json (see
+  // RunDetail.runConfig) — falling back to just the Run row's own suiteMode
+  // for a run that predates that file.
+  const viewingHistoricalRun = !!selectedRunId && !showLiveSurface && !!detail?.run;
+  const historicalProject = detail?.run ? projectsById.get(detail.run.projectId) : undefined;
+  const effectiveTestingScope = viewingHistoricalRun
+    ? (detail?.runConfig?.testingScope ?? 'both')
+    : testingScope;
+  const effectiveSuiteMode = viewingHistoricalRun
+    ? (detail?.runConfig?.suiteMode ?? detail?.run?.suiteMode ?? 'fresh')
+    : suiteMode;
+  const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
+  const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
+
+  /**
+   * Clears the historical-run view and resets the compose form to defaults,
+   * ready for a fresh run. Also marks the run-history auto-select as already
+   * decided: on the very first-ever visit to Runs this app session (before
+   * `runs` has finished loading), that effect is still armed and would
+   * otherwise fire once history loads and stomp this reset right back to the
+   * latest run — see its own comment above. Sets awaitingFreshRunConfig so a
+   * late-arriving settle confirmation for a DIFFERENT, already-abandoned run
+   * (see that effect's own comment) can't hijack this screen either.
+   */
+  const startNewRunConfig = useCallback((): void => {
+    autoSelectedOnce.current = true;
+    awaitingFreshRunConfig = true;
+    setSelectedRunId(null);
+    setPrd('');
+    setPrdFileName(null);
+    setPrdFileError(null);
+    setInstructions('');
+    setTestingScope('both');
+    setSuiteMode('fresh');
+    setFormCollapsed(false);
+  }, []);
+
+  // "Run" clicked on the Projects list — always land on the editable compose
+  // form for that project, exactly like "New run", never a leftover selected
+  // historical run's read-only detail. See lastSeenRunRequestSeq above for
+  // why this compares against module state rather than a useRef.
+  useEffect(() => {
+    if (runRequestSeq === undefined) return;
+    if (runRequestSeq !== lastSeenRunRequestSeq) {
+      startNewRunConfig();
+      if (initialProjectId) setProjectId(initialProjectId);
+    }
+    lastSeenRunRequestSeq = runRequestSeq;
+  }, [runRequestSeq, initialProjectId, startNewRunConfig]);
+
   return (
     <div className="flex h-full min-h-0">
-      {/* History rail */}
-      <div
-        className={cn(
-          'flex shrink-0 flex-col border-r border-border pb-6 pt-8',
-          historyCollapsed ? 'w-12 items-center px-1' : 'w-64 px-4',
-        )}
-      >
-        <RunHistory
-          runs={runs}
-          loading={runsLoading}
-          error={runsError}
-          selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
-          onSelect={(id) => {
-            setSelectedRunId(id);
-          }}
-          onRefresh={() => void refreshRuns()}
-          projectsById={projectsById}
-          collapsed={historyCollapsed}
-          onToggleCollapse={() => setHistoryCollapsed((v) => !v)}
-        />
-      </div>
+      {/* History rail — shown/hidden entirely from the activity bar (re-clicking
+          the Runs icon), not by an in-page collapse control. */}
+      {!sidebarCollapsed && (
+        <div className="flex w-64 shrink-0 flex-col border-r border-border px-4 pb-6 pt-8">
+          <RunHistory
+            runs={runs}
+            loading={runsLoading}
+            error={runsError}
+            selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
+            onSelect={(id) => {
+              // An explicit history pick overrides any still-pending "show me
+              // a blank compose screen" intent from a recent Run/New run click.
+              awaitingFreshRunConfig = false;
+              setSelectedRunId(id);
+            }}
+            onRefresh={() => void refreshRuns()}
+            onDelete={(id) => void deleteRun(id)}
+            onNewRun={startNewRunConfig}
+            projectsById={projectsById}
+          />
+        </div>
+      )}
 
       {/* Main */}
       <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8 [@media(max-height:800px)]:pb-3 [@media(max-height:800px)]:pt-4">
@@ -411,12 +599,23 @@ export function RunsView({
         {/* Controls */}
         <Card className="mt-5 shrink-0 [@media(max-height:800px)]:mt-3">
           <CardHeader className="flex flex-row items-center justify-between">
-            <CardTitle>Start a run</CardTitle>
-            {formCollapsed && selectedProject && (
-              <span className="truncate font-mono text-xs text-muted">
-                {selectedProject.name} · {TESTING_SCOPES.find((s) => s.value === testingScope)?.label}
-              </span>
-            )}
+            <div className="flex items-center gap-2">
+              <CardTitle>{viewingHistoricalRun ? 'Run configuration' : 'Start a run'}</CardTitle>
+              {viewingHistoricalRun && <Badge tone="muted">Read-only</Badge>}
+            </div>
+            <div className="flex items-center gap-2">
+              {formCollapsed && !viewingHistoricalRun && selectedProject && (
+                <span className="truncate font-mono text-xs text-muted">
+                  {selectedProject.name} · {TESTING_SCOPES.find((s) => s.value === testingScope)?.label}
+                </span>
+              )}
+              {formCollapsed && viewingHistoricalRun && (
+                <span className="truncate font-mono text-xs text-muted">
+                  {historicalProject?.name ?? detail?.run?.projectId} ·{' '}
+                  {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.label}
+                </span>
+              )}
+            </div>
           </CardHeader>
           {!formCollapsed && (
             <CardContent>
@@ -424,26 +623,37 @@ export function RunsView({
                 <div>
                   <Label className="mb-1.5 block">Project</Label>
                   <Select
-                    value={projectId}
+                    value={viewingHistoricalRun ? (detail?.run?.projectId ?? '') : projectId}
                     onChange={(e) => setProjectId(e.target.value)}
                     // Stays editable while a run is active — picking a different
                     // project here configures the run that "Queue run" adds
                     // behind it, not the one currently executing.
-                    disabled={projectsLoading || runnable.length === 0}
+                    disabled={viewingHistoricalRun || projectsLoading || runnable.length === 0}
                   >
-                    {runnable.length === 0 && <option value="">No active projects — create one first</option>}
-                    {runnable.map((p) => (
-                      <option key={p.id} value={p.id}>
-                        {p.name}
+                    {viewingHistoricalRun ? (
+                      <option value={detail?.run?.projectId ?? ''}>
+                        {historicalProject?.name ?? detail?.run?.projectId ?? 'Unknown project'}
                       </option>
-                    ))}
+                    ) : (
+                      <>
+                        {runnable.length === 0 && (
+                          <option value="">No active projects — create one first</option>
+                        )}
+                        {runnable.map((p) => (
+                          <option key={p.id} value={p.id}>
+                            {p.name}
+                          </option>
+                        ))}
+                      </>
+                    )}
                   </Select>
                 </div>
                 <div>
                   <Label className="mb-1.5 block">Testing Scope</Label>
                   <Select
-                    value={testingScope}
+                    value={effectiveTestingScope}
                     onChange={(e) => setTestingScope(e.target.value as TestingScope)}
+                    disabled={viewingHistoricalRun}
                   >
                     {TESTING_SCOPES.map((s) => (
                       <option key={s.value} value={s.value}>
@@ -452,12 +662,16 @@ export function RunsView({
                     ))}
                   </Select>
                   <p className="mt-1 text-[11px] text-muted">
-                    {TESTING_SCOPES.find((s) => s.value === testingScope)?.hint}
+                    {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.hint}
                   </p>
                 </div>
                 <div>
                   <Label className="mb-1.5 block">Suite Mode</Label>
-                  <Select value={suiteMode} onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}>
+                  <Select
+                    value={effectiveSuiteMode}
+                    onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}
+                    disabled={viewingHistoricalRun}
+                  >
                     {SUITE_MODES.map((m) => (
                       <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
                         {m.label}
@@ -465,9 +679,9 @@ export function RunsView({
                     ))}
                   </Select>
                   <p className="mt-1 text-[11px] text-muted">
-                    {SUITE_MODES.find((m) => m.value === suiteMode)?.hint}
+                    {SUITE_MODES.find((m) => m.value === effectiveSuiteMode)?.hint}
                   </p>
-                  {suiteMode !== 'fresh' && lastSuccessfulRun && (
+                  {!viewingHistoricalRun && suiteMode !== 'fresh' && lastSuccessfulRun && (
                     <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
                       Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
                     </p>
@@ -477,87 +691,125 @@ export function RunsView({
                   <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
                   <div className="relative">
                     <Textarea
-                      value={prd}
+                      value={effectivePrd}
                       onChange={(e) => {
                         setPrd(e.target.value);
                         // The text no longer reflects the uploaded file verbatim.
                         setPrdFileName(null);
                       }}
                       placeholder="Paste requirements to ground test generation…"
-                      className="pr-9"
+                      className={viewingHistoricalRun ? undefined : 'pr-9'}
+                      // readOnly (not disabled) for a historical run: prevents edits
+                      // while keeping the textarea scrollable — disabled:pointer-events-none
+                      // blocks wheel-scrolling over the field entirely.
+                      readOnly={viewingHistoricalRun}
                     />
-                    <button
-                      type="button"
-                      onClick={() => void uploadPrdFile()}
-                      disabled={prdFileBusy}
-                      aria-label="Upload a PRD file"
-                      title="Upload a PRD file"
-                      className={cn(
-                        'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
-                        'text-muted transition-colors hover:bg-panel hover:text-fg',
-                        'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
-                        'disabled:pointer-events-none disabled:opacity-50',
-                      )}
-                    >
-                      {prdFileBusy ? (
-                        <Loader2 className="h-4 w-4 animate-spin" />
-                      ) : (
-                        <Plus className="h-4 w-4" />
-                      )}
-                    </button>
+                    {!viewingHistoricalRun && (
+                      <button
+                        type="button"
+                        onClick={() => void uploadPrdFile()}
+                        disabled={prdFileBusy}
+                        aria-label="Upload a PRD file"
+                        title="Upload a PRD file"
+                        className={cn(
+                          'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
+                          'text-muted transition-colors hover:bg-panel hover:text-fg',
+                          'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
+                          'disabled:pointer-events-none disabled:opacity-50',
+                        )}
+                      >
+                        {prdFileBusy ? (
+                          <Loader2 className="h-4 w-4 animate-spin" />
+                        ) : (
+                          <Plus className="h-4 w-4" />
+                        )}
+                      </button>
+                    )}
                   </div>
-                  <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
-                    <span>
-                      {prdFileName ? (
-                        <>
-                          Selected file: <span className="font-mono text-fg">{prdFileName}</span>
-                        </>
-                      ) : (
-                        'No file selected — paste text above or upload a PRD.'
-                      )}
-                    </span>
-                    <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
-                  </div>
+                  {!viewingHistoricalRun && (
+                    <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
+                      <span>
+                        {prdFileName ? (
+                          <>
+                            Selected file: <span className="font-mono text-fg">{prdFileName}</span>
+                          </>
+                        ) : (
+                          'No file selected — paste text above or upload a PRD.'
+                        )}
+                      </span>
+                      <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
+                    </div>
+                  )}
                   {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
+                </div>
+                <div className="sm:col-span-3">
+                  <Label className="mb-1.5 block">Additional instructions (optional)</Label>
+                  <Textarea
+                    value={effectiveInstructions}
+                    onChange={(e) => setInstructions(e.target.value)}
+                    placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
+                    readOnly={viewingHistoricalRun}
+                  />
+                  <p className="mt-1 text-[11px] text-muted">
+                    Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for
+                    directives on how Healix should approach testing it.
+                  </p>
                 </div>
               </div>
 
               <div className="mt-4 flex min-w-0 items-center justify-between">
-                <div className="min-w-0 text-xs text-muted">
-                  {selectedProject ? (
+                {viewingHistoricalRun ? (
+                  <div className="min-w-0 text-xs text-muted">
                     <span
                       className="block truncate font-mono"
-                      title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+                      title={historicalProject?.baseUrl ?? historicalProject?.repoPath ?? undefined}
                     >
-                      {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
+                      {historicalProject?.baseUrl ?? historicalProject?.repoPath ?? 'no target configured'}
                     </span>
-                  ) : (
-                    'Select a project to begin.'
-                  )}
-                </div>
-                <div className="flex shrink-0 items-center gap-2">
-                  {/* Also offered while paused — cancelling a paused run is a
-                      real, meaningful choice (give up on it entirely) distinct
-                      from Resume (pick it back up); it uses the same
-                      IPC path either way (run:cancel force-settles it even
-                      with no live controller to abort). */}
-                  {(isActive || engine.phase === 'paused') && (
-                    <Button
-                      variant="outline"
-                      className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
-                      onClick={cancel}
-                      // No runId yet means there is nothing to abort (still 'starting').
-                      disabled={cancelling || !engine.runId}
-                    >
-                      <Square className="h-4 w-4" />
-                      {cancelling ? 'Cancelling…' : 'Cancel'}
-                    </Button>
-                  )}
-                  <Button onClick={startOrQueue} disabled={!projectId}>
-                    {isActive ? <ListPlus className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                    {isActive ? 'Queue run' : 'Start run'}
-                  </Button>
-                </div>
+                  </div>
+                ) : (
+                  <>
+                    <div className="min-w-0 text-xs text-muted">
+                      {selectedProject ? (
+                        <span
+                          className="block truncate font-mono"
+                          title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+                        >
+                          {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
+                        </span>
+                      ) : (
+                        'Select a project to begin.'
+                      )}
+                    </div>
+                    <div className="flex shrink-0 items-center gap-2">
+                      {/* Also offered while paused — cancelling a paused run is a
+                          real, meaningful choice (give up on it entirely) distinct
+                          from Resume (pick it back up); it uses the same
+                          IPC path either way (run:cancel force-settles it even
+                          with no live controller to abort). */}
+                      {(isActive || engine.phase === 'paused') && (
+                        <Button
+                          variant="outline"
+                          className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
+                          onClick={cancel}
+                          // No runId yet means there is nothing to abort (still 'starting').
+                          // Also blocked while a pause is already in flight — the abort
+                          // signal only carries ONE reason (AbortController.abort() is a
+                          // no-op once already aborted), so racing both actions
+                          // wouldn't reliably act as either a cancel or a pause.
+                          disabled={cancelling || pausing || !engine.runId}
+                        >
+                          <Square className="h-4 w-4" />
+                          {cancelling ? 'Cancelling…' : 'Cancel'}
+                        </Button>
+                      )}
+                      <Button onClick={startOrQueue} disabled={!projectId}>
+                        {isActive ? <ListPlus className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                        {isActive ? 'Queue run' : 'Start run'}
+                      </Button>
+                    </div>
+                  </>
+                )}
               </div>
             </CardContent>
           )}
@@ -569,6 +821,20 @@ export function RunsView({
             <button
               type="button"
               onClick={() => setQueueError(null)}
+              aria-label="Dismiss"
+              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+            >
+              <X className="h-4 w-4" />
+            </button>
+          </div>
+        )}
+
+        {runDeleteError && (
+          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+            <p>{runDeleteError}</p>
+            <button
+              type="button"
+              onClick={() => setRunDeleteError(null)}
               aria-label="Dismiss"
               className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
             >

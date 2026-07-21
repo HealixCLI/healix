@@ -128,10 +128,29 @@ describe('shapeRunShow', () => {
       pauseReason: null,
     };
     const tests: TestCase[] = [
-      { id: 't1', runId: 'r1', title: 'login', reqTag: null, tier: null, status: 'passed', specPath: null },
+      {
+        id: 't1',
+        runId: 'r1',
+        title: 'login',
+        reqTag: null,
+        tier: null,
+        status: 'passed',
+        specPath: null,
+        description: null,
+        details: null,
+      },
     ];
     const results: TestResult[] = [
-      { id: 'res1', testId: 't1', status: 'passed', durationMs: 12, error: null, artifactsJson: null },
+      {
+        id: 'res1',
+        testId: 't1',
+        status: 'passed',
+        durationMs: 12,
+        error: null,
+        artifactsJson: null,
+        description: null,
+        details: null,
+      },
     ];
 
     expect(shapeRunShow(run, tests, results)).toEqual({ run, tests, results });

@@ -1,4 +1,5 @@
 import { spawn, type ChildProcess } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { access, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 
@@ -87,9 +88,29 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     }
   }
   if (ctx.baseUrl) env.HEALIX_BASE_URL = ctx.baseUrl;
-  if (ctx.testUsername && ctx.testPassword) {
-    env.HEALIX_TIERB_EMAIL = ctx.testUsername;
-    env.HEALIX_TIERB_PASSWORD = ctx.testPassword;
+  const credentials = ctx.credentials ?? [];
+  if (credentials.length > 0) {
+    // Every credential, passed as one JSON blob so the auth fixture can log
+    // each one in and save its OWN storageState (see authSetupContents() in
+    // templates.ts) — this is what lets generated tests pick a specific
+    // role's session via test.use({ storageState: ... }). The default
+    // (roleless, or first) credential is ALSO exposed as the plain
+    // EMAIL/PASSWORD pair for the fixture's single-credential fallback path.
+    env.HEALIX_TIERB_CREDENTIALS_JSON = JSON.stringify(
+      credentials.map((c) => ({
+        authType: c.authType,
+        username: c.username,
+        password: c.password,
+        role: c.role,
+        token: c.token,
+        urlTemplate: c.urlTemplate,
+        extraParams: c.extraParams,
+        authCheckText: c.authCheckText,
+      })),
+    );
+    const defaultCredential = credentials.find((c) => c.role === null) ?? credentials[0];
+    env.HEALIX_TIERB_EMAIL = defaultCredential.username;
+    env.HEALIX_TIERB_PASSWORD = defaultCredential.password;
     // The auth fixture requires all three of email/password/loginUrl to
     // attempt a real login (see authSetupContents() in templates.ts). Prefer
     // EXPLORE's discovered/scored login candidate (hash- and region-prefix
@@ -574,10 +595,29 @@ function errorText(result: PwResult | undefined): string {
   return '';
 }
 
+const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
+// Playwright still writes a video file when the page never repainted before
+// the context closed (a very fast test, or one that only ever saw about:blank)
+// — the result is a valid webm with a real duration but no visible content.
+// Real recorded frames push a webm well past this size even for a couple of
+// seconds of ordinary web content; empirically these blank ones land under 4KB.
+const MIN_VIDEO_BYTES = 8 * 1024;
+
+/** A video artifact whose file is implausibly small to contain any real recorded frames. */
+function isBlankVideo(path: string): boolean {
+  if (!VIDEO_EXT.test(path)) return false;
+  try {
+    return statSync(path).size < MIN_VIDEO_BYTES;
+  } catch {
+    return false; // can't verify (e.g. already cleaned up) — keep it rather than silently drop evidence
+  }
+}
+
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
   return (attachments ?? [])
     .map((a) => a.path)
-    .filter((p): p is string => typeof p === 'string' && p.length > 0);
+    .filter((p): p is string => typeof p === 'string' && p.length > 0)
+    .filter((p) => !isBlankVideo(p));
 }
 
 interface ParsedReport {

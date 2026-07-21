@@ -83,6 +83,24 @@ export function isTextFile(filePath: string): boolean {
 }
 
 /**
+ * Redact obvious secrets (API keys, tokens, passwords, bearer tokens) from
+ * arbitrary text, independent of file-export context (no suite dir/home dir
+ * rewriting, no literal-credential redaction — see {@link sanitizeContent} for
+ * that fuller pipeline). Used for redacting captured network traffic bodies
+ * before they're stored on an exploration artifact or fed into a prompt.
+ */
+export function redactSecrets(content: string): string {
+  let out = content;
+  for (const pattern of SECRET_PATTERNS) {
+    // RegExp objects with the global flag carry lastIndex state across calls;
+    // reset defensively before each use.
+    pattern.regex.lastIndex = 0;
+    out = out.replace(pattern.regex, pattern.replace);
+  }
+  return out;
+}
+
+/**
  * Escape a string for safe literal use inside a RegExp.
  */
 function escapeRegExp(value: string): string {
@@ -108,16 +126,45 @@ function replaceAllPaths(content: string, needle: string, replacement: string): 
   return out;
 }
 
+/** One of the target app's own login credentials — only known to the caller (project record). */
+export interface ExportCredential {
+  username?: string | null;
+  password?: string | null;
+}
+
+/**
+ * Redact literal occurrences of every one of the project's stored test
+ * credentials (there may be several — see storage's ProjectCredential). The
+ * KEY=value / "key": "value" patterns above only catch secrets that are
+ * labeled as such; a generated spec that hardcodes the literal password
+ * (e.g. `await page.fill('#pw', 'Real+Passw0rd')`) has no such label and
+ * would otherwise ship in the clear. Guarded by a minimum length so a short
+ * value (e.g. a 2-3 char username) doesn't blow away unrelated text.
+ */
+function redactLiteralCredentials(content: string, credentials: ExportCredential[] | undefined): string {
+  if (!credentials || credentials.length === 0) return content;
+  let out = content;
+  for (const cred of credentials) {
+    for (const value of [cred.username, cred.password]) {
+      if (value && value.length >= 4) {
+        out = out.replace(new RegExp(escapeRegExp(value), 'g'), '<REDACTED>');
+      }
+    }
+  }
+  return out;
+}
+
 /**
  * Sanitize the textual contents of a copied suite file:
  *  - rewrites the absolute suite directory prefix to a relative placeholder,
  *  - rewrites the user's home directory prefix to a stable placeholder,
- *  - redacts obvious secrets (API keys, tokens, passwords, bearer tokens).
+ *  - redacts obvious secrets (API keys, tokens, passwords, bearer tokens),
+ *  - redacts literal occurrences of the project's own test credentials.
  *
  * Order matters: the (longer, more specific) suite directory is replaced before
  * the home directory so nested paths collapse correctly.
  */
-export function sanitizeContent(content: string, suiteDir: string): string {
+export function sanitizeContent(content: string, suiteDir: string, credentials?: ExportCredential[]): string {
   const home = os.homedir();
   const normalizedSuite = path.resolve(suiteDir);
 
@@ -129,12 +176,8 @@ export function sanitizeContent(content: string, suiteDir: string): string {
     out = replaceAllPaths(out, home, HOME_PLACEHOLDER);
   }
 
-  for (const pattern of SECRET_PATTERNS) {
-    // RegExp objects with the global flag carry lastIndex state across calls;
-    // reset defensively before each use.
-    pattern.regex.lastIndex = 0;
-    out = out.replace(pattern.regex, pattern.replace);
-  }
+  out = redactSecrets(out);
+  out = redactLiteralCredentials(out, credentials);
 
   return out;
 }

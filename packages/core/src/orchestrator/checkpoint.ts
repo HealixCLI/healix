@@ -24,6 +24,7 @@ export interface ResumeCheckpoint {
     provider?: ProviderId;
     autoApprove?: boolean;
     prd?: string;
+    instructions?: string;
   };
   /** The finalized, human-approved plan — resume never re-plans or re-shows the approval gate. */
   plan: TestPlan;

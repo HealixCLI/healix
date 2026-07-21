@@ -1,6 +1,8 @@
-import type { Project, Run } from '../storage/types.js';
+import { relative, sep } from 'node:path';
+import type { Project, Run, TestCase } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
+import type { ExternalDependency } from '../target/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** One triaged failure, attached to the report. */
@@ -36,8 +38,14 @@ export interface RunReport {
   plan: TestPlan;
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
+  /** Persisted TestCase rows for this run, used to enrich the Results table with description/details. */
+  tests: TestCase[];
   /** Artifact files collected from the mode after execution (relative paths). */
   artifacts: string[];
+  /** External dependencies detected/mocked for this run (empty when mocking wasn't enabled). */
+  dependencies: ExternalDependency[];
+  /** How many requests the local mock server actually intercepted, keyed by dependency id. */
+  mockedRequestCounts: Record<string, number>;
   /** Item-level generation accounting across GENERATE and any gap-fill iterations. */
   generation?: GenerationStats;
   /** Functionality-unit coverage reached by the coverage-feedback loop; null when it didn't run (e.g. reuse mode, or no functionality inventory). */
@@ -51,7 +59,10 @@ export function buildReport(input: {
   plan: TestPlan;
   outcome: ExecOutcome | null;
   triage: ReportTriageEntry[];
+  tests?: TestCase[];
   artifacts?: string[];
+  dependencies?: ExternalDependency[];
+  mockedRequestCounts?: Record<string, number>;
   generation?: GenerationStats;
   coverage?: ReportCoverageSummary | null;
 }): RunReport {
@@ -61,7 +72,10 @@ export function buildReport(input: {
     plan: input.plan,
     outcome: input.outcome,
     triage: input.triage,
+    tests: input.tests ?? [],
     artifacts: input.artifacts ?? [],
+    dependencies: input.dependencies ?? [],
+    mockedRequestCounts: input.mockedRequestCounts ?? {},
     generation: input.generation,
     coverage: input.coverage ?? null,
     generatedAt: new Date().toISOString(),
@@ -165,6 +179,47 @@ function renderSuggestedFix(verdict: TriageResult['verdict'], patch: string, cla
   return `<div${cls}><strong>Recommended fix:</strong> ${esc(patch)}</div>`;
 }
 
+const IMG_EXT = /\.(png|jpe?g|gif|webp)$/i;
+const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
+
+/**
+ * Evidence for one test row — screenshot(s), video, and anything else
+ * captured (trace.zip, error-context.md, …). `reportDir` is the absolute
+ * directory report.html itself is written to (runDir/reports); artifact
+ * paths are absolute on disk, so we link to them relative to that directory
+ * rather than embedding data (this stays a single file, but still resolves
+ * correctly as long as the report is opened from alongside the run's suite/
+ * folder — the same layout it was generated in). Without a reportDir (older
+ * callers, unit tests) we fall back to the original plain-basename listing,
+ * since we have no safe path to link to.
+ */
+function renderArtifacts(artifacts: string[] | undefined, reportDir: string | undefined): string {
+  if (!artifacts || artifacts.length === 0) return '';
+  if (!reportDir) {
+    return `<div class="hist">${artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`;
+  }
+  const items = artifacts.map((abs) => ({
+    href: relative(reportDir, abs).split(sep).join('/'),
+    name: baseName(abs),
+  }));
+  const images = items.filter((i) => IMG_EXT.test(i.name));
+  const videos = items.filter((i) => VIDEO_EXT.test(i.name));
+  const other = items.filter((i) => !IMG_EXT.test(i.name) && !VIDEO_EXT.test(i.name));
+  const imgHtml = images
+    .map(
+      (i) =>
+        `<a href="${esc(i.href)}" target="_blank" rel="noopener"><img src="${esc(i.href)}" alt="${esc(
+          i.name,
+        )}" class="ev-thumb" /></a>`,
+    )
+    .join('');
+  const videoHtml = videos
+    .map((i) => `<video controls preload="metadata" class="ev-video" src="${esc(i.href)}"></video>`)
+    .join('');
+  const otherHtml = other.map((i) => `<a class="ev-file" href="${esc(i.href)}">${esc(i.name)}</a>`).join('');
+  return `<div class="evidence">${imgHtml}${videoHtml}${otherHtml}</div>`;
+}
+
 function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
   if (!error) return '';
   const { summary, rest } = splitErrorText(error);
@@ -182,9 +237,18 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
   return `<div class="err-summary">${esc(summary)}</div>${triageBlock}${detailsBlock}`;
 }
 
-/** Render a self-contained, dependency-free HTML report. */
-export function renderReportHtml(report: RunReport): string {
-  const { run, project, plan, outcome, triage, coverage } = report;
+/**
+ * Render a self-contained, dependency-free HTML report.
+ *
+ * `opts.reportDir` — the absolute directory this HTML will be written to
+ * (runDir/reports) — enables linking each result row to its own evidence
+ * (screenshot/video/trace) relative to that location; omit it (e.g. in unit
+ * tests, or if the report is rendered before its final location is known) to
+ * fall back to a plain basename listing with no links.
+ */
+export function renderReportHtml(report: RunReport, opts: { reportDir?: string } = {}): string {
+  const { reportDir } = opts;
+  const { run, project, plan, outcome, triage, tests, dependencies, mockedRequestCounts, coverage } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
@@ -198,6 +262,19 @@ export function renderReportHtml(report: RunReport): string {
     <ul>${notes.map((n) => `<li>${esc(n)}</li>`).join('')}</ul>
   </section>`
       : '';
+
+  const dependencyRows = dependencies
+    .map((d) => {
+      const mocked = d.mockStrategy !== 'undeterminable';
+      const requestCount = mockedRequestCounts[d.id] ?? 0;
+      const statusLabel = mocked
+        ? `mocked (${d.mockStrategy})${requestCount > 0 ? ` — ${requestCount} request(s) intercepted` : ''}`
+        : `not mocked${d.note ? ` — ${d.note}` : ''}`;
+      return `<tr class="${mocked ? '' : 'rejected'}"><td>${esc(d.label)}</td><td>${esc(d.category)}</td><td>${esc(
+        d.source,
+      )}</td><td>${esc(statusLabel)}</td></tr>`;
+    })
+    .join('');
 
   const planRows = plan.items
     .map((it) => {
@@ -219,16 +296,26 @@ export function renderReportHtml(report: RunReport): string {
   // Triage is keyed by title so a failed row can show its verdict/rationale
   // inline instead of forcing readers to cross-reference a separate table.
   const triageByTitle = new Map<string, ReportTriageEntry>(triage.map((t) => [t.title, t]));
+  // Persisted TestCase rows are also keyed by title (the same title a result
+  // row carries once updateTestTitle has run) so the Results table can show
+  // the scenario's description/intent without needing testId on ExecResultItem.
+  const testByTitle = new Map<string, TestCase>(tests.map((t) => [t.title, t]));
 
   const resultRows = (outcome?.results ?? [])
     .map((r) => {
-      const artifactNote =
-        r.artifacts && r.artifacts.length > 0
-          ? `<div class="hist">${r.artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`
+      const matchedTest = testByTitle.get(r.title);
+      const descriptionCell =
+        [matchedTest?.description, matchedTest?.details].filter(Boolean).length > 0
+          ? `${matchedTest?.description ? esc(matchedTest.description) : ''}${
+              matchedTest?.details ? `<div class="hist">${esc(matchedTest.details)}</div>` : ''
+            }`
           : '';
       return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
         formatDuration(r.durationMs),
-      )}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}${artifactNote}</td></tr>`;
+      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}</td><td>${renderArtifacts(
+        r.artifacts,
+        reportDir,
+      )}</td></tr>`;
     })
     .join('');
 
@@ -302,6 +389,12 @@ export function renderReportHtml(report: RunReport): string {
   .verdict-flaky { background: #9a670030; }
   .verdict-ambiguous { background: #88848430; }
   details summary { cursor: pointer; font-size: .75rem; color: #888; }
+  .evidence { display: flex; flex-wrap: wrap; gap: .4rem; margin-top: .35rem; }
+  .ev-thumb { width: 96px; height: 64px; object-fit: cover; border-radius: 4px; border: 1px solid #8884; }
+  .ev-video { width: 160px; max-height: 100px; border-radius: 4px; border: 1px solid #8884; background: #000; }
+  .ev-file { font-size: .75rem; color: #888; align-self: center; border: 1px solid #8884; border-radius: 4px;
+    padding: .1rem .4rem; text-decoration: none; }
+  .ev-file:hover { color: inherit; }
 </style>
 </head>
 <body>
@@ -339,8 +432,8 @@ export function renderReportHtml(report: RunReport): string {
   <section>
     <h2>Results</h2>
     <table>
-      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Error</th></tr></thead>
-      <tbody>${resultRows || '<tr><td colspan="4"><em>No results.</em></td></tr>'}</tbody>
+      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Description</th><th>Error</th><th>Evidence</th></tr></thead>
+      <tbody>${resultRows || '<tr><td colspan="6"><em>No results.</em></td></tr>'}</tbody>
     </table>
   </section>
 
@@ -351,6 +444,19 @@ export function renderReportHtml(report: RunReport): string {
     <table>
       <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>
+    </table>
+  </section>`
+      : ''
+  }
+
+  ${
+    dependencies.length > 0
+      ? `<section>
+    <h2>External dependencies</h2>
+    <p>${dependencies.filter((d) => d.mockStrategy !== 'undeterminable').length} of ${dependencies.length} detected dependenc${dependencies.length === 1 ? 'y was' : 'ies were'} mocked for this run.</p>
+    <table>
+      <thead><tr><th>Dependency</th><th>Category</th><th>Detected via</th><th>Status</th></tr></thead>
+      <tbody>${dependencyRows}</tbody>
     </table>
   </section>`
       : ''

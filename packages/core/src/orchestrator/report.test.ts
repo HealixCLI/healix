@@ -1,6 +1,7 @@
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildReport, degradationNotes, renderReportHtml, type RunReport } from './report.js';
-import type { Project, Run } from '../storage/types.js';
+import type { Project, Run, TestCase } from '../storage/types.js';
 import type { ExecOutcome, TestPlan } from '../modes/types.js';
 
 function makeRun(overrides: Partial<Run> = {}): Run {
@@ -29,8 +30,7 @@ function makeProject(): Project {
     baseUrl: 'https://app.example.test',
     createdAt: '2026-01-01T00:00:00.000Z',
     archivedAt: null,
-    testUsername: null,
-    testPassword: null,
+    credentials: [],
   };
 }
 
@@ -172,8 +172,7 @@ const project: Project = {
   repoPath: null,
   createdAt: new Date(0).toISOString(),
   archivedAt: null,
-  testUsername: null,
-  testPassword: null,
+  credentials: [],
 };
 
 const plan: TestPlan = { summary: 'One feature.', items: [] };
@@ -204,6 +203,66 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('test-failed-1.png');
     // The full local filesystem path must never leak into the report.
     expect(html).not.toContain('C:\\runs\\r1');
+  });
+
+  it("given a reportDir, links a UI test's evidence (screenshot + video) relative to it", () => {
+    const runRoot = join('runs', 'r1');
+    const reportDir = join(runRoot, 'reports');
+    const testResultsDir = join(runRoot, 'suite', 'test-results', 'foo');
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          status: 'failed',
+          durationMs: 5,
+          error: 'boom',
+          artifacts: [
+            join(testResultsDir, 'test-failed-1.png'),
+            join(testResultsDir, 'video.webm'),
+            join(testResultsDir, 'trace.zip'),
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report, { reportDir });
+    expect(html).toContain('class="ev-thumb"');
+    expect(html).toContain('class="ev-video"');
+    expect(html).toContain('class="ev-file"');
+    expect(html).toContain('trace.zip');
+    // Links are relative to reportDir — the run's own root dir name never appears.
+    expect(html).not.toContain(runRoot);
+  });
+
+  it('given a reportDir, an API test with only a trace (no page, so no screenshot/video) still links it', () => {
+    const runRoot = join('runs', 'r2');
+    const reportDir = join(runRoot, 'reports');
+    const testResultsDir = join(runRoot, 'suite', 'test-results', 'bar');
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-2] tierC-api: rejects an unauthenticated request',
+          status: 'failed',
+          durationMs: 5,
+          error: 'expect(response.status()).toBe(401)',
+          artifacts: [join(testResultsDir, 'trace.zip')],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report, { reportDir });
+    expect(html).toContain('class="ev-file"');
+    expect(html).toContain('trace.zip');
+    expect(html).not.toContain('class="ev-thumb"');
+    expect(html).not.toContain('class="ev-video"');
   });
 
   it('renders an app-bug recommendation as prose under "Recommended fix", not a <code> test-patch block', () => {
@@ -356,6 +415,49 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     const html = renderReportHtml(report);
     expect(html).not.toContain('>coverage<');
     expect(html).not.toContain('<h2>Coverage</h2>');
+  });
+
+  it("joins a matched TestCase's description/details into the Results table", () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: 'Login — positive: user submits valid credentials', status: 'passed', durationMs: 5 },
+      ],
+    };
+    const tests: TestCase[] = [
+      {
+        id: 'tst_1',
+        runId: run.id,
+        title: 'Login — positive: user submits valid credentials',
+        reqTag: 'REQ-1',
+        tier: 'tierA-public',
+        status: 'passed',
+        specPath: null,
+        description: 'user submits valid credentials',
+        details: 'Verify the login flow authenticates a user and redirects to the dashboard.',
+      },
+    ];
+    const report = buildReport({ run, project, plan, outcome, triage: [], tests });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<th>Description</th>');
+    expect(html).toContain('user submits valid credentials');
+    expect(html).toContain('Verify the login flow authenticates a user and redirects to the dashboard.');
+  });
+
+  it('renders an empty description cell (no crash) when no TestCase row matches the result title', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: 'Untracked scenario', status: 'passed', durationMs: 5 }],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<td></td><td></td></tr>');
   });
 
   it('surfaces the coverage ratio and lists uncovered functionality units when present', () => {

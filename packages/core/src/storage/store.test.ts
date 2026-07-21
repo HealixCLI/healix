@@ -70,6 +70,129 @@ describe('HealixStore schema', () => {
       expect(info.tables).toContain(table);
     }
   });
+
+  it('migrates a pre-v9 database to add description/details columns without touching existing rows', async () => {
+    // Open + migrate a fresh DB to v9+, insert a row the "old" way, then verify
+    // an independent connection sees the new nullable columns and the row's
+    // pre-existing data is untouched.
+    const s = await store();
+    const project = s.createProject({ name: 'migration-project', baseUrl: 'https://migration.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'legacy row',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+
+    const info = await dbInfo();
+    expect(info.version).toBeGreaterThanOrEqual(9);
+
+    const db = new DatabaseSync(dbPath());
+    try {
+      const cols = (db.prepare('PRAGMA table_info(tests)').all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      );
+      expect(cols).toContain('description');
+      expect(cols).toContain('details');
+      const resultCols = (db.prepare('PRAGMA table_info(results)').all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      );
+      expect(resultCols).toContain('description');
+      expect(resultCols).toContain('details');
+
+      const row = db.prepare('SELECT * FROM tests WHERE id = ?').get(test.id) as Record<string, unknown>;
+      expect(row.title).toBe('legacy row');
+      expect(row.description).toBeNull();
+      expect(row.details).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe('TestCase/TestResult description and details', () => {
+  it('round-trips description/details through insertTest/insertResult and the row mappers', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'desc-project', baseUrl: 'https://desc.test' });
+    const run = s.createRun(project.id);
+
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'Login — positive: user submits valid credentials',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'pending',
+      description: 'user submits valid credentials',
+      details: 'Verify the login flow authenticates a user and redirects to the dashboard.',
+    });
+    expect(test.description).toBe('user submits valid credentials');
+    expect(test.details).toBe('Verify the login flow authenticates a user and redirects to the dashboard.');
+
+    const result = s.insertResult({
+      testId: test.id,
+      status: 'passed',
+      durationMs: 120,
+      error: null,
+      artifactsJson: null,
+      description: test.description,
+      details: test.details,
+    });
+    expect(result.description).toBe(test.description);
+    expect(result.details).toBe(test.details);
+
+    // Round-trip via listTests/getTest/listResults (which run rows through rowToTest/rowToResult).
+    const [listed] = s.listTests(run.id);
+    expect(listed?.description).toBe('user submits valid credentials');
+    expect(listed?.details).toBe(
+      'Verify the login flow authenticates a user and redirects to the dashboard.',
+    );
+
+    const fetched = s.getTest(test.id);
+    expect(fetched?.description).toBe('user submits valid credentials');
+    expect(fetched?.details).toBe(
+      'Verify the login flow authenticates a user and redirects to the dashboard.',
+    );
+
+    const [listedResult] = s.listResults(run.id);
+    expect(listedResult?.description).toBe(test.description);
+    expect(listedResult?.details).toBe(test.details);
+  });
+
+  it('defaults description/details to null when omitted', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'desc-null-project', baseUrl: 'https://desc-null.test' });
+    const run = s.createRun(project.id);
+
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'no scenario data',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+    expect(test.description).toBeNull();
+    expect(test.details).toBeNull();
+
+    const result = s.insertResult({
+      testId: test.id,
+      status: 'passed',
+      durationMs: null,
+      error: null,
+      artifactsJson: null,
+    });
+    expect(result.description).toBeNull();
+    expect(result.details).toBeNull();
+
+    expect(s.getTest(test.id)?.description).toBeNull();
+    expect(s.getTest(test.id)?.details).toBeNull();
+  });
+
+  it('getTest returns undefined for an unknown id', async () => {
+    const s = await store();
+    expect(s.getTest('tst_does-not-exist')).toBeUndefined();
+  });
 });
 
 describe('deleteProject cascade', () => {
@@ -204,25 +327,56 @@ describe('updateProject', () => {
     const project = s.createProject({
       name: 'Auth Project',
       baseUrl: 'https://auth.test',
-      testUsername: 'tester@auth.test',
-      testPassword: 'hunter2',
+      credentials: [{ username: 'tester@auth.test', password: 'hunter2' }],
     });
-    expect(project.testUsername).toBe('tester@auth.test');
-    expect(project.testPassword).toBe('hunter2');
-    expect(s.getProject(project.id)).toMatchObject({
-      testUsername: 'tester@auth.test',
-      testPassword: 'hunter2',
-    });
+    const expected = [
+      {
+        id: expect.any(String),
+        authType: 'form',
+        username: 'tester@auth.test',
+        password: 'hunter2',
+        role: null,
+        token: null,
+        urlTemplate: null,
+        extraParams: null,
+        authCheckText: null,
+      },
+    ];
+    expect(project.credentials).toEqual(expected);
+    expect(s.getProject(project.id)?.credentials).toEqual(expected);
 
     const cleared = s.updateProject(project.id, {
       name: 'Auth Project',
       baseUrl: 'https://auth.test',
-      testUsername: null,
-      testPassword: null,
+      credentials: [],
     });
-    expect(cleared.testUsername).toBeNull();
-    expect(cleared.testPassword).toBeNull();
-    expect(s.getProject(project.id)).toMatchObject({ testUsername: null, testPassword: null });
+    expect(cleared.credentials).toEqual([]);
+    expect(s.getProject(project.id)?.credentials).toEqual([]);
+  });
+
+  it('supports multiple credentials with optional roles, preserving save order', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'Multi-Role Project',
+      baseUrl: 'https://auth.test',
+      credentials: [
+        { username: 'admin@auth.test', password: 'adminpw', role: 'admin' },
+        { username: 'user@auth.test', password: 'userpw' },
+      ],
+    });
+    expect(project.credentials.map((c) => ({ username: c.username, role: c.role }))).toEqual([
+      { username: 'admin@auth.test', role: 'admin' },
+      { username: 'user@auth.test', role: null },
+    ]);
+
+    // Replace-all: updating drops any credential not in the new list.
+    const updated = s.updateProject(project.id, {
+      name: 'Multi-Role Project',
+      baseUrl: 'https://auth.test',
+      credentials: [{ username: 'user@auth.test', password: 'userpw' }],
+    });
+    expect(updated.credentials).toHaveLength(1);
+    expect(updated.credentials[0]?.role).toBeNull();
   });
 
   it('throws and persists nothing when the edit would violate the invariant', async () => {
@@ -334,6 +488,27 @@ describe('deleteRun cascade', () => {
     expect(await countRows('tests')).toBe(N);
     expect(await countRows('results')).toBe(N);
     expect(await countRows('agent_events')).toBe(N);
+  });
+});
+
+describe('insertResult', () => {
+  it('DUPLICATE-RESULT GUARD: re-persisting a result for the same testId replaces the prior row instead of adding a second one', async () => {
+    // Simulates a tier re-executed after a resume that raced the checkpoint
+    // write (see insertResult's doc comment) — the orchestrator calls
+    // insertResult again for a test that already has a result row from the
+    // earlier, unacknowledged attempt.
+    const s = await store();
+    const project = s.createProject({ name: 'result-upsert', baseUrl: 'https://result-upsert.test' });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({ runId: run.id, title: 't0', reqTag: null, tier: null, status: 'pending' });
+
+    s.insertResult({ testId: t.id, status: 'failed', durationMs: 10, error: 'boom', artifactsJson: null });
+    s.insertResult({ testId: t.id, status: 'passed', durationMs: 12, error: null, artifactsJson: null });
+
+    const results = s.listResults(run.id);
+    expect(results).toHaveLength(1);
+    expect(results[0]).toMatchObject({ testId: t.id, status: 'passed', durationMs: 12 });
+    expect(await countRows('results')).toBe(1);
   });
 });
 

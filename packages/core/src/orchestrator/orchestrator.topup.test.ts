@@ -201,6 +201,9 @@ const fakeBrowser: BrowserSurface = {
   onFrame(_cb: (png: Buffer) => void): () => void {
     return () => {};
   },
+  drainNetworkEvents() {
+    return [];
+  },
   async stop(): Promise<void> {},
 };
 
@@ -358,6 +361,140 @@ describe('orchestrator top-up / reuse suite modes', () => {
     expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-001', 'REQ-002']));
   });
 
+  it("REUSE COUNT MATCHES BASE: a base-run test row missing its own specPath (e.g. persistResults' fallback-insert path) still carries forward via a sibling row sharing the same reqTag", async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Fallback Row Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // Two scenarios so the generated file genuinely has two `test(...)` blocks
+    // (see makeRealisticFakeMode.generate) — realistically matching the
+    // production shape where a spec file has more real test() blocks than the
+    // DB ends up cleanly tracking one-for-one.
+    const run1Provider = fakeProviderWithPlan(
+      [
+        {
+          title: 'Home loads',
+          reqTag: 'REQ-001',
+          tier: 'tierA-public',
+          intent: 'Landing renders.',
+          scenarios: [
+            { kind: 'positive', description: 'loads' },
+            { kind: 'edge', description: 'reloads' },
+          ],
+        },
+      ],
+      [],
+    );
+    const run1Orchestrator = createOrchestrator({
+      provider: run1Provider,
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run1 = await run1Orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    expect(store.listTests(run1.runId)).toHaveLength(2);
+
+    // Simulate the historical bug directly: a third scenario for REQ-001 whose
+    // row never got a specPath (persistResults' fallback-insert path hits this
+    // when a result can't be positionally matched back to its pre-registered
+    // row — see insertResult's and mergeExecOutcomes' doc comments for the
+    // duplicate-execution scenario that triggers it). Its sibling rows for the
+    // same reqTag DO have a specPath. A matching third `test(...)` line is
+    // appended to the real file so the fake executor's result count for this
+    // reqTag is 3, not 2 — mirroring how the file genuinely has one more
+    // scenario than the DB tracked cleanly.
+    const siblings = store.listTests(run1.runId).filter((t) => t.reqTag === 'REQ-001');
+    expect(siblings.every((t) => t.specPath)).toBe(true);
+    const specAbsPath = join(
+      dataDir,
+      'projects',
+      project.id,
+      'runs',
+      run1.runId,
+      'suite',
+      siblings[0].specPath!,
+    );
+    await writeFile(specAbsPath, (await readFile(specAbsPath, 'utf-8')) + "test('scenario 3');\n", 'utf-8');
+    store.insertTest({
+      runId: run1.runId,
+      title: '[REQ:REQ-001] negative: retried scenario with no tracked spec file',
+      reqTag: 'REQ-001',
+      tier: null,
+      status: 'passed',
+    });
+    expect(store.listTests(run1.runId)).toHaveLength(3);
+
+    // ---- Run 2: reuse. All three REQ-001 rows must carry forward — the count
+    // must exactly match the base run's total, not silently drop the specPath-less one.
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+    expect(store.listTests(run2.runId)).toHaveLength(3);
+  });
+
+  it('REUSE WITH APPROVAL GATE: an empty (by design) reuse plan is not mistaken for "all items rejected"', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Approval Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1Provider = fakeProviderWithPlan(
+      [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'Landing renders.' }],
+      [],
+    );
+    const run1Orchestrator = createOrchestrator({
+      provider: run1Provider,
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run1 = await run1Orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    // ---- Run 2: reuse, WITH a real approval gate (autoApprove: false) — this is
+    // the desktop app's actual shape ("Approve & Continue" on the Plan Review
+    // panel). The gate approves whatever plan it's handed; reuse mode hands it
+    // an intentionally empty items array (see suiteMode === 'reuse' above), and
+    // that must not be read as "the user rejected everything."
+    let gateReceivedPlan: TestPlan | undefined;
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run(
+      { projectId: project.id, suiteMode: 'reuse', autoApprove: false },
+      {
+        onPlan: async (plan) => {
+          gateReceivedPlan = plan;
+          return { decision: 'proceed', plan };
+        },
+      },
+    );
+
+    expect(gateReceivedPlan?.planSource).toBe('reuse');
+    expect(gateReceivedPlan?.items).toHaveLength(0);
+    expect(run2.status).toBe('passed');
+    expect(store.listTests(run2.runId)).toHaveLength(1);
+  });
+
   it('REUSE CARRIES THE ENTIRE SUITE: a failing test from the base run is re-run too, not silently dropped', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
@@ -440,8 +577,10 @@ describe('orchestrator top-up / reuse suite modes', () => {
     expect(run1.status).toBe('failed');
     expect(store.getLastSuccessfulRun(project.id)?.id).toBe(run1.runId);
 
-    // ---- Run 2: top-up against that failed run. Only REQ-001 (the passing one) carries forward;
-    // REQ-002 (failed) is not carried, so re-proposing it must go through AI generation again. ----
+    // ---- Run 2: top-up against that failed run. Top-up carries EVERY base
+    // test forward regardless of status — REQ-002 (failed last time) is
+    // carried and re-executed, not regenerated, since re-proposing it in the
+    // plan must find it already covered. ----
     const run2GenerateCalls: TestPlan[] = [];
     const run2Provider = fakeProviderWithPlan(
       [{ title: 'Checkout works', reqTag: 'REQ-002', tier: 'tierA-public', intent: 'Checkout flow.' }],
@@ -461,11 +600,19 @@ describe('orchestrator top-up / reuse suite modes', () => {
 
     expect(run2.status).toBe('passed');
     expect(store.getRun(run2.runId)).toMatchObject({ suiteMode: 'topup', baseRunId: run1.runId });
-    expect(run2GenerateCalls).toHaveLength(1);
-    expect(run2GenerateCalls[0].items.map((i) => i.reqTag)).toEqual(['REQ-002']);
+    // Zero items sent for (re)generation: REQ-002 is already covered by the
+    // carried-forward test, despite having failed in the base run. (Top-up
+    // still invokes generate() once with an empty item list — a pre-existing,
+    // harmless no-op call — so this asserts on the items, not the call count.)
+    expect(run2GenerateCalls.flatMap((p) => p.items)).toHaveLength(0);
 
     const run2Tests = store.listTests(run2.runId);
     expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-001', 'REQ-002']));
+    // REQ-002's spec file is the carried-forward one, not a freshly generated one.
+    const run1Tests = store.listTests(run1.runId);
+    const carriedReq002 = run2Tests.find((t) => t.reqTag === 'REQ-002')!;
+    const baseReq002 = run1Tests.find((t) => t.reqTag === 'REQ-002')!;
+    expect(carriedReq002.specPath).toBe(baseReq002.specPath);
   });
 
   it('NO BASE RUN: top-up/reuse with no prior successful run errors up front, no run row, no provider calls', async () => {

@@ -206,6 +206,9 @@ const fakeBrowser: BrowserSurface = {
   onFrame(_cb: (png: Buffer) => void): () => void {
     return () => {};
   },
+  drainNetworkEvents() {
+    return [];
+  },
   async stop(): Promise<void> {},
 };
 
@@ -274,6 +277,25 @@ describe('orchestrator integration (offline DI seam)', () => {
     expect(titles).toEqual(['Home loads', 'Login works']);
     // No duplicate test rows (one per canned spec).
     expect(new Set(tests.map((t) => t.id)).size).toBe(2);
+
+    // ---- description/details: the canned plan items have no explicit scenarios,
+    // so plan.ts's normalizeItem synthesizes a single positive scenario whose
+    // description mirrors intent — description and details end up equal here,
+    // both sourced from TestPlanItem.intent. ----
+    const home = tests.find((t) => t.title === 'Home loads');
+    expect(home?.description).toBe('Landing renders.');
+    expect(home?.details).toBe('Landing renders.');
+    const login = tests.find((t) => t.title === 'Login works');
+    expect(login?.description).toBe('User can sign in.');
+    expect(login?.details).toBe('User can sign in.');
+
+    // ---- results mirror the same description/details from their parent test ----
+    const results = store.listResults(summary.runId);
+    for (const r of results) {
+      const parent = tests.find((t) => t.id === r.testId);
+      expect(r.description).toBe(parent?.description ?? null);
+      expect(r.details).toBe(parent?.details ?? null);
+    }
 
     // ---- events emitted to the hook ----
     expect(events.length).toBeGreaterThan(0);

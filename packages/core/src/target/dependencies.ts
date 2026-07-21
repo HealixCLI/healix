@@ -364,7 +364,12 @@ const CONFIG_URL_RE = /\burl\s*:\s*(?:`([^`]*)`|'([^']*)'|"([^"]*)")/i;
 
 const MAX_ENDPOINTS_PER_DEP = 40;
 
-function normalizeEndpointPath(raw: string): string {
+/** Collapse a template-literal interpolation (`${id}`) to a `:param` placeholder so
+ * `/reward/${id}` and `/reward/${x}` collapse to the same pattern. Exported so other
+ * ground-truth sources (e.g. EXPLORE's captured network traffic, see
+ * `browser/network-capture.ts`) normalize endpoint paths the same way this static
+ * scan does, keeping both sides comparable. */
+export function normalizeEndpointPath(raw: string): string {
   return raw.replace(/\$\{[^}]*\}/g, ':param');
 }
 

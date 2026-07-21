@@ -1,5 +1,5 @@
 import { describe, expect, it } from 'vitest';
-import { runPlanPhase, attemptPlanCompletion } from './index.js';
+import { runPlanPhase, attemptPlanCompletion, buildWeightedBatches, splitUnitsByWeight } from './index.js';
 import type { OrchestratorEvent } from './types.js';
 import type { PlanRepoContext } from './plan.js';
 import type { Project } from '../storage/types.js';
@@ -11,7 +11,7 @@ import type {
   PlanResult,
   ProviderAdapter,
 } from '../providers/types.js';
-import type { FunctionalityUnit } from '../target/functionality-index.js';
+import { estimateUnitWeight, type FunctionalityUnit } from '../target/functionality-index.js';
 
 // ---------------------------------------------------------------------------
 // Targeted, offline coverage of runPlanPhase/attemptPlanCompletion — the
@@ -397,4 +397,245 @@ describe('runPlanPhase batch progress events', () => {
     expect(failed?.reason).toBeTruthy();
     expect(batchEvents.some((e) => e.status === 'ok')).toBe(true);
   }, 10_000);
+});
+
+describe('estimateUnitWeight', () => {
+  function unit(overrides: Partial<FunctionalityUnit> = {}): FunctionalityUnit {
+    return { key: 'route:/x', kind: 'route', label: 'page: /x', file: 'app/x/page.tsx', ...overrides };
+  }
+
+  it('gives a plain route the lowest weight', () => {
+    expect(estimateUnitWeight(unit())).toBe(2);
+  });
+
+  it('weighs an endpoint higher than a plain route', () => {
+    expect(estimateUnitWeight(unit({ kind: 'endpoint' }))).toBeGreaterThan(estimateUnitWeight(unit()));
+  });
+
+  it('adds weight for request/response schemas and auth requirements', () => {
+    const bare = unit({ kind: 'endpoint' });
+    const rich = unit({
+      kind: 'endpoint',
+      requestSchema: { type: 'object' },
+      responseSchema: { type: 'object' },
+      authRequired: true,
+    });
+    expect(estimateUnitWeight(rich)).toBe(estimateUnitWeight(bare) + 3);
+  });
+});
+
+describe('buildWeightedBatches', () => {
+  function makeUnits(count: number, overrides: Partial<FunctionalityUnit> = {}): FunctionalityUnit[] {
+    return Array.from({ length: count }, (_, i) => ({
+      key: `route:/page-${i}`,
+      kind: 'route' as const,
+      label: `page: /page-${i}`,
+      file: `app/page-${i}/page.tsx`,
+      ...overrides,
+    }));
+  }
+
+  it('keeps every batch at or under the weight budget', () => {
+    const units = makeUnits(50, { kind: 'endpoint', requestSchema: {}, authRequired: true });
+    const batches = buildWeightedBatches(units);
+    expect(batches.length).toBeGreaterThan(1);
+    for (const batch of batches) {
+      const weight = batch.reduce((sum, u) => sum + estimateUnitWeight(u), 0);
+      expect(weight).toBeLessThanOrEqual(45);
+    }
+    expect(batches.flat()).toHaveLength(50);
+  });
+
+  it('caps batch size at PLAN_BATCH_MAX_UNITS even when the weight budget would allow more', () => {
+    const units = makeUnits(50); // weight 2 each — well under budget by weight alone
+    const batches = buildWeightedBatches(units);
+    for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(20);
+    expect(batches.flat()).toHaveLength(50);
+  });
+
+  it('gives an over-budget single unit its own batch rather than dropping it', () => {
+    const heavy: FunctionalityUnit = {
+      key: 'endpoint:POST /checkout',
+      kind: 'endpoint',
+      label: 'POST /checkout',
+      file: 'api/checkout.ts',
+      requestSchema: {},
+      responseSchema: {},
+      authRequired: true,
+    };
+    const units = [heavy, ...makeUnits(3)];
+    // heavy weighs 6 — pass a budget below that so it can't share a batch with anything.
+    const batches = buildWeightedBatches(units, 5, 20);
+    expect(batches.flat()).toHaveLength(4);
+    expect(batches.some((b) => b.length === 1 && b[0] === heavy)).toBe(true);
+  });
+});
+
+describe('splitUnitsByWeight', () => {
+  function makeUnits(count: number): FunctionalityUnit[] {
+    return Array.from({ length: count }, (_, i) => ({
+      key: `route:/page-${i}`,
+      kind: 'route' as const,
+      label: `page: /page-${i}`,
+      file: `app/page-${i}/page.tsx`,
+    }));
+  }
+
+  it('splits evenly-weighted units into two non-empty halves covering every unit exactly once', () => {
+    const units = makeUnits(10);
+    const [left, right] = splitUnitsByWeight(units);
+    expect(left.length).toBeGreaterThan(0);
+    expect(right.length).toBeGreaterThan(0);
+    expect([...left, ...right]).toEqual(units);
+  });
+
+  it('balances a heavy unit against several light ones rather than cutting by raw index', () => {
+    const heavy: FunctionalityUnit = {
+      key: 'endpoint:POST /checkout',
+      kind: 'endpoint',
+      label: 'POST /checkout',
+      file: 'api/checkout.ts',
+      requestSchema: {},
+      responseSchema: {},
+      authRequired: true,
+    };
+    // heavy weighs 6, two light routes weigh 2 each (10 total, half = 5) — heavy alone
+    // already reaches half the total weight, so it lands alone in the left half. A naive
+    // index-based half split of 3 units (cut at position ~1-2) would instead have paired
+    // heavy with a light unit.
+    const units = [heavy, ...makeUnits(2)];
+    const [left] = splitUnitsByWeight(units);
+    expect(left).toEqual([heavy]);
+  });
+
+  it('never leaves one half empty even when a single unit dominates the total weight', () => {
+    const heavy: FunctionalityUnit = {
+      key: 'endpoint:POST /checkout',
+      kind: 'endpoint',
+      label: 'POST /checkout',
+      file: 'api/checkout.ts',
+      requestSchema: {},
+      responseSchema: {},
+      authRequired: true,
+    };
+    const units = [heavy, makeUnits(1)[0]!];
+    const [left, right] = splitUnitsByWeight(units);
+    expect(left.length).toBeGreaterThan(0);
+    expect(right.length).toBeGreaterThan(0);
+  });
+});
+
+describe('runPlanPhase shrink-and-retry on truncation', () => {
+  /** Returns unbalanced (never-closing) fenced JSON — parsePlanWithDiagnostics classifies this as 'truncated'. */
+  function truncatedFencedJson(): string {
+    return ['```json', '{ "summary": "cut off mid-response", "items": [ { "title": "partial"'].join('\n');
+  }
+
+  /** Truncates any plan completion whose batch has more than `threshold` units; otherwise succeeds. */
+  function truncatingAboveThreshold(threshold: number): ProviderAdapter & { calls: number } {
+    const adapter = {
+      id: 'claude' as const,
+      label: 'Truncates above threshold',
+      capabilities: ['plan' as const],
+      calls: 0,
+      async detect(): Promise<DetectResult> {
+        return { installed: true, binPath: '/fake/claude', version: '1.0.0' };
+      },
+      async health(): Promise<HealthResult> {
+        return {
+          provider: 'claude',
+          status: 'ready',
+          installed: true,
+          binPath: '/fake/claude',
+          version: '1.0.0',
+          authenticated: true,
+          model: 'fake',
+          latencyMs: 1,
+          detail: 'OK',
+        };
+      },
+      async plan(): Promise<PlanResult> {
+        return {
+          provider: 'claude',
+          ok: true,
+          plan: fencedJson(SIMPLE_PLAN),
+          raw: SIMPLE_PLAN,
+          detail: 'OK',
+        };
+      },
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        adapter.calls += 1;
+        if (opts?.mode !== 'plan') {
+          return { provider: 'claude', ok: true, text: 'n/a', raw: null, detail: 'OK' };
+        }
+        const keys = [...prompt.matchAll(/unitKey: "([^"]+)"/g)].map((m) => m[1]);
+        if (keys.length > threshold) {
+          return { provider: 'claude', ok: true, text: truncatedFencedJson(), raw: null, detail: 'OK' };
+        }
+        const body = {
+          summary: `Batch covering ${keys.length} unit(s).`,
+          items: keys.map((key) => ({
+            title: `Covers ${key}`,
+            tier: 'tierA-public',
+            intent: `Exercises ${key}.`,
+            unitKey: key,
+          })),
+        };
+        return { provider: 'claude', ok: true, text: fencedJson(body), raw: body, detail: 'OK' };
+      },
+    };
+    return adapter;
+  }
+
+  function makeUnits(count: number): FunctionalityUnit[] {
+    return Array.from({ length: count }, (_, i) => ({
+      key: `route:/page-${i}`,
+      kind: 'route' as const,
+      label: `page: /page-${i}`,
+      file: `app/page-${i}/page.tsx`,
+    }));
+  }
+
+  it('splits a batch that keeps truncating until sub-batches are small enough to succeed', async () => {
+    const units = makeUnits(30);
+    const provider = truncatingAboveThreshold(5);
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+    const { emit, events } = capturingEmit();
+
+    const plan = await runPlanPhase(
+      provider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      emit,
+      { provider },
+      repoIndex,
+    );
+
+    expect(plan.planSource).toBe('ai');
+    expect(plan.fallbackReason).toBeUndefined();
+    expect(plan.items).toHaveLength(30);
+    expect(new Set(plan.items.map((it) => it.unitKey)).size).toBe(30);
+    expect(events.some((e) => e.message.includes('splitting'))).toBe(true);
+  }, 20_000);
+
+  it('gives up and leaves units uncovered once split depth is exhausted for a batch that never succeeds', async () => {
+    // Just over the 20-unit batch cap — enough to force one 20-unit batch through the
+    // full split tree (kept minimal since every failing node pays a real 2s retry delay).
+    const units = makeUnits(21);
+    // Always truncates, no matter how small the batch gets — split retries eventually exhaust.
+    const provider = truncatingAboveThreshold(0);
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+
+    const plan = await runPlanPhase(
+      provider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider },
+      repoIndex,
+    );
+
+    expect(plan.planSource).toBe('fallback');
+    expect(plan.fallbackReason).toBeTruthy();
+  }, 45_000);
 });

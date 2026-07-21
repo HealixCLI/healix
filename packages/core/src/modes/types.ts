@@ -2,6 +2,7 @@ import type { ProviderAdapter } from '../providers/types.js';
 import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
+import type { ObservedEndpoint } from '../browser/network-capture.js';
 import type { SourceContext } from '../target/source-context.js';
 import type { ModeId, ProjectCredential, Tier, TestStatus } from '../storage/types.js';
 
@@ -13,6 +14,9 @@ export interface ExplorationArtifact {
   /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
   useful: boolean;
   uselessReason?: string;
+  /** Real endpoints observed on the wire during the crawl — see GAP-046 and
+   * `browser/network-capture.ts`'s `collectObservedEndpoints()`. */
+  observedEndpoints: ObservedEndpoint[];
 }
 
 export type ExplorationMode = 'computer-use' | 'codegen';
@@ -146,16 +150,56 @@ export interface GeneratedSpec {
   contents: string;
 }
 
+/**
+ * Why a spec got quarantined. 'parse' is the original (still-common) reason:
+ * a syntax defect `attemptBracketRepair` couldn't fix. 'quality' is a static
+ * quality-audit hard finding that survived block-level pruning (see
+ * quality-audit.ts). 'codegen-defect' singles out a parse failure on a
+ * source-grounded spec (one carrying a `[SRC:file]` citation) — that spec
+ * was generated FROM a real file Healix already indexed, so a parse failure
+ * there indicates a codegen bug rather than an ordinary model slip, and
+ * should be surfaced louder than routine per-spec quarantine noise.
+ */
+export type QuarantineCategory = 'parse' | 'quality' | 'codegen-defect';
+
 export interface QuarantinedSpec {
   spec: GeneratedSpec;
   reason: string;
+  category?: QuarantineCategory;
 }
 
-/** Result of a mode's pre-execution parse-check gate — see modes/playwright/validate.ts. */
+/** One static quality-audit finding — see modes/playwright/quality-audit.ts. */
+export type QualityFindingCode =
+  | 'empty-assertion-block'
+  | 'useless-wildcard-assertion'
+  | 'hardcoded-credential-literal'
+  | 'absolute-url-assertion'
+  | 'disabled-button-race-risk'
+  | 'disabled-button-click-race';
+
+export interface QualityFinding {
+  code: QualityFindingCode;
+  /** 'hard' findings block a test block (pruned, or the whole spec quarantined if pruning isn't viable); 'warn' findings are non-blocking signal only. */
+  severity: 'hard' | 'warn';
+  message: string;
+  testTitle?: string;
+  /** [start, end) character offsets of the enclosing test(...) block in the source — used to prune just that block rather than the whole file. */
+  blockRange?: [number, number];
+}
+
+/** A spec that shipped (ok or repaired) but still carries non-blocking quality findings — surfaced to the report/UI as signal, never as a reason to fail the run. */
+export interface QualityWarning {
+  spec: GeneratedSpec;
+  findings: QualityFinding[];
+}
+
+/** Result of a mode's pre-execution parse-check + quality-audit gate — see modes/playwright/validate.ts. */
 export interface ValidationResult {
   ok: GeneratedSpec[];
   repaired: GeneratedSpec[];
   quarantined: QuarantinedSpec[];
+  /** Specs in ok/repaired that still carry soft (non-blocking) quality findings. Always present; empty when there's nothing to report. */
+  warnings: QualityWarning[];
 }
 
 export interface ExecResultItem {

@@ -83,6 +83,24 @@ export function isTextFile(filePath: string): boolean {
 }
 
 /**
+ * Redact obvious secrets (API keys, tokens, passwords, bearer tokens) from
+ * arbitrary text, independent of file-export context (no suite dir/home dir
+ * rewriting, no literal-credential redaction — see {@link sanitizeContent} for
+ * that fuller pipeline). Used for redacting captured network traffic bodies
+ * before they're stored on an exploration artifact or fed into a prompt.
+ */
+export function redactSecrets(content: string): string {
+  let out = content;
+  for (const pattern of SECRET_PATTERNS) {
+    // RegExp objects with the global flag carry lastIndex state across calls;
+    // reset defensively before each use.
+    pattern.regex.lastIndex = 0;
+    out = out.replace(pattern.regex, pattern.replace);
+  }
+  return out;
+}
+
+/**
  * Escape a string for safe literal use inside a RegExp.
  */
 function escapeRegExp(value: string): string {
@@ -158,13 +176,7 @@ export function sanitizeContent(content: string, suiteDir: string, credentials?:
     out = replaceAllPaths(out, home, HOME_PLACEHOLDER);
   }
 
-  for (const pattern of SECRET_PATTERNS) {
-    // RegExp objects with the global flag carry lastIndex state across calls;
-    // reset defensively before each use.
-    pattern.regex.lastIndex = 0;
-    out = out.replace(pattern.regex, pattern.replace);
-  }
-
+  out = redactSecrets(out);
   out = redactLiteralCredentials(out, credentials);
 
   return out;

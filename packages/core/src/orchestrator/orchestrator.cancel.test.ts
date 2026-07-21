@@ -173,6 +173,9 @@ const fakeBrowser: BrowserSurface = {
   onFrame(_cb: (png: Buffer) => void): () => void {
     return () => {};
   },
+  drainNetworkEvents() {
+    return [];
+  },
   async stop(): Promise<void> {},
 };
 

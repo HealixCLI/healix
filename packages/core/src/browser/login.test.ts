@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { describe, expect, it, vi } from 'vitest';
 import { attemptLogin } from './login.js';
 import type {
   BrowserSurface,
@@ -44,6 +44,9 @@ function makeFakeBrowser(config: {
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
     },
+    drainNetworkEvents() {
+      return [];
+    },
     async stop(): Promise<void> {},
   };
 }
@@ -79,17 +82,28 @@ describe('attemptLogin()', () => {
   });
 
   it('fails when the login page re-renders with the password field still present (wrong credentials)', async () => {
-    const browser = makeFakeBrowser({
-      pages: {
-        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
-      },
-      // No onSubmitGoTo entry: click() is a no-op, session stays on /login.
-    });
+    // A genuine failure never resolves on its own — attemptLogin polls up to
+    // LOGIN_SETTLE_TIMEOUT_MS (10s) waiting for a redirect that never comes,
+    // so this exercises that full wait via fake timers rather than a real
+    // 10-second sleep.
+    vi.useFakeTimers();
+    try {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        },
+        // No onSubmitGoTo entry: click() is a no-op, session stays on /login.
+      });
 
-    const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'wrong-pw');
+      const resultPromise = attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'wrong-pw');
+      await vi.advanceTimersByTimeAsync(10_000);
+      const result = await resultPromise;
 
-    expect(result.ok).toBe(false);
-    expect(result.reason).toMatch(/still on a page with a password field/i);
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/still on a page with a password field/i);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 
   it('fails fast when the candidate page has no password field at all', async () => {
@@ -145,5 +159,139 @@ describe('attemptLogin()', () => {
 
     expect(result.ok).toBe(false);
     expect(result.reason).toMatch(/login form interaction failed/i);
+  });
+
+  describe('findLoginSubmitButton() tiers (via attemptLogin, selector recorded per click)', () => {
+    it('picks the in-form submit-type button over a same-page name-matching decoy (tier 1 wins)', async () => {
+      // The exact C&A shape: the real submit button's visible name is
+      // localized ("Pokračovať") and matches nothing, but it IS a
+      // type="submit" button inside the form. A decoy button elsewhere on
+      // the page happens to have an English name-matching label ("Continue
+      // reading") — tier 1 must win so the decoy is never clicked.
+      const realSubmit: InteractiveElement = {
+        role: 'button',
+        name: 'Pokračovať',
+        selector: '#real-submit',
+        inForm: true,
+        buttonType: 'submit',
+      };
+      const decoy: InteractiveElement = {
+        role: 'button',
+        name: 'Continue reading',
+        selector: '#decoy',
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, decoy, realSubmit] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(clicked).toEqual(['#real-submit']);
+    });
+
+    it('falls back to selector/testid keyword matching when there is no <form> wrapper', async () => {
+      // Non-semantic SPA markup: no inForm/buttonType signal at all, but the
+      // developer-facing selector (built from data-testid) reads as a submit
+      // action even though the visible name is localized.
+      const testIdSubmit: InteractiveElement = {
+        role: 'button',
+        name: 'Pokračovať',
+        selector: 'button[data-testid="login-submit"]',
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, testIdSubmit] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(clicked).toEqual(['button[data-testid="login-submit"]']);
+    });
+
+    it('falls back to the visible-name regex only when neither structural signal is present (backward compat)', async () => {
+      // Selector deliberately doesn't match SELECTOR_SUBMIT_HINT_RE (no
+      // "submit"/"login"/etc. substring) and there's no inForm/buttonType —
+      // only the visible name ("Sign in") can identify this as the button.
+      const nameOnlyButton: InteractiveElement = {
+        role: 'button',
+        name: 'Sign in',
+        selector: '#action-button',
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, nameOnlyButton] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(clicked).toEqual(['#action-button']);
+    });
+
+    it('never picks a disabled button at any tier', async () => {
+      const disabledSubmit: InteractiveElement = {
+        role: 'button',
+        name: 'Sign in',
+        selector: '#disabled-submit',
+        inForm: true,
+        buttonType: 'submit',
+        disabled: true,
+      };
+      const enabledFallback: InteractiveElement = {
+        role: 'button',
+        name: 'Sign in',
+        selector: '#enabled-fallback',
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': {
+            elements: [EMAIL_FIELD, PASSWORD_FIELD, disabledSubmit, enabledFallback],
+          },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(clicked).toEqual(['#enabled-fallback']);
+    });
   });
 });

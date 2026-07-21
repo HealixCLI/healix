@@ -3,6 +3,7 @@ import { crawl, crawlWithAuth, reconcileStaticRoutePaths } from './crawler.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
+  CapturedNetworkEvent,
   DomSnapshot,
   InteractiveElement,
   Point,
@@ -11,6 +12,8 @@ import type {
 interface FakePage {
   title?: string;
   elements: InteractiveElement[];
+  /** Network traffic to hand back from drainNetworkEvents() after navigating to this page. */
+  network?: CapturedNetworkEvent[];
 }
 
 /**
@@ -19,6 +22,11 @@ interface FakePage {
  * actually lands on, mirroring how a real page's `page.url()` can differ from
  * what was requested. `onClickGoTo` maps a source URL to a destination URL,
  * simulating a login form's submit button navigating on success.
+ * `onClickSelectorGoTo` maps a specific clicked selector to a destination URL
+ * (regardless of the current URL) — used to give two candidates on the same
+ * page distinct destinations for click-probing tests. `log`, when provided,
+ * records every `goto`/`click` call (as `goto:<url>` / `click:<selector>`) in
+ * order, so tests can assert reset-after-click sequencing.
  */
 function makeFakeBrowser(config: {
   pages: Record<string, FakePage>;
@@ -26,18 +34,29 @@ function makeFakeBrowser(config: {
   throwFor?: Set<string>;
   delayMs?: number;
   onClickGoTo?: Record<string, string>;
+  onClickSelectorGoTo?: Record<string, string>;
+  recordClicks?: string[];
+  log?: string[];
 }): BrowserSurface {
   let currentUrl = '';
+  let networkBuffer: CapturedNetworkEvent[] = [];
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
+      config.log?.push(`goto:${url}`);
       if (config.throwFor?.has(url)) {
+        // Model a request that actually fired (and would otherwise leak into the
+        // next route's drain) even though this navigation ultimately fails.
+        const events = config.pages[url]?.network;
+        if (events) networkBuffer.push(...events);
         throw new Error(`fake nav failure for ${url}`);
       }
       if (config.delayMs) {
         await new Promise((resolve) => setTimeout(resolve, config.delayMs));
       }
       currentUrl = config.redirects?.[url] ?? url;
+      const events = config.pages[currentUrl]?.network;
+      if (events) networkBuffer.push(...events);
     },
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
@@ -49,7 +68,14 @@ function makeFakeBrowser(config: {
       }
       return { url: currentUrl, title: page.title ?? currentUrl, interactiveElements: page.elements };
     },
-    async click(_selector: string): Promise<void> {
+    async click(selector: string): Promise<void> {
+      config.recordClicks?.push(selector);
+      config.log?.push(`click:${selector}`);
+      const bySelector = config.onClickSelectorGoTo?.[selector];
+      if (bySelector) {
+        currentUrl = bySelector;
+        return;
+      }
       const next = config.onClickGoTo?.[currentUrl];
       if (next) currentUrl = next;
     },
@@ -58,6 +84,11 @@ function makeFakeBrowser(config: {
     async pressKey(_key: string): Promise<void> {},
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
+    },
+    drainNetworkEvents(): CapturedNetworkEvent[] {
+      const drained = networkBuffer;
+      networkBuffer = [];
+      return drained;
     },
     async stop(): Promise<void> {},
   };
@@ -293,6 +324,232 @@ describe('crawl()', () => {
   });
 });
 
+describe('crawl() click-probing (route discovery beyond <a href>)', () => {
+  it('discovers a route reachable only via a button click when the link queue is thin (SPA nav without <a href>)', async () => {
+    // Mirrors the real-world case this closes (GAP-042): a page whose only
+    // navigation is a <button>, not a real anchor, so extractLinks() alone
+    // would stall the crawl at exactly one route.
+    const signIn = button('Sign In');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [signIn] },
+        'https://a.test/login': { elements: [button('Continue')] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/login' },
+      recordClicks,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.visitedCount).toBe(2);
+    expect(result.routes.map((r) => r.url).sort()).toEqual(['https://a.test/', 'https://a.test/login']);
+    expect(recordClicks).toContain(signIn.selector);
+  });
+
+  it('never click-probes a control whose name reads as a destructive/mutating action', async () => {
+    const unsafeButton = button('Register now');
+    const safeButton = button('View Menu');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [unsafeButton, safeButton] },
+        'https://a.test/menu': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/menu' },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).not.toContain(unsafeButton.selector);
+    expect(recordClicks).toContain(safeButton.selector);
+  });
+
+  it('does click-probe a non-submit control inside a <form> (e.g. a login/register view toggle)', async () => {
+    // Some apps put their login<->register view toggle inside the
+    // registration <form> (a "Log in instead" button that isn't itself a
+    // submit control). Excluding every in-form button meant the crawler
+    // could discover the registration route but never the login route
+    // behind that toggle. A non-submit in-form button can't mutate/submit
+    // the form, so it's no riskier than any other click-probe candidate.
+    const inFormToggle: InteractiveElement = {
+      role: 'button',
+      name: 'Log in instead',
+      selector: '#toggle-login-btn',
+      inForm: true,
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [inFormToggle] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toEqual(['#toggle-login-btn']);
+  });
+
+  it('never click-probes a submit-type control inside a <form>', async () => {
+    const inFormSubmit: InteractiveElement = {
+      role: 'button',
+      name: 'Continue',
+      selector: '#continue-btn',
+      inForm: true,
+      buttonType: 'submit',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [inFormSubmit] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toEqual([]);
+  });
+
+  it('never click-probes a disabled control', async () => {
+    const disabledButton: InteractiveElement = {
+      role: 'button',
+      name: 'Next',
+      selector: '#next-btn',
+      disabled: true,
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [disabledButton] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toEqual([]);
+  });
+
+  it('never click-probes a submit-type button', async () => {
+    const submitButton: InteractiveElement = {
+      role: 'button',
+      name: 'Next',
+      selector: '#next',
+      buttonType: 'submit',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [submitButton] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toEqual([]);
+  });
+
+  it('does not click-probe a page while the link-following queue still has 3+ pending URLs', async () => {
+    const extraNav = button('Extra Nav');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [
+            link('https://a.test/p1'),
+            link('https://a.test/p2'),
+            link('https://a.test/p3'),
+            extraNav,
+          ],
+        },
+        'https://a.test/p1': { elements: [] },
+        'https://a.test/p2': { elements: [] },
+        'https://a.test/p3': { elements: [] },
+      },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toEqual([]);
+  });
+
+  it('caps click-probes at 4 candidates on a single page even with more safe candidates available', async () => {
+    const buttons = Array.from({ length: 6 }, (_, i) => button(`Nav ${i}`));
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: buttons } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks.length).toBeLessThanOrEqual(4);
+  });
+
+  it('resets to the original page after each navigating click, so every safe candidate is tried from the same starting point', async () => {
+    const btnA = button('Go A');
+    const btnB = button('Go B');
+    const log: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [btnA, btnB] },
+        'https://a.test/a': { elements: [] },
+        'https://a.test/b': { elements: [] },
+      },
+      onClickSelectorGoTo: {
+        [btnA.selector]: 'https://a.test/a',
+        [btnB.selector]: 'https://a.test/b',
+      },
+      log,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes.map((r) => r.url).sort()).toEqual([
+      'https://a.test/',
+      'https://a.test/a',
+      'https://a.test/b',
+    ]);
+    // Each navigating click must be followed by a reset goto() back to the
+    // original page BEFORE the next candidate is clicked — otherwise btnB
+    // would be clicked from page /a instead of from the original page.
+    expect(log).toEqual([
+      'goto:https://a.test/',
+      `click:${btnA.selector}`,
+      'goto:https://a.test/',
+      `click:${btnB.selector}`,
+      'goto:https://a.test/',
+      'goto:https://a.test/a',
+      'goto:https://a.test/b',
+    ]);
+  });
+
+  it('exhausts the total click-probe budget across the crawl, not just per page', async () => {
+    // 10 pages reachable only by clicking a button (no <a href>), each
+    // offering 4 safe candidates (the per-page max). Spending 4 clicks per
+    // page against a crawl-wide budget of 20 means only ~5 of the 10 pages
+    // can ever be reached via click-probing — proving the budget is shared
+    // across the whole crawl, not reset per page.
+    const navButtons = () => [button('Nav A'), button('Nav B'), button('Nav C'), button('Nav D')];
+    const pageCount = 10;
+    const recordClicks: string[] = [];
+    const pages: Record<string, FakePage> = { 'https://a.test/': { elements: navButtons() } };
+    const onClickGoTo: Record<string, string> = { 'https://a.test/': 'https://a.test/p0' };
+    for (let i = 0; i < pageCount; i += 1) {
+      const url = `https://a.test/p${i}`;
+      pages[url] = { elements: navButtons() };
+      onClickGoTo[url] = i + 1 < pageCount ? `https://a.test/p${i + 1}` : 'https://a.test/pEnd';
+    }
+    pages['https://a.test/pEnd'] = { elements: [] };
+
+    const browser = makeFakeBrowser({ pages, onClickGoTo, recordClicks });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks.length).toBeLessThanOrEqual(20);
+    // Nowhere near all 10 button-only pages get reached before the
+    // crawl-wide click-probe budget runs out.
+    expect(result.visitedCount).toBeLessThan(pageCount);
+  });
+});
+
 const EMAIL_FIELD: InteractiveElement = {
   role: 'textbox',
   name: 'Email',
@@ -305,7 +562,16 @@ const PASSWORD_FIELD: InteractiveElement = {
   selector: '#password',
   inputType: 'password',
 };
-const SUBMIT_BUTTON: InteractiveElement = { role: 'button', name: 'Sign in', selector: '#submit' };
+// Realistic markup: a login form's submit button lives inside a <form>, so
+// click-probing (which never touches in-form controls) must never fire it
+// prematurely during the plain anonymous crawl() that precedes attemptLogin().
+const SUBMIT_BUTTON: InteractiveElement = {
+  role: 'button',
+  name: 'Sign in',
+  selector: '#submit',
+  inForm: true,
+  buttonType: 'submit',
+};
 
 describe('crawlWithAuth()', () => {
   it('returns anonymous-only routes and skips auth when no credentials are supplied', async () => {
@@ -370,6 +636,33 @@ describe('crawlWithAuth()', () => {
     expect(authUrls.sort()).toEqual(['https://a.test/dashboard', 'https://a.test/dashboard/settings']);
   });
 
+  it('prefers a /login-hinted route over a /register-hinted route when both have a password field', async () => {
+    // Both routes carry a password field (a common shape: registration also
+    // collects a password), but only /login is the actual login page. Wiring
+    // /register's form with the login credentials would fail (missing
+    // required registration fields) even though a password field was found.
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/register'), link('https://a.test/login')],
+        },
+        'https://a.test/register': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/dashboard': { elements: [{ role: 'heading', name: 'Dashboard', selector: 'h1' }] },
+      },
+      onClickGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+    });
+
+    const result = await crawlWithAuth(browser, 'https://a.test/', {
+      credentials: { username: 'user@a.test', password: 'correct-pw' },
+    });
+
+    expect(result.authAttempted).toBe(true);
+    expect(result.authVerified).toBe(true);
+    const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
+    expect(authUrls).toEqual(['https://a.test/dashboard']);
+  });
+
   it('degrades to anonymous-only when login cannot be verified (wrong credentials)', async () => {
     const browser = makeFakeBrowser({
       pages: {
@@ -422,5 +715,59 @@ describe('reconcileStaticRoutePaths()', () => {
   it('skips a path that fails to resolve against a malformed base URL rather than throwing', () => {
     expect(() => reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).not.toThrow();
     expect(reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).toEqual([]);
+  });
+});
+
+describe('crawl() network capture (GAP-046)', () => {
+  it('attaches the network events captured while a route settled to that route', async () => {
+    const homeEvents: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://a.test/api/profile', status: 200, responseBody: '{"name":"Ada"}' },
+    ];
+    const aboutEvents: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://a.test/api/about', status: 200, responseBody: '{"version":1}' },
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/about')], network: homeEvents },
+        'https://a.test/about': { elements: [], network: aboutEvents },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes).toHaveLength(2);
+    const home = result.routes.find((r) => r.url === 'https://a.test/');
+    const about = result.routes.find((r) => r.url === 'https://a.test/about');
+    expect(home?.networkEvents).toEqual(homeEvents);
+    expect(about?.networkEvents).toEqual(aboutEvents);
+  });
+
+  it('gives a route an empty networkEvents array when nothing was captured for it', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [] } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0]?.networkEvents).toEqual([]);
+  });
+
+  it('discards traffic from a failed navigation instead of attributing it to the next successful route', async () => {
+    const deadEvents: CapturedNetworkEvent[] = [
+      { method: 'GET', url: 'https://a.test/api/dead', status: 500 },
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/dead': { elements: [], network: deadEvents },
+        'https://a.test/ok': { elements: [] },
+      },
+      throwFor: new Set(['https://a.test/dead']),
+    });
+
+    const result = await crawl(browser, 'https://a.test/dead', { seedRoutes: ['https://a.test/ok'] });
+
+    expect(result.routes).toHaveLength(1);
+    expect(result.routes[0]?.url).toBe('https://a.test/ok');
+    expect(result.routes[0]?.networkEvents).toEqual([]);
   });
 });

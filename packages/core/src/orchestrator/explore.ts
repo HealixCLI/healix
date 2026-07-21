@@ -9,6 +9,7 @@ import {
   type CrawlWithAuthResult,
 } from '../browser/crawler.js';
 import type { BrowserSurface } from '../browser/types.js';
+import { collectObservedEndpoints } from '../browser/network-capture.js';
 import type { ExplorationArtifact } from '../modes/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 import type { OrchestratorEvent } from './types.js';
@@ -237,6 +238,7 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       loginCandidates,
       useful: quality.useful,
       uselessReason: quality.reason,
+      observedEndpoints: collectObservedEndpoints(crawlResult),
     };
   } finally {
     if (unsubFrames) {

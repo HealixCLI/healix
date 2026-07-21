@@ -46,8 +46,9 @@ import {
   parsePlanWithDiagnostics,
   synthesizePlan,
   type PlanRepoContext,
+  type PlanParseFailureReason,
 } from './plan.js';
-import type { FunctionalityUnit } from '../target/functionality-index.js';
+import { estimateUnitWeight, type FunctionalityUnit } from '../target/functionality-index.js';
 import { indexSource } from '../target/source-index.js';
 import { persistSourceContext } from '../target/context-store.js';
 import type { SourceContext } from '../target/source-context.js';
@@ -96,19 +97,26 @@ const STORE_FAILURE_WARN_THRESHOLD = 3;
 /** Small delay before a same-provider plan retry — cheap insurance against a one-off CLI hiccup/timeout. */
 const PLAN_SAME_PROVIDER_RETRY_DELAY_MS = 2_000;
 /**
- * Units per batched planning call — keeps each individual completion's expected
- * JSON response small enough to avoid output-length truncation (see
- * PlanParseFailureReason 'truncated' in plan.ts). A repo with more detected
- * functionality units than this is planned across multiple smaller calls
- * instead of one monolithic request covering everything at once.
+ * Target sum of estimateUnitWeight() across a batched planning call — keeps each
+ * individual completion's expected JSON response small enough to avoid
+ * output-length truncation (see PlanParseFailureReason 'truncated' in plan.ts).
+ * A repo whose total estimated weight exceeds this is planned across multiple
+ * smaller calls instead of one monolithic request covering everything at once.
  *
- * Kept conservative (well under what "no truncation" alone would require)
- * because unit count understates real response size: each unit's plan item
- * also carries an uncapped scenarios array (positive/negative/edge), so a
- * batch of richly-scenario'd units can produce a much larger response than
- * the same batch size with one scenario per unit.
+ * Sizing by weight rather than raw unit count accounts for each unit's plan
+ * item also carrying an uncapped scenarios array (positive/negative/edge):
+ * scenario-heavy units (endpoints, spec-derived units with schemas/auth) count
+ * for more than a plain route, so a batch of richly-scenario'd units shrinks
+ * automatically instead of silently producing a much larger response than a
+ * same-size batch of light units.
  */
-const PLAN_BATCH_UNIT_SIZE = 15;
+const PLAN_BATCH_WEIGHT_BUDGET = 45;
+
+/** Hard cap on units per batch regardless of weight — a structural safety net against pathological inputs. */
+const PLAN_BATCH_MAX_UNITS = 20;
+
+/** Max recursive halvings of a still-truncating batch before its units are left uncovered. */
+const PLAN_MAX_SPLIT_DEPTH = 3;
 
 /**
  * Run state machine for the Healix orchestrator. Every phase transition is
@@ -545,6 +553,36 @@ async function runPipeline(
     // functions) so the plan phase can reuse its repo indexer for grounding,
     // and LAUNCH needs it regardless of whether this is a resume.
     const target = makeTarget();
+
+    // Default (never override) testingScope to 'frontend' for a white-box
+    // project statically detected as frontend-only. Without this, every
+    // no-backend app still plans/generates tierC-api specs against a guessed
+    // base URL and guessed endpoints — structurally unable to pass. Detection
+    // is unambiguous-only: anything other than a clean 'frontend' verdict
+    // (including 'unknown') leaves the 'both' default alone, since a false
+    // narrow would silently drop real API coverage. An explicit user choice
+    // (including one restored from a resumed run's checkpoint) always wins —
+    // this only fires when opts.testingScope was never set.
+    if (opts.testingScope === undefined && project.repoPath) {
+      try {
+        const det = await target.detect(project.repoPath);
+        if (det.kind === 'frontend') {
+          opts.testingScope = 'frontend';
+          emit(
+            'plan',
+            'debug',
+            'Detected a frontend-only project (no backend found); defaulting testing scope to ' +
+              '"frontend" (skips tierC-api generation). Pass an explicit testingScope to include API tests.',
+          );
+        }
+      } catch (err) {
+        emit(
+          'plan',
+          'debug',
+          `Project-kind detection failed (testing scope defaults to 'both'): ${errMsg(err)}`,
+        );
+      }
+    }
 
     if (resumeFrom) {
       // Resuming: the plan was already finalized and approved before the
@@ -1159,13 +1197,46 @@ async function runPipeline(
         // treated as always-valid.
         const validation = mode.validate
           ? await mode.validate(ctx, [...newSpecs, ...carriedSpecs])
-          : { ok: [...newSpecs, ...carriedSpecs], repaired: [], quarantined: [] };
+          : { ok: [...newSpecs, ...carriedSpecs], repaired: [], quarantined: [], warnings: [] };
         if (validation.quarantined.length > 0) {
+          const codegenDefects = validation.quarantined.filter((q) => q.category === 'codegen-defect');
+          // Codegen defects (a parse failure on a spec generated FROM a real,
+          // already-indexed source file — see validate.ts's SRC_CITATION_RE)
+          // indicate a bug in generation itself, not an ordinary model slip —
+          // surface them louder/separately so they don't get lost among
+          // routine per-spec quarantine noise.
+          if (codegenDefects.length > 0) {
+            emit(
+              'generate',
+              'error',
+              `${codegenDefects.length} source-grounded spec(s) failed to parse — likely a codegen defect, not a routine quality issue.`,
+              { codegenDefects: codegenDefects.map((q) => ({ title: q.spec.title, reason: q.reason })) },
+            );
+          }
           emit(
             'generate',
             'warn',
-            `${validation.quarantined.length} spec(s) quarantined after failing to parse (one repair attempt each).`,
-            { quarantined: validation.quarantined.map((q) => ({ title: q.spec.title, reason: q.reason })) },
+            `${validation.quarantined.length} spec(s) quarantined after failing validation.`,
+            {
+              quarantined: validation.quarantined.map((q) => ({
+                title: q.spec.title,
+                reason: q.reason,
+                category: q.category,
+              })),
+            },
+          );
+        }
+        if (validation.warnings.length > 0) {
+          emit(
+            'generate',
+            'warn',
+            `${validation.warnings.length} spec(s) shipped with non-blocking quality findings.`,
+            {
+              warnings: validation.warnings.map((w) => ({
+                title: w.spec.title,
+                findings: w.findings.map((f) => f.message),
+              })),
+            },
           );
         }
         // Only `contents` legitimately flows out of validation (a bracket-repair
@@ -1777,12 +1848,15 @@ export async function attemptPlanCompletion(
   opts: RunOptions,
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
   overrides?: OrchestratorOverrides,
-): Promise<{ plan: TestPlan } | { plan: null; reason: string }> {
+): Promise<{ plan: TestPlan } | { plan: null; reason: string; failureReason?: PlanParseFailureReason }> {
   // Attempt a single completion with one provider; classifies the outcome so the
   // caller can decide whether to retry with a fallback.
   const attempt = async (
     p: ProviderAdapter,
-  ): Promise<{ plan: TestPlan } | { plan: null; retryable: boolean; reason: string }> => {
+  ): Promise<
+    | { plan: TestPlan }
+    | { plan: null; retryable: boolean; reason: string; failureReason?: PlanParseFailureReason }
+  > => {
     try {
       const completion = await p.complete(prompt, {
         mode: 'plan',
@@ -1810,7 +1884,7 @@ export async function attemptPlanCompletion(
           'warn',
           `Could not parse plan JSON from "${p.id}" (${parsed.failureReason ?? 'unknown'}).`,
         );
-        return { plan: null, retryable, reason };
+        return { plan: null, retryable, reason, failureReason: parsed.failureReason };
       }
       // ok:false is a provider-level failure → eligible for one fallback retry.
       emit('plan', 'warn', `Provider "${p.id}" returned no usable plan (${completion.detail}).`);
@@ -1850,7 +1924,7 @@ export async function attemptPlanCompletion(
     }
   }
 
-  return { plan: null, reason: last.reason };
+  return { plan: null, reason: last.reason, failureReason: last.failureReason };
 }
 
 /**
@@ -1858,16 +1932,82 @@ export async function attemptPlanCompletion(
  * only once every attempt (including retries — see attemptPlanCompletion) is
  * exhausted.
  *
- * A large functionality inventory is planned across multiple smaller batches
- * (see PLAN_BATCH_UNIT_SIZE) instead of one monolithic request — asking the
- * model for a single unbounded JSON response covering the entire app's
- * surface is what makes output-length truncation likely in the first place.
- * A batch that fails outright contributes zero items (NOT its own smoke
+ * A large functionality inventory is planned across multiple smaller batches,
+ * sized by estimated scenario volume rather than raw unit count (see
+ * PLAN_BATCH_WEIGHT_BUDGET, buildWeightedBatches) instead of one monolithic
+ * request — asking the model for a single unbounded JSON response covering
+ * the entire app's surface is what makes output-length truncation likely in
+ * the first place. If a batch still comes back truncated after
+ * attemptPlanCompletion's own retries/fallback are exhausted, it is split in
+ * half by weight and each half retried recursively (see planBatch,
+ * PLAN_MAX_SPLIT_DEPTH) rather than giving up on the whole batch outright.
+ * A batch that ultimately fails contributes zero items (NOT its own smoke
  * fallback, which wouldn't make sense scoped to a handful of known units) —
  * its units simply stay uncovered for the coverage-feedback loop to pick up
  * afterward. Only a total wipeout (no batch produced anything at all) falls
  * back to synthesizePlan().
  */
+
+/**
+ * Greedily group units into batches whose estimateUnitWeight() sum stays within
+ * `weightBudget`, also capping each batch at `maxUnits` regardless of weight, as a
+ * structural safety net. A single unit whose own weight already exceeds the budget
+ * still gets its own batch — a unit can't be split further.
+ *
+ * `weightBudget`/`maxUnits` default to the production constants; overridable so tests
+ * can exercise the over-budget-single-unit edge case without needing a unit whose
+ * estimateUnitWeight() genuinely exceeds the real budget.
+ *
+ * Exported for tests.
+ */
+export function buildWeightedBatches(
+  units: FunctionalityUnit[],
+  weightBudget = PLAN_BATCH_WEIGHT_BUDGET,
+  maxUnits = PLAN_BATCH_MAX_UNITS,
+): FunctionalityUnit[][] {
+  const batches: FunctionalityUnit[][] = [];
+  let current: FunctionalityUnit[] = [];
+  let currentWeight = 0;
+  for (const u of units) {
+    const w = estimateUnitWeight(u);
+    if (current.length > 0 && (currentWeight + w > weightBudget || current.length >= maxUnits)) {
+      batches.push(current);
+      current = [];
+      currentWeight = 0;
+    }
+    current.push(u);
+    currentWeight += w;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/**
+ * Split units into two halves with roughly equal estimateUnitWeight() sums, cutting
+ * at unit boundaries only (a unit's scenarios always land in exactly one half). Used
+ * to shrink a batch that truncated even after attemptPlanCompletion's own retries —
+ * an index-based half split could leave one half still scenario-heavy and truncating
+ * again, while a weight-based cut balances both halves' expected output volume.
+ *
+ * Exported for tests.
+ */
+export function splitUnitsByWeight(units: FunctionalityUnit[]): [FunctionalityUnit[], FunctionalityUnit[]] {
+  const total = units.reduce((sum, u) => sum + estimateUnitWeight(u), 0);
+  const half = total / 2;
+  let running = 0;
+  let cut = 1;
+  for (let i = 0; i < units.length; i++) {
+    running += estimateUnitWeight(units[i]!);
+    if (running >= half) {
+      cut = i + 1;
+      break;
+    }
+  }
+  // Guard against a degenerate cut leaving one side empty (e.g. one dominant unit).
+  cut = Math.max(1, Math.min(cut, units.length - 1));
+  return [units.slice(0, cut), units.slice(cut)];
+}
+
 export async function runPlanPhase(
   provider: ProviderAdapter,
   project: Project,
@@ -1877,8 +2017,9 @@ export async function runPlanPhase(
   repoIndex?: PlanRepoContext,
 ): Promise<TestPlan> {
   const units = repoIndex?.functionality ?? [];
+  const totalWeight = units.reduce((sum, u) => sum + estimateUnitWeight(u), 0);
 
-  if (units.length <= PLAN_BATCH_UNIT_SIZE) {
+  if (totalWeight <= PLAN_BATCH_WEIGHT_BUDGET && units.length <= PLAN_BATCH_MAX_UNITS) {
     const prompt = buildPlanPrompt(project, opts, repoIndex);
     const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
     if (result.plan) return { ...result.plan, planSource: 'ai' };
@@ -1890,55 +2031,81 @@ export async function runPlanPhase(
     };
   }
 
-  const batches: FunctionalityUnit[][] = [];
-  for (let i = 0; i < units.length; i += PLAN_BATCH_UNIT_SIZE) {
-    batches.push(units.slice(i, i + PLAN_BATCH_UNIT_SIZE));
-  }
+  const batches = buildWeightedBatches(units);
   emit(
     'plan',
     'info',
-    `Planning ${units.length} unit(s) across ${batches.length} batch(es) of up to ${PLAN_BATCH_UNIT_SIZE}.`,
+    `Planning ${units.length} unit(s) across ${batches.length} batch(es) (weight budget ${PLAN_BATCH_WEIGHT_BUDGET}, max ${PLAN_BATCH_MAX_UNITS} unit(s)/batch).`,
   );
 
   const items: TestPlanItem[] = [];
   const failedBatches: string[] = [];
 
-  for (let i = 0; i < batches.length; i++) {
-    if (opts.signal?.aborted) break;
-    const prompt = buildBatchPlanPrompt(project, opts, batches[i]!, i + 1, batches.length, repoIndex);
-    emit('plan', 'info', `Planning batch ${i + 1}/${batches.length} (${batches[i]!.length} unit(s)).`);
+  // Plans one batch, splitting it in half by weight and retrying each half
+  // (up to PLAN_MAX_SPLIT_DEPTH times) if attemptPlanCompletion exhausts its
+  // own retries and still reports a truncated response — the batch's own
+  // weight estimate under-shot the model's actual output for these units.
+  // `batchIndex`/`totalBatches` identify the top-level batch a call (or, after
+  // splitting, a sub-batch) descends from — stable across recursion so
+  // progress events and prompt text ("batch N of M") stay meaningful even
+  // after a split; `label` (e.g. "2/4" then "2/4a", "2/4b") disambiguates
+  // sub-batches from the same top-level slot in logs.
+  const planBatch = async (
+    batchUnits: FunctionalityUnit[],
+    batchIndex: number,
+    label: string,
+    depth: number,
+  ): Promise<void> => {
+    const prompt = buildBatchPlanPrompt(project, opts, batchUnits, batchIndex + 1, batches.length, repoIndex);
+    emit('plan', 'info', `Planning batch ${label} (${batchUnits.length} unit(s)).`);
     const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
     if (result.plan) {
       items.push(...result.plan.items);
+      emit('plan', 'info', `Batch ${label} generated ${result.plan.items.length} item(s).`, {
+        kind: 'plan-batch',
+        batchIndex,
+        totalBatches: batches.length,
+        label,
+        items: result.plan.items,
+        status: 'ok',
+      });
+      return;
+    }
+
+    if (result.failureReason === 'truncated' && batchUnits.length > 1 && depth < PLAN_MAX_SPLIT_DEPTH) {
+      const [left, right] = splitUnitsByWeight(batchUnits);
       emit(
         'plan',
         'info',
-        `Batch ${i + 1}/${batches.length} generated ${result.plan.items.length} item(s).`,
-        {
-          kind: 'plan-batch',
-          batchIndex: i,
-          totalBatches: batches.length,
-          items: result.plan.items,
-          status: 'ok',
-        },
+        `Batch ${label} still truncated after retries; splitting ${batchUnits.length} unit(s) into ` +
+          `${left.length} + ${right.length} by weight and retrying.`,
       );
-    } else {
-      failedBatches.push(`batch ${i + 1}/${batches.length}: ${result.reason}`);
-      emit(
-        'plan',
-        'warn',
-        `Batch ${i + 1}/${batches.length} produced no usable plan (${result.reason}); its units will be ` +
-          'left for the coverage-feedback loop.',
-        {
-          kind: 'plan-batch',
-          batchIndex: i,
-          totalBatches: batches.length,
-          items: [],
-          status: 'failed',
-          reason: result.reason,
-        },
-      );
+      await planBatch(left, batchIndex, `${label}a`, depth + 1);
+      await planBatch(right, batchIndex, `${label}b`, depth + 1);
+      return;
     }
+
+    failedBatches.push(`batch ${label}: ${result.reason}`);
+    emit(
+      'plan',
+      'warn',
+      `Batch ${label} produced no usable plan (${result.reason}); its units will be left for the ` +
+        'coverage-feedback loop.',
+      {
+        kind: 'plan-batch',
+        batchIndex,
+        totalBatches: batches.length,
+        label,
+        items: [],
+        status: 'failed',
+        reason: result.reason,
+      },
+    );
+  };
+
+  for (let i = 0; i < batches.length; i++) {
+    if (opts.signal?.aborted) break;
+    await planBatch(batches[i]!, i, `${i + 1}/${batches.length}`, 0);
   }
 
   if (items.length === 0) {

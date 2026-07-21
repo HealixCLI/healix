@@ -78,8 +78,16 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       return result;
     }
 
+    // Framework-generated ids are reassigned per render tree, not persisted
+    // across page loads, so a selector built from one will resolve against a
+    // completely different element (or nothing) the next time the page
+    // loads — e.g. React's useId() (`_r_4_`, `:r4:`) or MUI's `mui-3`.
+    // Matches these known shapes so selectorFor() falls through to a stable
+    // attribute instead of trusting the id.
+    const UNSTABLE_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+
     function selectorFor(el: DomElement): string {
-      if (el.id) {
+      if (el.id && !UNSTABLE_ID_RE.test(el.id)) {
         return `#${cssEscape(el.id)}`;
       }
 
@@ -113,7 +121,7 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           }
         }
         parts.unshift(part);
-        if (current.id) {
+        if (current.id && !UNSTABLE_ID_RE.test(current.id)) {
           parts[0] = `#${cssEscape(current.id)}`;
           break;
         }
@@ -223,6 +231,19 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       }
     }
 
+    function isInForm(el: DomElement): boolean {
+      let node: DomElement | null = el.parentElement;
+      while (node) {
+        if (node.tagName.toLowerCase() === 'form') return true;
+        node = node.parentElement;
+      }
+      return false;
+    }
+
+    function isDisabled(el: DomElement): boolean {
+      return el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
+    }
+
     function isVisible(el: DomElement): boolean {
       if (el.hidden) {
         return false;
@@ -244,12 +265,18 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       }
       seen.add(el);
       const tag = el.tagName.toLowerCase();
+      const inForm = isInForm(el);
+      const rawButtonType = tag === 'button' ? (el.getAttribute('type') ?? '').toLowerCase() : undefined;
       out.push({
         role: roleFor(el),
         name: accessibleName(el),
         selector: selectorFor(el),
         href: tag === 'a' ? (el.getAttribute('href') ?? undefined) : undefined,
         inputType: tag === 'input' ? (el.getAttribute('type') ?? 'text').toLowerCase() : undefined,
+        // An untyped <button> inside a <form> implicitly submits per HTML spec.
+        buttonType: tag === 'button' ? rawButtonType || (inForm ? 'submit' : '') : undefined,
+        inForm,
+        disabled: isDisabled(el),
       });
     }
 

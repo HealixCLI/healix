@@ -35,6 +35,24 @@ export interface FunctionalityIndex {
   summary: string;
 }
 
+/**
+ * Rough estimate of how many scenarios a unit will contribute to a plan-generation
+ * response, used by the orchestrator to size planning batches by expected output
+ * volume rather than raw unit count (see PLAN_BATCH_WEIGHT_BUDGET in orchestrator/index.ts).
+ * A plain route with no known schema/auth is assumed to need the fewest scenarios;
+ * endpoints and spec-derived units with request/response schemas or auth requirements
+ * tend to warrant more negative/edge cases (validation failures, auth failures), so
+ * each such signal bumps the estimate.
+ */
+export function estimateUnitWeight(u: FunctionalityUnit): number {
+  let w = 2;
+  if (u.kind === 'endpoint') w += 1;
+  if (u.requestSchema) w += 1;
+  if (u.responseSchema) w += 1;
+  if (u.authRequired) w += 1;
+  return w;
+}
+
 const SKIP_DIRS = new Set<string>([
   'node_modules',
   '.git',

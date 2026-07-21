@@ -71,6 +71,9 @@ function makeFakeBrowser(config: {
         // no-op unsubscribe — unsub tracking (if a test needs it) happens separately below.
       };
     },
+    drainNetworkEvents() {
+      return [];
+    },
     async stop(): Promise<void> {
       state.stopped = true;
     },
@@ -181,6 +184,7 @@ describe('assessExplorationUsefulness()', () => {
             depth: 0,
             hasPasswordField: true,
             role: 'anonymous',
+            networkEvents: [],
           },
         ],
         visitedCount: 1,
@@ -211,6 +215,7 @@ describe('assessExplorationUsefulness()', () => {
             depth: 0,
             hasPasswordField: false,
             role: 'anonymous',
+            networkEvents: [],
           },
           {
             url: 'https://a.test/b',
@@ -223,6 +228,7 @@ describe('assessExplorationUsefulness()', () => {
             depth: 1,
             hasPasswordField: false,
             role: 'anonymous',
+            networkEvents: [],
           },
         ],
       }),
@@ -248,6 +254,7 @@ describe('assessExplorationUsefulness()', () => {
             depth: 0,
             hasPasswordField: false,
             role: 'anonymous',
+            networkEvents: [],
           },
           {
             url: 'https://a.test/about',
@@ -256,6 +263,7 @@ describe('assessExplorationUsefulness()', () => {
             depth: 1,
             hasPasswordField: false,
             role: 'anonymous',
+            networkEvents: [],
           },
         ],
       }),

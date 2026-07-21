@@ -79,4 +79,149 @@ describe('scaffold — mock fixture generation', () => {
     // The undeterminable dependency (no route-intercept strategy) must not appear.
     expect(contents).not.toContain('pkg:nodemailer');
   });
+
+  it('attributes real EXPLORE-observed endpoints to the dependency whose hostname they were seen on, even with no static endpoint detection (GAP-046 + multi-dependency case)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_API_BASE_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example.com'],
+      },
+      {
+        id: 'env:VITE_MOBILE_WRAPPER_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_MOBILE_WRAPPER_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu-api-gateway.example.com'],
+      },
+    ];
+    const mockResponses: Record<string, MockResponse> = {
+      'env:VITE_API_BASE_URL': { status: 200, body: { profile: true } },
+      'env:VITE_MOBILE_WRAPPER_URL': { status: 200, body: { wrapper: true } },
+    };
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses,
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/mobile/v2/api/customer/coupons',
+            status: 200,
+            sampleResponseBody: '{"entity":{"customers":[{"coupons":[]}]}}',
+            host: 'eu-api-gateway.example.com',
+          },
+          {
+            method: 'GET',
+            pathPattern: '/auth/profile',
+            status: 200,
+            sampleResponseBody: '{"userId":"abc"}',
+            host: 'eu.api.example.com',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    expect(contents).toContain('/mobile/v2/api/customer/coupons');
+    expect(contents).toContain('/auth/profile');
+
+    const routesMatch = /const MOCKED_ROUTES = (\[[\s\S]*?\n\]);/.exec(contents);
+    expect(routesMatch).not.toBeNull();
+    const routes = JSON.parse(routesMatch![1]);
+    const wrapperRoute = routes.find((r: { id: string }) => r.id === 'env:VITE_MOBILE_WRAPPER_URL');
+    const backendRoute = routes.find((r: { id: string }) => r.id === 'env:VITE_API_BASE_URL');
+
+    // The coupons endpoint's per-path mock lives on the wrapper dependency, not the profile one.
+    expect(wrapperRoute.endpoints).toEqual([
+      expect.objectContaining({
+        method: 'GET',
+        pathPattern: '/mobile/v2/api/customer/coupons',
+        response: { status: 200, body: { entity: { customers: [{ coupons: [] }] } } },
+      }),
+    ]);
+    expect(backendRoute.endpoints).toEqual([
+      expect.objectContaining({
+        method: 'GET',
+        pathPattern: '/auth/profile',
+        response: { status: 200, body: { userId: 'abc' } },
+      }),
+    ]);
+  });
+
+  it('lets a statically-detected endpoint win over an observed one for the same (method, path)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'backend',
+        label: 'Backend API',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['api.example.com'],
+        endpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/customer/profile',
+            response: { status: 200, body: { fromStatic: true } },
+          },
+        ],
+      },
+    ];
+    const mockResponses: Record<string, MockResponse> = {
+      'env:VITE_API_BASE_URL': { status: 200, body: {} },
+    };
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses,
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/customer/profile',
+            status: 200,
+            sampleResponseBody: '{"fromObserved":true}',
+            host: 'api.example.com',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    expect(contents).toContain('fromStatic');
+    expect(contents).not.toContain('fromObserved');
+  });
 });

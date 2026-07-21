@@ -207,6 +207,13 @@ export function RunsView({
     engine.phase === 'plan-streaming' ||
     engine.phase === 'awaiting-approval';
 
+  // Mirrors `engine` for the settle effect below, whose refreshRuns().then()
+  // callback needs to read the LATEST engine state at the time it resolves,
+  // not the stale snapshot closed over when the effect fired — see that
+  // effect's own comment for why.
+  const engineRef = useRef(engine);
+  engineRef.current = engine;
+
   // Re-attach to a run that's still genuinely parked awaiting approval in the
   // main process — its approval promise only dies on app restart, not on
   // navigating away from this view — but whose live engine state was lost
@@ -261,6 +268,12 @@ export function RunsView({
       lastSettledRef.current = key;
       const settledId = engine.runId;
       void refreshRuns().then(() => {
+        // Stale by the time this resolves: the user already moved on (e.g.
+        // cancelled this run, then immediately started a different one
+        // before this refresh came back) — engine.runId no longer points at
+        // the run this callback was about. Selecting it now would yank the
+        // view away from whatever the user is already looking at.
+        if (engineRef.current.runId !== settledId) return;
         setSelectedRunId(settledId);
         void reloadDetail();
       });

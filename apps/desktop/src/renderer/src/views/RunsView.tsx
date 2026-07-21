@@ -73,6 +73,18 @@ let persistedSelectedRunId: string | null | undefined;
 // never fires this on the very first mount.
 let lastSeenRunRequestSeq = 0;
 
+// Same reasoning again, for the "run just settled, auto-select it" effect
+// below: engine.phase/engine.runId are lifted to App.tsx and stay at their
+// settled values indefinitely (until a new run actually starts), so a
+// useRef-based "have I already handled this settle" guard would reset blank
+// on every single remount and re-fire for the SAME stale settled run every
+// time RunsView remounts — e.g. clicking Run for a totally different project
+// right after a previous run was cancelled would still get its async
+// refreshRuns().then() callback firing again and yanking the fresh compose
+// form back to that old cancelled run. Module state remembers it was already
+// handled across the remount.
+let lastSettledKey: string | null = null;
+
 export function RunsView({
   initialProjectId,
   runRequestSeq,
@@ -260,12 +272,11 @@ export function RunsView({
   // (paused -> resumed -> paused again, or paused -> cancelled) — a runId-only
   // guard would fire once on the first settle and then never again for that
   // run, leaving history/detail stuck showing the earlier status forever.
-  const lastSettledRef = useRef<string | null>(null);
   useEffect(() => {
     if (SETTLED_PHASES.includes(engine.phase) && engine.runId) {
       const key = `${engine.runId}:${engine.phase}`;
-      if (lastSettledRef.current === key) return;
-      lastSettledRef.current = key;
+      if (lastSettledKey === key) return;
+      lastSettledKey = key;
       const settledId = engine.runId;
       void refreshRuns().then(() => {
         // Stale by the time this resolves: the user already moved on (e.g.
@@ -279,7 +290,7 @@ export function RunsView({
       });
     }
     if (engine.phase === 'idle' || engine.phase === 'starting') {
-      lastSettledRef.current = null;
+      lastSettledKey = null;
     }
   }, [engine.phase, engine.runId, refreshRuns, reloadDetail]);
 

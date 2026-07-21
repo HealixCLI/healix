@@ -1,4 +1,5 @@
 import type { ChildProcess } from 'node:child_process';
+import { statSync } from 'node:fs';
 import { access, readFile, stat } from 'node:fs/promises';
 import { join } from 'node:path';
 import spawn from 'cross-spawn';
@@ -598,10 +599,29 @@ function errorText(result: PwResult | undefined): string {
   return '';
 }
 
+const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
+// Playwright still writes a video file when the page never repainted before
+// the context closed (a very fast test, or one that only ever saw about:blank)
+// — the result is a valid webm with a real duration but no visible content.
+// Real recorded frames push a webm well past this size even for a couple of
+// seconds of ordinary web content; empirically these blank ones land under 4KB.
+const MIN_VIDEO_BYTES = 8 * 1024;
+
+/** A video artifact whose file is implausibly small to contain any real recorded frames. */
+function isBlankVideo(path: string): boolean {
+  if (!VIDEO_EXT.test(path)) return false;
+  try {
+    return statSync(path).size < MIN_VIDEO_BYTES;
+  } catch {
+    return false; // can't verify (e.g. already cleaned up) — keep it rather than silently drop evidence
+  }
+}
+
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
   return (attachments ?? [])
     .map((a) => a.path)
-    .filter((p): p is string => typeof p === 'string' && p.length > 0);
+    .filter((p): p is string => typeof p === 'string' && p.length > 0)
+    .filter((p) => !isBlankVideo(p));
 }
 
 interface ParsedReport {

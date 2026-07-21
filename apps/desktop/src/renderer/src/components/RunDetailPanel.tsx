@@ -22,6 +22,7 @@ import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
 import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
 import { cn } from '../lib/utils';
 import {
+  artifactKind,
   artifactLeaf,
   artifactUrl,
   computeStageDurations,
@@ -63,6 +64,8 @@ export function RunDetailPanel({
   const [note, setNote] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
   const [historyCaseKey, setHistoryCaseKey] = useState<{ reqTag: string | null; title: string } | null>(null);
+  // Shared across the Results (per-row) and Media tabs so a screenshot opens the same lightbox either way.
+  const [preview, setPreview] = useState<Preview | null>(null);
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
   const triage = report?.triage ?? [];
@@ -260,6 +263,7 @@ export function RunDetailPanel({
                 mediaFolders={mediaFolders}
                 onShowMedia={showMedia}
                 onShowHistory={(row) => setHistoryCaseKey({ reqTag: row.reqTag, title: row.title })}
+                setPreview={setPreview}
               />
             </div>
           </div>
@@ -276,10 +280,13 @@ export function RunDetailPanel({
               suiteDir={suiteDir}
               runStatus={run.status}
               focusFolder={focusFolder}
+              setPreview={setPreview}
             />
           </div>
         )}
       </div>
+
+      {preview && <Lightbox preview={preview} onClose={() => setPreview(null)} />}
 
       {historyCaseKey && (
         <TestCaseHistoryDrawer
@@ -313,6 +320,19 @@ interface JoinedRow {
   error: string | null;
   description: string | null;
   details: string | null;
+  /** This test's own artifact paths (relative to the suite's test-results dir), from TestResult.artifactsJson. */
+  artifacts: string[];
+}
+
+/** TestResult.artifactsJson is a JSON array of relative paths; malformed/missing rows just have no evidence. */
+function parseArtifacts(json: string | null | undefined): string[] {
+  if (!json) return [];
+  try {
+    const parsed: unknown = JSON.parse(json);
+    return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
 }
 
 function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
@@ -331,6 +351,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
         error: r?.error ?? null,
         description: t.description,
         details: t.details,
+        artifacts: parseArtifacts(r?.artifactsJson),
       };
     });
   }
@@ -345,6 +366,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
     error: r.error,
     description: null,
     details: null,
+    artifacts: parseArtifacts(r.artifactsJson),
   }));
 }
 
@@ -442,12 +464,14 @@ function ResultsTable({
   mediaFolders,
   onShowMedia,
   onShowHistory,
+  setPreview,
 }: {
   rows: JoinedRow[];
   /** Artifact folders that contain media; drives the per-row camera button. */
   mediaFolders: string[];
   onShowMedia: (title: string) => void;
   onShowHistory: (row: JoinedRow) => void;
+  setPreview: (p: Preview | null) => void;
 }) {
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
   const toggle = (key: string): void => {
@@ -567,6 +591,7 @@ function ResultsTable({
                           {r.error}
                         </pre>
                       )}
+                      <TestCaseEvidence artifacts={r.artifacts} setPreview={setPreview} />
                     </div>
                   </TableCell>
                 </TableRow>
@@ -576,6 +601,94 @@ function ResultsTable({
         })}
       </TableBody>
     </Table>
+  );
+}
+
+/**
+ * Inline evidence for a single test row's own expanded detail — screenshots,
+ * video, and any other captured artifact (trace.zip, error-context.md, …),
+ * sourced from this test's own TestResult.artifactsJson rather than the
+ * run-wide slug-matching heuristic the Media tab uses, so it's exact
+ * regardless of outcome (passed, failed, blocked, or otherwise).
+ *
+ * Unlike the Media tab's `artifacts: string[]` (paths relative to the suite's
+ * test-results dir), these come straight from Playwright's own attachment
+ * list — already ABSOLUTE paths — so they're used as-is, with no suiteDir join.
+ */
+function TestCaseEvidence({
+  artifacts,
+  setPreview,
+}: {
+  artifacts: string[];
+  setPreview: (p: Preview | null) => void;
+}) {
+  if (artifacts.length === 0) {
+    return <p className="text-xs text-muted/70">No evidence captured for this test.</p>;
+  }
+  const images = artifacts.filter((a) => artifactKind(a) === 'image');
+  const videos = artifacts.filter((a) => artifactKind(a) === 'video');
+  const other = artifacts.filter((a) => artifactKind(a) !== 'image' && artifactKind(a) !== 'video');
+
+  return (
+    <div className="flex flex-col gap-2 border-t border-border/50 pt-2">
+      <span className="text-[11px] font-medium uppercase tracking-wide text-muted">Evidence</span>
+      {videos.length > 0 && (
+        <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
+          {videos.map((abs) => (
+            <video
+              key={abs}
+              src={artifactUrl(abs)}
+              controls
+              preload="metadata"
+              className="w-full rounded-md border border-border bg-black"
+            />
+          ))}
+        </div>
+      )}
+      {images.length > 0 && (
+        <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
+          {images.map((abs) => {
+            const src = artifactUrl(abs);
+            return (
+              <button
+                key={abs}
+                type="button"
+                onClick={() => setPreview({ src, name: artifactLeaf(abs), abs })}
+                className="group relative overflow-hidden rounded-md border border-border bg-black transition-colors hover:border-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
+                title={abs}
+              >
+                <img
+                  src={src}
+                  alt={artifactLeaf(abs)}
+                  loading="lazy"
+                  className="aspect-video w-full object-cover object-top transition-transform duration-200 group-hover:scale-[1.02]"
+                />
+              </button>
+            );
+          })}
+        </div>
+      )}
+      {other.length > 0 && (
+        <ul className="flex flex-col gap-1">
+          {other.map((abs) => (
+            <li key={abs} className="flex items-center justify-between gap-3">
+              <span className="min-w-0 truncate font-mono text-[11px] text-muted" title={abs}>
+                {artifactLeaf(abs)}
+              </span>
+              <Button
+                size="sm"
+                variant="ghost"
+                className="h-6 px-2 text-[11px]"
+                onClick={() => void window.healix.showItemInFolder(abs)}
+              >
+                <FolderOpen className="h-3 w-3" />
+                Reveal
+              </Button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -627,13 +740,14 @@ function ArtifactsGallery({
   suiteDir,
   runStatus,
   focusFolder = null,
+  setPreview,
 }: {
   artifacts: string[];
   suiteDir: string | null;
   runStatus: string;
   focusFolder?: string | null;
+  setPreview: (p: Preview | null) => void;
 }) {
-  const [preview, setPreview] = useState<Preview | null>(null);
   const groups = useMemo(() => groupArtifacts(artifacts), [artifacts]);
 
   // Scroll the focused group into view (once per focus change / mount).
@@ -772,8 +886,6 @@ function ArtifactsGallery({
           );
         })}
       </div>
-
-      {preview && <Lightbox preview={preview} onClose={() => setPreview(null)} />}
     </>
   );
 }

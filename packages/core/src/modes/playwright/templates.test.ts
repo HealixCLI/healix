@@ -2,13 +2,13 @@ import { describe, expect, it } from 'vitest';
 import { authSetupContents, mockFixtureContents, playwrightConfigContents } from './templates.js';
 
 describe('playwrightConfigContents — artifact capture policy', () => {
-  it('records a screenshot AND video for every test, pass or fail', () => {
+  it('records a screenshot, video, AND trace for every test, pass or fail', () => {
     const cfg = playwrightConfigContents();
-    // 'on' (not 'only-on-failure' / 'retain-on-failure') is load-bearing: the
-    // run detail's media gallery must have something to show for EVERY UI test.
+    // 'on' (not 'retain-on-failure' / 'only-on-failure') is load-bearing: the
+    // run detail must have full evidence to show for EVERY test, not just failures.
     expect(cfg).toContain("screenshot: 'on'");
     expect(cfg).toContain("video: 'on'");
-    expect(cfg).toContain("trace: 'retain-on-failure'");
+    expect(cfg).toContain("trace: 'on'");
   });
 
   it('declares the json/html/list reporters that produce results.json and playwright-report/', () => {

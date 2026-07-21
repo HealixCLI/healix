@@ -1,3 +1,4 @@
+import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
 import { buildReport, degradationNotes, renderReportHtml, type RunReport } from './report.js';
 import type { Project, Run } from '../storage/types.js';
@@ -202,6 +203,66 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('test-failed-1.png');
     // The full local filesystem path must never leak into the report.
     expect(html).not.toContain('C:\\runs\\r1');
+  });
+
+  it('given a reportDir, links a UI test\'s evidence (screenshot + video) relative to it', () => {
+    const runRoot = join('runs', 'r1');
+    const reportDir = join(runRoot, 'reports');
+    const testResultsDir = join(runRoot, 'suite', 'test-results', 'foo');
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: fails',
+          status: 'failed',
+          durationMs: 5,
+          error: 'boom',
+          artifacts: [
+            join(testResultsDir, 'test-failed-1.png'),
+            join(testResultsDir, 'video.webm'),
+            join(testResultsDir, 'trace.zip'),
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report, { reportDir });
+    expect(html).toContain('class="ev-thumb"');
+    expect(html).toContain('class="ev-video"');
+    expect(html).toContain('class="ev-file"');
+    expect(html).toContain('trace.zip');
+    // Links are relative to reportDir — the run's own root dir name never appears.
+    expect(html).not.toContain(runRoot);
+  });
+
+  it('given a reportDir, an API test with only a trace (no page, so no screenshot/video) still links it', () => {
+    const runRoot = join('runs', 'r2');
+    const reportDir = join(runRoot, 'reports');
+    const testResultsDir = join(runRoot, 'suite', 'test-results', 'bar');
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-2] tierC-api: rejects an unauthenticated request',
+          status: 'failed',
+          durationMs: 5,
+          error: 'expect(response.status()).toBe(401)',
+          artifacts: [join(testResultsDir, 'trace.zip')],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report, { reportDir });
+    expect(html).toContain('class="ev-file"');
+    expect(html).toContain('trace.zip');
+    expect(html).not.toContain('class="ev-thumb"');
+    expect(html).not.toContain('class="ev-video"');
   });
 
   it('renders an app-bug recommendation as prose under "Recommended fix", not a <code> test-patch block', () => {

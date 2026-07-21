@@ -2242,10 +2242,11 @@ async function finalizeReport(
     generation: degradation?.generationStats,
     coverage: degradation?.coverage ?? null,
   });
-  const reportPath = join(runDir, 'reports', 'report.json');
+  const reportsDir = join(runDir, 'reports');
+  const reportPath = join(reportsDir, 'report.json');
   try {
     await writeJson(reportPath, report);
-    await writeFile(join(runDir, 'reports', 'report.html'), renderReportHtml(report), 'utf8');
+    await writeFile(join(reportsDir, 'report.html'), renderReportHtml(report, { reportDir: reportsDir }), 'utf8');
     noteStoreOk();
     return { reportPath };
   } catch (err) {

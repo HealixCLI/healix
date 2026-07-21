@@ -85,6 +85,20 @@ let lastSeenRunRequestSeq = 0;
 // handled across the remount.
 let lastSettledKey: string | null = null;
 
+// Closes a further gap the module state above doesn't: it only stops a
+// settle already handled in a PREVIOUS mount from re-firing. It does nothing
+// for a settle that fires for the FIRST time while the user is already
+// looking at a fresh compose screen for a different project — e.g. Cancel a
+// run, then immediately click Run elsewhere before the cancellation's
+// run:done confirmation actually arrives. That confirmation still lands
+// (engine.phase/runId are lifted to App.tsx and don't care which view is
+// mounted) and would hijack the compose screen the instant it does. True
+// from the moment the user explicitly asks for a blank compose screen (Run
+// button or New run) until a new run actually starts or they explicitly pick
+// a different history row — while true, the settle effect must not
+// auto-select anything.
+let awaitingFreshRunConfig = false;
+
 export function RunsView({
   initialProjectId,
   runRequestSeq,
@@ -285,12 +299,18 @@ export function RunsView({
         // the run this callback was about. Selecting it now would yank the
         // view away from whatever the user is already looking at.
         if (engineRef.current.runId !== settledId) return;
+        // The user explicitly asked for a blank compose screen (Run/New run)
+        // and no new run has started yet to supersede that intent — this
+        // settle confirmation (e.g. for the run they just cancelled to get
+        // here) arriving late must not hijack that screen back to it.
+        if (awaitingFreshRunConfig) return;
         setSelectedRunId(settledId);
         void reloadDetail();
       });
     }
     if (engine.phase === 'idle' || engine.phase === 'starting') {
       lastSettledKey = null;
+      awaitingFreshRunConfig = false;
     }
   }, [engine.phase, engine.runId, refreshRuns, reloadDetail]);
 
@@ -464,10 +484,18 @@ export function RunsView({
   // freshly-assigned runId as the selection so the live console keeps showing.
   // Skipped for a hydrated re-attach: selectedRunId is already set to that
   // run's id by the effect that triggers hydrate() in the first place.
+  //
+  // Also gated on the run actually being live (not settled): engine.runId
+  // stays set to the LAST run indefinitely — it's only ever cleared back to
+  // null at the very start of a fresh start()/resume(), never when a run
+  // finishes/cancels/errors. Without the settled check, resetting
+  // selectedRunId to null to open a fresh compose screen (Run/New run) would
+  // immediately get overwritten right back to that old, already-settled run
+  // by this same effect.
   useEffect(() => {
-    if (!engine.runId || engine.hydrated) return;
+    if (!engine.runId || engine.hydrated || SETTLED_PHASES.includes(engine.phase)) return;
     if (selectedRunId === null) setSelectedRunId(engine.runId);
-  }, [engine.runId, engine.hydrated, selectedRunId]);
+  }, [engine.runId, engine.hydrated, engine.phase, selectedRunId]);
 
   // Viewing a selected run that isn't the live-tracked one — i.e. a genuinely
   // historical (already-run) row picked from the sidebar. The "Start a run"
@@ -492,10 +520,13 @@ export function RunsView({
    * decided: on the very first-ever visit to Runs this app session (before
    * `runs` has finished loading), that effect is still armed and would
    * otherwise fire once history loads and stomp this reset right back to the
-   * latest run — see its own comment above.
+   * latest run — see its own comment above. Sets awaitingFreshRunConfig so a
+   * late-arriving settle confirmation for a DIFFERENT, already-abandoned run
+   * (see that effect's own comment) can't hijack this screen either.
    */
   const startNewRunConfig = useCallback((): void => {
     autoSelectedOnce.current = true;
+    awaitingFreshRunConfig = true;
     setSelectedRunId(null);
     setPrd('');
     setPrdFileName(null);
@@ -531,6 +562,9 @@ export function RunsView({
             error={runsError}
             selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
             onSelect={(id) => {
+              // An explicit history pick overrides any still-pending "show me
+              // a blank compose screen" intent from a recent Run/New run click.
+              awaitingFreshRunConfig = false;
               setSelectedRunId(id);
             }}
             onRefresh={() => void refreshRuns()}

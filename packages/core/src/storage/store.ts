@@ -384,13 +384,36 @@ export class HealixStore {
   }
 
   // ---- tests + results ----
-  insertTest(test: Omit<TestCase, 'id' | 'specPath'> & { id?: string; specPath?: string | null }): TestCase {
-    const full: TestCase = { ...test, id: test.id ?? `tst_${nanoid(10)}`, specPath: test.specPath ?? null };
+  insertTest(
+    test: Omit<TestCase, 'id' | 'specPath' | 'description' | 'details'> & {
+      id?: string;
+      specPath?: string | null;
+      description?: string | null;
+      details?: string | null;
+    },
+  ): TestCase {
+    const full: TestCase = {
+      ...test,
+      id: test.id ?? `tst_${nanoid(10)}`,
+      specPath: test.specPath ?? null,
+      description: test.description ?? null,
+      details: test.details ?? null,
+    };
     this.db
       .prepare(
-        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path, description, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(full.id, full.runId, full.title, full.reqTag, full.tier, full.status, full.specPath);
+      .run(
+        full.id,
+        full.runId,
+        full.title,
+        full.reqTag,
+        full.tier,
+        full.status,
+        full.specPath,
+        full.description,
+        full.details,
+      );
     return full;
   }
 
@@ -416,14 +439,34 @@ export class HealixStore {
    * behind, silently inflating any count that sums `results` rather than
    * joining through one-row-per-test.
    */
-  insertResult(result: Omit<TestResult, 'id'> & { id?: string }): TestResult {
-    const full: TestResult = { ...result, id: result.id ?? `res_${nanoid(10)}` };
+  insertResult(
+    result: Omit<TestResult, 'id' | 'description' | 'details'> & {
+      id?: string;
+      description?: string | null;
+      details?: string | null;
+    },
+  ): TestResult {
+    const full: TestResult = {
+      ...result,
+      id: result.id ?? `res_${nanoid(10)}`,
+      description: result.description ?? null,
+      details: result.details ?? null,
+    };
     this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
-        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json) VALUES (?, ?, ?, ?, ?, ?)',
+        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(full.id, full.testId, full.status, full.durationMs, full.error, full.artifactsJson);
+      .run(
+        full.id,
+        full.testId,
+        full.status,
+        full.durationMs,
+        full.error,
+        full.artifactsJson,
+        full.description,
+        full.details,
+      );
     return full;
   }
 
@@ -431,6 +474,14 @@ export class HealixStore {
     return (
       this.db.prepare('SELECT * FROM tests WHERE run_id = ?').all(runId) as Array<Record<string, unknown>>
     ).map(rowToTest);
+  }
+
+  /** Single test row by id, e.g. to copy its description/details onto a result being persisted. */
+  getTest(id: string): TestCase | undefined {
+    const row = this.db.prepare('SELECT * FROM tests WHERE id = ?').get(id) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? rowToTest(row) : undefined;
   }
 
   /** All result rows for a run, joined through tests (results have no run_id of their own). */
@@ -589,6 +640,8 @@ function rowToTest(r: Record<string, unknown>): TestCase {
     tier: s(r.tier),
     status: s(r.status) as TestCase['status'],
     specPath: s(r.spec_path),
+    description: s(r.description),
+    details: s(r.details),
   };
 }
 
@@ -600,6 +653,8 @@ function rowToResult(r: Record<string, unknown>): TestResult {
     durationMs: n(r.duration_ms),
     error: s(r.error),
     artifactsJson: s(r.artifacts_json),
+    description: s(r.description),
+    details: s(r.details),
   };
 }
 

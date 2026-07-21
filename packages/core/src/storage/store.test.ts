@@ -70,6 +70,129 @@ describe('HealixStore schema', () => {
       expect(info.tables).toContain(table);
     }
   });
+
+  it('migrates a pre-v9 database to add description/details columns without touching existing rows', async () => {
+    // Open + migrate a fresh DB to v9+, insert a row the "old" way, then verify
+    // an independent connection sees the new nullable columns and the row's
+    // pre-existing data is untouched.
+    const s = await store();
+    const project = s.createProject({ name: 'migration-project', baseUrl: 'https://migration.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'legacy row',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+
+    const info = await dbInfo();
+    expect(info.version).toBeGreaterThanOrEqual(9);
+
+    const db = new DatabaseSync(dbPath());
+    try {
+      const cols = (db.prepare('PRAGMA table_info(tests)').all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      );
+      expect(cols).toContain('description');
+      expect(cols).toContain('details');
+      const resultCols = (db.prepare('PRAGMA table_info(results)').all() as Array<{ name: string }>).map(
+        (c) => c.name,
+      );
+      expect(resultCols).toContain('description');
+      expect(resultCols).toContain('details');
+
+      const row = db.prepare('SELECT * FROM tests WHERE id = ?').get(test.id) as Record<string, unknown>;
+      expect(row.title).toBe('legacy row');
+      expect(row.description).toBeNull();
+      expect(row.details).toBeNull();
+    } finally {
+      db.close();
+    }
+  });
+});
+
+describe('TestCase/TestResult description and details', () => {
+  it('round-trips description/details through insertTest/insertResult and the row mappers', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'desc-project', baseUrl: 'https://desc.test' });
+    const run = s.createRun(project.id);
+
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'Login — positive: user submits valid credentials',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'pending',
+      description: 'user submits valid credentials',
+      details: 'Verify the login flow authenticates a user and redirects to the dashboard.',
+    });
+    expect(test.description).toBe('user submits valid credentials');
+    expect(test.details).toBe('Verify the login flow authenticates a user and redirects to the dashboard.');
+
+    const result = s.insertResult({
+      testId: test.id,
+      status: 'passed',
+      durationMs: 120,
+      error: null,
+      artifactsJson: null,
+      description: test.description,
+      details: test.details,
+    });
+    expect(result.description).toBe(test.description);
+    expect(result.details).toBe(test.details);
+
+    // Round-trip via listTests/getTest/listResults (which run rows through rowToTest/rowToResult).
+    const [listed] = s.listTests(run.id);
+    expect(listed?.description).toBe('user submits valid credentials');
+    expect(listed?.details).toBe(
+      'Verify the login flow authenticates a user and redirects to the dashboard.',
+    );
+
+    const fetched = s.getTest(test.id);
+    expect(fetched?.description).toBe('user submits valid credentials');
+    expect(fetched?.details).toBe(
+      'Verify the login flow authenticates a user and redirects to the dashboard.',
+    );
+
+    const [listedResult] = s.listResults(run.id);
+    expect(listedResult?.description).toBe(test.description);
+    expect(listedResult?.details).toBe(test.details);
+  });
+
+  it('defaults description/details to null when omitted', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'desc-null-project', baseUrl: 'https://desc-null.test' });
+    const run = s.createRun(project.id);
+
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'no scenario data',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+    expect(test.description).toBeNull();
+    expect(test.details).toBeNull();
+
+    const result = s.insertResult({
+      testId: test.id,
+      status: 'passed',
+      durationMs: null,
+      error: null,
+      artifactsJson: null,
+    });
+    expect(result.description).toBeNull();
+    expect(result.details).toBeNull();
+
+    expect(s.getTest(test.id)?.description).toBeNull();
+    expect(s.getTest(test.id)?.details).toBeNull();
+  });
+
+  it('getTest returns undefined for an unknown id', async () => {
+    const s = await store();
+    expect(s.getTest('tst_does-not-exist')).toBeUndefined();
+  });
 });
 
 describe('deleteProject cascade', () => {

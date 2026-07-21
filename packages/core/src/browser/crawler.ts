@@ -1,4 +1,4 @@
-import { attemptLogin } from './login.js';
+import { attemptLogin, attemptLoginViaToggle } from './login.js';
 import type { BrowserSurface, CapturedNetworkEvent, DomSnapshot, InteractiveElement } from './types.js';
 
 export interface CrawledRoute {
@@ -10,6 +10,12 @@ export interface CrawledRoute {
   hasPasswordField: boolean;
   /** Whether this route was reached before or after a verified login. */
   role: 'anonymous' | 'authenticated';
+  /** A same-page click selector discovered during click-probing that reveals a
+   * login-shaped view (password + username field) without changing the URL —
+   * set only when the reveal happened on this route. Used by
+   * `attemptLoginViaToggle` to reproduce this state without relying on
+   * client-side toggle state surviving a fresh navigation. */
+  loginToggleSelector?: string;
   /** XHR/fetch traffic observed while this route settled (goto + snapshot). Not
    * perfectly attributed — a slow response from this route can land during the
    * next route's drain window — but sufficient as endpoint/status/body ground
@@ -107,6 +113,10 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
  */
 const UNSAFE_CLICK_TEXT_RE =
   /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|register|sign up|add to cart|clear|cancel/i;
+/** An accessible name that reads as a login/sign-in action — used both to score crawled login
+ * candidates (see `scoreLoginCandidates`) and, during click-probing, to recognize a same-URL
+ * toggle that reveals a login view (see `discoverClickRoutes`). */
+const LOGIN_TEXT_RE = /log[- ]?in|sign[- ]?in|prihl[aá]si/i;
 /** Cap on click candidates considered per page, before the per-visit MAX_CLICKS_PER_PAGE slice. */
 const CLICK_CANDIDATES_PER_PAGE = 8;
 /** Click-probe candidates actually clicked on a single page in one visit. */
@@ -128,6 +138,10 @@ function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
 export interface ClickDiscoveryResult {
   attempted: number;
   discoveredUrls: string[];
+  /** Selectors of in-page candidates whose click revealed a login-shaped view
+   * (matches LOGIN_TEXT_RE by name, and a password field is present afterward)
+   * without navigating — see `discoverClickRoutes`. */
+  loginToggleSelectors: string[];
 }
 
 /**
@@ -139,7 +153,14 @@ export interface ClickDiscoveryResult {
  * or with a name matching UNSAFE_CLICK_TEXT_RE. After each click, resets to
  * `originalUrl` (if the click navigated) or presses Escape (if it likely just
  * opened a menu/dropdown in place) before trying the next candidate, so the
- * page is always back in a known state for the caller.
+ * page is always back in a known state for the caller. A same-URL click whose
+ * candidate name reads as login (LOGIN_TEXT_RE) and reveals a password field
+ * is additionally recorded as a login-toggle selector: some SPAs flip between
+ * their register and login views as client-side state without changing the
+ * route, so the route-changed check alone would silently discard that login
+ * view (it would fall through to the "menu/dropdown" branch and get
+ * Escape-reverted) — leaving every login attempt to wrongly fill in the
+ * registration form instead (the exact bug this guards against).
  */
 async function discoverClickRoutes(
   browser: BrowserSurface,
@@ -150,6 +171,7 @@ async function discoverClickRoutes(
   const originalUrl = snapshot.url;
   const candidates = extractClickCandidates(snapshot).slice(0, Math.max(0, maxClicks));
   const discoveredUrls: string[] = [];
+  const loginToggleSelectors: string[] = [];
   let attempted = 0;
 
   for (const candidate of candidates) {
@@ -161,6 +183,9 @@ async function discoverClickRoutes(
         if (sameOrigin(after.url, origin)) discoveredUrls.push(after.url);
         discoveredUrls.push(...extractLinks(after, origin));
         await browser.goto(originalUrl).catch(() => undefined);
+      } else if (LOGIN_TEXT_RE.test(candidate.name) && hasPasswordField(after)) {
+        loginToggleSelectors.push(candidate.selector);
+        await browser.pressKey('Escape').catch(() => undefined);
       } else {
         // Click likely opened a menu/dropdown in place rather than navigating
         // — collect any newly revealed anchors, then close it.
@@ -173,7 +198,7 @@ async function discoverClickRoutes(
     }
   }
 
-  return { attempted, discoveredUrls };
+  return { attempted, discoveredUrls, loginToggleSelectors };
 }
 
 /** A stable per-route signature used to detect a single-shell SPA (every route looks identical). */
@@ -340,9 +365,12 @@ export async function crawl(
     if (remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD) {
       const maxClicks = Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes);
       const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks).catch(
-        (): ClickDiscoveryResult => ({ attempted: 0, discoveredUrls: [] }),
+        (): ClickDiscoveryResult => ({ attempted: 0, discoveredUrls: [], loginToggleSelectors: [] }),
       );
       remainingClickProbes -= clickResult.attempted;
+      if (clickResult.loginToggleSelectors.length > 0) {
+        routes[routes.length - 1].loginToggleSelector = clickResult.loginToggleSelectors[0];
+      }
       for (const discovered of clickResult.discoveredUrls) {
         const norm = normalizeUrl(discovered);
         if (!requested.has(norm) && !queued.has(norm)) {
@@ -389,8 +417,12 @@ const SIGNUP_URL_HINT_RE = /\bregister\b|\bsign-?up\b/i;
 
 /**
  * Picks the best login candidate among password-bearing routes: a route whose
- * URL reads as login wins outright; otherwise the first route that doesn't
- * read as registration/signup; otherwise (every candidate looks like
+ * URL reads as login wins outright; otherwise a route with a discovered
+ * same-URL login toggle (see `CrawledRoute.loginToggleSelector`) — stronger
+ * evidence of a genuine login view than merely "doesn't look like signup",
+ * which is exactly what misfires when the only password-bearing route is a
+ * register page with an in-form login toggle; otherwise the first route that
+ * doesn't read as registration/signup; otherwise (every candidate looks like
  * signup, or none has a URL hint at all) the first one found, same as before.
  * Login and registration pages commonly both carry a password field, so
  * "has a password field" alone can't disambiguate them — the URL hint
@@ -400,6 +432,7 @@ function pickLoginCandidate(routes: CrawledRoute[]): CrawledRoute | undefined {
   const passwordBearing = routes.filter((r) => r.hasPasswordField);
   return (
     passwordBearing.find((r) => LOGIN_URL_HINT_RE.test(r.url)) ??
+    routes.find((r) => r.loginToggleSelector) ??
     passwordBearing.find((r) => !SIGNUP_URL_HINT_RE.test(r.url)) ??
     passwordBearing[0]
   );
@@ -436,7 +469,15 @@ export async function crawlWithAuth(
     };
   }
 
-  const attempt = await attemptLogin(browser, candidate.url, creds.username, creds.password);
+  const attempt = candidate.loginToggleSelector
+    ? await attemptLoginViaToggle(
+        browser,
+        candidate.url,
+        candidate.loginToggleSelector,
+        creds.username,
+        creds.password,
+      )
+    : await attemptLogin(browser, candidate.url, creds.username, creds.password);
   if (!attempt.ok) {
     return {
       ...anonymous,
@@ -523,7 +564,6 @@ export interface LoginCandidate {
   source: 'crawled' | 'common-path';
 }
 
-const LOGIN_TEXT_RE = /log[- ]?in|sign[- ]?in|prihl[aá]si/i;
 /** Bounded last-resort fallback tried only when the crawl found no confident candidate. */
 const COMMON_LOGIN_PATHS = ['/login', '/signin', '/auth/login'];
 /** Minimum score treated as "confident" (crawled candidates only — see scoreLoginCandidates). */

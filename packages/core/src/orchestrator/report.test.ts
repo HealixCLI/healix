@@ -636,4 +636,36 @@ describe('report — step-by-step breakdown, for passed tests too', () => {
     expect(html).toContain('2 actions');
     expect(html).toContain('Fill &quot;seller@shop.test&quot; locator(&#39;#email&#39;)');
   });
+
+  it('marks each individual step as passed or failed, not just the test overall', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-5] negative: rejects a wrong password',
+          status: 'failed',
+          durationMs: 500,
+          error: 'expect(locator).toBeVisible() failed',
+          steps: [
+            { title: 'Open the sign-in page', durationMs: 100 },
+            { title: 'Enter credentials', durationMs: 80 },
+            {
+              title: 'Verify an error message is shown',
+              durationMs: 300,
+              error: 'expect(locator).toBeVisible() failed',
+            },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    // Two ok marks (the passed steps) and one fail mark (the failed step) —
+    // matching the actual rendered usage, not the CSS rule declarations.
+    expect(html.match(/class="step-mark step-mark-ok"/g)?.length).toBe(2);
+    expect(html.match(/class="step-mark step-mark-fail"/g)?.length).toBe(1);
+  });
 });

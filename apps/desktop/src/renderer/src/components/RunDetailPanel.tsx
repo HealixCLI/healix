@@ -3,6 +3,7 @@ import type { ReactNode } from 'react';
 import type { AgentEvent, TestCase, TestResult, TestStatus } from '@healix/core';
 import {
   Camera,
+  Check,
   ChevronDown,
   ChevronRight,
   FileText,
@@ -670,26 +671,33 @@ function TestCaseSteps({ steps }: { steps: StepItem[] }) {
  */
 function StepListItem({ step }: { step: StepItem }) {
   return (
-    <li className={cn(step.error ? 'text-err' : 'text-muted')}>
-      <span className={step.error ? '' : 'text-fg'}>{step.title}</span>{' '}
-      <span className="text-[11px] text-muted/70">{formatDuration(step.durationMs)}</span>
-      {step.error && (
-        <div className="mt-0.5 truncate font-mono text-[11px] text-err/80" title={step.error}>
-          {step.error.split('\n')[0]}
-        </div>
+    <li className={cn('flex items-start gap-1', step.error ? 'text-err' : 'text-muted')}>
+      {step.error ? (
+        <X className="mt-0.5 h-3 w-3 shrink-0 text-err" aria-label="Failed" />
+      ) : (
+        <Check className="mt-0.5 h-3 w-3 shrink-0 text-ok" aria-label="Passed" />
       )}
-      {step.steps && step.steps.length > 0 && (
-        <details className="mt-0.5">
-          <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-fg">
-            {step.steps.length} action{step.steps.length === 1 ? '' : 's'}
-          </summary>
-          <ol className="mt-1 flex flex-col gap-1 border-l border-border/40 pl-2.5 text-[11px]">
-            {step.steps.map((s, i) => (
-              <StepListItem key={i} step={s} />
-            ))}
-          </ol>
-        </details>
-      )}
+      <span className="min-w-0 flex-1">
+        <span className={step.error ? '' : 'text-fg'}>{step.title}</span>{' '}
+        <span className="text-[11px] text-muted/70">{formatDuration(step.durationMs)}</span>
+        {step.error && (
+          <div className="mt-0.5 truncate font-mono text-[11px] text-err/80" title={step.error}>
+            {step.error.split('\n')[0]}
+          </div>
+        )}
+        {step.steps && step.steps.length > 0 && (
+          <details className="mt-0.5">
+            <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-fg">
+              {step.steps.length} action{step.steps.length === 1 ? '' : 's'}
+            </summary>
+            <ol className="mt-1 flex flex-col gap-1 border-l border-border/40 pl-2.5 text-[11px]">
+              {step.steps.map((s, i) => (
+                <StepListItem key={i} step={s} />
+              ))}
+            </ol>
+          </details>
+        )}
+      </span>
     </li>
   );
 }

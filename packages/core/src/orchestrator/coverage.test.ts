@@ -156,12 +156,8 @@ describe('mergeExecOutcomes', () => {
   });
 
   it('re-execution of the SAME spec file still dedupes (resume-replay case)', () => {
-    const a = outcome([
-      { title: '[REQ:REQ-1] positive: loads', status: 'failed', specFile: 'spec-a.ts' },
-    ]);
-    const b = outcome([
-      { title: '[REQ:REQ-1] positive: loads', status: 'passed', specFile: 'spec-a.ts' },
-    ]);
+    const a = outcome([{ title: '[REQ:REQ-1] positive: loads', status: 'failed', specFile: 'spec-a.ts' }]);
+    const b = outcome([{ title: '[REQ:REQ-1] positive: loads', status: 'passed', specFile: 'spec-a.ts' }]);
 
     const merged = mergeExecOutcomes(a, b);
 

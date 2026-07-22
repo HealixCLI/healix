@@ -841,7 +841,9 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
 
-  const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : ACTION_HIGHLIGHTER_IMPORT_PATH;
+  const importSource = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
   const mockNote = ctx.mockExternalDependencies
     ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario.${formatMockContent(ctx)}`
     : '';
@@ -923,7 +925,9 @@ async function generateOne(
   const tier = resolveTier(item.tier);
   const reqTag = item.reqTag ?? item.id;
   const slug = slugify(item.title || item.id);
-  const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : ACTION_HIGHLIGHTER_IMPORT_PATH;
+  const extraAllowedImport = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
 
   // Carried across attempts: the note explaining WHY the last output was
   // rejected (fed back into the retry prompt) and the last violation list

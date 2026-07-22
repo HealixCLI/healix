@@ -821,10 +821,7 @@ function toExecStepItem(s: RawStep): ExecStepItem | null {
  * Keyed by title (same key parseReport groups results by); a retried test's
  * LAST attempt's steps win, since that's the outcome that's actually reported.
  */
-async function readStepsByTitle(
-  projectDir: string,
-  startedAt: number,
-): Promise<Map<string, ExecStepItem[]>> {
+async function readStepsByTitle(projectDir: string, startedAt: number): Promise<Map<string, ExecStepItem[]>> {
   const byTitle = new Map<string, ExecStepItem[]>();
   try {
     const candidate = join(projectDir, 'steps.json');

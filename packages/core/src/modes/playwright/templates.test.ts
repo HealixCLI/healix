@@ -69,13 +69,13 @@ describe('stepsReporterContents', () => {
     expect(src).toContain("'expect'");
   });
 
-  it('strips ANSI color codes from a step error — verified live against a real failing step\'s raw message', () => {
+  it("strips ANSI color codes from a step error — verified live against a real failing step's raw message", () => {
     const src = stepsReporterContents();
     expect(src).toContain('stripAnsi(s.error.message');
     expect(src).toContain('ANSI_RE');
   });
 
-  it('nests a test.step task\'s raw pw:api/expect actions underneath it, not flattened alongside it', () => {
+  it("nests a test.step task's raw pw:api/expect actions underneath it, not flattened alongside it", () => {
     const src = stepsReporterContents();
     // A test.step wrapper's own .steps children are captured as nested
     // entries; a bare pw:api/expect step (no wrapper) gets no children of

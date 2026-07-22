@@ -2234,7 +2234,19 @@ function persistResults(
         (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
         stableKey(undefined, s.title) === stableKey(undefined, r.title),
     );
-    const base = matched ? stableKey(tagFromTitle ?? matched.reqTag, matched.title) : null;
+    // registerSpecRows keyed every row purely off the plan item's own reqTag
+    // (`req:<tag>#<i>` — see stableKey), so the title's own "[REQ:<tag>]" is
+    // ALREADY enough to rebuild that key. Deriving `base` from `matched`
+    // instead (as before) made positional matching depend on `specs.find()`
+    // succeeding first — any mismatch between THIS call's `specs` and the
+    // original GENERATE-time list (a narrower/stale batch, a validation
+    // rewrite, ...) silently defeated matching for an otherwise-findable row,
+    // forking a same-titled orphan instead of reusing the one already reserved.
+    const base = tagFromTitle
+      ? stableKey(tagFromTitle, r.title)
+      : matched
+        ? stableKey(matched.reqTag, matched.title)
+        : null;
 
     let testId: string | undefined;
     if (base) {
@@ -2244,6 +2256,14 @@ function persistResults(
       testId =
         testIdByKey.get(`${base}#${scenarioIndex}`) ??
         (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
+      // The exact positional slot missed (e.g. results arrived in a different
+      // order than registerSpecRows assumed) — before minting a brand-new,
+      // metadata-less row below, claim any row GENERATE already registered
+      // for this reqTag that's still awaiting its result. This is what a
+      // correctly-ordered match would have found anyway; skipping it is what
+      // used to silently fork one reqTag into two rows sharing the same
+      // title, one fully populated and one orphaned (null tier/description).
+      if (!testId) testId = findPendingSlot(store, testIdByKey, base);
       if (testId) store.updateTestTitle(testId, r.title);
     }
     if (!testId) {
@@ -2324,6 +2344,28 @@ function stableKey(reqTag: string | null | undefined, title: string): string {
   const tag = reqTag?.trim();
   if (tag && tag.length > 0) return `req:${tag}`;
   return `title:${title.trim().toLowerCase().replace(/\s+/g, ' ')}`;
+}
+
+/**
+ * Last resort before persistResults would otherwise mint an orphan row: scan
+ * this reqTag's registered `${base}#N` slots for one still sitting at
+ * 'pending' (i.e. GENERATE reserved it but no result has claimed it yet) and
+ * hand that back instead. Positional matching normally finds the right slot
+ * on its own; this only fires when a result's encounter order didn't line up
+ * with registration order, and it's what stops that mismatch from forking a
+ * reqTag into two same-titled rows — one real, one metadata-less.
+ */
+function findPendingSlot(
+  store: HealixStore,
+  testIdByKey: Map<string, string>,
+  base: string,
+): string | undefined {
+  const prefix = `${base}#`;
+  for (const [key, id] of testIdByKey) {
+    if (!key.startsWith(prefix)) continue;
+    if (store.getTest(id)?.status === 'pending') return id;
+  }
+  return undefined;
 }
 
 /**

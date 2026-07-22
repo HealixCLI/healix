@@ -338,7 +338,17 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   // Persisted TestCase rows are also keyed by title (the same title a result
   // row carries once updateTestTitle has run) so the Results table can show
   // the scenario's description/intent without needing testId on ExecResultItem.
-  const testByTitle = new Map<string, TestCase>(tests.map((t) => [t.title, t]));
+  // Two rows can end up sharing a title (a persistResults matching miss forks
+  // a duplicate, metadata-less row alongside the real one — see orchestrator/
+  // index.ts's persistResults) — when that happens, prefer whichever row
+  // actually carries its GENERATE-time metadata over a later, emptier one.
+  const testByTitle = new Map<string, TestCase>();
+  for (const t of tests) {
+    const existing = testByTitle.get(t.title);
+    if (!existing || (existing.specPath == null && t.specPath != null)) {
+      testByTitle.set(t.title, t);
+    }
+  }
 
   const resultRows = (outcome?.results ?? [])
     .map((r) => {

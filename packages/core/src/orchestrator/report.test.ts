@@ -447,6 +447,50 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('Verify the login flow authenticates a user and redirects to the dashboard.');
   });
 
+  it('prefers the well-formed TestCase row over a metadata-less duplicate sharing the same title', () => {
+    // Reproduces a persistResults matching miss: the real, GENERATE-time row
+    // (specPath/tier/description set) and an orphan fallback-insert row (all
+    // of that null) end up with the exact same title. The report must not
+    // silently surface the emptier one just because it comes later in `tests`.
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: '[REQ:pli_1] positive: succeeds with valid input', status: 'failed', durationMs: 10 },
+      ],
+    };
+    const tests: TestCase[] = [
+      {
+        id: 'tst_real',
+        runId: run.id,
+        title: '[REQ:pli_1] positive: succeeds with valid input',
+        reqTag: 'pli_1',
+        tier: 'tierA-public',
+        status: 'flaky',
+        specPath: 'tests/tierA-public/example.spec.ts',
+        description: 'Navigate and assert the heading is visible',
+        details: 'Verify the page renders correctly.',
+      },
+      {
+        id: 'tst_orphan',
+        runId: run.id,
+        title: '[REQ:pli_1] positive: succeeds with valid input',
+        reqTag: 'pli_1',
+        tier: null,
+        status: 'failed',
+        specPath: null,
+        description: null,
+        details: null,
+      },
+    ];
+    const report = buildReport({ run, project, plan, outcome, triage: [], tests });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Navigate and assert the heading is visible');
+    expect(html).toContain('Verify the page renders correctly.');
+  });
+
   it('renders an empty description cell (no crash) when no TestCase row matches the result title', () => {
     const outcome: ExecOutcome = {
       passed: 1,

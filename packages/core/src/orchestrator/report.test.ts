@@ -457,7 +457,9 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
-      results: [{ title: '[REQ:pli_1] positive: succeeds with valid input', status: 'failed', durationMs: 10 }],
+      results: [
+        { title: '[REQ:pli_1] positive: succeeds with valid input', status: 'failed', durationMs: 10 },
+      ],
     };
     const tests: TestCase[] = [
       {

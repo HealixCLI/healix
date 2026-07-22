@@ -2151,7 +2151,7 @@ export async function runPlanPhase(
  * scenarios to be emitted as one test() each, in the same order they were
  * planned, so Playwright's report preserves that order too.
  */
-function registerSpecRows(
+export function registerSpecRows(
   store: HealixStore,
   runId: string,
   projectDir: string,
@@ -2211,7 +2211,7 @@ function registerSpecRows(
  * scenarios were registered for (unexpected but not fatal), gets its own
  * fallback row keyed by its own title so it's still recorded exactly once.
  */
-function persistResults(
+export function persistResults(
   store: HealixStore,
   runId: string,
   specs: GeneratedSpec[],
@@ -2234,7 +2234,19 @@ function persistResults(
         (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
         stableKey(undefined, s.title) === stableKey(undefined, r.title),
     );
-    const base = matched ? stableKey(tagFromTitle ?? matched.reqTag, matched.title) : null;
+    // stableKey ignores title whenever a reqTag is present, so tagFromTitle
+    // alone is enough to rebuild the SAME key registerSpecRows used — gating
+    // this on `matched` too meant a result whose spec object couldn't be
+    // found in THIS call's `specs` list (e.g. persistResults invoked once per
+    // tier with only that tier's own specs, while `outcome.results` — or a
+    // stray unfiltered Playwright invocation — carried a result for another
+    // tier's reqTag) fell through to the fallback insert below even though
+    // its real pre-registered row (with the correct tier/specPath) already
+    // existed, producing a phantom tier:null duplicate row and inflating the
+    // Results tab's count past report.html's (see coverage.ts's
+    // mergeExecOutcomes, which already dedupes by reqTag on the report side).
+    const reqTag = tagFromTitle ?? matched?.reqTag ?? null;
+    const base = reqTag ? stableKey(reqTag, matched?.title ?? r.title) : null;
 
     let testId: string | undefined;
     if (base) {

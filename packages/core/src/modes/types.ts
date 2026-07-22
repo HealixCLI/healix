@@ -217,6 +217,16 @@ export interface ExecResultItem {
   artifacts?: string[];
   /** Step-by-step breakdown for this outcome, present for both passed and failed tests. Absent for older suites without the steps reporter. */
   steps?: ExecStepItem[];
+  /**
+   * The spec file this result came from (relative path, as reported by the
+   * test runner) — when present, gives mergeExecOutcomes (coverage.ts) a
+   * stable identity independent of title text, so two distinct generated
+   * scenarios that coincidentally share wording (e.g. across gap-fill
+   * iterations) aren't mistaken for the same re-executed test. Optional:
+   * absent for synthetic/fallback result items that were never tied to a
+   * real spec file.
+   */
+  specFile?: string;
 }
 
 export interface ExecOutcome {

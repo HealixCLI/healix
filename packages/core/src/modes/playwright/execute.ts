@@ -558,11 +558,18 @@ export function findAuthSetupOutcome(report: PwReport): { failed: boolean; error
       }
     }
   };
-  const walk = (suite: PwSuite): void => {
-    for (const spec of suite.specs ?? []) visitSpec(spec, suite.file);
-    for (const child of suite.suites ?? []) walk(child);
+  // Playwright's JSON reporter only sets `file` on the outermost per-file
+  // suite — a nested test.describe() block (exactly what generated specs use)
+  // has no `file` of its own. Inherit the nearest ancestor's file rather than
+  // passing only the immediate parent's (usually-undefined, for a nested
+  // suite) `file` down — otherwise specs living inside a describe() block
+  // silently lose their file identity.
+  const walk = (suite: PwSuite, inheritedFile: string | undefined): void => {
+    const suiteFile = suite.file ?? inheritedFile;
+    for (const spec of suite.specs ?? []) visitSpec(spec, suiteFile);
+    for (const child of suite.suites ?? []) walk(child, suiteFile);
   };
-  for (const suite of report.suites ?? []) walk(suite);
+  for (const suite of report.suites ?? []) walk(suite, undefined);
   return { failed, error };
 }
 
@@ -725,6 +732,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       durationMs: totalDuration || undefined,
       error: worstError || undefined,
       artifacts: artifacts.length > 0 ? artifacts : undefined,
+      specFile: spec.file ?? suiteFile,
     };
     results.push(item);
 
@@ -748,13 +756,20 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
     }
   };
 
-  const walk = (suite: PwSuite, parentTitle: string): void => {
+  // Same reasoning as findAuthSetupOutcome's walk() above: a nested
+  // test.describe() suite (what every generated spec uses) has no `file` of
+  // its own in Playwright's JSON reporter — inherit the nearest ancestor's
+  // file instead of only ever passing the immediate parent's (often
+  // undefined) one down, so specFile below is populated reliably regardless
+  // of how deeply nested the spec's suite is.
+  const walk = (suite: PwSuite, parentTitle: string, inheritedFile: string | undefined): void => {
     const suiteTitle = parentTitle ? `${parentTitle} > ${suite.title ?? ''}` : (suite.title ?? '');
-    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle, suite.file);
-    for (const child of suite.suites ?? []) walk(child, suiteTitle);
+    const suiteFile = suite.file ?? inheritedFile;
+    for (const spec of suite.specs ?? []) processSpec(spec, suiteTitle, suiteFile);
+    for (const child of suite.suites ?? []) walk(child, suiteTitle, suiteFile);
   };
 
-  for (const suite of report.suites ?? []) walk(suite, '');
+  for (const suite of report.suites ?? []) walk(suite, '', undefined);
   return { results, passed, failed, blocked, flaky };
 }
 

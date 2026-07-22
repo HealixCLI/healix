@@ -123,6 +123,11 @@ function migrate(db: DatabaseSync): void {
     ensureColumn(db, 'tests', 'details', 'TEXT');
     ensureColumn(db, 'results', 'description', 'TEXT');
     ensureColumn(db, 'results', 'details', 'TEXT');
+    // v10: steps_json — per-test action/assertion breakdown (click, fill,
+    // navigate, assert...) captured by the custom Playwright reporter (see
+    // templates.ts's stepsReporterContents()), present for both passed and
+    // failed tests, not just failures.
+    ensureColumn(db, 'results', 'steps_json', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

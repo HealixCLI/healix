@@ -281,9 +281,20 @@ export function findForbiddenApis(source: string, extraAllowedImport?: string): 
  * Relative import path (constant across all specs, which always land two
  * directories deep at tests/<tier>/<slug>.spec.ts) to the Healix-authored mock
  * fixture — see scaffold.ts's mockFixtureContents(). Used in place of
- * '@playwright/test' when mocking is enabled for the run.
+ * ACTION_HIGHLIGHTER_IMPORT_PATH when mocking is enabled for the run (the mock
+ * fixture itself chains on top of the highlighter, so both are always active).
  */
 export const MOCK_FIXTURE_IMPORT_PATH = '../../fixtures/mock.fixture';
+
+/**
+ * Relative import path to the Healix-authored action-highlighter fixture —
+ * see templates.ts's actionHighlighterFixtureContents(). This is the DEFAULT
+ * import source for every generated spec (mocking-enabled runs use
+ * MOCK_FIXTURE_IMPORT_PATH instead, which itself imports from here) — no spec
+ * ever imports '@playwright/test' directly anymore, so every recorded video
+ * gets the visual action highlighter regardless of mocking.
+ */
+export const ACTION_HIGHLIGHTER_IMPORT_PATH = '../../fixtures/action-highlighter';
 
 export function looksLikePlaywrightSpec(source: string, extraAllowedImport?: string): boolean {
   const importsTest =
@@ -830,7 +841,9 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
 
-  const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : '@playwright/test';
+  const importSource = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
   const mockNote = ctx.mockExternalDependencies
     ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario.${formatMockContent(ctx)}`
     : '';
@@ -849,6 +862,12 @@ Requirements:
   This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
+- Wrap each meaningful action or assertion group in test.step('<clear, plain-English description>', async () => { ... }),
+  e.g. test.step('Enter a valid email and password', async () => { ... }) or
+  test.step('Verify the error message is shown', async () => { ... }) — write the description the way a
+  human tester would narrate what they're doing, NOT a restatement of the code (not "Fill input" or
+  "Click button"). This becomes the step-by-step breakdown shown in the run report; a test with no
+  test.step(...) wrapping still passes, but only Playwright's own generic action log appears instead.
 - For a negative/invalid-input scenario, do NOT fill invalid data and then click a submit-like
   control assuming the click succeeds and a validation message appears afterward — many real apps
   correctly disable that control on invalid input, and clicking a disabled control hangs until
@@ -906,7 +925,9 @@ async function generateOne(
   const tier = resolveTier(item.tier);
   const reqTag = item.reqTag ?? item.id;
   const slug = slugify(item.title || item.id);
-  const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : undefined;
+  const extraAllowedImport = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
 
   // Carried across attempts: the note explaining WHY the last output was
   // rejected (fed back into the retry prompt) and the last violation list

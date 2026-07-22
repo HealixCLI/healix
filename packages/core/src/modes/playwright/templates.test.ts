@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { authSetupContents, mockFixtureContents, playwrightConfigContents } from './templates.js';
+import {
+  actionHighlighterFixtureContents,
+  authSetupContents,
+  mockFixtureContents,
+  playwrightConfigContents,
+  stepsReporterContents,
+} from './templates.js';
 
 describe('playwrightConfigContents — artifact capture policy', () => {
   it('records a screenshot, video, AND trace for every test, pass or fail', () => {
@@ -34,12 +40,59 @@ describe('playwrightConfigContents — artifact capture policy', () => {
   });
 });
 
+describe('actionHighlighterFixtureContents', () => {
+  it('injects a passive, event-driven highlighter via addInitScript — no wrapping of Locator methods', () => {
+    const src = actionHighlighterFixtureContents();
+    expect(src).toContain("from '@playwright/test'");
+    expect(src).toContain('page.addInitScript(healixActionHighlighter)');
+    expect(src).toContain('export { expect };');
+    // Reacts to real DOM events Playwright's own actions already dispatch —
+    // never wraps click()/fill()/etc., since Locator isn't an exported class.
+    for (const evt of ['mousemove', 'pointerdown', 'focusin', 'scroll']) {
+      expect(src).toContain(`'${evt}'`);
+    }
+    expect(src.match(/addEventListener/g)?.length ?? 0).toBeGreaterThanOrEqual(5);
+  });
+
+  it('never calls waitForTimeout or sleeps — highlighting must add no artificial delay to the actual run', () => {
+    const src = actionHighlighterFixtureContents();
+    expect(src).not.toContain('waitForTimeout');
+    expect(src).not.toContain('slowMo');
+  });
+});
+
+describe('stepsReporterContents', () => {
+  it('keeps test.step (human-authored step names) alongside pw:api/expect as a fallback', () => {
+    const src = stepsReporterContents();
+    expect(src).toContain("'test.step'");
+    expect(src).toContain("'pw:api'");
+    expect(src).toContain("'expect'");
+  });
+
+  it("strips ANSI color codes from a step error — verified live against a real failing step's raw message", () => {
+    const src = stepsReporterContents();
+    expect(src).toContain('stripAnsi(s.error.message');
+    expect(src).toContain('ANSI_RE');
+  });
+
+  it("nests a test.step task's raw pw:api/expect actions underneath it, not flattened alongside it", () => {
+    const src = stepsReporterContents();
+    // A test.step wrapper's own .steps children are captured as nested
+    // entries; a bare pw:api/expect step (no wrapper) gets no children of
+    // its own — see toStepItem's category check.
+    expect(src).toContain("s.category === 'test.step'");
+    expect(src).toContain('.map(toStepItem)');
+  });
+});
+
 describe('mockFixtureContents', () => {
-  it('embeds the given routes and re-exports test/expect from @playwright/test', () => {
+  it('embeds the given routes and re-exports test/expect from the action-highlighter fixture', () => {
     const src = mockFixtureContents([
       { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
     ]);
-    expect(src).toContain("from '@playwright/test'");
+    // Chains on top of the highlighter (not '@playwright/test' directly) so a
+    // mocked run's recorded video still gets the visual action highlighter.
+    expect(src).toContain("from './action-highlighter.js'");
     expect(src).toContain('"id": "pkg:twilio"');
     expect(src).toContain('"api.twilio.com"');
     expect(src).toContain('page.route(');
@@ -63,10 +116,20 @@ describe('authSetupContents — locale-aware login fixture', () => {
     expect(fixture).toContain('prihl');
   });
 
-  it('clicks through a login-reveal control before searching for the form when no email field is visible', () => {
+  it('clicks through a login-reveal control before searching for the form when no identifier field is visible', () => {
     const fixture = authSetupContents();
-    expect(fixture).toContain('hasEmailField');
+    expect(fixture).toContain('hasIdentifierField');
     expect(fixture).toContain('submitButtonLocator(page, loginRevealRe)');
+  });
+
+  it('matches a plain "Username" field, not just "email" — a real timeout-with-no-selector-context bug found live', () => {
+    const fixture = authSetupContents();
+    // The identifier field isn't always an email; plenty of real apps label it
+    // just "Username" with nothing "email"-ish in the label, placeholder, or
+    // name/id attributes either. Matching only /e-?mail/i finds nothing and
+    // hangs the auth-setup for the full 60s test timeout.
+    expect(fixture).toContain('user\\s*name');
+    expect(fixture).toContain('autocomplete="username"');
   });
 
   it('prefers native submit semantics and test-hint attributes over localized button text when finding the submit button', () => {

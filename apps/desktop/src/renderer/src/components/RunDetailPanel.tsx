@@ -322,6 +322,16 @@ interface JoinedRow {
   details: string | null;
   /** This test's own artifact paths (relative to the suite's test-results dir), from TestResult.artifactsJson. */
   artifacts: string[];
+  /** Step-by-step breakdown (click, fill, navigate, assert...) from TestResult.stepsJson — present for both passed and failed tests. */
+  steps: StepItem[];
+}
+
+interface StepItem {
+  title: string;
+  durationMs: number;
+  error?: string;
+  /** The raw actions performed inside a human-authored test.step(...) task, when present. */
+  steps?: StepItem[];
 }
 
 /** TestResult.artifactsJson is a JSON array of relative paths; malformed/missing rows just have no evidence. */
@@ -330,6 +340,20 @@ function parseArtifacts(json: string | null | undefined): string[] {
   try {
     const parsed: unknown = JSON.parse(json);
     return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** TestResult.stepsJson is a JSON array of {title, durationMs, error?}; malformed/missing rows just show no steps. */
+function parseSteps(json: string | null | undefined): StepItem[] {
+  if (!json) return [];
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (s): s is StepItem => !!s && typeof s === 'object' && typeof (s as StepItem).title === 'string',
+    );
   } catch {
     return [];
   }
@@ -352,6 +376,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
         description: t.description,
         details: t.details,
         artifacts: parseArtifacts(r?.artifactsJson),
+        steps: parseSteps(r?.stepsJson),
       };
     });
   }
@@ -367,6 +392,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
     description: null,
     details: null,
     artifacts: parseArtifacts(r.artifactsJson),
+    steps: parseSteps(r.stepsJson),
   }));
 }
 
@@ -591,6 +617,7 @@ function ResultsTable({
                           {r.error}
                         </pre>
                       )}
+                      <TestCaseSteps steps={r.steps} />
                       <TestCaseEvidence artifacts={r.artifacts} setPreview={setPreview} />
                     </div>
                   </TableCell>
@@ -601,6 +628,69 @@ function ResultsTable({
         })}
       </TableBody>
     </Table>
+  );
+}
+
+/**
+ * Step-by-step breakdown (click, fill, navigate, assert...) for a single test
+ * row's own expanded detail — present for both passed and failed tests, not
+ * just failures, since seeing what a test actually DID is useful regardless
+ * of outcome. Sourced from TestResult.stepsJson (see execute.ts's custom
+ * Playwright reporter); absent for older suites scaffolded before it existed.
+ */
+function TestCaseSteps({ steps }: { steps: StepItem[] }) {
+  if (steps.length === 0) {
+    // Genuinely nothing ran (e.g. a config/credential check that throws
+    // before any page action — auth-setup's "no test credentials configured"
+    // case) as well as older suites scaffolded before the steps reporter
+    // existed both land here. Say so explicitly rather than rendering
+    // nothing, which reads as a bug ("why are there no steps?") rather than
+    // an accurate "there were none to record".
+    return <p className="text-xs text-muted/70">No steps recorded for this test.</p>;
+  }
+  return (
+    <details className="group">
+      <summary className="cursor-pointer text-xs text-muted hover:text-fg">
+        {steps.length} step{steps.length === 1 ? '' : 's'}
+      </summary>
+      <ol className="mt-1.5 flex flex-col gap-1 border-l border-border/60 pl-3 text-xs">
+        {steps.map((s, i) => (
+          <StepListItem key={i} step={s} />
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+/**
+ * One step — a human-authored test.step(...) task gets its own nested
+ * dropdown revealing the raw actions (click/fill/expect/etc.) performed
+ * inside it, so the high-level task name is what you see by default, with
+ * the technical blow-by-blow one click away rather than always-on noise.
+ */
+function StepListItem({ step }: { step: StepItem }) {
+  return (
+    <li className={cn(step.error ? 'text-err' : 'text-muted')}>
+      <span className={step.error ? '' : 'text-fg'}>{step.title}</span>{' '}
+      <span className="text-[11px] text-muted/70">{formatDuration(step.durationMs)}</span>
+      {step.error && (
+        <div className="mt-0.5 truncate font-mono text-[11px] text-err/80" title={step.error}>
+          {step.error.split('\n')[0]}
+        </div>
+      )}
+      {step.steps && step.steps.length > 0 && (
+        <details className="mt-0.5">
+          <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-fg">
+            {step.steps.length} action{step.steps.length === 1 ? '' : 's'}
+          </summary>
+          <ol className="mt-1 flex flex-col gap-1 border-l border-border/40 pl-2.5 text-[11px]">
+            {step.steps.map((s, i) => (
+              <StepListItem key={i} step={s} />
+            ))}
+          </ol>
+        </details>
+      )}
+    </li>
   );
 }
 

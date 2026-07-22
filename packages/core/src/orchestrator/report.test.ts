@@ -501,7 +501,10 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     };
     const report = buildReport({ run, project, plan, outcome, triage: [] });
     const html = renderReportHtml(report);
-    expect(html).toContain('<td></td><td></td></tr>');
+    // Description and Error cells are empty (no match, no error) — Steps and
+    // Evidence still render their own "nothing recorded" content, so the row
+    // doesn't end in two bare `<td></td>`s anymore.
+    expect(html).toContain('<td>Untracked scenario</td><td>passed</td><td>5ms</td><td></td><td></td>');
   });
 
   it('surfaces the coverage ratio and lists uncovered functionality units when present', () => {
@@ -526,5 +529,111 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('1/2 functionality unit(s) covered (50%)');
     expect(html).toContain('GET /checkout');
     expect(html).toContain('src/pages/checkout.tsx');
+  });
+});
+
+describe('report — step-by-step breakdown, for passed tests too', () => {
+  it("shows a passed test's steps, not just failed ones", () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: signs in successfully',
+          status: 'passed',
+          durationMs: 1200,
+          steps: [
+            { title: 'Navigate to /signin', durationMs: 300 },
+            { title: 'Fill "email"', durationMs: 50 },
+            { title: 'Fill "password"', durationMs: 40 },
+            { title: 'Click "Sign in"', durationMs: 400 },
+            { title: 'expect.toHaveURL', durationMs: 10 },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('class="steps"');
+    expect(html).toContain('5 steps');
+    expect(html).toContain('Navigate to /signin');
+    expect(html).toContain('Click &quot;Sign in&quot;');
+    // Only the CSS rule for step-failed should exist, no element actually uses it.
+    expect(html).not.toContain('class="step-failed"');
+  });
+
+  it('marks the specific failed step, not the whole list', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-2] negative: rejects bad password',
+          status: 'failed',
+          durationMs: 800,
+          error: 'expect(received).toHaveURL(expected)',
+          steps: [
+            { title: 'Navigate to /signin', durationMs: 300 },
+            { title: 'Fill "email"', durationMs: 50 },
+            { title: 'Click "Sign in"', durationMs: 400 },
+            { title: 'expect.toHaveURL', durationMs: 5, error: 'expect(received).toHaveURL(expected)' },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('class="step-failed"');
+    expect(html).toContain('4 steps');
+  });
+
+  it('says "no steps recorded" explicitly instead of an empty cell when a result has none (older suite, no reporter, or a test that failed before any action ran)', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: '[REQ:REQ-3] positive: legacy result', status: 'passed', durationMs: 100 }],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('class="steps"');
+    expect(html).toContain('No steps recorded.');
+  });
+
+  it('nests the raw actions under their test.step(...) task name instead of flattening them', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-4] positive: signs in',
+          status: 'passed',
+          durationMs: 500,
+          steps: [
+            {
+              title: 'Enter a valid email and password',
+              durationMs: 300,
+              steps: [
+                { title: 'Fill "seller@shop.test" locator(\'#email\')', durationMs: 100 },
+                { title: 'Fill "hunter22" locator(\'#password\')', durationMs: 40 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Enter a valid email and password');
+    expect(html).toContain('class="substeps"');
+    expect(html).toContain('2 actions');
+    expect(html).toContain('Fill &quot;seller@shop.test&quot; locator(&#39;#email&#39;)');
   });
 });

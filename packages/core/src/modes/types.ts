@@ -202,12 +202,28 @@ export interface ValidationResult {
   warnings: QualityWarning[];
 }
 
+/** One action/assertion step Playwright performed during a test — e.g. "click", "fill", "expect.toBeVisible". */
+export interface ExecStepItem {
+  title: string;
+  durationMs: number;
+  error?: string;
+  /**
+   * The raw actions (click/fill/expect/etc.) performed inside this step,
+   * present only when this entry is a human-authored test.step(...) wrapper —
+   * gives a high-level task name with the granular technical detail nested
+   * underneath, instead of forcing a choice between the two.
+   */
+  steps?: ExecStepItem[];
+}
+
 export interface ExecResultItem {
   title: string;
   status: TestStatus;
   durationMs?: number;
   error?: string;
   artifacts?: string[];
+  /** Step-by-step breakdown for this outcome, present for both passed and failed tests. Absent for older suites without the steps reporter. */
+  steps?: ExecStepItem[];
   /**
    * The spec file this result came from (relative path, as reported by the
    * test runner) — when present, gives mergeExecOutcomes (coverage.ts) a

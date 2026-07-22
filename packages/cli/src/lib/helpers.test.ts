@@ -150,6 +150,7 @@ describe('shapeRunShow', () => {
         artifactsJson: null,
         description: null,
         details: null,
+        stepsJson: null,
       },
     ];
 

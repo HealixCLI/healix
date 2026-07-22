@@ -5,7 +5,14 @@ import { join } from 'node:path';
 import spawn from 'cross-spawn';
 
 import type { Tier, TestStatus } from '../../storage/types.js';
-import type { ExecOutcome, ExecResultItem, GeneratedSpec, TestingScope, TestModeContext } from '../types.js';
+import type {
+  ExecOutcome,
+  ExecResultItem,
+  ExecStepItem,
+  GeneratedSpec,
+  TestingScope,
+  TestModeContext,
+} from '../types.js';
 import { tiersForScope } from '../types.js';
 
 const EXEC_TIMEOUT_MS = 30 * 60_000; // generous: full suite across three tiers
@@ -780,6 +787,65 @@ async function readResultsJson(projectDir: string, startedAt: number): Promise<P
   }
 }
 
+interface RawStep {
+  title?: string;
+  durationMs?: number;
+  error?: string;
+  steps?: RawStep[];
+}
+
+interface RawStepsEntry {
+  title?: string;
+  retry?: number;
+  steps?: RawStep[];
+}
+
+/** Recursively validates + normalizes a raw step (and its nested test.step children, if any). */
+function toExecStepItem(s: RawStep): ExecStepItem | null {
+  if (typeof s.title !== 'string') return null;
+  const children = Array.isArray(s.steps)
+    ? s.steps.map(toExecStepItem).filter((c): c is ExecStepItem => c !== null)
+    : undefined;
+  return {
+    title: s.title,
+    durationMs: Math.round(s.durationMs ?? 0),
+    error: s.error,
+    steps: children && children.length > 0 ? children : undefined,
+  };
+}
+
+/**
+ * steps.json is written by the custom reporter (see templates.ts's
+ * stepsReporterContents()) — a supplementary file alongside results.json,
+ * since Playwright's own json reporter drops step-level detail entirely.
+ * Keyed by title (same key parseReport groups results by); a retried test's
+ * LAST attempt's steps win, since that's the outcome that's actually reported.
+ */
+async function readStepsByTitle(projectDir: string, startedAt: number): Promise<Map<string, ExecStepItem[]>> {
+  const byTitle = new Map<string, ExecStepItem[]>();
+  try {
+    const candidate = join(projectDir, 'steps.json');
+    const st = await stat(candidate);
+    if (st.mtimeMs + 50 < startedAt) return byTitle;
+    const raw = await readFile(candidate, 'utf-8');
+    const entries = JSON.parse(raw) as RawStepsEntry[];
+    const retrySeen = new Map<string, number>();
+    for (const entry of entries) {
+      if (!entry.title || !Array.isArray(entry.steps)) continue;
+      const retry = entry.retry ?? 0;
+      if (retry < (retrySeen.get(entry.title) ?? -1)) continue;
+      retrySeen.set(entry.title, retry);
+      byTitle.set(
+        entry.title,
+        entry.steps.map(toExecStepItem).filter((s): s is ExecStepItem => s !== null),
+      );
+    }
+  } catch {
+    // absent or unreadable — steps are best-effort, never block the real outcome
+  }
+  return byTitle;
+}
+
 /** Last-ditch: try to JSON-parse stdout (the json reporter prints to stdout too). */
 function parseStdoutJson(stdout: string): PwReport | null {
   const text = stdout.trim();
@@ -917,6 +983,17 @@ export async function execute(
         timedOut: cmd.timedOut,
         tail,
       });
+    }
+  }
+
+  // Best-effort: attach the step-by-step breakdown (see stepsReporterContents()
+  // in templates.ts) to each result by title — steps.json is written
+  // regardless of whether results.json parsed, so this runs unconditionally.
+  const stepsByTitle = await readStepsByTitle(ctx.projectDir, startedAt);
+  if (stepsByTitle.size > 0) {
+    for (const r of parsed.results) {
+      const steps = stepsByTitle.get(r.title);
+      if (steps) r.steps = steps;
     }
   }
 

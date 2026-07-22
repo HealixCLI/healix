@@ -440,10 +440,11 @@ export class HealixStore {
    * joining through one-row-per-test.
    */
   insertResult(
-    result: Omit<TestResult, 'id' | 'description' | 'details'> & {
+    result: Omit<TestResult, 'id' | 'description' | 'details' | 'stepsJson'> & {
       id?: string;
       description?: string | null;
       details?: string | null;
+      stepsJson?: string | null;
     },
   ): TestResult {
     const full: TestResult = {
@@ -451,11 +452,12 @@ export class HealixStore {
       id: result.id ?? `res_${nanoid(10)}`,
       description: result.description ?? null,
       details: result.details ?? null,
+      stepsJson: result.stepsJson ?? null,
     };
     this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
-        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details, steps_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         full.id,
@@ -466,6 +468,7 @@ export class HealixStore {
         full.artifactsJson,
         full.description,
         full.details,
+        full.stepsJson,
       );
     return full;
   }
@@ -655,6 +658,7 @@ function rowToResult(r: Record<string, unknown>): TestResult {
     artifactsJson: s(r.artifacts_json),
     description: s(r.description),
     details: s(r.details),
+    stepsJson: s(r.steps_json),
   };
 }
 

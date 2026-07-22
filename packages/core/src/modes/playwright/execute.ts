@@ -787,10 +787,31 @@ async function readResultsJson(projectDir: string, startedAt: number): Promise<P
   }
 }
 
+interface RawStep {
+  title?: string;
+  durationMs?: number;
+  error?: string;
+  steps?: RawStep[];
+}
+
 interface RawStepsEntry {
   title?: string;
   retry?: number;
-  steps?: Array<{ title?: string; durationMs?: number; error?: string }>;
+  steps?: RawStep[];
+}
+
+/** Recursively validates + normalizes a raw step (and its nested test.step children, if any). */
+function toExecStepItem(s: RawStep): ExecStepItem | null {
+  if (typeof s.title !== 'string') return null;
+  const children = Array.isArray(s.steps)
+    ? s.steps.map(toExecStepItem).filter((c): c is ExecStepItem => c !== null)
+    : undefined;
+  return {
+    title: s.title,
+    durationMs: Math.round(s.durationMs ?? 0),
+    error: s.error,
+    steps: children && children.length > 0 ? children : undefined,
+  };
 }
 
 /**
@@ -819,9 +840,7 @@ async function readStepsByTitle(
       retrySeen.set(entry.title, retry);
       byTitle.set(
         entry.title,
-        entry.steps
-          .filter((s): s is { title: string; durationMs?: number; error?: string } => typeof s.title === 'string')
-          .map((s) => ({ title: s.title, durationMs: Math.round(s.durationMs ?? 0), error: s.error })),
+        entry.steps.map(toExecStepItem).filter((s): s is ExecStepItem => s !== null),
       );
     }
   } catch {

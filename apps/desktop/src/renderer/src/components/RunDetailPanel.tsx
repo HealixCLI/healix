@@ -330,6 +330,8 @@ interface StepItem {
   title: string;
   durationMs: number;
   error?: string;
+  /** The raw actions performed inside a human-authored test.step(...) task, when present. */
+  steps?: StepItem[];
 }
 
 /** TestResult.artifactsJson is a JSON array of relative paths; malformed/missing rows just have no evidence. */
@@ -653,18 +655,42 @@ function TestCaseSteps({ steps }: { steps: StepItem[] }) {
       </summary>
       <ol className="mt-1.5 flex flex-col gap-1 border-l border-border/60 pl-3 text-xs">
         {steps.map((s, i) => (
-          <li key={i} className={cn(s.error ? 'text-err' : 'text-muted')}>
-            <span className={s.error ? '' : 'text-fg'}>{s.title}</span>{' '}
-            <span className="text-[11px] text-muted/70">{formatDuration(s.durationMs)}</span>
-            {s.error && (
-              <div className="mt-0.5 truncate font-mono text-[11px] text-err/80" title={s.error}>
-                {s.error.split('\n')[0]}
-              </div>
-            )}
-          </li>
+          <StepListItem key={i} step={s} />
         ))}
       </ol>
     </details>
+  );
+}
+
+/**
+ * One step — a human-authored test.step(...) task gets its own nested
+ * dropdown revealing the raw actions (click/fill/expect/etc.) performed
+ * inside it, so the high-level task name is what you see by default, with
+ * the technical blow-by-blow one click away rather than always-on noise.
+ */
+function StepListItem({ step }: { step: StepItem }) {
+  return (
+    <li className={cn(step.error ? 'text-err' : 'text-muted')}>
+      <span className={step.error ? '' : 'text-fg'}>{step.title}</span>{' '}
+      <span className="text-[11px] text-muted/70">{formatDuration(step.durationMs)}</span>
+      {step.error && (
+        <div className="mt-0.5 truncate font-mono text-[11px] text-err/80" title={step.error}>
+          {step.error.split('\n')[0]}
+        </div>
+      )}
+      {step.steps && step.steps.length > 0 && (
+        <details className="mt-0.5">
+          <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-fg">
+            {step.steps.length} action{step.steps.length === 1 ? '' : 's'}
+          </summary>
+          <ol className="mt-1 flex flex-col gap-1 border-l border-border/40 pl-2.5 text-[11px]">
+            {step.steps.map((s, i) => (
+              <StepListItem key={i} step={s} />
+            ))}
+          </ol>
+        </details>
+      )}
+    </li>
   );
 }
 

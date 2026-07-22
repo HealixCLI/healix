@@ -207,6 +207,13 @@ export interface ExecStepItem {
   title: string;
   durationMs: number;
   error?: string;
+  /**
+   * The raw actions (click/fill/expect/etc.) performed inside this step,
+   * present only when this entry is a human-authored test.step(...) wrapper —
+   * gives a high-level task name with the granular technical detail nested
+   * underneath, instead of forcing a choice between the two.
+   */
+  steps?: ExecStepItem[];
 }
 
 export interface ExecResultItem {

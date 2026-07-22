@@ -560,4 +560,36 @@ describe('report — step-by-step breakdown, for passed tests too', () => {
     expect(html).not.toContain('class="steps"');
     expect(html).toContain('No steps recorded.');
   });
+
+  it('nests the raw actions under their test.step(...) task name instead of flattening them', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-4] positive: signs in',
+          status: 'passed',
+          durationMs: 500,
+          steps: [
+            {
+              title: 'Enter a valid email and password',
+              durationMs: 300,
+              steps: [
+                { title: 'Fill "seller@shop.test" locator(\'#email\')', durationMs: 100 },
+                { title: 'Fill "hunter22" locator(\'#password\')', durationMs: 40 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Enter a valid email and password');
+    expect(html).toContain('class="substeps"');
+    expect(html).toContain('2 actions');
+    expect(html).toContain('Fill &quot;seller@shop.test&quot; locator(&#39;#email&#39;)');
+  });
 });

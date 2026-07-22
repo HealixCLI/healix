@@ -74,6 +74,15 @@ describe('stepsReporterContents', () => {
     expect(src).toContain('stripAnsi(s.error.message');
     expect(src).toContain('ANSI_RE');
   });
+
+  it('nests a test.step task\'s raw pw:api/expect actions underneath it, not flattened alongside it', () => {
+    const src = stepsReporterContents();
+    // A test.step wrapper's own .steps children are captured as nested
+    // entries; a bare pw:api/expect step (no wrapper) gets no children of
+    // its own — see toStepItem's category check.
+    expect(src).toContain("s.category === 'test.step'");
+    expect(src).toContain('.map(toStepItem)');
+  });
 });
 
 describe('mockFixtureContents', () => {

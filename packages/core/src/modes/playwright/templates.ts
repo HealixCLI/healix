@@ -169,19 +169,30 @@ function stripAnsi(text) {
   return (text || '').replace(ANSI_RE, '');
 }
 
+function toStepItem(s) {
+  // Only a test.step(...) wrapper gets its raw actions nested underneath —
+  // a bare pw:api/expect step (no test.step wrapping) has no useful children
+  // of its own, just the same kind of entry, so nesting there would just be
+  // a step wrapping an identical copy of itself.
+  const children =
+    s.category === 'test.step'
+      ? (s.steps || []).filter((c) => c.category === 'pw:api' || c.category === 'expect').map(toStepItem)
+      : undefined;
+  return {
+    title: s.title,
+    durationMs: Math.round(s.duration || 0),
+    error: s.error ? stripAnsi(s.error.message || String(s.error)) : undefined,
+    steps: children && children.length > 0 ? children : undefined,
+  };
+}
+
 class HealixStepsReporter {
   constructor() {
     this.results = [];
   }
 
   onTestEnd(test, result) {
-    const steps = (result.steps || [])
-      .filter((s) => KEPT_CATEGORIES.has(s.category))
-      .map((s) => ({
-        title: s.title,
-        durationMs: Math.round(s.duration || 0),
-        error: s.error ? stripAnsi(s.error.message || String(s.error)) : undefined,
-      }));
+    const steps = (result.steps || []).filter((s) => KEPT_CATEGORIES.has(s.category)).map(toStepItem);
     if (steps.length === 0) return;
     this.results.push({ title: test.title, retry: result.retry, steps });
   }

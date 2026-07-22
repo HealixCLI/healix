@@ -227,6 +227,25 @@ function renderArtifacts(artifacts: string[] | undefined, reportDir: string | un
  * default so it doesn't dominate the row; absent entirely for older suites
  * scaffolded before the steps reporter existed.
  */
+/**
+ * One step's <li> — a human-authored test.step(...) task gets its own nested
+ * <details> revealing the raw actions (click/fill/expect/etc.) performed
+ * inside it, so a reader gets the high-level task name by default and can
+ * drop into the technical blow-by-blow only when they want to.
+ */
+function renderStepItem(s: ExecStepItem): string {
+  const errBlock = s.error ? `<div class="step-err">${esc(s.error.split('\n')[0] ?? s.error)}</div>` : '';
+  const children =
+    s.steps && s.steps.length > 0
+      ? `<details class="substeps"><summary>${s.steps.length} action${s.steps.length === 1 ? '' : 's'}</summary><ol>${s.steps
+          .map(renderStepItem)
+          .join('')}</ol></details>`
+      : '';
+  return `<li${s.error ? ' class="step-failed"' : ''}>${esc(s.title)} <span class="hist">${esc(
+    formatDuration(s.durationMs),
+  )}</span>${errBlock}${children}</li>`;
+}
+
 function renderSteps(steps: ExecStepItem[] | undefined): string {
   if (!steps || steps.length === 0) {
     // Genuinely nothing ran (e.g. auth-setup's "no credentials configured"
@@ -236,14 +255,7 @@ function renderSteps(steps: ExecStepItem[] | undefined): string {
     // blank (reads as a bug, not an accurate "there were none to record").
     return '<span class="hist">No steps recorded.</span>';
   }
-  const items = steps
-    .map((s) => {
-      const errBlock = s.error ? `<div class="step-err">${esc(s.error.split('\n')[0] ?? s.error)}</div>` : '';
-      return `<li${s.error ? ' class="step-failed"' : ''}>${esc(s.title)} <span class="hist">${esc(
-        formatDuration(s.durationMs),
-      )}</span>${errBlock}</li>`;
-    })
-    .join('');
+  const items = steps.map(renderStepItem).join('');
   return `<details class="steps"><summary>${steps.length} step${steps.length === 1 ? '' : 's'}</summary><ol>${items}</ol></details>`;
 }
 
@@ -425,6 +437,9 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   .steps li { margin-bottom: .2rem; }
   .steps li.step-failed { color: #cf222e; }
   .steps .step-err { font-size: .7rem; color: #cf222e; opacity: .85; }
+  .substeps { margin-top: .2rem; }
+  .substeps summary { color: #888; font-size: .7rem; }
+  .substeps ol { margin: .25rem 0 0; padding-left: 1rem; }
 </style>
 </head>
 <body>

@@ -1,6 +1,6 @@
 import { relative, sep } from 'node:path';
 import type { Project, Run, TestCase } from '../storage/types.js';
-import type { ExecOutcome, TestPlan } from '../modes/types.js';
+import type { ExecOutcome, ExecStepItem, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
 import type { ExternalDependency } from '../target/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
@@ -220,6 +220,33 @@ function renderArtifacts(artifacts: string[] | undefined, reportDir: string | un
   return `<div class="evidence">${imgHtml}${videoHtml}${otherHtml}</div>`;
 }
 
+/**
+ * Step-by-step breakdown (click, fill, navigate, assert...) for one result —
+ * present for both passed and failed tests, not just failures, since seeing
+ * what a test actually DID is useful regardless of outcome. Collapsed by
+ * default so it doesn't dominate the row; absent entirely for older suites
+ * scaffolded before the steps reporter existed.
+ */
+function renderSteps(steps: ExecStepItem[] | undefined): string {
+  if (!steps || steps.length === 0) {
+    // Genuinely nothing ran (e.g. auth-setup's "no credentials configured"
+    // check throwing before any page action) as well as older suites from
+    // before the steps reporter existed both land here — say so explicitly,
+    // matching the desktop UI's equivalent, rather than leaving the cell
+    // blank (reads as a bug, not an accurate "there were none to record").
+    return '<span class="hist">No steps recorded.</span>';
+  }
+  const items = steps
+    .map((s) => {
+      const errBlock = s.error ? `<div class="step-err">${esc(s.error.split('\n')[0] ?? s.error)}</div>` : '';
+      return `<li${s.error ? ' class="step-failed"' : ''}>${esc(s.title)} <span class="hist">${esc(
+        formatDuration(s.durationMs),
+      )}</span>${errBlock}</li>`;
+    })
+    .join('');
+  return `<details class="steps"><summary>${steps.length} step${steps.length === 1 ? '' : 's'}</summary><ol>${items}</ol></details>`;
+}
+
 function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
   if (!error) return '';
   const { summary, rest } = splitErrorText(error);
@@ -312,10 +339,9 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
           : '';
       return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
         formatDuration(r.durationMs),
-      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}</td><td>${renderArtifacts(
-        r.artifacts,
-        reportDir,
-      )}</td></tr>`;
+      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}</td><td>${renderSteps(
+        r.steps,
+      )}</td><td>${renderArtifacts(r.artifacts, reportDir)}</td></tr>`;
     })
     .join('');
 
@@ -395,6 +421,10 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   .ev-file { font-size: .75rem; color: #888; align-self: center; border: 1px solid #8884; border-radius: 4px;
     padding: .1rem .4rem; text-decoration: none; }
   .ev-file:hover { color: inherit; }
+  .steps ol { margin: .35rem 0 0; padding-left: 1.1rem; font-size: .78rem; }
+  .steps li { margin-bottom: .2rem; }
+  .steps li.step-failed { color: #cf222e; }
+  .steps .step-err { font-size: .7rem; color: #cf222e; opacity: .85; }
 </style>
 </head>
 <body>
@@ -432,8 +462,8 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   <section>
     <h2>Results</h2>
     <table>
-      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Description</th><th>Error</th><th>Evidence</th></tr></thead>
-      <tbody>${resultRows || '<tr><td colspan="6"><em>No results.</em></td></tr>'}</tbody>
+      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Description</th><th>Error</th><th>Steps</th><th>Evidence</th></tr></thead>
+      <tbody>${resultRows || '<tr><td colspan="7"><em>No results.</em></td></tr>'}</tbody>
     </table>
   </section>
 

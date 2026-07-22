@@ -87,7 +87,14 @@ function artifactRequestPath(rawUrl: string): string | null {
   // Windows: "/C:\foo" → "C:\foo".
   const abs = resolve(decoded.replace(/^\/([A-Za-z]:)/, '$1'));
   const root = resolve(projectsDir());
-  if (abs !== root && !abs.startsWith(root + sep)) return null;
+  // Windows filesystems are case-insensitive, but this is a plain string
+  // comparison — without normalizing case here, a containment check can
+  // fail (and silently 403 an otherwise-legitimate artifact) whenever the
+  // drive letter or a path segment's case differs from projectsDir()'s own
+  // resolved casing, which shows up as one artifact rendering fine and an
+  // otherwise-identical one appearing broken for no visible reason.
+  const cmp = process.platform === 'win32' ? (s: string) => s.toLowerCase() : (s: string) => s;
+  if (cmp(abs) !== cmp(root) && !cmp(abs).startsWith(cmp(root) + sep)) return null;
   return abs;
 }
 
@@ -96,7 +103,19 @@ function registerArtifactProtocol(): void {
     const abs = artifactRequestPath(request.url);
     if (!abs) return new Response('Not allowed', { status: 403 });
     try {
-      return await net.fetch(pathToFileURL(abs).toString());
+      // Forward the incoming Range header (sent by <video> for seeking, and
+      // by Chromium's own metadata-preload probe even before playback starts)
+      // through to the file:// fetch. Without it, every request — ranged or
+      // not — got the FULL file back with a 200, which a <video> element
+      // that asked for a byte range doesn't accept as valid: seeking breaks,
+      // and some files fail to decode at all and render as "corrupted"/black.
+      // Chromium's own file:// loader (which net.fetch uses under the hood)
+      // already knows how to answer a Range request correctly — it just
+      // needs the header passed through.
+      const range = request.headers.get('range');
+      return await net.fetch(pathToFileURL(abs).toString(), {
+        headers: range ? { Range: range } : undefined,
+      });
     } catch {
       return new Response('Not found', { status: 404 });
     }

@@ -144,6 +144,8 @@ export interface TestResult {
   description: string | null;
   /** Mirrors the parent TestCase's details at result-persist time. */
   details: string | null;
+  /** JSON array of {title, durationMs, error?} — the action/assertion steps Playwright performed. Null for older rows or when the reporter produced none. */
+  stepsJson: string | null;
 }
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error';

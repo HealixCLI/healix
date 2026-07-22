@@ -5,11 +5,13 @@ import type { TestModeContext } from '../types.js';
 import type { ObservedEndpoint } from '../../browser/network-capture.js';
 import {
   TIERS,
+  actionHighlighterFixtureContents,
   authSetupContents,
   gitignoreContents,
   mockFixtureContents,
   packageJsonContents,
   playwrightConfigContents,
+  stepsReporterContents,
   suiteReadmeContents,
   tierReadmeContents,
   type MockRouteEntry,
@@ -136,6 +138,8 @@ export async function scaffold(ctx: TestModeContext): Promise<void> {
     [join(projectDir, 'package.json'), packageJsonContents({ name: suiteName(projectDir) })],
     [join(projectDir, 'playwright.config.ts'), playwrightConfigContents({ baseUrl: ctx.baseUrl })],
     [join(fixturesDir, 'auth.setup.ts'), authSetupContents()],
+    [join(fixturesDir, 'action-highlighter.ts'), actionHighlighterFixtureContents()],
+    [join(fixturesDir, 'steps-reporter.cjs'), stepsReporterContents()],
     [join(projectDir, 'README.md'), suiteReadmeContents({ baseUrl: ctx.baseUrl })],
     [join(projectDir, '.gitignore'), gitignoreContents()],
   ];

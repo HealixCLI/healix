@@ -8,7 +8,12 @@ import type {
   TestModeContext,
   ValidationResult,
 } from '../types.js';
-import { hasExpect, looksLikePlaywrightSpec, MOCK_FIXTURE_IMPORT_PATH } from './generate.js';
+import {
+  ACTION_HIGHLIGHTER_IMPORT_PATH,
+  hasExpect,
+  looksLikePlaywrightSpec,
+  MOCK_FIXTURE_IMPORT_PATH,
+} from './generate.js';
 import { ensureSuiteDeps, runCommand } from './execute.js';
 import { auditSpecQuality, pruneHardFindings } from './quality-audit.js';
 
@@ -295,7 +300,9 @@ export async function validateSuite(ctx: TestModeContext, specs: GeneratedSpec[]
     // fixture instead of '@playwright/test' directly (see generate.ts) — the
     // repaired-spec sanity check needs to accept that import too, or a
     // genuinely-fixed mocked spec would be wrongly quarantined here.
-    const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : undefined;
+    const extraAllowedImport = ctx.mockExternalDependencies
+      ? MOCK_FIXTURE_IMPORT_PATH
+      : ACTION_HIGHLIGHTER_IMPORT_PATH;
     const fixed = attemptBracketRepair(spec.contents);
     if (fixed && looksLikePlaywrightSpec(fixed, extraAllowedImport) && hasExpect(fixed)) {
       await writeFile(spec.path, fixed, 'utf-8');

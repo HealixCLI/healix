@@ -2278,6 +2278,7 @@ function persistResults(
         artifactsJson: r.artifacts && r.artifacts.length > 0 ? JSON.stringify(r.artifacts) : null,
         description: parentTest?.description ?? null,
         details: parentTest?.details ?? null,
+        stepsJson: r.steps && r.steps.length > 0 ? JSON.stringify(r.steps) : null,
       });
       noteStoreOk();
     } catch (err) {

@@ -71,19 +71,36 @@ export function computeCoverage(
 }
 
 /**
- * Merge two ExecOutcome objects. Deduplicates by normalized title, keeping
- * `b`'s result on a collision — a test executed in both `a` and `b` (e.g. a
- * tier re-executed after a resume that raced the checkpoint write, see
+ * Identity used to detect a genuine re-execution of the SAME test across two
+ * merged outcomes: specFile + normalized title when the result carries a
+ * specFile (the common case — see execute.ts's parseReport), or just the
+ * normalized title when it doesn't (synthetic/fallback items with no real
+ * spec file to key on). Scoping by specFile as well as title matters because
+ * two DIFFERENT generated scenarios (e.g. from separate gap-fill iterations)
+ * can coincidentally share near-identical wording despite living in distinct
+ * spec files — title-only matching mistook those for the same test and
+ * silently dropped one, undercounting the report relative to the DB (which
+ * has no such collision since it keys rows by reqTag+position, not title).
+ */
+function mergeIdentity(r: ExecOutcome['results'][number]): string {
+  const title = normalizeTitle(r.title);
+  return r.specFile ? `file:${r.specFile}#${title}` : `title:${title}`;
+}
+
+/**
+ * Merge two ExecOutcome objects. Deduplicates by mergeIdentity, keeping `b`'s
+ * result on a collision — a test executed in both `a` and `b` (e.g. a tier
+ * re-executed after a resume that raced the checkpoint write, see
  * insertResult's doc comment) must count once, with its latest outcome, not
  * twice. Counters are recomputed from the deduplicated results rather than
  * summed, so passed/failed/blocked/flaky can never drift out of sync with
- * `results.length` the way plain addition would if a title collided.
+ * `results.length` the way plain addition would if an identity collided.
  */
 export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
-  const byTitle = new Map<string, ExecOutcome['results'][number]>();
-  for (const r of a.results) byTitle.set(normalizeTitle(r.title), r);
-  for (const r of b.results) byTitle.set(normalizeTitle(r.title), r);
-  const results = [...byTitle.values()];
+  const byIdentity = new Map<string, ExecOutcome['results'][number]>();
+  for (const r of a.results) byIdentity.set(mergeIdentity(r), r);
+  for (const r of b.results) byIdentity.set(mergeIdentity(r), r);
+  const results = [...byIdentity.values()];
   return {
     passed: results.filter((r) => r.status === 'passed').length,
     failed: results.filter((r) => r.status === 'failed').length,

@@ -241,7 +241,10 @@ function renderStepItem(s: ExecStepItem): string {
           .map(renderStepItem)
           .join('')}</ol></details>`
       : '';
-  return `<li${s.error ? ' class="step-failed"' : ''}>${esc(s.title)} <span class="hist">${esc(
+  const mark = s.error
+    ? '<span class="step-mark step-mark-fail" aria-label="Failed">✕</span>'
+    : '<span class="step-mark step-mark-ok" aria-label="Passed">✓</span>';
+  return `<li${s.error ? ' class="step-failed"' : ''}>${mark}${esc(s.title)} <span class="hist">${esc(
     formatDuration(s.durationMs),
   )}</span>${errBlock}${children}</li>`;
 }
@@ -450,6 +453,9 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   .substeps { margin-top: .2rem; }
   .substeps summary { color: #888; font-size: .7rem; }
   .substeps ol { margin: .25rem 0 0; padding-left: 1rem; }
+  .step-mark { display: inline-block; width: 1.1em; font-weight: 700; }
+  .step-mark-ok { color: #1a7f37; }
+  .step-mark-fail { color: #cf222e; }
 </style>
 </head>
 <body>

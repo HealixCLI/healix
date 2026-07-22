@@ -1,4 +1,4 @@
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useRef, useState } from 'react';
 import type { Project, Run, RunStatus } from '@healix/core';
 import { ChevronLeft, ChevronRight, Plus, RefreshCw, Trash2 } from 'lucide-react';
 import { Badge } from './ui/badge';
@@ -7,6 +7,9 @@ import { ConfirmDialog } from './ui/confirm-dialog';
 import { Select } from './ui/select';
 import { cn } from '../lib/utils';
 import { ALL_RUN_STATUSES, formatCreatedAt, formatRunStatus, runStatusTone } from '../lib/run-format';
+
+/** Matches RunRow's `duration-200` collapse transition — the row is actually removed once this elapses. */
+const DELETE_COLLAPSE_MS = 200;
 
 /** Sentinel option value meaning "no status filter applied". */
 const ALL_STATUSES = 'all';
@@ -46,10 +49,71 @@ export function RunHistory({
   // across refreshes/re-renders without the caller needing to know about it.
   const [statusFilter, setStatusFilter] = useState<StatusFilter>(ALL_STATUSES);
 
+  // The list is newest-first and RunsView polls for updates every ~3s while
+  // any run is active — a run starting elsewhere gets inserted at the TOP,
+  // pushing every row below it down. If that happens while the user is
+  // hovering the rail (about to click, or mid-way through confirming a
+  // delete on some other row), the row under their cursor shifts out from
+  // under them: a click lands on the wrong run, or on nothing, and the
+  // delete confirmation seems to randomly not appear. Freeze the visible
+  // order the moment the mouse enters the list (or a delete flow starts —
+  // confirming a delete usually means the mouse has ALREADY left the list
+  // for the centered dialog, so hover alone wouldn't keep it frozen for that
+  // whole flow) and only resume following the live `runs` prop once both the
+  // mouse has left AND nothing is pending.
+  const [hovering, setHovering] = useState(false);
+  const [confirmingId, setConfirmingId] = useState<string | null>(null);
+  const [closingId, setClosingId] = useState<string | null>(null);
+  // Ids we've already told the parent to delete but whose removal the live
+  // `runs` prop hasn't confirmed yet (the IPC delete + refresh is async).
+  // Filtered out of what's shown regardless of frozen/live source below, so
+  // a run can never visually reappear between "we told the parent to delete
+  // it" and "the parent's list actually stopped containing it" — without
+  // this, unfreezing (e.g. because the mouse already left the list) at
+  // exactly the wrong moment would show the stale, not-yet-refreshed live
+  // list that still has the row in it.
+  const [pendingRemovalIds, setPendingRemovalIds] = useState<ReadonlySet<string>>(new Set());
+  useEffect(() => {
+    setPendingRemovalIds((prev) => {
+      if (prev.size === 0) return prev;
+      const liveIds = new Set(runs.map((r) => r.id));
+      const stillPending = [...prev].filter((id) => liveIds.has(id));
+      return stillPending.length === prev.size ? prev : new Set(stillPending);
+    });
+  }, [runs]);
+
+  const pending = confirmingId !== null || closingId !== null || pendingRemovalIds.size > 0;
+  const frozenRunsRef = useRef<Run[] | null>(null);
+  if ((hovering || pending) && frozenRunsRef.current === null) {
+    frozenRunsRef.current = runs;
+  } else if (!hovering && !pending) {
+    frozenRunsRef.current = null;
+  }
+  const stableRuns = useMemo(() => {
+    const base = frozenRunsRef.current ?? runs;
+    return pendingRemovalIds.size === 0 ? base : base.filter((r) => !pendingRemovalIds.has(r.id));
+  }, [runs, pendingRemovalIds]);
+
   const filteredRuns = useMemo(
-    () => (statusFilter === ALL_STATUSES ? runs : runs.filter((r) => r.status === statusFilter)),
-    [runs, statusFilter],
+    () => (statusFilter === ALL_STATUSES ? stableRuns : stableRuns.filter((r) => r.status === statusFilter)),
+    [stableRuns, statusFilter],
   );
+
+  const requestDelete = (runId: string): void => setConfirmingId(runId);
+  const cancelDelete = (): void => setConfirmingId(null);
+  const confirmDelete = (runId: string): void => {
+    setConfirmingId(null);
+    setClosingId(runId);
+    // Give the collapse transition (DELETE_COLLAPSE_MS) time to play before
+    // the actual delete + list refresh removes this row for real — otherwise
+    // it would just vanish instantly the moment the (fast) IPC call
+    // resolves, defeating the animation.
+    setTimeout(() => {
+      onDelete?.(runId);
+      setClosingId(null);
+      setPendingRemovalIds((prev) => new Set(prev).add(runId));
+    }, DELETE_COLLAPSE_MS);
+  };
 
   if (collapsed) {
     return (
@@ -109,7 +173,11 @@ export function RunHistory({
         <p className="mb-2 rounded-md border border-err/40 bg-err/10 px-2 py-1.5 text-xs text-err">{error}</p>
       )}
 
-      <div className="min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-panel/40">
+      <div
+        className="min-h-0 flex-1 overflow-auto rounded-lg border border-border bg-panel/40"
+        onMouseEnter={() => setHovering(true)}
+        onMouseLeave={() => setHovering(false)}
+      >
         {loading && runs.length === 0 && <p className="px-3 py-4 text-xs text-muted">Loading runs…</p>}
         {!loading && runs.length === 0 && !error && (
           <p className="px-3 py-4 text-xs text-muted">No runs yet. Start one above.</p>
@@ -125,7 +193,12 @@ export function RunHistory({
               selected={run.id === selectedRunId}
               projectName={projectsById.get(run.projectId)?.name}
               onSelect={() => onSelect(run.id)}
-              onDelete={onDelete ? () => onDelete(run.id) : undefined}
+              deletable={!!onDelete}
+              confirming={confirmingId === run.id}
+              closing={closingId === run.id}
+              onRequestDelete={() => requestDelete(run.id)}
+              onCancelDelete={cancelDelete}
+              onConfirmDelete={() => confirmDelete(run.id)}
             />
           ))}
         </ul>
@@ -136,32 +209,64 @@ export function RunHistory({
 
 /**
  * One history row: the selectable run button, plus a delete action (when
- * `onDelete` is given) gated behind an explicit confirmation dialog — the
- * click that opens it never itself deletes anything.
+ * `deletable` is set) gated behind the shared, screen-centered ConfirmDialog
+ * — the click that opens it never itself deletes anything. `confirming`/
+ * `closing` are owned by RunHistory (not local state) so it can freeze the
+ * whole list's order for the duration of a delete flow — see its own comment
+ * for why a purely row-local version of this state couldn't do that.
+ *
+ * Two things previously made rapid successive deletes feel like the list was
+ * "dancing", both fixed here without giving up the centered confirm dialog:
+ *  1. The trash icon was hover-only (opacity-0 until group-hover) and
+ *     absolutely positioned per row. Deleting a row shifts every row below it
+ *     up to fill the gap, but the mouse doesn't move — so it ends up hovering
+ *     a DIFFERENT run's icon, which pops in/out unpredictably as you try to
+ *     delete several in a row. The icon is now always visible (dimmed,
+ *     brightening on hover) so its position and presence are never in
+ *     question.
+ *  2. The row vanished from the list the instant onDelete() resolved, an
+ *     abrupt cut that reads as a jump. `closing` now plays a short
+ *     collapse-and-fade transition on this row FIRST, and only calls
+ *     onDelete() (the actual IPC delete + list refresh) once that transition
+ *     finishes — so removal reads as a smooth animation, not a snap.
  */
 function RunRow({
   run,
   selected,
   projectName,
   onSelect,
-  onDelete,
+  deletable,
+  confirming,
+  closing,
+  onRequestDelete,
+  onCancelDelete,
+  onConfirmDelete,
 }: {
   run: Run;
   selected: boolean;
   projectName: string | undefined;
   onSelect: () => void;
-  onDelete?: () => void;
+  deletable: boolean;
+  confirming: boolean;
+  closing: boolean;
+  onRequestDelete: () => void;
+  onCancelDelete: () => void;
+  onConfirmDelete: () => void;
 }) {
-  const [confirming, setConfirming] = useState(false);
-
   return (
-    <li className="group relative">
+    <li
+      className={cn(
+        'group relative overflow-hidden transition-[max-height,opacity] duration-200 ease-in',
+        closing ? 'max-h-0 opacity-0' : 'max-h-24 opacity-100',
+      )}
+    >
       <button
         type="button"
         onClick={onSelect}
+        disabled={closing}
         className={cn(
           'flex w-full flex-col gap-1 px-3 py-2.5 text-left transition-colors',
-          onDelete && 'pr-8',
+          deletable && 'pr-8',
           selected ? 'bg-accent/10' : 'hover:bg-panel',
         )}
       >
@@ -174,14 +279,25 @@ function RunRow({
           {run.mode && <span className="shrink-0 font-mono text-[11px] text-muted">{run.mode}</span>}
         </div>
       </button>
-      {onDelete && (
+      {deletable && !closing && (
+        // Centered via inset-y-0 + my-auto (box layout), NOT a translate-y
+        // transform: the shared Button component applies active:translate-y-px
+        // as a tactile "press" effect on every button, which shares the same
+        // CSS transform axis as a translate-based vertical-center trick — the
+        // instant this was pressed, :active's 1px value overrode the
+        // centering offset entirely, snapping the icon from centered to
+        // near the top of the row. That visible jump is what made the icon
+        // look like it was "moving" on click, and could carry the pointer
+        // off the button before mouseup, so the confirm dialog sometimes
+        // never opened. Auto-margin centering doesn't touch transform at
+        // all, so the press effect can no longer collide with it.
         <Button
           size="icon"
           variant="ghost"
-          onClick={() => setConfirming(true)}
+          onClick={onRequestDelete}
           aria-label="Delete run"
           title="Delete run"
-          className="absolute right-1 top-1/2 h-6 w-6 -translate-y-1/2 opacity-0 group-hover:opacity-100 focus-visible:opacity-100"
+          className="absolute inset-y-0 right-1 my-auto h-6 w-6 text-muted/70 hover:text-err"
         >
           <Trash2 className="h-3.5 w-3.5" />
         </Button>
@@ -192,11 +308,8 @@ function RunRow({
           description="This permanently removes the run's history, generated suite, and any screenshots/recordings. This cannot be undone."
           confirmLabel="Delete"
           destructive
-          onConfirm={() => {
-            setConfirming(false);
-            onDelete?.();
-          }}
-          onCancel={() => setConfirming(false)}
+          onConfirm={onConfirmDelete}
+          onCancel={onCancelDelete}
         />
       )}
     </li>

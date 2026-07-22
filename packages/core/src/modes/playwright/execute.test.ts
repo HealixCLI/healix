@@ -693,6 +693,49 @@ describe('parseReport — error text stays simple, not a wall of duplicates', ()
   });
 });
 
+describe('parseReport — specFile inheritance through nested describe() suites', () => {
+  it('inherits the file from an ancestor suite when the immediate (nested) suite and spec both lack one', () => {
+    // Real shape: Playwright's JSON reporter sets `file` on the outermost
+    // per-file suite, but a nested test.describe() block — exactly what
+    // every generated spec wraps its scenarios in — has no `file` of its
+    // own. Without inheriting from the ancestor, specFile would end up
+    // undefined here, silently falling back to title-only merge identity
+    // (see coverage.ts's mergeExecOutcomes) and reintroducing the exact
+    // report-vs-Results-tab count mismatch the specFile field exists to fix.
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: '',
+          file: 'tests/tierA-public/REQ-1.spec.ts',
+          specs: [],
+          suites: [
+            {
+              // The test.describe('[REQ:REQ-1] ...') block: no `file` of its own.
+              title: '[REQ:REQ-1] Widget list',
+              specs: [
+                {
+                  title: '[REQ:REQ-1] positive: loads',
+                  // No `file` on the spec either — the case that used to fall
+                  // all the way back to undefined.
+                  tests: [
+                    {
+                      status: 'passed',
+                      projectName: 'tierA-public',
+                      results: [{ status: 'passed', duration: 5 }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.specFile).toBe('tests/tierA-public/REQ-1.spec.ts');
+  });
+});
+
 describe('findAuthSetupOutcome', () => {
   it('detects a failed auth-setup by project name or file and captures its error', () => {
     const r = report([

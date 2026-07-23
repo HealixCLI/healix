@@ -104,6 +104,7 @@ const api = {
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
     ipcRenderer.invoke('runs:caseHistory', { projectId, ...key }),
   projectMetrics: (projectId: string) => ipcRenderer.invoke('runs:projectMetrics', { projectId }),
+  usageCrossRun: (projectId?: string) => ipcRenderer.invoke('usage:crossRun', { projectId }),
 
   // per-item plan revision (AI-regenerates one item from human feedback)
   reviseItem: (args: { projectId: string; item: unknown; suggestion: string }) =>

@@ -10,6 +10,7 @@ import type {
   RunSummary,
   SuiteBundle,
   TestPlanItem,
+  UsageAggregate,
 } from '@healix/core';
 import type {
   ActiveRunSnapshot,
@@ -90,6 +91,7 @@ export interface HealixBridge {
   suiteDiff: (runId: string) => Promise<SuiteDiffSummary | null>;
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) => Promise<TestCaseHistory>;
   projectMetrics: (projectId: string) => Promise<ProjectMetrics | null>;
+  usageCrossRun: (projectId?: string) => Promise<UsageAggregate>;
 
   onRunEvent: (cb: (msg: RunChannelMessage) => void) => () => void;
 }

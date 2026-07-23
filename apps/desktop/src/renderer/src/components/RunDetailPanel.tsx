@@ -1,6 +1,6 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { AgentEvent, TestCase, TestResult, TestStatus } from '@healix/core';
+import type { AgentEvent, TestCase, TestResult, TestStatus, UsageRow } from '@healix/core';
 import {
   Camera,
   Check,
@@ -21,6 +21,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Tabs } from './ui/tabs';
 import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
 import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
+import { SHOW_TOKEN_USAGE } from '../lib/feature-flags';
 import { cn } from '../lib/utils';
 import {
   artifactKind,
@@ -39,7 +40,7 @@ import {
 } from '../lib/run-format';
 import type { StageDuration } from '../lib/run-format';
 
-type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts';
+type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts' | 'usage';
 
 const VERDICT_TONE: Record<string, 'ok' | 'warn' | 'err' | 'muted' | 'default'> = {
   app_is_wrong: 'err',
@@ -170,11 +171,15 @@ export function RunDetailPanel({
 
   const { run } = detail;
 
+  const usage = detail.usage ?? [];
+
+  // Usage tab is gated behind SHOW_TOKEN_USAGE — see feature-flags.ts.
   const TABS: ReadonlyArray<{ value: DetailTab; label: string }> = [
     { value: 'timeline', label: `Timeline · ${detail.events.length}` },
     { value: 'results', label: `Results · ${rows.length}` },
     { value: 'triage', label: `Triage · ${triage.length}` },
     { value: 'artifacts', label: `Media · ${mediaCount}` },
+    ...(SHOW_TOKEN_USAGE ? [{ value: 'usage' as const, label: `Usage · ${usage.length}` }] : []),
   ];
 
   return (
@@ -283,6 +288,11 @@ export function RunDetailPanel({
               focusFolder={focusFolder}
               setPreview={setPreview}
             />
+          </div>
+        )}
+        {tab === 'usage' && SHOW_TOKEN_USAGE && (
+          <div className="min-h-0 flex-1 overflow-auto">
+            <UsagePanel usage={usage} />
           </div>
         )}
       </div>
@@ -816,6 +826,120 @@ function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+// ---- Usage --------------------------------------------------------------
+
+/** Formats a token count for display; '—' when null (the provider/call reported no usage). */
+function formatTokens(n: number | null): string {
+  return n === null ? '—' : n.toLocaleString();
+}
+
+/** Formats a USD cost for display; '—' when null (not every provider reports cost). */
+function formatCost(n: number | null): string {
+  return n === null ? '—' : `$${n < 0.01 && n > 0 ? n.toFixed(4) : n.toFixed(2)}`;
+}
+
+interface PhaseUsage {
+  phase: string;
+  rows: UsageRow[];
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costUsd: number | null;
+}
+
+/** Sums nullable numbers, staying null only when EVERY value is null (vs. 0 when some are 0/absent-but-known). */
+function sumNullable(values: Array<number | null>): number | null {
+  const known = values.filter((v): v is number => v !== null);
+  return known.length > 0 ? known.reduce((a, b) => a + b, 0) : null;
+}
+
+function groupUsageByPhase(usage: UsageRow[]): PhaseUsage[] {
+  const byPhase = new Map<string, UsageRow[]>();
+  for (const u of usage) {
+    const list = byPhase.get(u.phase) ?? [];
+    list.push(u);
+    byPhase.set(u.phase, list);
+  }
+  return [...byPhase.entries()].map(([phase, rows]) => ({
+    phase,
+    rows,
+    inputTokens: sumNullable(rows.map((r) => r.inputTokens)),
+    outputTokens: sumNullable(rows.map((r) => r.outputTokens)),
+    costUsd: sumNullable(rows.map((r) => r.costUsd)),
+  }));
+}
+
+/** Compact total + per-phase/task token/cost breakdown for a single run. */
+function UsagePanel({ usage }: { usage: UsageRow[] }) {
+  const phases = useMemo(() => groupUsageByPhase(usage), [usage]);
+  const totalInput = useMemo(() => sumNullable(phases.map((p) => p.inputTokens)), [phases]);
+  const totalOutput = useMemo(() => sumNullable(phases.map((p) => p.outputTokens)), [phases]);
+  const totalCost = useMemo(() => sumNullable(phases.map((p) => p.costUsd)), [phases]);
+  const totalTokens =
+    totalInput === null && totalOutput === null ? null : (totalInput ?? 0) + (totalOutput ?? 0);
+
+  if (usage.length === 0) {
+    return (
+      <EmptyHint>
+        No usage recorded for this run — this run may predate usage tracking, or its provider didn't report
+        token/cost data.
+      </EmptyHint>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <StatTileRow className="sm:grid-cols-4">
+        <StatTile label="Total tokens" value={formatTokens(totalTokens)} />
+        <StatTile label="Input" value={formatTokens(totalInput)} />
+        <StatTile label="Output" value={formatTokens(totalOutput)} />
+        <StatTile label="Cost" value={formatCost(totalCost)} />
+      </StatTileRow>
+
+      <div className="flex flex-col gap-4">
+        {phases.map((p) => (
+          <section key={p.phase} className="rounded-lg border border-border bg-panel/40 p-3">
+            <header className="mb-2 flex items-center justify-between gap-2">
+              <span className="font-mono text-xs uppercase tracking-wide text-fg">{p.phase}</span>
+              <span className="text-[11px] text-muted">
+                {formatTokens(p.inputTokens)} in · {formatTokens(p.outputTokens)} out ·{' '}
+                {formatCost(p.costUsd)}
+              </span>
+            </header>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Task</TableHead>
+                  <TableHead>Provider</TableHead>
+                  <TableHead className="text-right">Input</TableHead>
+                  <TableHead className="text-right">Output</TableHead>
+                  <TableHead className="text-right">Cost</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {p.rows.map((r) => (
+                  <TableRow key={r.id}>
+                    <TableCell className="max-w-[16rem] truncate" title={r.task ?? undefined}>
+                      {r.task ?? '—'}
+                    </TableCell>
+                    <TableCell className="font-mono text-[11px] text-muted">{r.provider}</TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.inputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.outputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">{formatCost(r.costUsd)}</TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </section>
+        ))}
+      </div>
+    </div>
   );
 }
 

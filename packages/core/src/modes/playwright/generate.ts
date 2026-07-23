@@ -874,6 +874,14 @@ Requirements:
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
 - Be self-contained and runnable; do not import any other local helpers beyond the one import above.
+- When a scenario CREATES a new resource that the app enforces as unique (e.g. registering a user
+  by email, creating an account/username), do NOT hardcode a fixed literal value for that unique
+  field — embed \`Date.now()\` (or a similarly varying value) in it, e.g.
+  \`\`email-\${Date.now()}@example.com\`\`. A fixed value passes once against a real, persistent
+  backend and then fails every later re-run with a duplicate/conflict error, since the app correctly
+  remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
+  path itself should still register their own fresh unique value first, then reuse THAT same value for
+  the collision attempt within the same test.
 - ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
@@ -956,6 +964,7 @@ async function generateOne(
         readOnly: true,
         signal: ctx.signal,
       });
+      ctx.onUsage?.('generate', item.title, ctx.provider.id, res.raw);
       if (!res.ok) {
         emit(ctx, `Codegen provider error for "${item.title}" (attempt ${attempt + 1}): ${res.detail}`);
         providerFailureDetail = res.detail;

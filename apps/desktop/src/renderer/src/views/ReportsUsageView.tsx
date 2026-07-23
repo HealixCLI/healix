@@ -15,6 +15,7 @@ export function ReportsUsageView() {
 
   const perRun = aggregate?.perRun ?? [];
   const perPhase = aggregate?.perPhase ?? [];
+  const perModel = aggregate?.perModel ?? [];
   const grandTotalInput = sumNullable(perPhase.map((p) => p.totalInputTokens));
   const grandTotalOutput = sumNullable(perPhase.map((p) => p.totalOutputTokens));
   const grandTotalCost = sumNullable(perPhase.map((p) => p.totalCostUsd));
@@ -87,6 +88,50 @@ export function ReportsUsageView() {
                     </TableCell>
                     <TableCell className="text-right text-xs text-muted">
                       {formatTokens(p.avgCacheCreationInputTokens)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </section>
+
+          <section>
+            <h2 className="mb-3 text-sm font-semibold text-muted">Per-model totals</h2>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Model</TableHead>
+                  <TableHead className="text-right">Calls</TableHead>
+                  <TableHead className="text-right">Avg input</TableHead>
+                  <TableHead className="text-right">Avg output</TableHead>
+                  <TableHead className="text-right">Avg cost</TableHead>
+                  <TableHead className="text-right">Total cost</TableHead>
+                  <TableHead className="text-right">Avg cache read</TableHead>
+                  <TableHead className="text-right">Avg cache create</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {perModel.map((m) => (
+                  <TableRow key={m.model}>
+                    <TableCell className="font-mono text-xs text-fg">{m.model}</TableCell>
+                    <TableCell className="text-right text-xs text-muted">{m.callCount}</TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(m.avgInputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(m.avgOutputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatCost(m.avgCostUsd)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatCost(m.totalCostUsd)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(m.avgCacheReadInputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(m.avgCacheCreationInputTokens)}
                     </TableCell>
                   </TableRow>
                 ))}

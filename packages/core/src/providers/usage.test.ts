@@ -15,6 +15,7 @@ describe('extractUsage', () => {
       costUsd: 0.241425,
       cacheCreationInputTokens: null,
       cacheReadInputTokens: null,
+      model: 'claude-haiku-4-5-20251001',
     });
   });
 
@@ -44,6 +45,21 @@ describe('extractUsage', () => {
     const result = extractUsage(raw);
     expect(result?.cacheCreationInputTokens).toBe(9637);
     expect(result?.cacheReadInputTokens).toBe(33201);
+    // The requested model (sonnet) has far fewer input/output tokens than the
+    // incidental haiku entry (2+9=11 vs 530+13=543), but its cache activity
+    // (9637+33201=42838) makes its total weight dominant — proving the model
+    // pick isn't fooled by a heavily-cached call's small fresh-token count.
+    expect(result?.model).toBe('claude-sonnet-5');
+  });
+
+  it('picks the model with the most fresh tokens when neither entry has cache activity', () => {
+    const raw = {
+      modelUsage: {
+        'claude-haiku-4-5-20251001': { inputTokens: 8, outputTokens: 2 },
+        'claude-sonnet-5': { inputTokens: 400, outputTokens: 900 },
+      },
+    };
+    expect(extractUsage(raw)?.model).toBe('claude-sonnet-5');
   });
 
   it('returns null when raw has no modelUsage at all (e.g. a RawCommand from a timeout/abort)', () => {
@@ -66,6 +82,7 @@ describe('extractUsage', () => {
       costUsd: null,
       cacheCreationInputTokens: null,
       cacheReadInputTokens: null,
+      model: 'some-model',
     });
   });
 

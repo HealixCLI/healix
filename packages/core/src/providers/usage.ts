@@ -6,6 +6,23 @@ export interface UsageTotals {
   costUsd: number | null;
   cacheCreationInputTokens: number | null;
   cacheReadInputTokens: number | null;
+  /**
+   * The dominant model for this completion — the `modelUsage` key with the
+   * highest total token weight (input + output + cache-creation + cache-read).
+   * A single completion can report more than one model (e.g. an incidental
+   * small Claude Code-internal call alongside the one actually requested via
+   * `--model`), so picking by weight favors the model that did the real work
+   * over a small internal side-call. Cache tokens are included in the weight
+   * because a heavily-cached call can have a tiny `inputTokens` count (most of
+   * its context came from the cache, not fresh input) while still being the
+   * real request — input+output alone would then wrongly favor an incidental
+   * call with no cache activity (confirmed against a real observed response
+   * where the requested Sonnet call had inputTokens:2/outputTokens:9 but
+   * cacheReadInputTokens:33201, versus an internal Haiku call with
+   * inputTokens:530/outputTokens:13 and no cache activity at all — input+output
+   * alone would have picked Haiku). Null if no entry has token fields.
+   */
+  model: string | null;
 }
 
 /**
@@ -46,16 +63,21 @@ export function extractUsage(raw: unknown): UsageTotals | null {
   let sawTokens = false;
   let sawCost = false;
   let sawCacheTokens = false;
+  let dominantModel: string | null = null;
+  let dominantWeight = -1;
 
-  for (const entry of Object.values(modelUsage as Record<string, unknown>)) {
+  for (const [modelName, entry] of Object.entries(modelUsage as Record<string, unknown>)) {
     if (!entry || typeof entry !== 'object') continue;
     const e = entry as Record<string, unknown>;
+    let entryTokenWeight = 0;
     if (typeof e.inputTokens === 'number') {
       inputTokens += e.inputTokens;
+      entryTokenWeight += e.inputTokens;
       sawTokens = true;
     }
     if (typeof e.outputTokens === 'number') {
       outputTokens += e.outputTokens;
+      entryTokenWeight += e.outputTokens;
       sawTokens = true;
     }
     if (typeof e.costUSD === 'number') {
@@ -64,11 +86,17 @@ export function extractUsage(raw: unknown): UsageTotals | null {
     }
     if (typeof e.cacheCreationInputTokens === 'number') {
       cacheCreationInputTokens += e.cacheCreationInputTokens;
+      entryTokenWeight += e.cacheCreationInputTokens;
       sawCacheTokens = true;
     }
     if (typeof e.cacheReadInputTokens === 'number') {
       cacheReadInputTokens += e.cacheReadInputTokens;
+      entryTokenWeight += e.cacheReadInputTokens;
       sawCacheTokens = true;
+    }
+    if (entryTokenWeight > dominantWeight) {
+      dominantWeight = entryTokenWeight;
+      dominantModel = modelName;
     }
   }
 
@@ -79,5 +107,6 @@ export function extractUsage(raw: unknown): UsageTotals | null {
     costUsd: sawCost ? costUsd : null,
     cacheCreationInputTokens: sawCacheTokens ? cacheCreationInputTokens : null,
     cacheReadInputTokens: sawCacheTokens ? cacheReadInputTokens : null,
+    model: dominantModel,
   };
 }

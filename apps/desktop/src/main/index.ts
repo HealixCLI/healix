@@ -1179,7 +1179,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
 ipcMain.handle(
   'usage:crossRun',
   async (_e, payload: { projectId?: string } | undefined): Promise<UsageAggregate> => {
-    const empty: UsageAggregate = { perRun: [], perPhase: [] };
+    const empty: UsageAggregate = { perRun: [], perPhase: [], perModel: [] };
     const store = await getStore();
     if (!store) return empty;
     try {

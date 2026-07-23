@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 12;
+export const SCHEMA_VERSION = 13;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -84,6 +84,9 @@ CREATE TABLE IF NOT EXISTS agent_events (
 -- v12: cache-read/cache-creation token counts alongside the existing
 -- input/output/cost columns — null when the provider reported no cache
 -- activity for that call (not every call writes to or reads from the cache).
+-- v13: model — the dominant modelUsage entry (by input+output tokens) that
+-- actually served the call, e.g. 'claude-sonnet-5'. Null when the provider
+-- reported no usage at all.
 CREATE TABLE IF NOT EXISTS usage (
   id                          TEXT PRIMARY KEY,
   run_id                      TEXT NOT NULL REFERENCES runs(id),
@@ -95,6 +98,7 @@ CREATE TABLE IF NOT EXISTS usage (
   cost_usd                    REAL,
   cache_creation_input_tokens INTEGER,
   cache_read_input_tokens     INTEGER,
+  model                       TEXT,
   created_at                  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

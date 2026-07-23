@@ -137,6 +137,10 @@ function migrate(db: DatabaseSync): void {
     // fresh installs).
     ensureColumn(db, 'usage', 'cache_creation_input_tokens', 'INTEGER');
     ensureColumn(db, 'usage', 'cache_read_input_tokens', 'INTEGER');
+    // v13: model — the dominant modelUsage entry that served each call, added
+    // to an existing usage table via ensureColumn (the CREATE above only
+    // helps fresh installs).
+    ensureColumn(db, 'usage', 'model', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

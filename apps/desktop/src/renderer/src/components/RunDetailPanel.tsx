@@ -904,6 +904,7 @@ function UsagePanel({ usage }: { usage: UsageRow[] }) {
                 <TableRow>
                   <TableHead>Task</TableHead>
                   <TableHead>Provider</TableHead>
+                  <TableHead>Model</TableHead>
                   <TableHead className="text-right">Input</TableHead>
                   <TableHead className="text-right">Output</TableHead>
                   <TableHead className="text-right">Cost</TableHead>
@@ -918,6 +919,7 @@ function UsagePanel({ usage }: { usage: UsageRow[] }) {
                       {r.task ?? '—'}
                     </TableCell>
                     <TableCell className="font-mono text-[11px] text-muted">{r.provider}</TableCell>
+                    <TableCell className="font-mono text-[11px] text-muted">{r.model ?? '—'}</TableCell>
                     <TableCell className="text-right text-xs text-muted">
                       {formatTokens(r.inputTokens)}
                     </TableCell>

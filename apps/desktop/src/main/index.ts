@@ -55,6 +55,8 @@ import {
   writeModelConfigOverrides,
   type ModelEffortConfig,
   type ModelEffortOverrides,
+  type UsageRow,
+  type UsageAggregate,
 } from '@healix/core';
 
 // Last-resort net: every ipcMain handler already catches its own errors and
@@ -1093,6 +1095,8 @@ export interface RunDetail {
    * (a run from before this feature existed, or the write failed).
    */
   runConfig: RunConfigSnapshot | null;
+  /** Per-call token/cost usage captured during this run (plan/generate/triage) — feeds the Usage tab. */
+  usage: UsageRow[];
 }
 
 ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<RunDetail> => {
@@ -1107,6 +1111,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     reportHtmlPath: null,
     plan: null,
     runConfig: null,
+    usage: [],
   };
   const runId = payload?.runId;
   if (!runId) return empty;
@@ -1119,6 +1124,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   let tests: TestCase[] = [];
   let results: TestResult[] = [];
   let events: AgentEvent[] = [];
+  let usage: UsageRow[] = [];
   try {
     run = store.getRun(runId);
   } catch {
@@ -1138,6 +1144,11 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     events = store.listEvents(runId);
   } catch {
     events = [];
+  }
+  try {
+    usage = store.listUsageForRun(runId);
+  } catch {
+    usage = [];
   }
 
   // On-disk artifacts live under <projectsDir>/<projectId>/runs/<runId>/...
@@ -1161,8 +1172,23 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     runConfig = await readRunConfigSnapshot(runDir);
   }
 
-  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan, runConfig };
+  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan, runConfig, usage };
 });
+
+/** Cross-run usage aggregation for the Reports/Usage page — omit projectId for every project. */
+ipcMain.handle(
+  'usage:crossRun',
+  async (_e, payload: { projectId?: string } | undefined): Promise<UsageAggregate> => {
+    const empty: UsageAggregate = { perRun: [], perPhase: [] };
+    const store = await getStore();
+    if (!store) return empty;
+    try {
+      return store.getUsageAggregate({ projectId: payload?.projectId });
+    } catch {
+      return empty;
+    }
+  },
+);
 
 /** Most recent fully-passed run for a project — drives the Suite Mode toggle's enable/disable state. */
 ipcMain.handle('runs:lastSuccessful', async (_e, payload: { projectId: string }): Promise<Run | null> => {

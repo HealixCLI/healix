@@ -16,6 +16,8 @@ export {
   type ModelEffortConfig,
   type ModelEffortOverrides,
 } from './providers/model-config.js';
+export { extractUsage } from './providers/usage.js';
+export type { UsageTotals, UsageRecorder } from './providers/usage.js';
 
 // Doctor / facade
 export { doctor, type DoctorReport } from './healix.js';

@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from '../providers/types.js';
+import type { UsageRecorder } from '../providers/usage.js';
 
 export type Verdict = 'test_is_wrong' | 'app_is_wrong' | 'environment' | 'flaky' | 'ambiguous';
 
@@ -37,5 +38,10 @@ export interface TriageEngine {
    * CLI child process) when its own patience runs out, instead of abandoning
    * it to keep running in the background untracked.
    */
-  analyze(input: TriageInput, provider: ProviderAdapter, signal?: AbortSignal): Promise<TriageResult>;
+  analyze(
+    input: TriageInput,
+    provider: ProviderAdapter,
+    signal?: AbortSignal,
+    onUsage?: UsageRecorder,
+  ): Promise<TriageResult>;
 }

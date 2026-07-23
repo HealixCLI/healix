@@ -11,6 +11,7 @@ import type {
   TestResult,
   TestingScope,
   TestPlan,
+  UsageRow,
 } from '@healix/core';
 
 export interface ProviderSummary {
@@ -126,6 +127,8 @@ export interface RunDetail {
    * (a run from before this feature existed, or the write failed).
    */
   runConfig: RunConfigSnapshot | null;
+  /** Per-call token/cost usage captured during this run (plan/generate/triage) — feeds the Usage tab. */
+  usage: UsageRow[];
 }
 
 /** The options a run was started with, permanently recorded (unlike the pausable checkpoint). */

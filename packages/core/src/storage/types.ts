@@ -160,6 +160,58 @@ export interface AgentEvent {
   createdAt: string;
 }
 
+/** One captured provider.complete() call's token/cost usage within a run. */
+export interface UsageRow {
+  id: string;
+  runId: string;
+  phase: string;
+  /** Human label scoping this row within its phase (e.g. a spec item's title, or 'gap-fill'). Null when the call site has none. */
+  task: string | null;
+  provider: ProviderId;
+  /** Null when the provider/call reported no usage (e.g. a timeout, or a provider that doesn't report usage). */
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costUsd: number | null;
+  createdAt: string;
+}
+
+/** Input shape for recordUsage — id/createdAt are assigned on persist. */
+export interface NewUsage {
+  runId: string;
+  phase: string;
+  task?: string | null;
+  provider: ProviderId;
+  inputTokens?: number | null;
+  outputTokens?: number | null;
+  costUsd?: number | null;
+}
+
+/** One run's total usage — a row in the Reports/Usage page's cross-run table. */
+export interface UsageRunSummary {
+  runId: string;
+  runCreatedAt: string;
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costUsd: number | null;
+}
+
+/** One phase's usage aggregated across every run in scope — the Reports/Usage page's per-phase averages. */
+export interface UsagePhaseSummary {
+  phase: string;
+  callCount: number;
+  avgInputTokens: number | null;
+  avgOutputTokens: number | null;
+  avgCostUsd: number | null;
+  totalInputTokens: number | null;
+  totalOutputTokens: number | null;
+  totalCostUsd: number | null;
+}
+
+export interface UsageAggregate {
+  perRun: UsageRunSummary[];
+  perPhase: UsagePhaseSummary[];
+}
+
 /** Input shape for a single credential when creating/updating a project — no id yet, assigned on persist. */
 export interface NewProjectCredential {
   authType?: CredentialAuthType;

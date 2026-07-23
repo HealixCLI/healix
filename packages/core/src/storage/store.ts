@@ -8,6 +8,7 @@ import type {
   EventLevel,
   NewProject,
   NewProjectCredential,
+  NewUsage,
   PauseReason,
   Project,
   ProjectCredential,
@@ -17,6 +18,8 @@ import type {
   TestCase,
   TestResult,
   TestStatus,
+  UsageAggregate,
+  UsageRow,
 } from './types.js';
 
 /**
@@ -368,9 +371,11 @@ export class HealixStore {
       this.db.prepare('DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)').run(id);
       // 2. agent_events of this run
       this.db.prepare('DELETE FROM agent_events WHERE run_id = ?').run(id);
-      // 3. tests of this run
+      // 3. usage rows of this run
+      this.db.prepare('DELETE FROM usage WHERE run_id = ?').run(id);
+      // 4. tests of this run
       this.db.prepare('DELETE FROM tests WHERE run_id = ?').run(id);
-      // 4. the run row itself
+      // 5. the run row itself
       this.db.prepare('DELETE FROM runs WHERE id = ?').run(id);
       this.db.exec('COMMIT');
     } catch (err) {
@@ -552,6 +557,104 @@ export class HealixStore {
       ).map(rowToEvent)
     );
   }
+
+  /** Persist one captured provider.complete() call's token/cost usage. Never throws on a bad runId — this schema never enables `PRAGMA foreign_keys`, so the runId REFERENCES is unenforced (like every other FK here); an orphaned row is simply possible, at the caller's own risk, matching insertResult's best-effort style. */
+  recordUsage(input: NewUsage): UsageRow {
+    const row: UsageRow = {
+      id: `usg_${nanoid(10)}`,
+      runId: input.runId,
+      phase: input.phase,
+      task: input.task ?? null,
+      provider: input.provider,
+      inputTokens: input.inputTokens ?? null,
+      outputTokens: input.outputTokens ?? null,
+      costUsd: input.costUsd ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        'INSERT INTO usage (id, run_id, phase, task, provider, input_tokens, output_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        row.id,
+        row.runId,
+        row.phase,
+        row.task,
+        row.provider,
+        row.inputTokens,
+        row.outputTokens,
+        row.costUsd,
+        row.createdAt,
+      );
+    return row;
+  }
+
+  listUsageForRun(runId: string): UsageRow[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM usage WHERE run_id = ? ORDER BY created_at ASC, rowid ASC')
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToUsage);
+  }
+
+  /**
+   * Cross-run usage aggregation for the Reports/Usage page: one row per run
+   * (its own total tokens/cost, newest-first) plus per-phase averages across
+   * every matching run. Scoped to a project when given, else every run in the
+   * store — mirrors listRuns' own (projectId?) scoping.
+   */
+  getUsageAggregate(opts: { projectId?: string } = {}): UsageAggregate {
+    const runFilter = opts.projectId ? 'WHERE r.project_id = ?' : '';
+    const params = opts.projectId ? [opts.projectId] : [];
+
+    // rowid tiebreaker: same reasoning as listRuns/listEvents — created_at has
+    // only second resolution, so two runs created within the same second (easy
+    // on a fast CI runner) would otherwise sort nondeterministically.
+    const perRunRows = this.db
+      .prepare(
+        `SELECT r.id AS run_id, r.created_at AS run_created_at,
+                SUM(u.input_tokens) AS input_tokens, SUM(u.output_tokens) AS output_tokens, SUM(u.cost_usd) AS cost_usd
+         FROM runs r
+         LEFT JOIN usage u ON u.run_id = r.id
+         ${runFilter}
+         GROUP BY r.id
+         ORDER BY r.created_at DESC, r.rowid DESC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+
+    const perPhaseRows = this.db
+      .prepare(
+        `SELECT u.phase AS phase, COUNT(*) AS call_count,
+                AVG(u.input_tokens) AS avg_input_tokens, AVG(u.output_tokens) AS avg_output_tokens, AVG(u.cost_usd) AS avg_cost_usd,
+                SUM(u.input_tokens) AS total_input_tokens, SUM(u.output_tokens) AS total_output_tokens, SUM(u.cost_usd) AS total_cost_usd
+         FROM usage u
+         JOIN runs r ON r.id = u.run_id
+         ${runFilter}
+         GROUP BY u.phase
+         ORDER BY u.phase ASC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+
+    return {
+      perRun: perRunRows.map((r) => ({
+        runId: String(r.run_id),
+        runCreatedAt: String(r.run_created_at),
+        inputTokens: n(r.input_tokens),
+        outputTokens: n(r.output_tokens),
+        costUsd: n(r.cost_usd),
+      })),
+      perPhase: perPhaseRows.map((r) => ({
+        phase: String(r.phase),
+        callCount: Number(r.call_count ?? 0),
+        avgInputTokens: n(r.avg_input_tokens),
+        avgOutputTokens: n(r.avg_output_tokens),
+        avgCostUsd: n(r.avg_cost_usd),
+        totalInputTokens: n(r.total_input_tokens),
+        totalOutputTokens: n(r.total_output_tokens),
+        totalCostUsd: n(r.total_cost_usd),
+      })),
+    };
+  }
 }
 
 let cached: HealixStore | null = null;
@@ -670,6 +773,20 @@ function rowToEvent(r: Record<string, unknown>): AgentEvent {
     level: String(r.level) as EventLevel,
     message: String(r.message),
     dataJson: s(r.data_json),
+    createdAt: String(r.created_at),
+  };
+}
+
+function rowToUsage(r: Record<string, unknown>): UsageRow {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    phase: String(r.phase),
+    task: s(r.task),
+    provider: String(r.provider) as UsageRow['provider'],
+    inputTokens: n(r.input_tokens),
+    outputTokens: n(r.output_tokens),
+    costUsd: n(r.cost_usd),
     createdAt: String(r.created_at),
   };
 }

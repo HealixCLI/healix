@@ -11,6 +11,7 @@
  * whenever the provider errors, times out, or returns an unparseable reply.
  */
 import type { ProviderAdapter } from '../providers/types.js';
+import type { UsageRecorder } from '../providers/usage.js';
 import type { TriageEngine, TriageInput, TriageResult } from './types.js';
 import { classifyByRules } from './rules.js';
 import { buildTriagePrompt, parseTriageReply } from './prompt.js';
@@ -50,6 +51,7 @@ export function createTriageEngine(): TriageEngine {
       input: TriageInput,
       provider: ProviderAdapter,
       signal?: AbortSignal,
+      onUsage?: UsageRecorder,
     ): Promise<TriageResult> {
       // Deterministic baseline is always computed: it is the fallback and also
       // seeds a suggestedPatch the AI may omit.
@@ -65,6 +67,7 @@ export function createTriageEngine(): TriageEngine {
       let reply: Awaited<ReturnType<ProviderAdapter['complete']>>;
       try {
         reply = await provider.complete(prompt, { timeoutMs: ANALYZE_TIMEOUT_MS, signal });
+        onUsage?.('triage', input.title, provider.id, reply.raw);
       } catch {
         // Provider threw (process error, etc.) — never leak; fall back.
         return baseline;

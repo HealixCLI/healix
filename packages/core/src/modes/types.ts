@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from '../providers/types.js';
+import type { UsageRecorder } from '../providers/usage.js';
 import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
@@ -269,6 +270,8 @@ export interface TestModeContext {
   /** White-box static-analysis result (routes/endpoints/forms/auth patterns), set during PLAN; grounds generation and triage with real source-file citations. */
   sourceContext?: SourceContext;
   emit?: (phase: string, message: string, data?: unknown) => void;
+  /** Reports a provider.complete() call's token/cost usage back to the run's store — see UsageRecorder. */
+  onUsage?: UsageRecorder;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
   /**

@@ -4,9 +4,11 @@ import { Sidebar, type RunStatusBadge, type ViewId } from './components/Sidebar'
 import { ProjectsView } from './views/ProjectsView';
 import { RunsView } from './views/RunsView';
 import { ProjectDashboardView } from './views/ProjectDashboardView';
+import { ReportsUsageView } from './views/ReportsUsageView';
 import { SettingsView } from './views/SettingsView';
 import { useRunEngine } from './lib/run-engine';
 import { useRunQueue } from './lib/run-queue';
+import { SHOW_TOKEN_USAGE } from './lib/feature-flags';
 
 /** Live indicator for the Runs nav item, derived from the run engine + queue — visible from any view. */
 function runStatusBadgeFor(phase: string, queueLength: number): RunStatusBadge | null {
@@ -93,6 +95,11 @@ export default function App() {
             onBack={() => setView('projects')}
             onRunProject={runProject}
           />
+        )}
+        {view === 'reports' && SHOW_TOKEN_USAGE && (
+          <div className="h-full overflow-auto">
+            <ReportsUsageView />
+          </div>
         )}
         {view === 'settings' && (
           <div className="h-full overflow-auto">

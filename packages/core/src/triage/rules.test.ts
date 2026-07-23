@@ -33,7 +33,8 @@ describe('classifyByRules / engine.classify', () => {
     it('classifies a no-credentials-configured blocked message as environment', () => {
       const result = engine.classify({
         title: '[REQ:REQ-1] authenticated flow',
-        error: 'Tier B ran without credentials (no HEALIX_TIERB_* configured; anonymous session).\nsome failure',
+        error:
+          'Tier B ran without credentials (no HEALIX_TIERB_* configured; anonymous session).\nsome failure',
       });
       expect(result.verdict).toBe('environment');
     });
@@ -45,7 +46,8 @@ describe('classifyByRules / engine.classify', () => {
       // distinction matters once verdicts diverge or rationale text is surfaced to the user.
       const result = engine.classify({
         title: '[REQ:REQ-1] authenticated flow',
-        error: 'Error: Auth setup failed — Tier B prerequisite not met.\nError: connect ECONNREFUSED 127.0.0.1:3000',
+        error:
+          'Error: Auth setup failed — Tier B prerequisite not met.\nError: connect ECONNREFUSED 127.0.0.1:3000',
       });
       expect(result.rationale).toContain('BLOCKED, not failed');
     });

@@ -413,7 +413,12 @@ describe('buildPlanPrompt (repo context)', () => {
     const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
     const units: FunctionalityUnit[] = [
       { key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' },
-      { key: 'endpoint:GET /get-customers', kind: 'endpoint', label: 'GET /get-customers', file: 'src/server.ts' },
+      {
+        key: 'endpoint:GET /get-customers',
+        kind: 'endpoint',
+        label: 'GET /get-customers',
+        file: 'src/server.ts',
+      },
     ];
     const prompt = buildPlanPrompt(
       project,

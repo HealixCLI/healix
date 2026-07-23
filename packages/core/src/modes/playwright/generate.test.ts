@@ -1063,9 +1063,7 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
 
   it('warns a tierC-api item off a route-kind unit instead of treating it as a real backend endpoint', async () => {
     const sourceContext: TestModeContext['sourceContext'] = {
-      units: [
-        { key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' },
-      ],
+      units: [{ key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' }],
       forms: [],
       authPatterns: [],
       selectorHints: [],
@@ -1086,9 +1084,7 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
 
   it('does not warn a tierA-public item off a route-kind unit — a route IS the right unit for a UI test', async () => {
     const sourceContext: TestModeContext['sourceContext'] = {
-      units: [
-        { key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' },
-      ],
+      units: [{ key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' }],
       forms: [],
       authPatterns: [],
       selectorHints: [],
@@ -1123,7 +1119,10 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
         summary: '',
         truncated: false,
       }),
-      { summary: 'one item', items: [{ ...PLAN.items[0], tier: 'tierC-api', unitKey: 'endpoint:GET /api/users/:id' }] },
+      {
+        summary: 'one item',
+        items: [{ ...PLAN.items[0], tier: 'tierC-api', unitKey: 'endpoint:GET /api/users/:id' }],
+      },
     );
     expect(calls[0].prompt).not.toContain('WARNING');
   });

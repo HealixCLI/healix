@@ -144,7 +144,10 @@ describe('auditSpecQuality', () => {
   });
 
   it('flags a click on a bare repeatable-role locator with no name filter as an ambiguous-locator-risk warn', () => {
-    const source = block('navigates via the baz link', `  await page.getByRole('link').click();\n  await expect(page).toHaveURL(/baz/);`);
+    const source = block(
+      'navigates via the baz link',
+      `  await page.getByRole('link').click();\n  await expect(page).toHaveURL(/baz/);`,
+    );
     const findings = auditSpecQuality(source);
     expect(findings).toEqual([expect.objectContaining({ code: 'ambiguous-locator-risk', severity: 'warn' })]);
   });
@@ -166,7 +169,10 @@ describe('auditSpecQuality', () => {
   });
 
   it('flags a click on a short getByText locator as an ambiguous-locator-risk warn', () => {
-    const source = block('clicks baz', `  await page.getByText('baz').click();\n  await expect(page).toHaveURL(/baz/);`);
+    const source = block(
+      'clicks baz',
+      `  await page.getByText('baz').click();\n  await expect(page).toHaveURL(/baz/);`,
+    );
     const findings = auditSpecQuality(source);
     expect(findings).toEqual([expect.objectContaining({ code: 'ambiguous-locator-risk', severity: 'warn' })]);
   });
@@ -180,7 +186,10 @@ describe('auditSpecQuality', () => {
   });
 
   it('flags a click on a bare CSS class locator as an ambiguous-locator-risk warn', () => {
-    const source = block('clicks the alert', `  await page.locator('.alert').click();\n  await expect(page).toHaveURL(/alert/);`);
+    const source = block(
+      'clicks the alert',
+      `  await page.locator('.alert').click();\n  await expect(page).toHaveURL(/alert/);`,
+    );
     const findings = auditSpecQuality(source);
     expect(findings).toEqual([expect.objectContaining({ code: 'ambiguous-locator-risk', severity: 'warn' })]);
   });

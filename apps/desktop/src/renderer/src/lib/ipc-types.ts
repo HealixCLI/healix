@@ -33,6 +33,12 @@ export interface StartRunArgs {
    * distinct from the PRD, which describes WHAT the app does.
    */
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
   /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
@@ -46,11 +52,43 @@ export interface ProviderLoginResult {
   detail: string;
 }
 
-/** Result of the native "upload a PRD" file picker (pdf/doc/docx/md/txt). */
+/** Header-only preview of one worksheet, cheap enough to compute for every sheet in a workbook. */
+export interface SheetPreview {
+  name: string;
+  rowCount: number;
+  /** First ~8 column headers, truncated with an ellipsis marker if the sheet is wider. */
+  headers: string[];
+}
+
+/** Result of the native "upload a PRD" file picker (pdf/doc/docx/md/txt/xlsx/xls/csv). */
 export interface PickPrdFileResult {
   canceled: boolean;
   fileName?: string;
   text?: string;
+  error?: string;
+  /** True only when the workbook has more than one non-empty sheet and the renderer must show a picker. */
+  needsSheetPicker?: boolean;
+  /** Present alongside needsSheetPicker so the follow-up extractPrdSheets call knows which file to reread. */
+  filePath?: string;
+  /** Preview of every non-empty sheet, present alongside needsSheetPicker. */
+  sheets?: SheetPreview[];
+  /** Present when text came from a spreadsheet (single-sheet fast path or after picker selection). */
+  sourceKind?: 'file' | 'spreadsheet';
+  selectedSheets?: string[];
+  /** Non-fatal notes (e.g. row-cap truncation) — distinct from `error`, which means the upload failed outright. */
+  warnings?: string[];
+}
+
+/** Result of previewing an already-picked spreadsheet's sheets (re-opening the picker). */
+export interface PreviewPrdSheetsResult {
+  sheets?: SheetPreview[];
+  error?: string;
+}
+
+/** Result of extracting the user's selected sheets from an already-picked spreadsheet. */
+export interface ExtractPrdSheetsResult {
+  sheets?: { name: string; content: string }[];
+  warnings?: string[];
   error?: string;
 }
 
@@ -97,6 +135,12 @@ export interface RunConfigSnapshot {
   provider?: ProviderId;
   prd?: string;
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
 }
 
 /**

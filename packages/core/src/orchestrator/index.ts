@@ -194,6 +194,9 @@ async function resumePipeline(
     autoApprove: true,
     prd: checkpoint.runOptions.prd,
     instructions: checkpoint.runOptions.instructions,
+    prdSourceKind: checkpoint.runOptions.prdSourceKind,
+    prdFileName: checkpoint.runOptions.prdFileName,
+    prdSelectedSheets: checkpoint.runOptions.prdSelectedSheets,
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
@@ -403,6 +406,9 @@ async function runPipeline(
     provider: opts.provider,
     prd: opts.prd,
     instructions: opts.instructions,
+    prdSourceKind: opts.prdSourceKind,
+    prdFileName: opts.prdFileName,
+    prdSelectedSheets: opts.prdSelectedSheets,
   });
 
   if (!resumeFrom) {
@@ -492,6 +498,9 @@ async function runPipeline(
         autoApprove: opts.autoApprove,
         prd: opts.prd,
         instructions: opts.instructions,
+        prdSourceKind: opts.prdSourceKind,
+        prdFileName: opts.prdFileName,
+        prdSelectedSheets: opts.prdSelectedSheets,
       },
       plan: effectivePlan,
       generatedItemIds: effectivePlan.items

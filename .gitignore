@@ -27,3 +27,6 @@ coverage/
 
 # packaged app output
 apps/desktop/release/
+
+# Local-only design notes (not meant to be committed)
+docs/design/prd-excel-csv-upload.md

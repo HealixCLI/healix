@@ -63,9 +63,12 @@
     "@babel/traverse": "^7.26.4",
     "@babel/types": "^7.26.3",
     "archiver": "^7.0.1",
+    "chardet": "^2.0.0",
+    "iconv-lite": "^0.6.3",
     "mammoth": "^1.12.0",
     "pdf-parse": "^1.1.1",
-    "playwright": "^1.49.1"
+    "playwright": "^1.49.1",
+    "xlsx": "^0.18.5"
   },
   "devDependencies": {
     "@healix/core": "workspace:*",

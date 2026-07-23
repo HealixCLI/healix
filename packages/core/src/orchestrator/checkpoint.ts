@@ -25,6 +25,9 @@ export interface ResumeCheckpoint {
     autoApprove?: boolean;
     prd?: string;
     instructions?: string;
+    prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+    prdFileName?: string;
+    prdSelectedSheets?: string[];
   };
   /** The finalized, human-approved plan — resume never re-plans or re-shows the approval gate. */
   plan: TestPlan;

@@ -1212,6 +1212,46 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
   });
 });
 
+// ---- mocked dependencies: the mock server never inspects headers/auth ----------------------
+
+describe('generate — warns that the mock server cannot organically enforce auth/ownership rejections', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-mockauth-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWithMocking(mockExternalDependencies: boolean): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      mockExternalDependencies,
+    };
+  }
+
+  it('warns that the mock matches only by method+path and needs mockOverride for 401/403/ownership rejections', async () => {
+    await generate(ctxWithMocking(true), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('CRITICAL');
+    expect(prompt).toContain('never inspects headers, tokens, or the request body');
+    expect(prompt).toContain('mockOverride');
+  });
+
+  it('omits the mock-auth warning entirely when this run does not mock external dependencies', async () => {
+    await generate(ctxWithMocking(false), PLAN);
+    expect(calls[0].prompt).not.toContain('CRITICAL');
+  });
+});
+
 describe('generate — ProviderUnavailableError (systemic outage signal)', () => {
   let projectDir: string;
   let calls: FakeCall[];

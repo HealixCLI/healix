@@ -20,6 +20,37 @@ function verdictFor(error: string, title = 'example test'): Verdict {
 }
 
 describe('classifyByRules / engine.classify', () => {
+  describe('blocked tierB-auth prerequisite (Healix synthetic message)', () => {
+    it('classifies an auth-setup-failed blocked message as environment, not ambiguous', () => {
+      const result = engine.classify({
+        title: '[REQ:REQ-1] authenticated flow',
+        error: 'Error: Auth setup failed — Tier B prerequisite not met.\nsome nested setup error',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('classifies a no-credentials-configured blocked message as environment', () => {
+      const result = engine.classify({
+        title: '[REQ:REQ-1] authenticated flow',
+        error: 'Tier B ran without credentials (no HEALIX_TIERB_* configured; anonymous session).\nsome failure',
+      });
+      expect(result.verdict).toBe('environment');
+    });
+
+    it('takes precedence over environment-flavored text nested inside the setup error', () => {
+      // The wrapped setup error itself contains ECONNREFUSED — the blocked-tierB rule must
+      // still win (it's a MORE specific, MORE certain signal) rather than falling through to
+      // the generic environment_unreachable rule, though both land on 'environment' here the
+      // distinction matters once verdicts diverge or rationale text is surfaced to the user.
+      const result = engine.classify({
+        title: '[REQ:REQ-1] authenticated flow',
+        error: 'Error: Auth setup failed — Tier B prerequisite not met.\nError: connect ECONNREFUSED 127.0.0.1:3000',
+      });
+      expect(result.rationale).toContain('BLOCKED, not failed');
+    });
+  });
+
   describe('environment failures', () => {
     it('classifies ECONNREFUSED as environment', () => {
       expect(verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000')).toBe('environment');

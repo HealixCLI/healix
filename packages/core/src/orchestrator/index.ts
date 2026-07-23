@@ -90,8 +90,19 @@ export type { ResumeCheckpoint } from './checkpoint.js';
 
 /** Per-call budget for the best-effort AI triage enrichment. */
 const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
-/** How many failures (at most) get escalated to AI triage analysis. */
-const TRIAGE_AI_LIMIT = 3;
+/**
+ * How many failures (at most) get escalated to AI triage analysis. Raised from 3 to 8 to 20:
+ * a real 21-failure run showed 8 still left 14 failures stuck at the generic low-confidence
+ * baseline ('ambiguous', rationale "no more context available") — the un-escalated remainder is
+ * exactly what was causing ambiguous-heavy reports. Processed in TRIAGE_AI_BATCH_SIZE-sized
+ * concurrent batches (see below) rather than all at once, since each call spawns a real CLI
+ * child process (providers/claude.ts's runCli) — this is a provider-call-cost/process-count
+ * budget, not a wall-clock one (batching keeps wall-clock to roughly
+ * ceil(TRIAGE_AI_LIMIT / TRIAGE_AI_BATCH_SIZE) * TRIAGE_ANALYZE_TIMEOUT_MS in the worst case).
+ */
+const TRIAGE_AI_LIMIT = 20;
+/** How many AI-escalation calls (each a real CLI child process) run concurrently at once. */
+const TRIAGE_AI_BATCH_SIZE = 5;
 /** Consecutive best-effort store-write failures before we warn that persistence is down. */
 const STORE_FAILURE_WARN_THRESHOLD = 3;
 /** Small delay before a same-provider plan retry — cheap insurance against a one-off CLI hiccup/timeout. */
@@ -1599,42 +1610,52 @@ async function runPipeline(
           return { r, input, triage, unit };
         });
 
-        // Best-effort AI enrichment for the first N failures, run CONCURRENTLY
-        // (each with its own bounded AbortController) rather than one at a
-        // time — triage was previously the run's most serial phase, adding up
-        // to TRIAGE_AI_LIMIT * TRIAGE_ANALYZE_TIMEOUT_MS of pure wall-clock.
-        const aiCandidates = baseline.filter((b) => b.triage !== null).slice(0, TRIAGE_AI_LIMIT);
-        await Promise.all(
-          aiCandidates.map(async (b) => {
-            // Read the matched source-context unit's file lazily — only AI-enriched candidates
-            // need it (classify()'s deterministic rules never look at source), so most failures
-            // never pay this read.
-            if (b.unit && project.repoPath) {
-              try {
-                const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
-                b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
-              } catch (err) {
-                emit(
-                  'triage',
-                  'debug',
-                  `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
-                );
-              }
-            }
-            const controller = new AbortController();
+        // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
+        // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
+        // AbortController) rather than one at a time OR all at once — triage was previously
+        // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
+        // child process (providers/claude.ts's runCli), so an unbounded burst of
+        // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
+        // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
+        // failures that most need it (low-confidence/ambiguous baselines) rather than on
+        // whichever failures happen to execute first — a rule-confident test_is_wrong near
+        // the top of the results array was previously "spending" a slot that a genuinely
+        // ambiguous failure further down needed far more.
+        const aiCandidates = baseline
+          .filter((b) => b.triage !== null)
+          .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
+          .slice(0, TRIAGE_AI_LIMIT);
+
+        const enrichOne = async (b: (typeof aiCandidates)[number]): Promise<void> => {
+          // Read the matched source-context unit's file lazily — only AI-enriched candidates
+          // need it (classify()'s deterministic rules never look at source), so most failures
+          // never pay this read.
+          if (b.unit && project.repoPath) {
             try {
-              const enriched = await withTimeoutAbort(
-                engine.analyze(b.input, provider, controller.signal),
-                TRIAGE_ANALYZE_TIMEOUT_MS,
-                controller,
-              );
-              if (enriched) b.triage = enriched;
+              const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
+              b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
             } catch (err) {
-              // Timeout / analyze() threw — keep the deterministic baseline.
-              emit('triage', 'debug', `AI triage skipped for "${b.r.title}": ${errMsg(err)}`);
+              emit('triage', 'debug', `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`);
             }
-          }),
-        );
+          }
+          const controller = new AbortController();
+          try {
+            const enriched = await withTimeoutAbort(
+              engine.analyze(b.input, provider, controller.signal),
+              TRIAGE_ANALYZE_TIMEOUT_MS,
+              controller,
+            );
+            if (enriched) b.triage = enriched;
+          } catch (err) {
+            // Timeout / analyze() threw — keep the deterministic baseline.
+            emit('triage', 'debug', `AI triage skipped for "${b.r.title}": ${errMsg(err)}`);
+          }
+        };
+
+        for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
+          const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
+          await Promise.all(batch.map(enrichOne));
+        }
 
         for (const b of baseline) {
           if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });

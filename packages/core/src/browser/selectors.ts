@@ -87,8 +87,14 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
     const UNSTABLE_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
 
     function selectorFor(el: DomElement): string {
+      // Trust an id only when it's actually unique on the page — some real (if invalid) HTML
+      // reuses the same id on more than one element, which would otherwise silently produce a
+      // selector that resolves to >1 node (a strict-mode violation at test-execution time).
       if (el.id && !UNSTABLE_ID_RE.test(el.id)) {
-        return `#${cssEscape(el.id)}`;
+        const idCandidate = `#${cssEscape(el.id)}`;
+        if (doc.querySelectorAll(idCandidate).length === 1) {
+          return idCandidate;
+        }
       }
 
       const tag = el.tagName.toLowerCase();
@@ -121,7 +127,11 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           }
         }
         parts.unshift(part);
-        if (current.id && !UNSTABLE_ID_RE.test(current.id)) {
+        if (
+          current.id &&
+          !UNSTABLE_ID_RE.test(current.id) &&
+          doc.querySelectorAll(`#${cssEscape(current.id)}`).length === 1
+        ) {
           parts[0] = `#${cssEscape(current.id)}`;
           break;
         }
@@ -278,6 +288,23 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         inForm,
         disabled: isDisabled(el),
       });
+    }
+
+    // Flag (role, name) pairs shared by more than one visible element — a generated
+    // getByRole(role, { name }) locator would strict-mode-violate against either one, so
+    // generation needs to know ahead of time rather than discovering it at test-execution time.
+    const roleNameCounts = new Map<string, number>();
+    for (const item of out) {
+      if (!item.name) continue;
+      const key = `${item.role} ${item.name}`;
+      roleNameCounts.set(key, (roleNameCounts.get(key) ?? 0) + 1);
+    }
+    for (const item of out) {
+      if (!item.name) continue;
+      const key = `${item.role} ${item.name}`;
+      if ((roleNameCounts.get(key) ?? 0) > 1) {
+        item.ambiguousMatch = true;
+      }
     }
 
     return out;

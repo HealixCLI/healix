@@ -1061,6 +1061,72 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     expect(prompt).toContain('[SRC:routes/userRoutes.js]');
   });
 
+  it('warns a tierC-api item off a route-kind unit instead of treating it as a real backend endpoint', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [{ key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' }],
+      forms: [],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    const planWithRouteUnit: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], tier: 'tierC-api', unitKey: 'route:/' }],
+    };
+    await generate(ctxWith(sourceContext), planWithRouteUnit);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('src/routes/AppRouter.tsx');
+    expect(prompt).toContain('WARNING');
+    expect(prompt).toContain('NOT a confirmed backend REST endpoint');
+  });
+
+  it('does not warn a tierA-public item off a route-kind unit — a route IS the right unit for a UI test', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [{ key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' }],
+      forms: [],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    const planWithRouteUnit: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], tier: 'tierA-public', unitKey: 'route:/' }],
+    };
+    await generate(ctxWith(sourceContext), planWithRouteUnit);
+    expect(calls[0].prompt).not.toContain('WARNING');
+  });
+
+  it('does not warn a tierC-api item off an endpoint-kind unit', async () => {
+    await generate(
+      ctxWith({
+        units: [
+          {
+            key: 'endpoint:GET /api/users/:id',
+            kind: 'endpoint',
+            label: 'GET /api/users/:id',
+            file: 'routes/userRoutes.js',
+            method: 'GET',
+          },
+        ],
+        forms: [],
+        authPatterns: [],
+        selectorHints: [],
+        specSources: [],
+        summary: '',
+        truncated: false,
+      }),
+      {
+        summary: 'one item',
+        items: [{ ...PLAN.items[0], tier: 'tierC-api', unitKey: 'endpoint:GET /api/users/:id' }],
+      },
+    );
+    expect(calls[0].prompt).not.toContain('WARNING');
+  });
+
   it('includes authoritative schema/auth info for a spec-provenance unit', async () => {
     const sourceContext: TestModeContext['sourceContext'] = {
       units: [
@@ -1142,6 +1208,46 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     expect(calls).toHaveLength(2);
     expect(calls[1].prompt).toContain('[SRC:routes/userRoutes.js]');
     expect(specs[0].contents).toContain('[SRC:routes/userRoutes.js]');
+  });
+});
+
+// ---- mocked dependencies: the mock server never inspects headers/auth ----------------------
+
+describe('generate — warns that the mock server cannot organically enforce auth/ownership rejections', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-mockauth-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWithMocking(mockExternalDependencies: boolean): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      mockExternalDependencies,
+    };
+  }
+
+  it('warns that the mock matches only by method+path and needs mockOverride for 401/403/ownership rejections', async () => {
+    await generate(ctxWithMocking(true), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('CRITICAL');
+    expect(prompt).toContain('never inspects headers, tokens, or the request body');
+    expect(prompt).toContain('mockOverride');
+  });
+
+  it('omits the mock-auth warning entirely when this run does not mock external dependencies', async () => {
+    await generate(ctxWithMocking(false), PLAN);
+    expect(calls[0].prompt).not.toContain('CRITICAL');
   });
 });
 

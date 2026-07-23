@@ -32,6 +32,14 @@ const RE_SELECTOR_NOT_FOUND =
 const RE_ENVIRONMENT =
   /(net::ERR_CONNECTION|net::ERR_|ECONNREFUSED|ENOTFOUND|EAI_AGAIN|socket hang up|page\.goto: *Timeout|Timeout.*(?:goto|navigat)|Navigation (?:timeout|failed)|net::ERR_NAME_NOT_RESOLVED)/i;
 
+// Healix's own synthetic 'blocked' messages (execute.ts) — a tierB-auth prerequisite
+// wasn't met (setup fixture failed, or the project has no credentials configured so the
+// session ran anonymously). Neither the app nor the test is defective; this is a run-setup
+// gap that only project configuration can close. Must run BEFORE the generic environment
+// rule below, since a wrapped setup error can itself contain environment-flavored text
+// (e.g. a real ECONNREFUSED from a failed login attempt) that would otherwise steal the match.
+const RE_BLOCKED_TIERB = /Tier B prerequisite not met|Tier B ran without credentials/;
+
 // A bare Timeout (action/wait level) that is not already a navigation or
 // selector timeout — treated as environment/slowness.
 const RE_TIMEOUT = /\bTimeout(?:Error)?\b|timed out/i;
@@ -62,20 +70,34 @@ function mk(verdict: Verdict, confidence: number, rationale: string): TriageResu
 
 /**
  * Rule order matters (first-match-wins):
- *  1. environment   — a down server makes every selector lookup "fail", so it
+ *  1. blocked_tierb — Healix's own synthetic "prerequisite not met" message;
+ *     must pre-empt everything else since a wrapped setup error can contain
+ *     any other signal (environment, assertion, ...) inside it.
+ *  2. environment   — a down server makes every selector lookup "fail", so it
  *     must pre-empt the selector rule.
- *  2. assertion     — expect() mismatch; content checks lean app_is_wrong,
+ *  3. assertion     — expect() mismatch; content checks lean app_is_wrong,
  *     everything else is genuinely ambiguous. Runs BEFORE the selector rule
  *     because Playwright assertion-timeout output embeds locator phrases
  *     ("waiting for locator", getBy*) that would otherwise be misclassified as
  *     test_is_wrong.
- *  3. selector      — locator not found / strict-mode → the test is wrong.
+ *  4. selector      — locator not found / strict-mode → the test is wrong.
  *     Suppressed when assertion signals (expect(), Expected/Received,
  *     toHaveText/toBeVisible …) are present.
- *  4. flaky         — visibility/detached/instability.
- *  5. timeout       — residual bare timeouts → environment/slowness.
+ *  5. flaky         — visibility/detached/instability.
+ *  6. timeout       — residual bare timeouts → environment/slowness.
  */
 const RULES: readonly Rule[] = [
+  {
+    id: 'blocked_tierb_prerequisite',
+    match(error) {
+      if (!RE_BLOCKED_TIERB.test(error)) return null;
+      return mk(
+        'environment',
+        0.9,
+        'This test was BLOCKED, not failed: a Tier-B auth prerequisite was not met (either the auth setup fixture itself failed, or the project has no test credentials configured, so the session ran anonymously). Neither the app nor the test is defective — add test credentials (or fix the underlying auth setup failure) to unblock this coverage.',
+      );
+    },
+  },
   {
     id: 'environment_unreachable',
     match(error) {

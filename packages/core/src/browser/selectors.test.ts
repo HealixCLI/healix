@@ -253,6 +253,87 @@ describe('selectors.clamp (accessible-name normalizer)', () => {
  * fail merely because no parser exists — that would make the test
  * environment-dependent.
  */
+/**
+ * Role+name ambiguity post-pass, copied verbatim (as plain-array logic, no DOM
+ * dependency) from the tail of `collectInteractiveElements`'s `page.evaluate`
+ * callback — flags every element whose (role, name) pair is shared by another
+ * visible element on the same page, since a generated `getByRole(role, {
+ * name })` locator would strict-mode-violate against either one.
+ */
+interface AmbiguityCheckItem {
+  role: string;
+  name: string;
+  ambiguousMatch?: boolean;
+}
+
+function flagAmbiguousMatches(out: AmbiguityCheckItem[]): void {
+  const roleNameCounts = new Map<string, number>();
+  for (const item of out) {
+    if (!item.name) continue;
+    const key = `${item.role} ${item.name}`;
+    roleNameCounts.set(key, (roleNameCounts.get(key) ?? 0) + 1);
+  }
+  for (const item of out) {
+    if (!item.name) continue;
+    const key = `${item.role} ${item.name}`;
+    if ((roleNameCounts.get(key) ?? 0) > 1) {
+      item.ambiguousMatch = true;
+    }
+  }
+}
+
+describe('selectors.flagAmbiguousMatches (role+name duplicate detection)', () => {
+  it('flags two elements sharing the same role and name', () => {
+    const out: AmbiguityCheckItem[] = [
+      { role: 'link', name: 'foo' },
+      { role: 'link', name: 'foo' },
+    ];
+    flagAmbiguousMatches(out);
+    expect(out[0].ambiguousMatch).toBe(true);
+    expect(out[1].ambiguousMatch).toBe(true);
+  });
+
+  it('does not flag elements with the same name but different roles', () => {
+    const out: AmbiguityCheckItem[] = [
+      { role: 'link', name: 'foo' },
+      { role: 'button', name: 'foo' },
+    ];
+    flagAmbiguousMatches(out);
+    expect(out[0].ambiguousMatch).toBeUndefined();
+    expect(out[1].ambiguousMatch).toBeUndefined();
+  });
+
+  it('does not flag a unique role+name pair', () => {
+    const out: AmbiguityCheckItem[] = [
+      { role: 'link', name: 'foo' },
+      { role: 'link', name: 'bar' },
+    ];
+    flagAmbiguousMatches(out);
+    expect(out[0].ambiguousMatch).toBeUndefined();
+    expect(out[1].ambiguousMatch).toBeUndefined();
+  });
+
+  it('ignores elements with an empty accessible name (nothing for getByRole name-matching to collide on)', () => {
+    const out: AmbiguityCheckItem[] = [
+      { role: 'generic', name: '' },
+      { role: 'generic', name: '' },
+    ];
+    flagAmbiguousMatches(out);
+    expect(out[0].ambiguousMatch).toBeUndefined();
+    expect(out[1].ambiguousMatch).toBeUndefined();
+  });
+
+  it('flags all members when three or more elements collide', () => {
+    const out: AmbiguityCheckItem[] = [
+      { role: 'row', name: 'Edit' },
+      { role: 'row', name: 'Edit' },
+      { role: 'row', name: 'Edit' },
+    ];
+    flagAmbiguousMatches(out);
+    expect(out.every((o) => o.ambiguousMatch === true)).toBe(true);
+  });
+});
+
 function assertParsesIfPossible(selector: string): void {
   const maybeDoc = (globalThis as { document?: { querySelector?(s: string): unknown } }).document;
   if (!maybeDoc || typeof maybeDoc.querySelector !== 'function') {

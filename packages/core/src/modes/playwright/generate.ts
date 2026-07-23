@@ -727,7 +727,10 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
     const genericNote = NON_SEMANTIC_ROLES.has(el.role)
       ? " (NOT a semantic link/button — use text or the selector shown, never getByRole('link'/'button'))"
       : '';
-    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}`;
+    const ambiguousNote = el.ambiguousMatch
+      ? ' (⚠ AMBIGUOUS: another element on this page shares this exact role+name — a plain getByRole/getByText by role+name WILL throw a strict-mode violation here; use the selector shown, narrow it further, or chain .first()/.nth())'
+      : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}`;
   });
 
   const omitted = totalCount - selected.length;
@@ -741,7 +744,7 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
 
   return `
 
-Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
+Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. This also means using the selector shown EXACTLY as given — do NOT modify it, combine it with your own guessed parent/child CSS combinator (e.g. turning a real "#checkbox" into an invented "#checkbox > input"), or otherwise assume a DOM nesting relationship you were not shown; the string after "->" is already the complete, correct selector for that exact element. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
 ${lines.join('\n')}${more}`;
 }
 
@@ -762,6 +765,29 @@ function formatRoutingGuidance(ctx: TestModeContext): string {
   return `
 
 This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
+}
+
+/** Cap on distinct route URLs listed, so a large crawl can't blow up the prompt. */
+const MAX_ROUTES_LISTED = 30;
+
+/**
+ * Real URLs actually visited during EXPLORE — grounds toHaveURL()/navigation assertions in
+ * what the app really does, not a guessed conventional path. A recurring real-data failure
+ * pattern this closes: a generated test asserting `toHaveURL(/register/)` or a redirect to
+ * "/" when the real app actually uses "/signup" or "/signin" for the same concept — the model
+ * guessed a common convention instead of using the route this list already contains. Returns
+ * '' when no exploration data exists (e.g. tierC-api, or a black-box run with nothing crawled).
+ */
+function formatObservedRoutes(ctx: TestModeContext): string {
+  const routes = ctx.exploration?.crawl.routes ?? [];
+  if (routes.length === 0) return '';
+  const urls = Array.from(new Set(routes.map((r) => r.url)));
+  const shown = urls.slice(0, MAX_ROUTES_LISTED);
+  const omitted = urls.length - shown.length;
+  const more = omitted > 0 ? ` (+${omitted} more not shown)` : '';
+  return `
+
+Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), use one of these real observed URLs/paths, or a regex scoped only to what you're sure of (e.g. that the path changed away from the current one) — do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
 }
 
 /** Render a plan item's scenarios as a numbered list for the generation prompt. */
@@ -790,7 +816,7 @@ function truncateJson(value: unknown, maxChars: number): string {
  * for spec-derived (provenance: 'spec') units, and any real form fields observed in that file.
  * Returns '' when the item has no unitKey or nothing in sourceContext matches it.
  */
-function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string {
+function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem, tier: Tier): string {
   const unit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
   if (!unit) return '';
 
@@ -800,6 +826,17 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string
     `Source grounding — this feature maps to real source at ${unit.file}${unit.method ? ` (${unit.method})` : ''}.`,
     `You MUST include a comment "// [SRC:${unit.file}]" somewhere in the generated spec, naming this exact file, so its grounding is traceable.`,
   ];
+
+  // Real-data-traced bug: a tierC-api item can get matched to a frontend `route`/`component`
+  // unit (e.g. a React Router path from AppRouter.tsx) rather than a real backend `endpoint` —
+  // the unit is legitimately grounded (the file IS real), but it serves HTML/JS navigation, not
+  // a JSON API. Without this warning the model happily calls `request.get(unit.file's path)`
+  // expecting the feature's described JSON payload and gets an empty/unrelated response instead.
+  if (tier === 'tierC-api' && unit.kind !== 'endpoint') {
+    lines.push(
+      `WARNING: this source unit is a ${unit.kind === 'route' ? 'frontend client-side route (React Router/page navigation)' : 'frontend component'}, NOT a confirmed backend REST endpoint — it may only serve the app's HTML/JS shell, not JSON data. Do NOT assume a raw HTTP request (the \`request\` fixture) to this exact path returns the JSON payload described in this feature's intent unless a real backend endpoint/controller/spec confirms it elsewhere in this prompt — if nothing confirms it, treat the request/response shape as unknown and assert only what you can verify (e.g. that the request doesn't 500), rather than specific fields you're guessing at.`,
+    );
+  }
 
   if (unit.provenance === 'spec') {
     lines.push(
@@ -829,14 +866,15 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
   const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
   const routingGuidance = formatRoutingGuidance(ctx);
-  const sourceGrounding = formatSourceGrounding(ctx, item);
+  const observedRoutes = formatObservedRoutes(ctx);
+  const sourceGrounding = formatSourceGrounding(ctx, item, tier);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page.'
+      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. `expect(response.status()).not.toBe(200)`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the `multipart` option on the request call (e.g. `await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.'
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
@@ -845,7 +883,7 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
     ? MOCK_FIXTURE_IMPORT_PATH
     : ACTION_HIGHLIGHTER_IMPORT_PATH;
   const mockNote = ctx.mockExternalDependencies
-    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario.${formatMockContent(ctx)}`
+    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario. CRITICAL: the mock matches ONLY by method + path — it never inspects headers, tokens, or the request body, so it CANNOT organically reject a missing/invalid Authorization header, an unauthorized role, or cross-tenant/ownership access with a 401/403/404. If a scenario asserts that kind of rejection, you MUST call \`mockOverride(...)\` with that exact status first, or the mock will silently return its default success response and the assertion will fail every time — this is true even for a request you never customized before.${formatMockContent(ctx)}`
     : '';
 
   return `You are generating ONE Playwright test spec file in TypeScript covering ONE feature with
@@ -861,6 +899,15 @@ Requirements:
   followed by its scenario kind, e.g. test('[REQ:${reqTag}] positive: succeeds with valid input', ...).
   This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
+- After EVERY page.goto(...) (or a click that navigates), before interacting with any page-specific
+  element, verify the navigation actually landed on a real, expected page — not a 404/error/blank
+  page — using a SHORT, bounded check (e.g. \`await expect(page.locator('body')).not.toContainText('Not Found', { timeout: 3000 })\`,
+  or asserting an element from the inventory that should always be present on that page). Skipping
+  this is the single biggest cause of a mysterious full-timeout hang: if navigation silently lands on
+  the wrong page (a transient server error, a redirect you didn't expect, a typo'd path), every
+  subsequent locator for that page's real elements will never resolve, and the test burns the ENTIRE
+  default test timeout (tens of seconds) waiting on something that will never appear, instead of
+  failing fast with a clear, diagnosable reason.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
 - Wrap each meaningful action or assertion group in test.step('<clear, plain-English description>', async () => { ... }),
   e.g. test.step('Enter a valid email and password', async () => { ... }) or
@@ -873,6 +920,20 @@ Requirements:
   correctly disable that control on invalid input, and clicking a disabled control hangs until
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
+- Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
+  \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
+  (CI machines, headless vs. headed, network conditions) vary widely in speed, making this
+  assertion flaky/brittle regardless of whether the app works correctly. Verify the OUTCOME of an
+  action (e.g. the swap/update actually happened) using Playwright's own built-in waiting/retry
+  behavior instead of a manual millisecond comparison.
+- Before calling a single-target action (click/fill/check/dblclick/selectOption/hover) on a locator,
+  make sure it can only match ONE element on the real page — Playwright throws a strict-mode
+  violation (and the test fails) if the locator resolves to more than one match. A bare
+  \`getByRole('link'/'button'/etc.)\`, a short \`getByText(...)\`, or a class/tag CSS selector are the
+  ones most likely to collide with another real element. Narrow it with a distinguishing
+  \`{ name: ... }\`/\`{ exact: true }\` filter, a more specific visible text/data-testid/id, or chain
+  \`.first()\`/\`.nth()\` when you intend a specific match — only rely on an unscoped locator when the
+  inventory above shows it is the sole element of that role/name on the page.
 - Be self-contained and runnable; do not import any other local helpers beyond the one import above.
 - When a scenario CREATES a new resource that the app enforces as unique (e.g. registering a user
   by email, creating an account/username), do NOT hardcode a fixed literal value for that unique
@@ -882,7 +943,7 @@ Requirements:
   remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
   path itself should still register their own fresh unique value first, then reuse THAT same value for
   the collision attempt within the same test.
-- ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
+- ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${observedRoutes}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}

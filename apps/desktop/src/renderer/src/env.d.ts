@@ -13,8 +13,10 @@ import type {
 } from '@healix/core';
 import type {
   ActiveRunSnapshot,
+  ExtractPrdSheetsResult,
   PickPrdFileResult,
   PickRepoPathResult,
+  PreviewPrdSheetsResult,
   ProviderLoginResult,
   ProviderSummary,
   QueuedRunSummary,
@@ -70,6 +72,8 @@ export interface HealixBridge {
 
   // ---- PRD file upload ----
   pickPrdFile: () => Promise<PickPrdFileResult>;
+  previewPrdSheets: (filePath: string) => Promise<PreviewPrdSheetsResult>;
+  extractPrdSheets: (filePath: string, selectedSheetNames: string[]) => Promise<ExtractPrdSheetsResult>;
 
   // ---- repo path folder picker ----
   pickRepoPath: () => Promise<PickRepoPathResult>;

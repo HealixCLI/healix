@@ -16,6 +16,7 @@ import {
 } from 'electron';
 import mammoth from 'mammoth';
 import pdfParse from 'pdf-parse';
+import { extractSheets, previewSheets, type SheetPreview } from './spreadsheet.js';
 import {
   doctor,
   ProviderRouter,
@@ -373,6 +374,12 @@ export interface StartRunArgs {
    * distinct from the PRD, which describes WHAT the app does.
    */
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
   /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
@@ -403,6 +410,9 @@ async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunS
         autoApprove: args.autoApprove ?? false,
         prd: args.prd,
         instructions: args.instructions,
+        prdSourceKind: args.prdSourceKind,
+        prdFileName: args.prdFileName,
+        prdSelectedSheets: args.prdSelectedSheets,
         suiteMode: args.suiteMode,
         baseRunId: args.baseRunId,
         signal: controller.signal,
@@ -788,16 +798,44 @@ ipcMain.handle('shell:showItem', (_e, target: string): { ok: boolean } => {
 
 // ---- PRD file upload (native file picker + text extraction) ----
 
-const PRD_FILE_FILTERS = [{ name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] }];
+const PRD_FILE_FILTERS = [
+  { name: 'All PRD files', extensions: ['pdf', 'doc', 'docx', 'md', 'txt', 'xlsx', 'xls', 'csv'] },
+  { name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] },
+  { name: 'Spreadsheets', extensions: ['xlsx', 'xls', 'csv'] },
+];
+
+const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv']);
 
 export interface PickPrdFileResult {
   canceled: boolean;
   fileName?: string;
   text?: string;
   error?: string;
+  /** True only when the workbook has more than one non-empty sheet and the renderer must show a picker. */
+  needsSheetPicker?: boolean;
+  /** Present alongside needsSheetPicker so the renderer's follow-up extractPrdSheets call knows which file to reread. */
+  filePath?: string;
+  /** Preview of every non-empty sheet, present alongside needsSheetPicker. */
+  sheets?: SheetPreview[];
+  /** Present when text came from a spreadsheet (single-sheet fast path or after picker selection). */
+  sourceKind?: 'file' | 'spreadsheet';
+  selectedSheets?: string[];
+  /** Non-fatal notes (e.g. row-cap truncation) — distinct from `error`, which means the upload failed outright. */
+  warnings?: string[];
 }
 
-/** Extract plain text from an uploaded PRD file, used verbatim as acceptance criteria. */
+export interface PreviewPrdSheetsResult {
+  sheets?: SheetPreview[];
+  error?: string;
+}
+
+export interface ExtractPrdSheetsResult {
+  sheets?: { name: string; content: string }[];
+  warnings?: string[];
+  error?: string;
+}
+
+/** Extract plain text from an uploaded prose PRD file, used verbatim as acceptance criteria. */
 async function extractPrdText(filePath: string): Promise<string> {
   const ext = extname(filePath).toLowerCase();
   switch (ext) {
@@ -817,6 +855,11 @@ async function extractPrdText(filePath: string): Promise<string> {
   }
 }
 
+/** Joins extracted sheets into one PRD-ready string, labeling each under its own heading. */
+function joinSheetsAsPrd(sheets: { name: string; content: string }[]): string {
+  return sheets.map((s) => `--- Sheet: ${s.name} ---\n${s.content}`).join('\n\n');
+}
+
 ipcMain.handle('dialog:pickPrdFile', async (event: IpcMainInvokeEvent): Promise<PickPrdFileResult> => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const picked = win
@@ -826,13 +869,68 @@ ipcMain.handle('dialog:pickPrdFile', async (event: IpcMainInvokeEvent): Promise<
 
   const filePath = picked.filePaths[0];
   const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
+  const ext = extname(filePath).toLowerCase();
+
+  if (SPREADSHEET_EXTENSIONS.has(ext)) {
+    try {
+      const sheets = await previewSheets(filePath);
+      if (sheets.length === 0) {
+        return { canceled: false, fileName, error: 'This file has no data to import.' };
+      }
+      if (sheets.length === 1) {
+        // A CSV can never have more than one sheet, and a single-sheet workbook
+        // doesn't need a picker either — go straight through, same shape as the
+        // existing prose-file path.
+        const { sheets: extracted, warnings } = await extractSheets(filePath, [sheets[0].name]);
+        return {
+          canceled: false,
+          fileName,
+          text: joinSheetsAsPrd(extracted),
+          sourceKind: 'spreadsheet',
+          selectedSheets: [sheets[0].name],
+          warnings: warnings.length > 0 ? warnings : undefined,
+        };
+      }
+      return { canceled: false, fileName, filePath, needsSheetPicker: true, sheets };
+    } catch (err) {
+      return { canceled: false, fileName, error: errMsg(err) };
+    }
+  }
+
   try {
     const text = (await extractPrdText(filePath)).trim();
-    return { canceled: false, fileName, text };
+    return { canceled: false, fileName, text, sourceKind: 'file' };
   } catch (err) {
     return { canceled: false, fileName, error: errMsg(err) };
   }
 });
+
+ipcMain.handle(
+  'dialog:previewPrdSheets',
+  async (_event: IpcMainInvokeEvent, filePath: string): Promise<PreviewPrdSheetsResult> => {
+    try {
+      return { sheets: await previewSheets(filePath) };
+    } catch (err) {
+      return { error: errMsg(err) };
+    }
+  },
+);
+
+ipcMain.handle(
+  'dialog:extractPrdSheets',
+  async (
+    _event: IpcMainInvokeEvent,
+    filePath: string,
+    selectedSheetNames: string[],
+  ): Promise<ExtractPrdSheetsResult> => {
+    try {
+      const { sheets, warnings } = await extractSheets(filePath, selectedSheetNames);
+      return { sheets, warnings };
+    } catch (err) {
+      return { error: errMsg(err) };
+    }
+  },
+);
 
 // ---- Repo path folder picker (Project create/edit form) ----
 

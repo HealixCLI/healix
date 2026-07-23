@@ -561,6 +561,16 @@ export function RunsView({
   // by this same effect.
   useEffect(() => {
     if (!engine.runId || engine.hydrated || SETTLED_PHASES.includes(engine.phase)) return;
+    // The user explicitly asked for a blank compose screen (Run/New run) to
+    // queue a different run behind whatever the engine is already tracking —
+    // e.g. clicking "+" while another run is active never touches engine
+    // phase (queueRun doesn't set 'starting' the way start() does), so
+    // without this guard this effect would immediately snap selectedRunId
+    // right back to that unrelated already-active run, locking the fresh
+    // compose form the instant it opened. Cleared the moment a genuinely new
+    // run actually starts (phase 'starting'/'idle', see the settle effect
+    // above) or the user picks a different history row instead.
+    if (awaitingFreshRunConfig) return;
     if (selectedRunId === null) setSelectedRunId(engine.runId);
   }, [engine.runId, engine.hydrated, engine.phase, selectedRunId]);
 
@@ -571,7 +581,18 @@ export function RunsView({
   // RunDetail.runConfig) — falling back to just the Run row's own suiteMode
   // for a run that predates that file.
   const viewingHistoricalRun = !!selectedRunId && !showLiveSurface && !!detail?.run;
+  // Locks every config field to read-only: either a genuinely historical row
+  // (viewingHistoricalRun), or the run THIS card was just used to start,
+  // still live (showLiveSurface implies isActive — see its own definition) —
+  // once a run has begun, its configuration can no longer be edited. A fresh
+  // compose form (e.g. right after "+"/New run while another run executes
+  // elsewhere) has showLiveSurface false, so it stays editable for queuing.
+  const configLocked = viewingHistoricalRun || showLiveSurface;
   const historicalProject = detail?.run ? projectsById.get(detail.run.projectId) : undefined;
+  // Whichever project this locked/historical view's config belongs to —
+  // historicalProject for a genuinely past row, selectedProject (still valid,
+  // never reset mid-run) for the run this card itself just started.
+  const lockedProject = viewingHistoricalRun ? historicalProject : selectedProject;
   const effectiveTestingScope = viewingHistoricalRun
     ? (detail?.runConfig?.testingScope ?? 'both')
     : testingScope;
@@ -581,7 +602,9 @@ export function RunsView({
   const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
   const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
   // "Source: TestCases.xlsx (sheets: Login, Signup)" for a spreadsheet-sourced
-  // historical run, falling back to plain filename-only display otherwise.
+  // run, falling back to plain filename-only display otherwise. Historical
+  // reads from the persisted run-config snapshot; the still-live case reads
+  // straight from the upload-flow state (never cleared once a run starts).
   const historicalPrdSource = viewingHistoricalRun
     ? detail?.runConfig?.prdFileName
       ? detail.runConfig.prdSourceKind === 'spreadsheet' && detail.runConfig.prdSelectedSheets?.length
@@ -589,6 +612,13 @@ export function RunsView({
         : `Source: ${detail.runConfig.prdFileName}`
       : null
     : null;
+  const lockedPrdSource = viewingHistoricalRun
+    ? historicalPrdSource
+    : prdFileName
+      ? prdSourceKind === 'spreadsheet' && prdSelectedSheets && prdSelectedSheets.length > 0
+        ? `Source: ${prdFileName} (sheets: ${prdSelectedSheets.join(', ')})`
+        : `Source: ${prdFileName}`
+      : null;
 
   /**
    * Clears the historical-run view and resets the compose form to defaults,
@@ -672,18 +702,18 @@ export function RunsView({
           <Card className="mt-5 shrink-0 [@media(max-height:800px)]:mt-3">
             <CardHeader className="flex flex-row items-center justify-between">
               <div className="flex items-center gap-2">
-                <CardTitle>{viewingHistoricalRun ? 'Run configuration' : 'Start a run'}</CardTitle>
-                {viewingHistoricalRun && <Badge tone="muted">Read-only</Badge>}
+                <CardTitle>{configLocked ? 'Run configuration' : 'Start a run'}</CardTitle>
+                {configLocked && <Badge tone="muted">Read-only</Badge>}
               </div>
               <div className="flex items-center gap-2">
-                {formCollapsed && !viewingHistoricalRun && selectedProject && (
+                {formCollapsed && !configLocked && selectedProject && (
                   <span className="truncate font-mono text-xs text-muted">
                     {selectedProject.name} · {TESTING_SCOPES.find((s) => s.value === testingScope)?.label}
                   </span>
                 )}
-                {formCollapsed && viewingHistoricalRun && (
+                {formCollapsed && configLocked && (
                   <span className="truncate font-mono text-xs text-muted">
-                    {historicalProject?.name ?? detail?.run?.projectId} ·{' '}
+                    {lockedProject?.name ?? detail?.run?.projectId} ·{' '}
                     {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.label}
                   </span>
                 )}
@@ -695,16 +725,16 @@ export function RunsView({
                   <div>
                     <Label className="mb-1.5 block">Project</Label>
                     <Select
-                      value={viewingHistoricalRun ? (detail?.run?.projectId ?? '') : projectId}
+                      value={configLocked ? (lockedProject?.id ?? '') : projectId}
                       onChange={(e) => setProjectId(e.target.value)}
-                      // Stays editable while a run is active — picking a different
-                      // project here configures the run that "Queue run" adds
-                      // behind it, not the one currently executing.
-                      disabled={viewingHistoricalRun || projectsLoading || runnable.length === 0}
+                      // Stays editable only for a fresh, not-yet-started compose
+                      // form — picking a different project here configures the
+                      // NEXT run to start/queue, never one already underway.
+                      disabled={configLocked || projectsLoading || runnable.length === 0}
                     >
-                      {viewingHistoricalRun ? (
-                        <option value={detail?.run?.projectId ?? ''}>
-                          {historicalProject?.name ?? detail?.run?.projectId ?? 'Unknown project'}
+                      {configLocked ? (
+                        <option value={lockedProject?.id ?? ''}>
+                          {lockedProject?.name ?? detail?.run?.projectId ?? 'Unknown project'}
                         </option>
                       ) : (
                         <>
@@ -725,7 +755,7 @@ export function RunsView({
                     <Select
                       value={effectiveTestingScope}
                       onChange={(e) => setTestingScope(e.target.value as TestingScope)}
-                      disabled={viewingHistoricalRun}
+                      disabled={configLocked}
                     >
                       {TESTING_SCOPES.map((s) => (
                         <option key={s.value} value={s.value}>
@@ -742,7 +772,7 @@ export function RunsView({
                     <Select
                       value={effectiveSuiteMode}
                       onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}
-                      disabled={viewingHistoricalRun}
+                      disabled={configLocked}
                     >
                       {SUITE_MODES.map((m) => (
                         <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
@@ -753,7 +783,7 @@ export function RunsView({
                     <p className="mt-1 text-[11px] text-muted">
                       {SUITE_MODES.find((m) => m.value === effectiveSuiteMode)?.hint}
                     </p>
-                    {!viewingHistoricalRun && suiteMode !== 'fresh' && lastSuccessfulRun && (
+                    {!configLocked && suiteMode !== 'fresh' && lastSuccessfulRun && (
                       <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
                         Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
                       </p>
@@ -773,13 +803,13 @@ export function RunsView({
                           setPrdFileWarning(null);
                         }}
                         placeholder="Paste requirements to ground test generation…"
-                        className={viewingHistoricalRun ? undefined : 'pr-9'}
-                        // readOnly (not disabled) for a historical run: prevents edits
-                        // while keeping the textarea scrollable — disabled:pointer-events-none
+                        className={configLocked ? undefined : 'pr-9'}
+                        // readOnly (not disabled) once locked: prevents edits while
+                        // keeping the textarea scrollable — disabled:pointer-events-none
                         // blocks wheel-scrolling over the field entirely.
-                        readOnly={viewingHistoricalRun}
+                        readOnly={configLocked}
                       />
-                      {!viewingHistoricalRun && (
+                      {!configLocked && (
                         <button
                           type="button"
                           onClick={() => void uploadPrdFile()}
@@ -801,7 +831,7 @@ export function RunsView({
                         </button>
                       )}
                     </div>
-                    {!viewingHistoricalRun && (
+                    {!configLocked && (
                       <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
                         <span>
                           {prdFileName ? (
@@ -822,8 +852,8 @@ export function RunsView({
                         </span>
                       </div>
                     )}
-                    {viewingHistoricalRun && historicalPrdSource && (
-                      <p className="mt-1 text-[11px] text-muted">{historicalPrdSource}</p>
+                    {configLocked && lockedPrdSource && (
+                      <p className="mt-1 text-[11px] text-muted">{lockedPrdSource}</p>
                     )}
                     {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
                     {!prdFileError && prdFileWarning && (
@@ -836,7 +866,7 @@ export function RunsView({
                       value={effectiveInstructions}
                       onChange={(e) => setInstructions(e.target.value)}
                       placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
-                      readOnly={viewingHistoricalRun}
+                      readOnly={configLocked}
                     />
                     <p className="mt-1 text-[11px] text-muted">
                       Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for
@@ -846,13 +876,13 @@ export function RunsView({
                 </div>
 
                 <div className="mt-4 flex min-w-0 items-center justify-between">
-                  {viewingHistoricalRun ? (
+                  {configLocked ? (
                     <div className="min-w-0 text-xs text-muted">
                       <span
                         className="block truncate font-mono"
-                        title={historicalProject?.baseUrl ?? historicalProject?.repoPath ?? undefined}
+                        title={lockedProject?.baseUrl ?? lockedProject?.repoPath ?? undefined}
                       >
-                        {historicalProject?.baseUrl ?? historicalProject?.repoPath ?? 'no target configured'}
+                        {lockedProject?.baseUrl ?? lockedProject?.repoPath ?? 'no target configured'}
                       </span>
                     </div>
                   ) : (
@@ -869,28 +899,12 @@ export function RunsView({
                           'Select a project to begin.'
                         )}
                       </div>
+                      {/* Only ever "Start run" for a fresh, never-started compose
+                        form, or "Queue run" when composing this run's config
+                        while a DIFFERENT run is already executing — Cancel/
+                        Pause/Resume live in their own bar below, scoped to
+                        whichever run is actually active/pausable. */}
                       <div className="flex shrink-0 items-center gap-2">
-                        {/* Also offered while paused — cancelling a paused run is a
-                          real, meaningful choice (give up on it entirely) distinct
-                          from Resume (pick it back up); it uses the same
-                          IPC path either way (run:cancel force-settles it even
-                          with no live controller to abort). */}
-                        {(isActive || engine.phase === 'paused') && (
-                          <Button
-                            variant="outline"
-                            className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
-                            onClick={cancel}
-                            // No runId yet means there is nothing to abort (still 'starting').
-                            // Also blocked while a pause is already in flight — the abort
-                            // signal only carries ONE reason (AbortController.abort() is a
-                            // no-op once already aborted), so racing both actions
-                            // wouldn't reliably act as either a cancel or a pause.
-                            disabled={cancelling || pausing || !engine.runId}
-                          >
-                            <Square className="h-4 w-4" />
-                            {cancelling ? 'Cancelling…' : 'Cancel'}
-                          </Button>
-                        )}
                         <Button onClick={startOrQueue} disabled={!projectId}>
                           {isActive ? <ListPlus className="h-4 w-4" /> : <Play className="h-4 w-4" />}
                           {isActive ? 'Queue run' : 'Start run'}
@@ -1005,17 +1019,24 @@ export function RunsView({
             </div>
           )}
 
-          {/* Pause/Resume bar: scoped to whichever run is currently being viewed
-            — live-tracked (running, or just paused and still selected) or a
-            paused row picked from history. `detail` tracks selectedRunId
-            regardless of which branch below is showing, so this covers both
-            without duplicating anything in each branch. Exactly one of the
-            two buttons is ever enabled: Pause while it's actually running,
-            Resume while it's actually paused — never both at once. */}
+          {/* Cancel/Pause/Resume bar: all three are actions performed on an
+            active run, grouped together. Cancel is scoped to whatever the
+            ENGINE is currently tracking (isActive || paused) regardless of
+            what's currently selected/browsed — e.g. it stays available while
+            composing a different run's config to queue behind it, or while
+            glancing at an unrelated historical row. Pause/Resume stay scoped
+            to whichever run is currently being VIEWED — live-tracked
+            (running, or just paused and still selected) or a paused row
+            picked from history. `detail` tracks selectedRunId regardless of
+            which branch below is showing, so this covers both without
+            duplicating anything in each branch. Exactly one of Pause/Resume
+            is ever enabled: Pause while it's actually running, Resume while
+            it's actually paused — never both at once. */}
           {(() => {
+            const cancelAvailable = isActive || engine.phase === 'paused';
             const viewedIsActive = showLiveSurface && isActive;
             const viewedIsPaused = detail?.run?.id === selectedRunId && detail.run.status === 'paused';
-            if (!viewedIsActive && !viewedIsPaused) return null;
+            if (!cancelAvailable && !viewedIsActive && !viewedIsPaused) return null;
             return (
               <div
                 className={cn(
@@ -1029,6 +1050,28 @@ export function RunsView({
                     : 'Pause to free this up for later — resumes from exactly where it left off, unlike Cancel.'}
                 </span>
                 <div className="flex shrink-0 items-center gap-2">
+                  {/* Also offered while paused — cancelling a paused run is a
+                    real, meaningful choice (give up on it entirely) distinct
+                    from Resume (pick it back up); it uses the same
+                    IPC path either way (run:cancel force-settles it even
+                    with no live controller to abort). */}
+                  {cancelAvailable && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
+                      onClick={cancel}
+                      // No runId yet means there is nothing to abort (still 'starting').
+                      // Also blocked while a pause is already in flight — the abort
+                      // signal only carries ONE reason (AbortController.abort() is a
+                      // no-op once already aborted), so racing both actions
+                      // wouldn't reliably act as either a cancel or a pause.
+                      disabled={cancelling || pausing || !engine.runId}
+                    >
+                      <Square className="h-4 w-4" />
+                      {cancelling ? 'Cancelling…' : 'Cancel'}
+                    </Button>
+                  )}
                   <Button
                     variant="outline"
                     size="sm"

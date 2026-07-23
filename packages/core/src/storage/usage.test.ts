@@ -103,6 +103,56 @@ CREATE INDEX IF NOT EXISTS idx_results_test ON results(test_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
 `;
 
+/**
+ * Frozen snapshot of the v11 schema (usage table present, but WITHOUT the
+ * cache_creation_input_tokens/cache_read_input_tokens columns this PR adds) —
+ * simulates a real on-disk DB from between the usage-tracking feature and
+ * this cache-token follow-up, same rationale as PRE_V11_SCHEMA_SQL above.
+ */
+const PRE_V12_SCHEMA_SQL = `
+${PRE_V11_SCHEMA_SQL}
+
+CREATE TABLE IF NOT EXISTS usage (
+  id            TEXT PRIMARY KEY,
+  run_id        TEXT NOT NULL REFERENCES runs(id),
+  phase         TEXT NOT NULL,
+  task          TEXT,
+  provider      TEXT NOT NULL,
+  input_tokens  INTEGER,
+  output_tokens INTEGER,
+  cost_usd      REAL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_run ON usage(run_id);
+`;
+
+/**
+ * Frozen snapshot of the v12 schema (cache-token columns present, but WITHOUT
+ * the `model` column this PR adds) — simulates a real on-disk DB from between
+ * the cache-token follow-up and this model-tracking follow-up, same rationale
+ * as the snapshots above.
+ */
+const PRE_V13_SCHEMA_SQL = `
+${PRE_V11_SCHEMA_SQL}
+
+CREATE TABLE IF NOT EXISTS usage (
+  id                          TEXT PRIMARY KEY,
+  run_id                      TEXT NOT NULL REFERENCES runs(id),
+  phase                       TEXT NOT NULL,
+  task                        TEXT,
+  provider                    TEXT NOT NULL,
+  input_tokens                INTEGER,
+  output_tokens               INTEGER,
+  cost_usd                    REAL,
+  cache_creation_input_tokens INTEGER,
+  cache_read_input_tokens     INTEGER,
+  created_at                  TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+CREATE INDEX IF NOT EXISTS idx_usage_run ON usage(run_id);
+`;
+
 let dataDir: string;
 
 beforeEach(() => {
@@ -143,6 +193,9 @@ describe('HealixStore usage tracking', () => {
       inputTokens: 100,
       outputTokens: 20,
       costUsd: 0.01,
+      cacheCreationInputTokens: 500,
+      cacheReadInputTokens: 1500,
+      model: 'claude-sonnet-5',
     });
     s.recordUsage({
       runId: run.id,
@@ -165,6 +218,15 @@ describe('HealixStore usage tracking', () => {
       inputTokens: 100,
       outputTokens: 20,
       costUsd: 0.01,
+      cacheCreationInputTokens: 500,
+      cacheReadInputTokens: 1500,
+      model: 'claude-sonnet-5',
+    });
+    // A call with no cache activity/model reported (2nd recordUsage call above omitted the fields).
+    expect(rows[1]).toMatchObject({
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      model: null,
     });
     expect(rows[2]).toMatchObject({
       task: 'flaky test',
@@ -172,6 +234,9 @@ describe('HealixStore usage tracking', () => {
       inputTokens: null,
       outputTokens: null,
       costUsd: null,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+      model: null,
     });
   });
 
@@ -195,6 +260,9 @@ describe('HealixStore usage tracking', () => {
       inputTokens: 100,
       outputTokens: 10,
       costUsd: 0.1,
+      cacheCreationInputTokens: 1000,
+      cacheReadInputTokens: 2000,
+      model: 'claude-sonnet-5',
     });
     s.recordUsage({
       runId: runA.id,
@@ -203,6 +271,7 @@ describe('HealixStore usage tracking', () => {
       inputTokens: 300,
       outputTokens: 30,
       costUsd: 0.3,
+      model: 'claude-haiku-4-5-20251001',
     });
     s.recordUsage({
       runId: runB.id,
@@ -211,6 +280,9 @@ describe('HealixStore usage tracking', () => {
       inputTokens: 200,
       outputTokens: 20,
       costUsd: 0.2,
+      cacheCreationInputTokens: 500,
+      cacheReadInputTokens: 4000,
+      model: 'claude-sonnet-5',
     });
 
     const agg = s.getUsageAggregate({ projectId: project.id });
@@ -222,16 +294,45 @@ describe('HealixStore usage tracking', () => {
     expect(first.inputTokens).toBe(200);
     expect(first.outputTokens).toBe(20);
     expect(first.costUsd).toBeCloseTo(0.2);
+    expect(first.cacheCreationInputTokens).toBe(500);
+    expect(first.cacheReadInputTokens).toBe(4000);
     expect(second.runId).toBe(runA.id);
     expect(second.inputTokens).toBe(400);
     expect(second.outputTokens).toBe(40);
     expect(second.costUsd).toBeCloseTo(0.4);
+    expect(second.cacheCreationInputTokens).toBe(1000);
+    expect(second.cacheReadInputTokens).toBe(2000);
 
     // Per-phase: 'plan' has 2 calls (100+200=300 total, avg 150); 'generate' has 1 call (300 total, avg 300).
     const plan = agg.perPhase.find((p) => p.phase === 'plan');
     const generate = agg.perPhase.find((p) => p.phase === 'generate');
-    expect(plan).toMatchObject({ callCount: 2, avgInputTokens: 150, totalInputTokens: 300 });
-    expect(generate).toMatchObject({ callCount: 1, avgInputTokens: 300, totalInputTokens: 300 });
+    expect(plan).toMatchObject({
+      callCount: 2,
+      avgInputTokens: 150,
+      totalInputTokens: 300,
+      avgCacheCreationInputTokens: 750,
+      totalCacheCreationInputTokens: 1500,
+      avgCacheReadInputTokens: 3000,
+      totalCacheReadInputTokens: 6000,
+    });
+    expect(generate).toMatchObject({
+      callCount: 1,
+      avgInputTokens: 300,
+      totalInputTokens: 300,
+      avgCacheCreationInputTokens: null,
+      totalCacheCreationInputTokens: null,
+    });
+
+    // Per-model: 'claude-sonnet-5' has 2 calls (100+200=300 total input); 'claude-haiku-4-5-20251001' has 1.
+    const sonnet = agg.perModel.find((m) => m.model === 'claude-sonnet-5');
+    const haiku = agg.perModel.find((m) => m.model === 'claude-haiku-4-5-20251001');
+    expect(sonnet).toMatchObject({
+      callCount: 2,
+      totalInputTokens: 300,
+      totalCacheCreationInputTokens: 1500,
+      totalCacheReadInputTokens: 6000,
+    });
+    expect(haiku).toMatchObject({ callCount: 1, totalInputTokens: 300 });
   });
 
   it('getUsageAggregate with no projectId scopes across every project', async () => {
@@ -298,7 +399,7 @@ describe('HealixStore usage tracking', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(11);
+    expect(info.version).toBe(13);
     expect(info.tables).toContain('usage');
 
     // Prove it's actually usable, not just present.
@@ -315,5 +416,77 @@ describe('HealixStore usage tracking', () => {
       }),
     ).not.toThrow();
     expect(s.listUsageForRun(run.id)).toHaveLength(1);
+  });
+
+  it('retrofits cache-token columns onto a pre-existing v11 database missing them', async () => {
+    // Simulate a real pre-fix installation: a DB file already at user_version = 11
+    // (usage table present, shipped by the token-usage-tracking feature) but WITHOUT
+    // the cache_creation_input_tokens/cache_read_input_tokens columns this PR adds.
+    const raw = new DatabaseSync(dbPath());
+    try {
+      raw.exec(PRE_V12_SCHEMA_SQL);
+      raw.exec('PRAGMA user_version = 11;');
+    } finally {
+      raw.close();
+    }
+
+    const s = await store();
+
+    const info = await dbInfo();
+    expect(info.version).toBe(13);
+
+    // Prove the retrofitted columns are actually usable, not just present.
+    const project = s.createProject({ name: 'retrofit-v12-project', baseUrl: 'https://retrofit-v12.test' });
+    const run = s.createRun(project.id);
+    expect(() =>
+      s.recordUsage({
+        runId: run.id,
+        phase: 'plan',
+        provider: 'claude',
+        inputTokens: 1,
+        outputTokens: 1,
+        costUsd: 0.01,
+        cacheCreationInputTokens: 50,
+        cacheReadInputTokens: 150,
+      }),
+    ).not.toThrow();
+    const rows = s.listUsageForRun(run.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ cacheCreationInputTokens: 50, cacheReadInputTokens: 150 });
+  });
+
+  it('retrofits the model column onto a pre-existing v12 database missing it', async () => {
+    // Simulate a real pre-fix installation: a DB file already at user_version = 12
+    // (cache-token columns present) but WITHOUT the `model` column this PR adds.
+    const raw = new DatabaseSync(dbPath());
+    try {
+      raw.exec(PRE_V13_SCHEMA_SQL);
+      raw.exec('PRAGMA user_version = 12;');
+    } finally {
+      raw.close();
+    }
+
+    const s = await store();
+
+    const info = await dbInfo();
+    expect(info.version).toBe(13);
+
+    // Prove the retrofitted column is actually usable, not just present.
+    const project = s.createProject({ name: 'retrofit-v13-project', baseUrl: 'https://retrofit-v13.test' });
+    const run = s.createRun(project.id);
+    expect(() =>
+      s.recordUsage({
+        runId: run.id,
+        phase: 'plan',
+        provider: 'claude',
+        inputTokens: 1,
+        outputTokens: 1,
+        costUsd: 0.01,
+        model: 'claude-sonnet-5',
+      }),
+    ).not.toThrow();
+    const rows = s.listUsageForRun(run.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({ model: 'claude-sonnet-5' });
   });
 });

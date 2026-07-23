@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 11;
+export const SCHEMA_VERSION = 13;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -81,16 +81,25 @@ CREATE TABLE IF NOT EXISTS agent_events (
 -- (e.g. a spec item's title, or 'gap-fill') scoping the row within its phase;
 -- input_tokens/output_tokens/cost_usd are null when the provider (or a
 -- timed-out/aborted call) reported no usage.
+-- v12: cache-read/cache-creation token counts alongside the existing
+-- input/output/cost columns — null when the provider reported no cache
+-- activity for that call (not every call writes to or reads from the cache).
+-- v13: model — the dominant modelUsage entry (by input+output tokens) that
+-- actually served the call, e.g. 'claude-sonnet-5'. Null when the provider
+-- reported no usage at all.
 CREATE TABLE IF NOT EXISTS usage (
-  id            TEXT PRIMARY KEY,
-  run_id        TEXT NOT NULL REFERENCES runs(id),
-  phase         TEXT NOT NULL,
-  task          TEXT,
-  provider      TEXT NOT NULL,
-  input_tokens  INTEGER,
-  output_tokens INTEGER,
-  cost_usd      REAL,
-  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+  id                          TEXT PRIMARY KEY,
+  run_id                      TEXT NOT NULL REFERENCES runs(id),
+  phase                       TEXT NOT NULL,
+  task                        TEXT,
+  provider                    TEXT NOT NULL,
+  input_tokens                INTEGER,
+  output_tokens               INTEGER,
+  cost_usd                    REAL,
+  cache_creation_input_tokens INTEGER,
+  cache_read_input_tokens     INTEGER,
+  model                       TEXT,
+  created_at                  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_credentials_project ON project_credentials(project_id);

@@ -6,6 +6,7 @@ import type {
   DetectResult,
   HealthOptions,
   HealthResult,
+  PlanOptions,
   PlanResult,
   ProviderAdapter,
 } from './types.js';
@@ -177,9 +178,12 @@ export class OpenAIProvider implements ProviderAdapter {
     };
   }
 
-  async plan(task: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<PlanResult> {
+  async plan(task: string, opts: PlanOptions = {}): Promise<PlanResult> {
     // Codex has no dedicated plan mode; the read-only sandbox in complete()
     // already prevents any file/system changes, so a plan request is safe.
+    // taskType is intentionally ignored here — per-task-type model/effort
+    // routing is Claude-only for now (Codex's reasoning-effort flag isn't
+    // confirmed yet; see providers/model-config.ts).
     const res = await this.complete(`Produce a plan only — do not modify anything.\n\n${task}`, {
       mode: 'plan',
       timeoutMs: opts.timeoutMs ?? 120_000,

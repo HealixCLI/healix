@@ -565,6 +565,8 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     // Codegen must never let the provider agent mutate the user's repo.
     expect(calls).toHaveLength(1);
     expect(calls[0].opts?.readOnly).toBe(true);
+    // Lets the provider resolve a per-task-type model/effort (see model-config.ts).
+    expect(calls[0].opts?.taskType).toBe('codegen');
   });
 
   it('emits a per-item "Dispatched i/n" event distinct from the batch "Progress" event', async () => {
@@ -603,6 +605,20 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     const violations = (skip?.data as { violations?: string[] }).violations;
     expect(violations).toBeDefined();
     expect(violations?.some((v) => v.includes('child_process'))).toBe(true);
+  });
+
+  it('keeps the retry prompt an exact extension of the first attempt (prompt-cache prefix)', async () => {
+    const ctx = makeCtx(makeProvider([CHILD_PROCESS_SPEC, CHILD_PROCESS_SPEC], calls));
+
+    await generate(ctx, PLAN);
+
+    expect(calls).toHaveLength(2);
+    // item/ctx/tier are identical across both attempts, so the only
+    // difference should be the retry note appended at the very end — if it
+    // were spliced mid-prompt instead, attempt 2 wouldn't share attempt 1's
+    // prefix and Anthropic's prompt cache could never hit on retry.
+    expect(calls[1].prompt.startsWith(calls[0].prompt)).toBe(true);
+    expect(calls[1].prompt.length).toBeGreaterThan(calls[0].prompt.length);
   });
 
   it('accepts a corrected spec on the retry after a forbidden first attempt', async () => {

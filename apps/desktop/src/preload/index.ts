@@ -49,6 +49,11 @@ const api = {
   providerHealth: (id: 'claude' | 'openai', probe?: boolean) =>
     ipcRenderer.invoke('provider:health', { id, probe }),
 
+  // Claude per-task-type model/effort config (Settings page)
+  getModelConfig: () => ipcRenderer.invoke('settings:getModelConfig'),
+  setModelConfig: (overrides: Record<string, { model?: string; effort?: string }>) =>
+    ipcRenderer.invoke('settings:setModelConfig', overrides),
+
   // projects
   listProjects: () => ipcRenderer.invoke('projects:list'),
   createProject: (input: {

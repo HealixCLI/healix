@@ -5,6 +5,17 @@ export * from './providers/types.js';
 export { ClaudeProvider } from './providers/claude.js';
 export { OpenAIProvider } from './providers/openai.js';
 export { ProviderRouter } from './providers/router.js';
+export {
+  DEFAULT_MODEL_CONFIG,
+  resolveModelAndEffort,
+  readModelConfigOverrides,
+  writeModelConfigOverrides,
+  type ClaudeModel,
+  type ClaudeEffort,
+  type ModelEffortSetting,
+  type ModelEffortConfig,
+  type ModelEffortOverrides,
+} from './providers/model-config.js';
 export { extractUsage } from './providers/usage.js';
 export type { UsageTotals, UsageRecorder } from './providers/usage.js';
 

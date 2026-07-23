@@ -43,5 +43,6 @@ export interface TriageEngine {
     provider: ProviderAdapter,
     signal?: AbortSignal,
     onUsage?: UsageRecorder,
+    cwd?: string,
   ): Promise<TriageResult>;
 }

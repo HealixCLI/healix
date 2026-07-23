@@ -171,20 +171,28 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
   return lines.join('\n');
 }
 
-/** Build buildPlanPrompt scoped to only `units`, with a caller-supplied prefix explaining the scoping. */
+/**
+ * Build buildPlanPrompt scoped to only `units`, with a caller-supplied note
+ * explaining the scoping appended AFTER the base prompt rather than prepended
+ * before it — this keeps buildPlanPrompt's static preamble as the true
+ * leading prefix of the final prompt, so it stays a stable, cacheable prefix
+ * shared across plan-generate/gap-fill/batch calls instead of being pushed
+ * out of leading position by a per-call-variable scoping sentence.
+ */
 function buildScopedPlanPrompt(
   project: Project,
   opts: RunOptions,
   units: FunctionalityUnit[],
   repoIndex: PlanRepoContext | undefined,
-  prefix: string,
+  suffixNote: string,
 ): string {
   const scopedIndex: PlanRepoContext = {
     summary: repoIndex?.summary ?? '',
     files: [],
     functionality: units,
   };
-  return prefix + buildPlanPrompt(project, opts, scopedIndex);
+  const base = buildPlanPrompt(project, opts, scopedIndex);
+  return suffixNote ? `${base}\n\n${suffixNote}` : base;
 }
 
 /**
@@ -205,7 +213,7 @@ export function buildGapFillPlanPrompt(
     uncoveredUnits,
     repoIndex,
     'A previous pass already planned and tested other parts of this application. ' +
-      'The list below is ONLY the functionality still missing coverage — focus exclusively on these.\n\n',
+      'The list below is ONLY the functionality still missing coverage — focus exclusively on these.',
   );
 }
 
@@ -226,13 +234,13 @@ export function buildBatchPlanPrompt(
   totalBatches: number,
   repoIndex?: PlanRepoContext,
 ): string {
-  const prefix =
+  const suffixNote =
     totalBatches > 1
       ? `This application has more detected functionality than fits in one planning pass. This is ` +
         `batch ${batchIndex} of ${totalBatches} — the list below is ONLY this batch's units; a separate ` +
-        `pass covers the rest. Plan for ONLY the units listed below.\n\n`
+        `pass covers the rest. Plan for ONLY the units listed below.`
       : '';
-  return buildScopedPlanPrompt(project, opts, batchUnits, repoIndex, prefix);
+  return buildScopedPlanPrompt(project, opts, batchUnits, repoIndex, suffixNote);
 }
 
 function scopeLabel(scope: TestingScope): string {
@@ -527,6 +535,7 @@ export async function reviseItem(
       mode: 'plan',
       cwd: project.repoPath ?? undefined,
       signal: opts.signal,
+      taskType: 'plan-revise-item',
     });
   } catch (err) {
     return { ok: false, detail: err instanceof Error ? err.message : String(err) };

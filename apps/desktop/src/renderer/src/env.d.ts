@@ -2,6 +2,8 @@
 import type {
   DoctorReport,
   HealthResult,
+  ModelEffortConfig,
+  ModelEffortOverrides,
   PlanApprovalResult,
   Project,
   NewProject,
@@ -82,6 +84,10 @@ export interface HealixBridge {
   // ---- provider connect / live health ----
   providerLogin: (id: ProviderId) => Promise<ProviderLoginResult>;
   providerHealth: (id: ProviderId, probe?: boolean) => Promise<HealthResult>;
+
+  // ---- Claude per-task-type model/effort config (Settings page) ----
+  getModelConfig: () => Promise<{ defaults: ModelEffortConfig; overrides: ModelEffortOverrides }>;
+  setModelConfig: (overrides: ModelEffortOverrides) => Promise<{ ok: true }>;
 
   // ---- run history ----
   listRuns: (projectId?: string) => Promise<Run[]>;

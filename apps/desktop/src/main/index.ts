@@ -50,6 +50,11 @@ import {
   type TestResult,
   type AgentEvent,
   type HealthResult,
+  DEFAULT_MODEL_CONFIG,
+  readModelConfigOverrides,
+  writeModelConfigOverrides,
+  type ModelEffortConfig,
+  type ModelEffortOverrides,
   type UsageRow,
   type UsageAggregate,
 } from '@healix/core';
@@ -1035,6 +1040,24 @@ ipcMain.handle(
   },
 );
 
+// ---- Claude per-task-type model/effort config (Settings page) ----
+
+ipcMain.handle(
+  'settings:getModelConfig',
+  async (): Promise<{ defaults: ModelEffortConfig; overrides: ModelEffortOverrides }> => {
+    const overrides = (await readModelConfigOverrides()) ?? {};
+    return { defaults: DEFAULT_MODEL_CONFIG, overrides };
+  },
+);
+
+ipcMain.handle(
+  'settings:setModelConfig',
+  async (_e, overrides: ModelEffortOverrides): Promise<{ ok: true }> => {
+    await writeModelConfigOverrides(overrides ?? {});
+    return { ok: true };
+  },
+);
+
 // ---- Runs: list + detail (read from store + on-disk run artifacts) ----
 
 /**
@@ -1156,7 +1179,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
 ipcMain.handle(
   'usage:crossRun',
   async (_e, payload: { projectId?: string } | undefined): Promise<UsageAggregate> => {
-    const empty: UsageAggregate = { perRun: [], perPhase: [] };
+    const empty: UsageAggregate = { perRun: [], perPhase: [], perModel: [] };
     const store = await getStore();
     if (!store) return empty;
     try {

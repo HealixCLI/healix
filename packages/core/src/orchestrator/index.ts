@@ -357,6 +357,9 @@ async function runPipeline(
         inputTokens: usage?.inputTokens ?? null,
         outputTokens: usage?.outputTokens ?? null,
         costUsd: usage?.costUsd ?? null,
+        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
+        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
+        model: usage?.model ?? null,
       });
       noteStoreOk();
     } catch (err) {
@@ -1487,7 +1490,11 @@ async function runPipeline(
             mode: 'plan',
             cwd: project.repoPath ?? undefined,
             signal,
+            taskType: 'plan-gapfill',
           });
+          if (completion.model) {
+            emit('plan', 'debug', `plan-gapfill used model=${completion.model} effort=${completion.effort}.`);
+          }
           recordUsage('plan', 'gap-fill', provider.id, completion.raw);
           if (completion.ok && completion.text) {
             gapPlan = parsePlan(completion.text, opts.testingScope ?? 'both');
@@ -1667,7 +1674,13 @@ async function runPipeline(
           const controller = new AbortController();
           try {
             const enriched = await withTimeoutAbort(
-              engine.analyze(b.input, provider, controller.signal, recordUsage),
+              engine.analyze(
+                b.input,
+                provider,
+                controller.signal,
+                recordUsage,
+                project.repoPath ?? undefined,
+              ),
               TRIAGE_ANALYZE_TIMEOUT_MS,
               controller,
             );
@@ -1929,7 +1942,11 @@ export async function attemptPlanCompletion(
         // cancelled run keep burning tokens; the adapter resolves ok:false,
         // and the pipeline's next boundary check turns that into 'cancelled'.
         signal: opts.signal,
+        taskType: 'plan-generate',
       });
+      if (completion.model) {
+        emit('plan', 'debug', `plan-generate used model=${completion.model} effort=${completion.effort}.`);
+      }
       recordUsage?.('plan', task, p.id, completion.raw);
       if (completion.ok && completion.text) {
         const parsed = parsePlanWithDiagnostics(completion.text, opts.testingScope ?? 'both');

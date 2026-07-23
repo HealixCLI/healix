@@ -52,6 +52,7 @@ export function createTriageEngine(): TriageEngine {
       provider: ProviderAdapter,
       signal?: AbortSignal,
       onUsage?: UsageRecorder,
+      cwd?: string,
     ): Promise<TriageResult> {
       // Deterministic baseline is always computed: it is the fallback and also
       // seeds a suggestedPatch the AI may omit.
@@ -66,7 +67,12 @@ export function createTriageEngine(): TriageEngine {
 
       let reply: Awaited<ReturnType<ProviderAdapter['complete']>>;
       try {
-        reply = await provider.complete(prompt, { timeoutMs: ANALYZE_TIMEOUT_MS, signal });
+        reply = await provider.complete(prompt, {
+          timeoutMs: ANALYZE_TIMEOUT_MS,
+          cwd,
+          signal,
+          taskType: 'triage',
+        });
         onUsage?.('triage', input.title, provider.id, reply.raw);
       } catch {
         // Provider threw (process error, etc.) — never leak; fall back.

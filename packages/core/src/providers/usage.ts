@@ -4,6 +4,8 @@ export interface UsageTotals {
   inputTokens: number;
   outputTokens: number;
   costUsd: number | null;
+  cacheCreationInputTokens: number | null;
+  cacheReadInputTokens: number | null;
 }
 
 /**
@@ -20,13 +22,16 @@ export type UsageRecorder = (phase: string, task: string | null, provider: Provi
  * Extract token/cost totals from a provider completion's `raw` field. Only the
  * Claude CLI's `--output-format json` shape is recognized today — it reports
  * per-model usage as `modelUsage: { [model]: { inputTokens, outputTokens,
- * costUSD, ... } }`, confirmed against a real `claude -p ... --output-format
- * json` response. A single completion can carry more than one model's entry
- * (observed in practice), so every model's tokens/cost are summed into one
- * total rather than picking just the first. Returns null for anything that
- * doesn't match — a timed-out/aborted completion (raw is the RawCommand, not
- * parsed JSON), or another provider's `raw` shape (e.g. OpenAI/Codex, which
- * doesn't report usage at all today).
+ * costUSD, cacheCreationInputTokens, cacheReadInputTokens, ... } }`, confirmed
+ * against a real `claude -p ... --output-format json` response (the cache
+ * fields are only present/non-zero when Anthropic's prompt cache actually
+ * wrote to or read from a cached prefix for that call). A single completion
+ * can carry more than one model's entry (observed in practice), so every
+ * model's tokens/cost/cache counts are summed into one total rather than
+ * picking just the first. Returns null for anything that doesn't match — a
+ * timed-out/aborted completion (raw is the RawCommand, not parsed JSON), or
+ * another provider's `raw` shape (e.g. OpenAI/Codex, which doesn't report
+ * usage at all today).
  */
 export function extractUsage(raw: unknown): UsageTotals | null {
   if (!raw || typeof raw !== 'object') return null;
@@ -36,8 +41,11 @@ export function extractUsage(raw: unknown): UsageTotals | null {
   let inputTokens = 0;
   let outputTokens = 0;
   let costUsd = 0;
+  let cacheCreationInputTokens = 0;
+  let cacheReadInputTokens = 0;
   let sawTokens = false;
   let sawCost = false;
+  let sawCacheTokens = false;
 
   for (const entry of Object.values(modelUsage as Record<string, unknown>)) {
     if (!entry || typeof entry !== 'object') continue;
@@ -54,8 +62,22 @@ export function extractUsage(raw: unknown): UsageTotals | null {
       costUsd += e.costUSD;
       sawCost = true;
     }
+    if (typeof e.cacheCreationInputTokens === 'number') {
+      cacheCreationInputTokens += e.cacheCreationInputTokens;
+      sawCacheTokens = true;
+    }
+    if (typeof e.cacheReadInputTokens === 'number') {
+      cacheReadInputTokens += e.cacheReadInputTokens;
+      sawCacheTokens = true;
+    }
   }
 
   if (!sawTokens) return null;
-  return { inputTokens, outputTokens, costUsd: sawCost ? costUsd : null };
+  return {
+    inputTokens,
+    outputTokens,
+    costUsd: sawCost ? costUsd : null,
+    cacheCreationInputTokens: sawCacheTokens ? cacheCreationInputTokens : null,
+    cacheReadInputTokens: sawCacheTokens ? cacheReadInputTokens : null,
+  };
 }

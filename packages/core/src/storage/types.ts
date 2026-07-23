@@ -172,6 +172,9 @@ export interface UsageRow {
   inputTokens: number | null;
   outputTokens: number | null;
   costUsd: number | null;
+  /** Null when the call reported no cache activity at all (not every call writes to or reads from Anthropic's prompt cache). */
+  cacheCreationInputTokens: number | null;
+  cacheReadInputTokens: number | null;
   createdAt: string;
 }
 
@@ -184,6 +187,8 @@ export interface NewUsage {
   inputTokens?: number | null;
   outputTokens?: number | null;
   costUsd?: number | null;
+  cacheCreationInputTokens?: number | null;
+  cacheReadInputTokens?: number | null;
 }
 
 /** One run's total usage — a row in the Reports/Usage page's cross-run table. */
@@ -193,6 +198,8 @@ export interface UsageRunSummary {
   inputTokens: number | null;
   outputTokens: number | null;
   costUsd: number | null;
+  cacheCreationInputTokens: number | null;
+  cacheReadInputTokens: number | null;
 }
 
 /** One phase's usage aggregated across every run in scope — the Reports/Usage page's per-phase averages. */
@@ -205,6 +212,10 @@ export interface UsagePhaseSummary {
   totalInputTokens: number | null;
   totalOutputTokens: number | null;
   totalCostUsd: number | null;
+  avgCacheCreationInputTokens: number | null;
+  avgCacheReadInputTokens: number | null;
+  totalCacheCreationInputTokens: number | null;
+  totalCacheReadInputTokens: number | null;
 }
 
 export interface UsageAggregate {

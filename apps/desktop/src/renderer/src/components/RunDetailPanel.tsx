@@ -840,6 +840,8 @@ interface PhaseUsage {
   inputTokens: number | null;
   outputTokens: number | null;
   costUsd: number | null;
+  cacheReadInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
 }
 
 function groupUsageByPhase(usage: UsageRow[]): PhaseUsage[] {
@@ -855,6 +857,8 @@ function groupUsageByPhase(usage: UsageRow[]): PhaseUsage[] {
     inputTokens: sumNullable(rows.map((r) => r.inputTokens)),
     outputTokens: sumNullable(rows.map((r) => r.outputTokens)),
     costUsd: sumNullable(rows.map((r) => r.costUsd)),
+    cacheReadInputTokens: sumNullable(rows.map((r) => r.cacheReadInputTokens)),
+    cacheCreationInputTokens: sumNullable(rows.map((r) => r.cacheCreationInputTokens)),
   }));
 }
 
@@ -892,7 +896,7 @@ function UsagePanel({ usage }: { usage: UsageRow[] }) {
               <span className="font-mono text-xs uppercase tracking-wide text-fg">{p.phase}</span>
               <span className="text-[11px] text-muted">
                 {formatTokens(p.inputTokens)} in · {formatTokens(p.outputTokens)} out ·{' '}
-                {formatCost(p.costUsd)}
+                {formatCost(p.costUsd)} · {formatTokens(p.cacheReadInputTokens)} cache read
               </span>
             </header>
             <Table>
@@ -903,6 +907,8 @@ function UsagePanel({ usage }: { usage: UsageRow[] }) {
                   <TableHead className="text-right">Input</TableHead>
                   <TableHead className="text-right">Output</TableHead>
                   <TableHead className="text-right">Cost</TableHead>
+                  <TableHead className="text-right">Cache read</TableHead>
+                  <TableHead className="text-right">Cache create</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -919,6 +925,12 @@ function UsagePanel({ usage }: { usage: UsageRow[] }) {
                       {formatTokens(r.outputTokens)}
                     </TableCell>
                     <TableCell className="text-right text-xs text-muted">{formatCost(r.costUsd)}</TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.cacheReadInputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.cacheCreationInputTokens)}
+                    </TableCell>
                   </TableRow>
                 ))}
               </TableBody>

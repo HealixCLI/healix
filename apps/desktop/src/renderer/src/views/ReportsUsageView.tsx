@@ -61,6 +61,8 @@ export function ReportsUsageView() {
                   <TableHead className="text-right">Avg output</TableHead>
                   <TableHead className="text-right">Avg cost</TableHead>
                   <TableHead className="text-right">Total cost</TableHead>
+                  <TableHead className="text-right">Avg cache read</TableHead>
+                  <TableHead className="text-right">Avg cache create</TableHead>
                 </TableRow>
               </TableHeader>
               <TableBody>
@@ -79,6 +81,12 @@ export function ReportsUsageView() {
                     </TableCell>
                     <TableCell className="text-right text-xs text-muted">
                       {formatCost(p.totalCostUsd)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(p.avgCacheReadInputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(p.avgCacheCreationInputTokens)}
                     </TableCell>
                   </TableRow>
                 ))}

@@ -13,7 +13,37 @@ describe('extractUsage', () => {
       inputTokens: 523,
       outputTokens: 18,
       costUsd: 0.241425,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
     });
+  });
+
+  it('sums cache-creation/cache-read tokens across every model, confirmed against a real CLI response shape', () => {
+    // Real field names/shape observed from a live `claude -p ... --output-format
+    // json` call: modelUsage[model].cacheCreationInputTokens/cacheReadInputTokens,
+    // only present/non-zero on the entry that actually wrote to or read from the
+    // prompt cache for that call.
+    const raw = {
+      modelUsage: {
+        'claude-haiku-4-5-20251001': {
+          inputTokens: 530,
+          outputTokens: 13,
+          costUSD: 0.000595,
+          cacheCreationInputTokens: 0,
+          cacheReadInputTokens: 0,
+        },
+        'claude-sonnet-5': {
+          inputTokens: 2,
+          outputTokens: 9,
+          costUSD: 0.067923,
+          cacheCreationInputTokens: 9637,
+          cacheReadInputTokens: 33201,
+        },
+      },
+    };
+    const result = extractUsage(raw);
+    expect(result?.cacheCreationInputTokens).toBe(9637);
+    expect(result?.cacheReadInputTokens).toBe(33201);
   });
 
   it('returns null when raw has no modelUsage at all (e.g. a RawCommand from a timeout/abort)', () => {
@@ -30,6 +60,19 @@ describe('extractUsage', () => {
 
   it('reports costUsd as null (not 0) when tokens are present but no entry reports a cost', () => {
     const raw = { modelUsage: { 'some-model': { inputTokens: 10, outputTokens: 5 } } };
-    expect(extractUsage(raw)).toEqual({ inputTokens: 10, outputTokens: 5, costUsd: null });
+    expect(extractUsage(raw)).toEqual({
+      inputTokens: 10,
+      outputTokens: 5,
+      costUsd: null,
+      cacheCreationInputTokens: null,
+      cacheReadInputTokens: null,
+    });
+  });
+
+  it('reports cache tokens as null (not 0) when no entry reports any cache activity', () => {
+    const raw = { modelUsage: { 'some-model': { inputTokens: 10, outputTokens: 5 } } };
+    const result = extractUsage(raw);
+    expect(result?.cacheCreationInputTokens).toBeNull();
+    expect(result?.cacheReadInputTokens).toBeNull();
   });
 });

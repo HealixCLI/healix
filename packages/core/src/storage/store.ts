@@ -569,11 +569,13 @@ export class HealixStore {
       inputTokens: input.inputTokens ?? null,
       outputTokens: input.outputTokens ?? null,
       costUsd: input.costUsd ?? null,
+      cacheCreationInputTokens: input.cacheCreationInputTokens ?? null,
+      cacheReadInputTokens: input.cacheReadInputTokens ?? null,
       createdAt: new Date().toISOString(),
     };
     this.db
       .prepare(
-        'INSERT INTO usage (id, run_id, phase, task, provider, input_tokens, output_tokens, cost_usd, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO usage (id, run_id, phase, task, provider, input_tokens, output_tokens, cost_usd, cache_creation_input_tokens, cache_read_input_tokens, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         row.id,
@@ -584,6 +586,8 @@ export class HealixStore {
         row.inputTokens,
         row.outputTokens,
         row.costUsd,
+        row.cacheCreationInputTokens,
+        row.cacheReadInputTokens,
         row.createdAt,
       );
     return row;
@@ -613,7 +617,8 @@ export class HealixStore {
     const perRunRows = this.db
       .prepare(
         `SELECT r.id AS run_id, r.created_at AS run_created_at,
-                SUM(u.input_tokens) AS input_tokens, SUM(u.output_tokens) AS output_tokens, SUM(u.cost_usd) AS cost_usd
+                SUM(u.input_tokens) AS input_tokens, SUM(u.output_tokens) AS output_tokens, SUM(u.cost_usd) AS cost_usd,
+                SUM(u.cache_creation_input_tokens) AS cache_creation_input_tokens, SUM(u.cache_read_input_tokens) AS cache_read_input_tokens
          FROM runs r
          LEFT JOIN usage u ON u.run_id = r.id
          ${runFilter}
@@ -626,7 +631,9 @@ export class HealixStore {
       .prepare(
         `SELECT u.phase AS phase, COUNT(*) AS call_count,
                 AVG(u.input_tokens) AS avg_input_tokens, AVG(u.output_tokens) AS avg_output_tokens, AVG(u.cost_usd) AS avg_cost_usd,
-                SUM(u.input_tokens) AS total_input_tokens, SUM(u.output_tokens) AS total_output_tokens, SUM(u.cost_usd) AS total_cost_usd
+                SUM(u.input_tokens) AS total_input_tokens, SUM(u.output_tokens) AS total_output_tokens, SUM(u.cost_usd) AS total_cost_usd,
+                AVG(u.cache_creation_input_tokens) AS avg_cache_creation_input_tokens, AVG(u.cache_read_input_tokens) AS avg_cache_read_input_tokens,
+                SUM(u.cache_creation_input_tokens) AS total_cache_creation_input_tokens, SUM(u.cache_read_input_tokens) AS total_cache_read_input_tokens
          FROM usage u
          JOIN runs r ON r.id = u.run_id
          ${runFilter}
@@ -642,6 +649,8 @@ export class HealixStore {
         inputTokens: n(r.input_tokens),
         outputTokens: n(r.output_tokens),
         costUsd: n(r.cost_usd),
+        cacheCreationInputTokens: n(r.cache_creation_input_tokens),
+        cacheReadInputTokens: n(r.cache_read_input_tokens),
       })),
       perPhase: perPhaseRows.map((r) => ({
         phase: String(r.phase),
@@ -652,6 +661,10 @@ export class HealixStore {
         totalInputTokens: n(r.total_input_tokens),
         totalOutputTokens: n(r.total_output_tokens),
         totalCostUsd: n(r.total_cost_usd),
+        avgCacheCreationInputTokens: n(r.avg_cache_creation_input_tokens),
+        avgCacheReadInputTokens: n(r.avg_cache_read_input_tokens),
+        totalCacheCreationInputTokens: n(r.total_cache_creation_input_tokens),
+        totalCacheReadInputTokens: n(r.total_cache_read_input_tokens),
       })),
     };
   }
@@ -787,6 +800,8 @@ function rowToUsage(r: Record<string, unknown>): UsageRow {
     inputTokens: n(r.input_tokens),
     outputTokens: n(r.output_tokens),
     costUsd: n(r.cost_usd),
+    cacheCreationInputTokens: n(r.cache_creation_input_tokens),
+    cacheReadInputTokens: n(r.cache_read_input_tokens),
     createdAt: String(r.created_at),
   };
 }

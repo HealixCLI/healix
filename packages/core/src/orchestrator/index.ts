@@ -346,6 +346,8 @@ async function runPipeline(
         inputTokens: usage?.inputTokens ?? null,
         outputTokens: usage?.outputTokens ?? null,
         costUsd: usage?.costUsd ?? null,
+        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
+        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
       });
       noteStoreOk();
     } catch (err) {

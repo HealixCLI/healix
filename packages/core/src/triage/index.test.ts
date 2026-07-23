@@ -71,6 +71,19 @@ describe('createTriageEngine().analyze — signal forwarding', () => {
     await createTriageEngine().analyze(INPUT, provider);
 
     expect(seenOpts?.signal).toBeUndefined();
+    expect(seenOpts?.cwd).toBeUndefined();
+  });
+
+  it('forwards the caller-provided cwd into provider.complete() unchanged', async () => {
+    let seenOpts: CompleteOptions | undefined;
+    const provider = fakeProvider(async (_prompt, opts) => {
+      seenOpts = opts;
+      return { provider: 'claude', ok: true, text: '', raw: null, detail: '' } satisfies CompletionResult;
+    });
+
+    await createTriageEngine().analyze(INPUT, provider, undefined, undefined, '/repo/path');
+
+    expect(seenOpts?.cwd).toBe('/repo/path');
   });
 
   it('falls back to the deterministic baseline when the provider call is aborted', async () => {

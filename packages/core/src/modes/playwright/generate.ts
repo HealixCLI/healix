@@ -826,7 +826,12 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string
 function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
-  const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
+  // Appended at the very end of the returned prompt (not interpolated here)
+  // so a retry's prompt stays an exact byte-for-byte extension of the
+  // previous attempt's prompt — that lets Anthropic's prefix-based prompt
+  // cache hit on retry instead of the note splicing mid-string and breaking
+  // the shared prefix between attempt 1 and attempt 2.
+  const strictNote = retryNote ? `\n\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier);
   const routingGuidance = formatRoutingGuidance(ctx);
   const sourceGrounding = formatSourceGrounding(ctx, item);
@@ -882,14 +887,14 @@ Requirements:
   remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
   path itself should still register their own fresh unique value first, then reuse THAT same value for
   the collision attempt within the same test.
-- ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
+- ${tierGuidance}${mockNote}${inventory}${routingGuidance}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
 
 Feature: ${item.title}
 Feature intent: ${item.intent}
-Tier: ${tierLabel(tier)}`;
+Tier: ${tierLabel(tier)}${strictNote}`;
 }
 
 interface GenOneOutcome {

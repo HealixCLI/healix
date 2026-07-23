@@ -289,6 +289,11 @@ describe('buildBatchPlanPrompt', () => {
     expect(prompt).toContain('route:/checkout');
     // Only this batch's unit is listed, not the other detected unit.
     expect(prompt).not.toContain('route:/other');
+    // The batch-position note must be appended AFTER buildPlanPrompt's static
+    // preamble, not prepended before it — otherwise the preamble stops being
+    // a stable, cacheable leading prefix shared across plan-generate/gap-fill/
+    // batch calls (see orchestrator/plan.ts's buildScopedPlanPrompt).
+    expect(prompt.startsWith('You are Healix, an autonomous QA engineer.')).toBe(true);
   });
 
   it('omits the batch-position prefix entirely when there is only one batch', () => {
@@ -473,6 +478,9 @@ describe('buildGapFillPlanPrompt', () => {
     expect(prompt).toContain('route:/settings');
     // Only the uncovered unit is listed, not the already-covered one.
     expect(prompt).not.toContain('route:/checkout');
+    // The "previous pass" note must be appended AFTER buildPlanPrompt's static
+    // preamble, not prepended before it — see the batch-prompt test above.
+    expect(prompt.startsWith('You are Healix, an autonomous QA engineer.')).toBe(true);
   });
 });
 

@@ -1654,7 +1654,13 @@ async function runPipeline(
             const controller = new AbortController();
             try {
               const enriched = await withTimeoutAbort(
-                engine.analyze(b.input, provider, controller.signal, recordUsage),
+                engine.analyze(
+                  b.input,
+                  provider,
+                  controller.signal,
+                  recordUsage,
+                  project.repoPath ?? undefined,
+                ),
                 TRIAGE_ANALYZE_TIMEOUT_MS,
                 controller,
               );

@@ -607,6 +607,9 @@ export class HealixStore {
     const runFilter = opts.projectId ? 'WHERE r.project_id = ?' : '';
     const params = opts.projectId ? [opts.projectId] : [];
 
+    // rowid tiebreaker: same reasoning as listRuns/listEvents — created_at has
+    // only second resolution, so two runs created within the same second (easy
+    // on a fast CI runner) would otherwise sort nondeterministically.
     const perRunRows = this.db
       .prepare(
         `SELECT r.id AS run_id, r.created_at AS run_created_at,
@@ -615,7 +618,7 @@ export class HealixStore {
          LEFT JOIN usage u ON u.run_id = r.id
          ${runFilter}
          GROUP BY r.id
-         ORDER BY r.created_at DESC`,
+         ORDER BY r.created_at DESC, r.rowid DESC`,
       )
       .all(...params) as Array<Record<string, unknown>>;
 

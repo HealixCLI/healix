@@ -16,7 +16,7 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../exec/run-cli.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../exec/run-cli.js')>();
-  return { ...actual, runCli: vi.fn() };
+  return { ...actual, runCli: vi.fn(), which: vi.fn() };
 });
 
 // readModelConfigOverrides hits the filesystem (appDataDir()); keep it
@@ -27,7 +27,7 @@ vi.mock('./model-config.js', async (importOriginal) => {
   return { ...actual, readModelConfigOverrides: vi.fn() };
 });
 
-import { runCli } from '../exec/run-cli.js';
+import { runCli, which } from '../exec/run-cli.js';
 import { readModelConfigOverrides } from './model-config.js';
 import { ClaudeProvider, parseClaudeJson } from './claude.js';
 
@@ -46,8 +46,16 @@ runCliMock.mockResolvedValue({
   aborted: false,
   durationMs: 0,
 });
+// which() shells out to the real PATH — CI runners don't have the `claude`
+// binary installed, so leaving this unmocked makes detect() (and anything
+// that calls it, like health()) non-deterministic across environments.
+// Force it to report installed so detect()/health() always reach runCli.
+const whichMock = vi.mocked(which);
+whichMock.mockResolvedValue('/usr/local/bin/claude');
 beforeEach(() => {
   runCliMock.mockClear();
+  whichMock.mockClear();
+  whichMock.mockResolvedValue('/usr/local/bin/claude');
   readOverridesMock.mockReset();
   readOverridesMock.mockResolvedValue(null);
 });

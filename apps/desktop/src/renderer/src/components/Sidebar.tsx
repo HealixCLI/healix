@@ -1,11 +1,12 @@
 import type { ReactNode } from 'react';
-import { FolderGit2, PlayCircle, Settings } from 'lucide-react';
+import { BarChart3, FolderGit2, PlayCircle, Settings } from 'lucide-react';
 import { Leaf } from './Leaf';
 import { cn } from '../lib/utils';
+import { SHOW_TOKEN_USAGE } from '../lib/feature-flags';
 
 // 'project-dashboard' is a deep-link-only destination (reached from ProjectsView,
 // like 'runs' can be) — it never appears in the sidebar's own nav list below.
-export type ViewId = 'projects' | 'runs' | 'settings' | 'project-dashboard';
+export type ViewId = 'projects' | 'runs' | 'reports' | 'settings' | 'project-dashboard';
 
 interface NavItem {
   id: ViewId;
@@ -13,10 +14,14 @@ interface NavItem {
   icon: ReactNode;
 }
 
-// Primary destinations. Projects is the landing screen.
+// Primary destinations. Projects is the landing screen. Reports (usage) is
+// gated behind SHOW_TOKEN_USAGE — see feature-flags.ts.
 const ITEMS: NavItem[] = [
   { id: 'projects', label: 'Projects', icon: <FolderGit2 className="h-5 w-5" /> },
   { id: 'runs', label: 'Runs', icon: <PlayCircle className="h-5 w-5" /> },
+  ...(SHOW_TOKEN_USAGE
+    ? [{ id: 'reports' as const, label: 'Reports', icon: <BarChart3 className="h-5 w-5" /> }]
+    : []),
 ];
 
 // Settings is pinned to the bottom; provider connection/auth lives inside it.

@@ -128,6 +128,10 @@ function migrate(db: DatabaseSync): void {
     // templates.ts's stepsReporterContents()), present for both passed and
     // failed tests, not just failures.
     ensureColumn(db, 'results', 'steps_json', 'TEXT');
+    // v11: usage table (per-call token/cost tracking) — no ensureColumn needed
+    // here; it's a brand-new table, so the CREATE TABLE IF NOT EXISTS already
+    // inside SCHEMA_SQL (executed unconditionally above, within this same
+    // version-gated block) is sufficient to retrofit it onto an existing DB.
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

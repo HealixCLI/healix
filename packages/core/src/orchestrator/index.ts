@@ -14,6 +14,8 @@ import type {
 } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
+import { extractUsage } from '../providers/usage.js';
+import type { UsageRecorder } from '../providers/usage.js';
 import { getTestMode } from '../modes/registry.js';
 import type {
   ExecOutcome,
@@ -337,6 +339,28 @@ async function runPipeline(
       } catch {
         /* never let a hook crash the run */
       }
+    }
+  };
+
+  // Captures token/cost usage for every provider.complete() call this run makes
+  // (plan, gap-fill plan, generate, triage — see UsageRecorder's call sites),
+  // feeding the Usage tab / Reports page. Best-effort like every other store
+  // write here: a bad extraction or a DB fault must never affect the run itself.
+  const recordUsage: UsageRecorder = (phase, task, providerId, raw) => {
+    try {
+      const usage = extractUsage(raw);
+      store.recordUsage({
+        runId,
+        phase,
+        task,
+        provider: providerId,
+        inputTokens: usage?.inputTokens ?? null,
+        outputTokens: usage?.outputTokens ?? null,
+        costUsd: usage?.costUsd ?? null,
+      });
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('recordUsage', err);
     }
   };
 
@@ -753,7 +777,7 @@ async function runPipeline(
           );
         }
 
-        plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex);
+        plan = await runPlanPhase(provider, project, opts, emit, overrides, repoIndex, recordUsage);
         // Enforce the testing-scope boundary as a backstop: plan.ts already asks
         // the model for (and normalizes tiers to) only in-scope tiers, but this
         // is the hard guarantee — filtered here, before approval/persistence, so
@@ -1019,6 +1043,7 @@ async function runPipeline(
       testingScope: opts.testingScope ?? 'both',
       sourceContext,
       emit: ctxEmit,
+      onUsage: recordUsage,
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
@@ -1463,6 +1488,7 @@ async function runPipeline(
             cwd: project.repoPath ?? undefined,
             signal,
           });
+          recordUsage('plan', 'gap-fill', provider.id, completion.raw);
           if (completion.ok && completion.text) {
             gapPlan = parsePlan(completion.text, opts.testingScope ?? 'both');
           } else {
@@ -1641,7 +1667,7 @@ async function runPipeline(
           const controller = new AbortController();
           try {
             const enriched = await withTimeoutAbort(
-              engine.analyze(b.input, provider, controller.signal),
+              engine.analyze(b.input, provider, controller.signal, recordUsage),
               TRIAGE_ANALYZE_TIMEOUT_MS,
               controller,
             );
@@ -1884,6 +1910,8 @@ export async function attemptPlanCompletion(
   opts: RunOptions,
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
   overrides?: OrchestratorOverrides,
+  recordUsage?: UsageRecorder,
+  task: string | null = null,
 ): Promise<{ plan: TestPlan } | { plan: null; reason: string; failureReason?: PlanParseFailureReason }> {
   // Attempt a single completion with one provider; classifies the outcome so the
   // caller can decide whether to retry with a fallback.
@@ -1902,6 +1930,7 @@ export async function attemptPlanCompletion(
         // and the pipeline's next boundary check turns that into 'cancelled'.
         signal: opts.signal,
       });
+      recordUsage?.('plan', task, p.id, completion.raw);
       if (completion.ok && completion.text) {
         const parsed = parsePlanWithDiagnostics(completion.text, opts.testingScope ?? 'both');
         if (parsed.plan) return { plan: parsed.plan };
@@ -2051,13 +2080,23 @@ export async function runPlanPhase(
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
   overrides?: OrchestratorOverrides,
   repoIndex?: PlanRepoContext,
+  recordUsage?: UsageRecorder,
 ): Promise<TestPlan> {
   const units = repoIndex?.functionality ?? [];
   const totalWeight = units.reduce((sum, u) => sum + estimateUnitWeight(u), 0);
 
   if (totalWeight <= PLAN_BATCH_WEIGHT_BUDGET && units.length <= PLAN_BATCH_MAX_UNITS) {
     const prompt = buildPlanPrompt(project, opts, repoIndex);
-    const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
+    const result = await attemptPlanCompletion(
+      provider,
+      prompt,
+      project,
+      opts,
+      emit,
+      overrides,
+      recordUsage,
+      'initial',
+    );
     if (result.plan) return { ...result.plan, planSource: 'ai' };
     emit('plan', 'warn', `Synthesizing fallback plan (reason: ${result.reason}).`);
     return {
@@ -2094,7 +2133,16 @@ export async function runPlanPhase(
   ): Promise<void> => {
     const prompt = buildBatchPlanPrompt(project, opts, batchUnits, batchIndex + 1, batches.length, repoIndex);
     emit('plan', 'info', `Planning batch ${label} (${batchUnits.length} unit(s)).`);
-    const result = await attemptPlanCompletion(provider, prompt, project, opts, emit, overrides);
+    const result = await attemptPlanCompletion(
+      provider,
+      prompt,
+      project,
+      opts,
+      emit,
+      overrides,
+      recordUsage,
+      label,
+    );
     if (result.plan) {
       items.push(...result.plan.items);
       emit('plan', 'info', `Batch ${label} generated ${result.plan.items.length} item(s).`, {

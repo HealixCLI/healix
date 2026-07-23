@@ -5,6 +5,8 @@ export * from './providers/types.js';
 export { ClaudeProvider } from './providers/claude.js';
 export { OpenAIProvider } from './providers/openai.js';
 export { ProviderRouter } from './providers/router.js';
+export { extractUsage } from './providers/usage.js';
+export type { UsageTotals, UsageRecorder } from './providers/usage.js';
 
 // Doctor / facade
 export { doctor, type DoctorReport } from './healix.js';

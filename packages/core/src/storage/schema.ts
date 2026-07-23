@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -76,9 +76,27 @@ CREATE TABLE IF NOT EXISTS agent_events (
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v11: per-call token/cost usage, one row per provider.complete() call captured
+-- during a run (plan, gap-fill plan, generate, triage). task is a human label
+-- (e.g. a spec item's title, or 'gap-fill') scoping the row within its phase;
+-- input_tokens/output_tokens/cost_usd are null when the provider (or a
+-- timed-out/aborted call) reported no usage.
+CREATE TABLE IF NOT EXISTS usage (
+  id            TEXT PRIMARY KEY,
+  run_id        TEXT NOT NULL REFERENCES runs(id),
+  phase         TEXT NOT NULL,
+  task          TEXT,
+  provider      TEXT NOT NULL,
+  input_tokens  INTEGER,
+  output_tokens INTEGER,
+  cost_usd      REAL,
+  created_at    TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_credentials_project ON project_credentials(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_tests_run ON tests(run_id);
 CREATE INDEX IF NOT EXISTS idx_results_test ON results(test_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
+CREATE INDEX IF NOT EXISTS idx_usage_run ON usage(run_id);
 `;

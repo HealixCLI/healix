@@ -955,6 +955,7 @@ async function generateOne(
         // US below — the provider only ever needs to return text.
         readOnly: true,
         signal: ctx.signal,
+        taskType: 'codegen',
       });
       if (!res.ok) {
         emit(ctx, `Codegen provider error for "${item.title}" (attempt ${attempt + 1}): ${res.detail}`);

@@ -50,6 +50,11 @@ import {
   type TestResult,
   type AgentEvent,
   type HealthResult,
+  DEFAULT_MODEL_CONFIG,
+  readModelConfigOverrides,
+  writeModelConfigOverrides,
+  type ModelEffortConfig,
+  type ModelEffortOverrides,
 } from '@healix/core';
 
 // Last-resort net: every ipcMain handler already catches its own errors and
@@ -1030,6 +1035,24 @@ ipcMain.handle(
       };
     }
     return provider.health({ probe: payload?.probe ?? true });
+  },
+);
+
+// ---- Claude per-task-type model/effort config (Settings page) ----
+
+ipcMain.handle(
+  'settings:getModelConfig',
+  async (): Promise<{ defaults: ModelEffortConfig; overrides: ModelEffortOverrides }> => {
+    const overrides = (await readModelConfigOverrides()) ?? {};
+    return { defaults: DEFAULT_MODEL_CONFIG, overrides };
+  },
+);
+
+ipcMain.handle(
+  'settings:setModelConfig',
+  async (_e, overrides: ModelEffortOverrides): Promise<{ ok: true }> => {
+    await writeModelConfigOverrides(overrides ?? {});
+    return { ok: true };
   },
 );
 

@@ -1,9 +1,13 @@
 import { describe, expect, it } from 'vitest';
 import { generateMockResponses, staticMockResponse } from './mock-responses.js';
-import type { ProviderAdapter } from '../providers/types.js';
+import type { CompleteOptions, ProviderAdapter } from '../providers/types.js';
 import type { ExternalDependency } from './types.js';
 
-function fakeProvider(text: string, ok = true): ProviderAdapter {
+function fakeProvider(
+  text: string,
+  ok = true,
+  onComplete?: (opts: CompleteOptions | undefined) => void,
+): ProviderAdapter {
   return {
     id: 'claude',
     label: 'Claude',
@@ -21,7 +25,10 @@ function fakeProvider(text: string, ok = true): ProviderAdapter {
       detail: '',
     }),
     plan: async () => ({ provider: 'claude', ok: true, plan: '', raw: null, detail: '' }),
-    complete: async () => ({ provider: 'claude', ok, text, raw: null, detail: '' }),
+    complete: async (_prompt, opts) => {
+      onComplete?.(opts);
+      return { provider: 'claude', ok, text, raw: null, detail: '' };
+    },
   };
 }
 
@@ -50,10 +57,15 @@ describe('staticMockResponse', () => {
 
 describe('generateMockResponses', () => {
   it('skips undeterminable dependencies and calls the provider only for mockable ones', async () => {
-    const provider = fakeProvider('```json\n{"responses":[]}\n```');
+    let capturedOpts: CompleteOptions | undefined;
+    const provider = fakeProvider('```json\n{"responses":[]}\n```', true, (opts) => {
+      capturedOpts = opts;
+    });
     const result = await generateMockResponses([smsDep, undeterminableDep], provider);
     expect(result.has('pkg:twilio')).toBe(true);
     expect(result.has('pkg:nodemailer')).toBe(false);
+    // Lets the provider resolve a per-task-type model/effort (see model-config.ts).
+    expect(capturedOpts?.taskType).toBe('mock-response');
   });
 
   it('returns only static fallbacks when there are no mockable dependencies (no provider call)', async () => {

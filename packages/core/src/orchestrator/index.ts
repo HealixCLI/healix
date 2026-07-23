@@ -1451,7 +1451,11 @@ async function runPipeline(
             mode: 'plan',
             cwd: project.repoPath ?? undefined,
             signal,
+            taskType: 'plan-gapfill',
           });
+          if (completion.model) {
+            emit('plan', 'debug', `plan-gapfill used model=${completion.model} effort=${completion.effort}.`);
+          }
           if (completion.ok && completion.text) {
             gapPlan = parsePlan(completion.text, opts.testingScope ?? 'both');
           } else {
@@ -1880,7 +1884,11 @@ export async function attemptPlanCompletion(
         // cancelled run keep burning tokens; the adapter resolves ok:false,
         // and the pipeline's next boundary check turns that into 'cancelled'.
         signal: opts.signal,
+        taskType: 'plan-generate',
       });
+      if (completion.model) {
+        emit('plan', 'debug', `plan-generate used model=${completion.model} effort=${completion.effort}.`);
+      }
       if (completion.ok && completion.text) {
         const parsed = parsePlanWithDiagnostics(completion.text, opts.testingScope ?? 'both');
         if (parsed.plan) return { plan: parsed.plan };

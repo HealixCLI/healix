@@ -57,6 +57,8 @@ describe('createTriageEngine().analyze — signal forwarding', () => {
     await createTriageEngine().analyze(INPUT, provider, controller.signal);
 
     expect(seenOpts?.signal).toBe(controller.signal);
+    // Lets the provider resolve a per-task-type model/effort (see model-config.ts).
+    expect(seenOpts?.taskType).toBe('triage');
   });
 
   it('works with no signal at all (orchestrator call sites that opt out)', async () => {

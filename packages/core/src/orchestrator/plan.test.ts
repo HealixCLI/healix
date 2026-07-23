@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../storage/types.js';
 import { tiersForScope } from '../modes/types.js';
+import type { TestPlanItem } from '../modes/types.js';
+import type { CompleteOptions, ProviderAdapter } from '../providers/types.js';
 import {
   buildBatchPlanPrompt,
   buildGapFillPlanPrompt,
   buildPlanPrompt,
   parsePlan,
   parsePlanWithDiagnostics,
+  reviseItem,
   synthesizePlan,
 } from './plan.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
@@ -508,5 +511,61 @@ describe('buildPlanPrompt (testing scope)', () => {
     expect(buildPlanPrompt(makeProject(), { projectId: 'p', testingScope: 'both' })).toContain(
       'Testing scope: Frontend + backend testing',
     );
+  });
+});
+
+describe('reviseItem — provider call wiring', () => {
+  const ITEM: TestPlanItem = {
+    id: 'pli_1',
+    title: 'Home loads',
+    reqTag: 'REQ-001',
+    tier: 'tierA-public',
+    intent: 'Landing renders.',
+    scenarios: [{ kind: 'positive', description: 'Home page loads successfully.' }],
+  };
+
+  function fakeProvider(onComplete: (opts: CompleteOptions | undefined) => void): ProviderAdapter {
+    return {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      async detect() {
+        return { installed: true, binPath: '/fake', version: '0.0.0' };
+      },
+      async health() {
+        return {
+          provider: 'claude',
+          status: 'ready',
+          installed: true,
+          binPath: '/fake',
+          version: '0.0.0',
+          authenticated: true,
+          model: null,
+          latencyMs: null,
+          detail: '',
+        };
+      },
+      async plan() {
+        return { provider: 'claude', ok: true, plan: '', raw: null, detail: '' };
+      },
+      async complete(_prompt, opts) {
+        onComplete(opts);
+        // A parse failure here is fine — this test only cares about how
+        // reviseItem calls the provider, not the revision's own outcome.
+        return { provider: 'claude', ok: false, text: '', raw: null, detail: 'unused' };
+      },
+    };
+  }
+
+  it('requests taskType "plan-revise-item" (per-task-type model/effort routing)', async () => {
+    let seenOpts: CompleteOptions | undefined;
+    const provider = fakeProvider((opts) => {
+      seenOpts = opts;
+    });
+
+    await reviseItem(provider, makeProject(), { projectId: 'prj_test' }, ITEM, 'Also check the footer.');
+
+    expect(seenOpts?.taskType).toBe('plan-revise-item');
+    expect(seenOpts?.mode).toBe('plan');
   });
 });

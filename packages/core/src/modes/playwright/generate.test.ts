@@ -565,6 +565,8 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     // Codegen must never let the provider agent mutate the user's repo.
     expect(calls).toHaveLength(1);
     expect(calls[0].opts?.readOnly).toBe(true);
+    // Lets the provider resolve a per-task-type model/effort (see model-config.ts).
+    expect(calls[0].opts?.taskType).toBe('codegen');
   });
 
   it('emits a per-item "Dispatched i/n" event distinct from the batch "Progress" event', async () => {

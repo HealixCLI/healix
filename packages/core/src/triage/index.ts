@@ -64,7 +64,11 @@ export function createTriageEngine(): TriageEngine {
 
       let reply: Awaited<ReturnType<ProviderAdapter['complete']>>;
       try {
-        reply = await provider.complete(prompt, { timeoutMs: ANALYZE_TIMEOUT_MS, signal });
+        reply = await provider.complete(prompt, {
+          timeoutMs: ANALYZE_TIMEOUT_MS,
+          signal,
+          taskType: 'triage',
+        });
       } catch {
         // Provider threw (process error, etc.) — never leak; fall back.
         return baseline;

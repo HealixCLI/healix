@@ -186,6 +186,7 @@ export async function generateMockResponses(
       timeoutMs: MOCK_RESPONSE_TIMEOUT_MS,
       readOnly: true,
       signal: opts?.signal,
+      taskType: 'mock-response',
     });
     if (completion.ok && completion.text) {
       const validKeys = new Set<string>();

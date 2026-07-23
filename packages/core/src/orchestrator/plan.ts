@@ -517,6 +517,7 @@ export async function reviseItem(
       mode: 'plan',
       cwd: project.repoPath ?? undefined,
       signal: opts.signal,
+      taskType: 'plan-revise-item',
     });
   } catch (err) {
     return { ok: false, detail: err instanceof Error ? err.message : String(err) };

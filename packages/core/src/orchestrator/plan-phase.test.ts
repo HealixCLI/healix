@@ -136,6 +136,27 @@ describe('runPlanPhase resilience', () => {
     expect(provider.calls).toBe(2);
   }, 10_000);
 
+  it('attemptPlanCompletion requests taskType "plan-generate" (per-task-type model/effort routing)', async () => {
+    let seenTaskType: string | undefined;
+    const provider = makeFlakyProvider(0, SIMPLE_PLAN);
+    const originalComplete = provider.complete.bind(provider);
+    provider.complete = async (prompt, opts) => {
+      seenTaskType = opts?.taskType;
+      return originalComplete(prompt, opts);
+    };
+    await attemptPlanCompletion(
+      provider,
+      'irrelevant prompt text',
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      {
+        provider,
+      },
+    );
+    expect(seenTaskType).toBe('plan-generate');
+  }, 10_000);
+
   it('attemptPlanCompletion never calls synthesizePlan — it returns null with a reason instead', async () => {
     const provider = makeFlakyProvider(Number.POSITIVE_INFINITY, SIMPLE_PLAN);
     const result = await attemptPlanCompletion(

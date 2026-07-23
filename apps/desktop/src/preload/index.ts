@@ -79,6 +79,9 @@ const api = {
     autoApprove?: boolean;
     prd?: string;
     instructions?: string;
+    prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+    prdFileName?: string;
+    prdSelectedSheets?: string[];
     suiteMode?: string;
     baseRunId?: string;
   }) => ipcRenderer.invoke('run:start', args),
@@ -119,6 +122,9 @@ const api = {
 
   // PRD file upload (native picker + text extraction, main-process side)
   pickPrdFile: () => ipcRenderer.invoke('dialog:pickPrdFile'),
+  previewPrdSheets: (filePath: string) => ipcRenderer.invoke('dialog:previewPrdSheets', filePath),
+  extractPrdSheets: (filePath: string, selectedSheetNames: string[]) =>
+    ipcRenderer.invoke('dialog:extractPrdSheets', filePath, selectedSheetNames),
 
   // Repo path folder picker (Project create/edit form)
   pickRepoPath: () => ipcRenderer.invoke('dialog:pickRepoPath'),

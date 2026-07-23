@@ -43,6 +43,12 @@ export interface RunOptions {
   autoApprove?: boolean;
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
+  /** How the `prd` text was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
   /**
    * Freeform additional instructions from the user, steering HOW the plan is
    * built rather than describing WHAT the app does (that's the PRD's job) —

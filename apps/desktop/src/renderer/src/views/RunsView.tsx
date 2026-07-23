@@ -7,6 +7,7 @@ import { Badge, type BadgeTone } from '../components/ui/badge';
 import { Select } from '../components/ui/select';
 import { Label } from '../components/ui/label';
 import { Textarea } from '../components/ui/textarea';
+import { SheetPickerDialog } from '../components/ui/sheet-picker-dialog';
 import { ConsoleLog } from '../components/ConsoleLog';
 import { PlanGate } from '../components/PlanGate';
 import { LiveBrowser } from '../components/LiveBrowser';
@@ -22,6 +23,7 @@ import { cn } from '../lib/utils';
 import { formatCreatedAt, isTerminalRun } from '../lib/run-format';
 import { SUITE_MODES, TESTING_SCOPES, type RunEngine, type RunPhase } from '../lib/run-engine';
 import type { RunQueue } from '../lib/run-queue';
+import type { SheetPreview } from '../lib/ipc-types';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
@@ -134,6 +136,19 @@ export function RunsView({
   const [prdFileName, setPrdFileName] = useState<string | null>(null);
   const [prdFileBusy, setPrdFileBusy] = useState(false);
   const [prdFileError, setPrdFileError] = useState<string | null>(null);
+  // Non-fatal notes (e.g. row-cap truncation) surfaced alongside the file
+  // status, distinct from prdFileError which means the upload failed outright.
+  const [prdFileWarning, setPrdFileWarning] = useState<string | null>(null);
+  // Provenance of the current `prd` text — carried through to the run's
+  // persisted config snapshot so history can show "Source: X.xlsx (sheets: ...)".
+  const [prdSourceKind, setPrdSourceKind] = useState<'text' | 'file' | 'spreadsheet' | null>(null);
+  const [prdSelectedSheets, setPrdSelectedSheets] = useState<string[] | null>(null);
+  // Set while a multi-sheet workbook's picker dialog is open; cleared on confirm/cancel.
+  const [sheetPickerFile, setSheetPickerFile] = useState<{
+    filePath: string;
+    fileName: string;
+    sheets: SheetPreview[];
+  } | null>(null);
   // Interactive prompting: freeform steering instructions ("how to test"),
   // distinct from the PRD ("what the app does") — sent to the planning
   // provider verbatim alongside it (see RunOptions.instructions).
@@ -403,6 +418,9 @@ export function RunsView({
       suiteMode,
       prd: prd.trim() || undefined,
       instructions: instructions.trim() || undefined,
+      prdSourceKind: prd.trim() ? (prdSourceKind ?? 'text') : undefined,
+      prdFileName: prd.trim() ? (prdFileName ?? undefined) : undefined,
+      prdSelectedSheets: prd.trim() ? (prdSelectedSheets ?? undefined) : undefined,
     };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
@@ -445,6 +463,7 @@ export function RunsView({
 
   const uploadPrdFile = async (): Promise<void> => {
     setPrdFileError(null);
+    setPrdFileWarning(null);
     setPrdFileBusy(true);
     try {
       const result = await window.healix.pickPrdFile();
@@ -453,8 +472,47 @@ export function RunsView({
         setPrdFileError(result.error);
         return;
       }
+      if (result.needsSheetPicker && result.filePath && result.sheets) {
+        // Multi-sheet workbook — hand off to the picker dialog instead of
+        // setting `prd` directly; confirmSheetSelection finishes the job.
+        setSheetPickerFile({
+          filePath: result.filePath,
+          fileName: result.fileName ?? '',
+          sheets: result.sheets,
+        });
+        return;
+      }
       setPrd(result.text ?? '');
       setPrdFileName(result.fileName ?? null);
+      setPrdSourceKind(result.sourceKind ?? 'file');
+      setPrdSelectedSheets(result.selectedSheets ?? null);
+      if (result.warnings && result.warnings.length > 0) setPrdFileWarning(result.warnings.join(' '));
+    } catch (err) {
+      setPrdFileError(err instanceof Error ? err.message : String(err));
+    } finally {
+      setPrdFileBusy(false);
+    }
+  };
+
+  const confirmSheetSelection = async (selectedNames: string[]): Promise<void> => {
+    const file = sheetPickerFile;
+    if (!file) return;
+    setSheetPickerFile(null);
+    setPrdFileError(null);
+    setPrdFileWarning(null);
+    setPrdFileBusy(true);
+    try {
+      const result = await window.healix.extractPrdSheets(file.filePath, selectedNames);
+      if (result.error) {
+        setPrdFileError(result.error);
+        return;
+      }
+      const joined = (result.sheets ?? []).map((s) => `--- Sheet: ${s.name} ---\n${s.content}`).join('\n\n');
+      setPrd(joined);
+      setPrdFileName(file.fileName);
+      setPrdSourceKind('spreadsheet');
+      setPrdSelectedSheets(selectedNames);
+      if (result.warnings && result.warnings.length > 0) setPrdFileWarning(result.warnings.join(' '));
     } catch (err) {
       setPrdFileError(err instanceof Error ? err.message : String(err));
     } finally {
@@ -503,6 +561,16 @@ export function RunsView({
   // by this same effect.
   useEffect(() => {
     if (!engine.runId || engine.hydrated || SETTLED_PHASES.includes(engine.phase)) return;
+    // The user explicitly asked for a blank compose screen (Run/New run) to
+    // queue a different run behind whatever the engine is already tracking —
+    // e.g. clicking "+" while another run is active never touches engine
+    // phase (queueRun doesn't set 'starting' the way start() does), so
+    // without this guard this effect would immediately snap selectedRunId
+    // right back to that unrelated already-active run, locking the fresh
+    // compose form the instant it opened. Cleared the moment a genuinely new
+    // run actually starts (phase 'starting'/'idle', see the settle effect
+    // above) or the user picks a different history row instead.
+    if (awaitingFreshRunConfig) return;
     if (selectedRunId === null) setSelectedRunId(engine.runId);
   }, [engine.runId, engine.hydrated, engine.phase, selectedRunId]);
 
@@ -513,7 +581,18 @@ export function RunsView({
   // RunDetail.runConfig) — falling back to just the Run row's own suiteMode
   // for a run that predates that file.
   const viewingHistoricalRun = !!selectedRunId && !showLiveSurface && !!detail?.run;
+  // Locks every config field to read-only: either a genuinely historical row
+  // (viewingHistoricalRun), or the run THIS card was just used to start,
+  // still live (showLiveSurface implies isActive — see its own definition) —
+  // once a run has begun, its configuration can no longer be edited. A fresh
+  // compose form (e.g. right after "+"/New run while another run executes
+  // elsewhere) has showLiveSurface false, so it stays editable for queuing.
+  const configLocked = viewingHistoricalRun || showLiveSurface;
   const historicalProject = detail?.run ? projectsById.get(detail.run.projectId) : undefined;
+  // Whichever project this locked/historical view's config belongs to —
+  // historicalProject for a genuinely past row, selectedProject (still valid,
+  // never reset mid-run) for the run this card itself just started.
+  const lockedProject = viewingHistoricalRun ? historicalProject : selectedProject;
   const effectiveTestingScope = viewingHistoricalRun
     ? (detail?.runConfig?.testingScope ?? 'both')
     : testingScope;
@@ -522,6 +601,24 @@ export function RunsView({
     : suiteMode;
   const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
   const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
+  // "Source: TestCases.xlsx (sheets: Login, Signup)" for a spreadsheet-sourced
+  // run, falling back to plain filename-only display otherwise. Historical
+  // reads from the persisted run-config snapshot; the still-live case reads
+  // straight from the upload-flow state (never cleared once a run starts).
+  const historicalPrdSource = viewingHistoricalRun
+    ? detail?.runConfig?.prdFileName
+      ? detail.runConfig.prdSourceKind === 'spreadsheet' && detail.runConfig.prdSelectedSheets?.length
+        ? `Source: ${detail.runConfig.prdFileName} (sheets: ${detail.runConfig.prdSelectedSheets.join(', ')})`
+        : `Source: ${detail.runConfig.prdFileName}`
+      : null
+    : null;
+  const lockedPrdSource = viewingHistoricalRun
+    ? historicalPrdSource
+    : prdFileName
+      ? prdSourceKind === 'spreadsheet' && prdSelectedSheets && prdSelectedSheets.length > 0
+        ? `Source: ${prdFileName} (sheets: ${prdSelectedSheets.join(', ')})`
+        : `Source: ${prdFileName}`
+      : null;
 
   /**
    * Clears the historical-run view and resets the compose form to defaults,
@@ -540,6 +637,10 @@ export function RunsView({
     setPrd('');
     setPrdFileName(null);
     setPrdFileError(null);
+    setPrdFileWarning(null);
+    setPrdSourceKind(null);
+    setPrdSelectedSheets(null);
+    setSheetPickerFile(null);
     setInstructions('');
     setTestingScope('both');
     setSuiteMode('fresh');
@@ -560,441 +661,484 @@ export function RunsView({
   }, [runRequestSeq, initialProjectId, startNewRunConfig]);
 
   return (
-    <div className="flex h-full min-h-0">
-      {/* History rail — shown/hidden entirely from the activity bar (re-clicking
+    <>
+      <div className="flex h-full min-h-0">
+        {/* History rail — shown/hidden entirely from the activity bar (re-clicking
           the Runs icon), not by an in-page collapse control. */}
-      {!sidebarCollapsed && (
-        <div className="flex w-64 shrink-0 flex-col border-r border-border px-4 pb-6 pt-8">
-          <RunHistory
-            runs={runs}
-            loading={runsLoading}
-            error={runsError}
-            selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
-            onSelect={(id) => {
-              // An explicit history pick overrides any still-pending "show me
-              // a blank compose screen" intent from a recent Run/New run click.
-              awaitingFreshRunConfig = false;
-              setSelectedRunId(id);
-            }}
-            onRefresh={() => void refreshRuns()}
-            onDelete={(id) => void deleteRun(id)}
-            onNewRun={startNewRunConfig}
-            projectsById={projectsById}
-          />
-        </div>
-      )}
-
-      {/* Main */}
-      <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8 [@media(max-height:800px)]:pb-3 [@media(max-height:800px)]:pt-4">
-        <header className="flex items-end justify-between border-b border-border pb-5 [@media(max-height:800px)]:pb-2">
-          <div>
-            <h1 className="font-mono text-xl font-semibold tracking-tight">Runs</h1>
-            <p className="mt-1 text-sm text-muted [@media(max-height:800px)]:hidden">
-              Plan → approve → explore → generate → execute → triage → report.
-            </p>
+        {!sidebarCollapsed && (
+          <div className="flex w-64 shrink-0 flex-col border-r border-border px-4 pb-6 pt-8">
+            <RunHistory
+              runs={runs}
+              loading={runsLoading}
+              error={runsError}
+              selectedRunId={showLiveSurface && !engine.hydrated ? null : selectedRunId}
+              onSelect={(id) => {
+                // An explicit history pick overrides any still-pending "show me
+                // a blank compose screen" intent from a recent Run/New run click.
+                awaitingFreshRunConfig = false;
+                setSelectedRunId(id);
+              }}
+              onRefresh={() => void refreshRuns()}
+              onDelete={(id) => void deleteRun(id)}
+              onNewRun={startNewRunConfig}
+              projectsById={projectsById}
+            />
           </div>
-          <Badge tone={PHASE_TONE[engine.phase]}>{PHASE_LABEL[engine.phase]}</Badge>
-        </header>
+        )}
 
-        {/* Controls */}
-        <Card className="mt-5 shrink-0 [@media(max-height:800px)]:mt-3">
-          <CardHeader className="flex flex-row items-center justify-between">
-            <div className="flex items-center gap-2">
-              <CardTitle>{viewingHistoricalRun ? 'Run configuration' : 'Start a run'}</CardTitle>
-              {viewingHistoricalRun && <Badge tone="muted">Read-only</Badge>}
+        {/* Main */}
+        <div className="flex min-w-0 flex-1 flex-col overflow-y-auto px-8 pb-6 pt-8 [@media(max-height:800px)]:pb-3 [@media(max-height:800px)]:pt-4">
+          <header className="flex items-end justify-between border-b border-border pb-5 [@media(max-height:800px)]:pb-2">
+            <div>
+              <h1 className="font-mono text-xl font-semibold tracking-tight">Runs</h1>
+              <p className="mt-1 text-sm text-muted [@media(max-height:800px)]:hidden">
+                Plan → approve → explore → generate → execute → triage → report.
+              </p>
             </div>
-            <div className="flex items-center gap-2">
-              {formCollapsed && !viewingHistoricalRun && selectedProject && (
-                <span className="truncate font-mono text-xs text-muted">
-                  {selectedProject.name} · {TESTING_SCOPES.find((s) => s.value === testingScope)?.label}
-                </span>
-              )}
-              {formCollapsed && viewingHistoricalRun && (
-                <span className="truncate font-mono text-xs text-muted">
-                  {historicalProject?.name ?? detail?.run?.projectId} ·{' '}
-                  {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.label}
-                </span>
-              )}
-            </div>
-          </CardHeader>
-          {!formCollapsed && (
-            <CardContent>
-              <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
-                <div>
-                  <Label className="mb-1.5 block">Project</Label>
-                  <Select
-                    value={viewingHistoricalRun ? (detail?.run?.projectId ?? '') : projectId}
-                    onChange={(e) => setProjectId(e.target.value)}
-                    // Stays editable while a run is active — picking a different
-                    // project here configures the run that "Queue run" adds
-                    // behind it, not the one currently executing.
-                    disabled={viewingHistoricalRun || projectsLoading || runnable.length === 0}
-                  >
-                    {viewingHistoricalRun ? (
-                      <option value={detail?.run?.projectId ?? ''}>
-                        {historicalProject?.name ?? detail?.run?.projectId ?? 'Unknown project'}
-                      </option>
-                    ) : (
-                      <>
-                        {runnable.length === 0 && (
-                          <option value="">No active projects — create one first</option>
-                        )}
-                        {runnable.map((p) => (
-                          <option key={p.id} value={p.id}>
-                            {p.name}
-                          </option>
-                        ))}
-                      </>
-                    )}
-                  </Select>
-                </div>
-                <div>
-                  <Label className="mb-1.5 block">Testing Scope</Label>
-                  <Select
-                    value={effectiveTestingScope}
-                    onChange={(e) => setTestingScope(e.target.value as TestingScope)}
-                    disabled={viewingHistoricalRun}
-                  >
-                    {TESTING_SCOPES.map((s) => (
-                      <option key={s.value} value={s.value}>
-                        {s.label}
-                      </option>
-                    ))}
-                  </Select>
-                  <p className="mt-1 text-[11px] text-muted">
-                    {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.hint}
-                  </p>
-                </div>
-                <div>
-                  <Label className="mb-1.5 block">Suite Mode</Label>
-                  <Select
-                    value={effectiveSuiteMode}
-                    onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}
-                    disabled={viewingHistoricalRun}
-                  >
-                    {SUITE_MODES.map((m) => (
-                      <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
-                        {m.label}
-                      </option>
-                    ))}
-                  </Select>
-                  <p className="mt-1 text-[11px] text-muted">
-                    {SUITE_MODES.find((m) => m.value === effectiveSuiteMode)?.hint}
-                  </p>
-                  {!viewingHistoricalRun && suiteMode !== 'fresh' && lastSuccessfulRun && (
-                    <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
-                      Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
-                    </p>
-                  )}
-                </div>
-                <div className="sm:col-span-3">
-                  <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
-                  <div className="relative">
-                    <Textarea
-                      value={effectivePrd}
-                      onChange={(e) => {
-                        setPrd(e.target.value);
-                        // The text no longer reflects the uploaded file verbatim.
-                        setPrdFileName(null);
-                      }}
-                      placeholder="Paste requirements to ground test generation…"
-                      className={viewingHistoricalRun ? undefined : 'pr-9'}
-                      // readOnly (not disabled) for a historical run: prevents edits
-                      // while keeping the textarea scrollable — disabled:pointer-events-none
-                      // blocks wheel-scrolling over the field entirely.
-                      readOnly={viewingHistoricalRun}
-                    />
-                    {!viewingHistoricalRun && (
-                      <button
-                        type="button"
-                        onClick={() => void uploadPrdFile()}
-                        disabled={prdFileBusy}
-                        aria-label="Upload a PRD file"
-                        title="Upload a PRD file"
-                        className={cn(
-                          'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
-                          'text-muted transition-colors hover:bg-panel hover:text-fg',
-                          'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
-                          'disabled:pointer-events-none disabled:opacity-50',
-                        )}
-                      >
-                        {prdFileBusy ? (
-                          <Loader2 className="h-4 w-4 animate-spin" />
-                        ) : (
-                          <Plus className="h-4 w-4" />
-                        )}
-                      </button>
-                    )}
-                  </div>
-                  {!viewingHistoricalRun && (
-                    <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
-                      <span>
-                        {prdFileName ? (
-                          <>
-                            Selected file: <span className="font-mono text-fg">{prdFileName}</span>
-                          </>
-                        ) : (
-                          'No file selected — paste text above or upload a PRD.'
-                        )}
-                      </span>
-                      <span className="shrink-0">Accepted: .pdf, .doc, .docx, .md, .txt</span>
-                    </div>
-                  )}
-                  {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
-                </div>
-                <div className="sm:col-span-3">
-                  <Label className="mb-1.5 block">Additional instructions (optional)</Label>
-                  <Textarea
-                    value={effectiveInstructions}
-                    onChange={(e) => setInstructions(e.target.value)}
-                    placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
-                    readOnly={viewingHistoricalRun}
-                  />
-                  <p className="mt-1 text-[11px] text-muted">
-                    Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for
-                    directives on how Healix should approach testing it.
-                  </p>
-                </div>
+            <Badge tone={PHASE_TONE[engine.phase]}>{PHASE_LABEL[engine.phase]}</Badge>
+          </header>
+
+          {/* Controls */}
+          <Card className="mt-5 shrink-0 [@media(max-height:800px)]:mt-3">
+            <CardHeader className="flex flex-row items-center justify-between">
+              <div className="flex items-center gap-2">
+                <CardTitle>{configLocked ? 'Run configuration' : 'Start a run'}</CardTitle>
+                {configLocked && <Badge tone="muted">Read-only</Badge>}
               </div>
-
-              <div className="mt-4 flex min-w-0 items-center justify-between">
-                {viewingHistoricalRun ? (
-                  <div className="min-w-0 text-xs text-muted">
-                    <span
-                      className="block truncate font-mono"
-                      title={historicalProject?.baseUrl ?? historicalProject?.repoPath ?? undefined}
-                    >
-                      {historicalProject?.baseUrl ?? historicalProject?.repoPath ?? 'no target configured'}
-                    </span>
-                  </div>
-                ) : (
-                  <>
-                    <div className="min-w-0 text-xs text-muted">
-                      {selectedProject ? (
-                        <span
-                          className="block truncate font-mono"
-                          title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
-                        >
-                          {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
-                        </span>
-                      ) : (
-                        'Select a project to begin.'
-                      )}
-                    </div>
-                    <div className="flex shrink-0 items-center gap-2">
-                      {/* Also offered while paused — cancelling a paused run is a
-                          real, meaningful choice (give up on it entirely) distinct
-                          from Resume (pick it back up); it uses the same
-                          IPC path either way (run:cancel force-settles it even
-                          with no live controller to abort). */}
-                      {(isActive || engine.phase === 'paused') && (
-                        <Button
-                          variant="outline"
-                          className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
-                          onClick={cancel}
-                          // No runId yet means there is nothing to abort (still 'starting').
-                          // Also blocked while a pause is already in flight — the abort
-                          // signal only carries ONE reason (AbortController.abort() is a
-                          // no-op once already aborted), so racing both actions
-                          // wouldn't reliably act as either a cancel or a pause.
-                          disabled={cancelling || pausing || !engine.runId}
-                        >
-                          <Square className="h-4 w-4" />
-                          {cancelling ? 'Cancelling…' : 'Cancel'}
-                        </Button>
-                      )}
-                      <Button onClick={startOrQueue} disabled={!projectId}>
-                        {isActive ? <ListPlus className="h-4 w-4" /> : <Play className="h-4 w-4" />}
-                        {isActive ? 'Queue run' : 'Start run'}
-                      </Button>
-                    </div>
-                  </>
+              <div className="flex items-center gap-2">
+                {formCollapsed && !configLocked && selectedProject && (
+                  <span className="truncate font-mono text-xs text-muted">
+                    {selectedProject.name} · {TESTING_SCOPES.find((s) => s.value === testingScope)?.label}
+                  </span>
+                )}
+                {formCollapsed && configLocked && (
+                  <span className="truncate font-mono text-xs text-muted">
+                    {lockedProject?.name ?? detail?.run?.projectId} ·{' '}
+                    {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.label}
+                  </span>
                 )}
               </div>
-            </CardContent>
+            </CardHeader>
+            {!formCollapsed && (
+              <CardContent>
+                <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
+                  <div>
+                    <Label className="mb-1.5 block">Project</Label>
+                    <Select
+                      value={configLocked ? (lockedProject?.id ?? '') : projectId}
+                      onChange={(e) => setProjectId(e.target.value)}
+                      // Stays editable only for a fresh, not-yet-started compose
+                      // form — picking a different project here configures the
+                      // NEXT run to start/queue, never one already underway.
+                      disabled={configLocked || projectsLoading || runnable.length === 0}
+                    >
+                      {configLocked ? (
+                        <option value={lockedProject?.id ?? ''}>
+                          {lockedProject?.name ?? detail?.run?.projectId ?? 'Unknown project'}
+                        </option>
+                      ) : (
+                        <>
+                          {runnable.length === 0 && (
+                            <option value="">No active projects — create one first</option>
+                          )}
+                          {runnable.map((p) => (
+                            <option key={p.id} value={p.id}>
+                              {p.name}
+                            </option>
+                          ))}
+                        </>
+                      )}
+                    </Select>
+                  </div>
+                  <div>
+                    <Label className="mb-1.5 block">Testing Scope</Label>
+                    <Select
+                      value={effectiveTestingScope}
+                      onChange={(e) => setTestingScope(e.target.value as TestingScope)}
+                      disabled={configLocked}
+                    >
+                      {TESTING_SCOPES.map((s) => (
+                        <option key={s.value} value={s.value}>
+                          {s.label}
+                        </option>
+                      ))}
+                    </Select>
+                    <p className="mt-1 text-[11px] text-muted">
+                      {TESTING_SCOPES.find((s) => s.value === effectiveTestingScope)?.hint}
+                    </p>
+                  </div>
+                  <div>
+                    <Label className="mb-1.5 block">Suite Mode</Label>
+                    <Select
+                      value={effectiveSuiteMode}
+                      onChange={(e) => setSuiteMode(e.target.value as SuiteMode)}
+                      disabled={configLocked}
+                    >
+                      {SUITE_MODES.map((m) => (
+                        <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
+                          {m.label}
+                        </option>
+                      ))}
+                    </Select>
+                    <p className="mt-1 text-[11px] text-muted">
+                      {SUITE_MODES.find((m) => m.value === effectiveSuiteMode)?.hint}
+                    </p>
+                    {!configLocked && suiteMode !== 'fresh' && lastSuccessfulRun && (
+                      <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
+                        Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
+                      </p>
+                    )}
+                  </div>
+                  <div className="sm:col-span-3">
+                    <Label className="mb-1.5 block">PRD / acceptance criteria (optional)</Label>
+                    <div className="relative">
+                      <Textarea
+                        value={effectivePrd}
+                        onChange={(e) => {
+                          setPrd(e.target.value);
+                          // The text no longer reflects the uploaded file verbatim.
+                          setPrdFileName(null);
+                          setPrdSourceKind('text');
+                          setPrdSelectedSheets(null);
+                          setPrdFileWarning(null);
+                        }}
+                        placeholder="Paste requirements to ground test generation…"
+                        className={configLocked ? undefined : 'pr-9'}
+                        // readOnly (not disabled) once locked: prevents edits while
+                        // keeping the textarea scrollable — disabled:pointer-events-none
+                        // blocks wheel-scrolling over the field entirely.
+                        readOnly={configLocked}
+                      />
+                      {!configLocked && (
+                        <button
+                          type="button"
+                          onClick={() => void uploadPrdFile()}
+                          disabled={prdFileBusy}
+                          aria-label="Upload a PRD file"
+                          title="Upload a PRD file"
+                          className={cn(
+                            'absolute right-2 top-2 flex h-6 w-6 items-center justify-center rounded-md',
+                            'text-muted transition-colors hover:bg-panel hover:text-fg',
+                            'focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent',
+                            'disabled:pointer-events-none disabled:opacity-50',
+                          )}
+                        >
+                          {prdFileBusy ? (
+                            <Loader2 className="h-4 w-4 animate-spin" />
+                          ) : (
+                            <Plus className="h-4 w-4" />
+                          )}
+                        </button>
+                      )}
+                    </div>
+                    {!configLocked && (
+                      <div className="mt-1 flex items-center justify-between gap-2 text-[11px] text-muted">
+                        <span>
+                          {prdFileName ? (
+                            <>
+                              Selected file: <span className="font-mono text-fg">{prdFileName}</span>
+                              {prdSourceKind === 'spreadsheet' &&
+                              prdSelectedSheets &&
+                              prdSelectedSheets.length > 0
+                                ? ` (sheets: ${prdSelectedSheets.join(', ')})`
+                                : ''}
+                            </>
+                          ) : (
+                            'No file selected — paste text above or upload a PRD.'
+                          )}
+                        </span>
+                        <span className="shrink-0">
+                          Accepted: .pdf, .doc, .docx, .md, .txt, .xlsx, .xls, .csv
+                        </span>
+                      </div>
+                    )}
+                    {configLocked && lockedPrdSource && (
+                      <p className="mt-1 text-[11px] text-muted">{lockedPrdSource}</p>
+                    )}
+                    {prdFileError && <p className="mt-1 text-[11px] text-err">{prdFileError}</p>}
+                    {!prdFileError && prdFileWarning && (
+                      <p className="mt-1 text-[11px] text-warn">{prdFileWarning}</p>
+                    )}
+                  </div>
+                  <div className="sm:col-span-3">
+                    <Label className="mb-1.5 block">Additional instructions (optional)</Label>
+                    <Textarea
+                      value={effectiveInstructions}
+                      onChange={(e) => setInstructions(e.target.value)}
+                      placeholder='Tell Healix how to test — e.g. "focus on accessibility", "prefer data-testid selectors", "skip mobile viewports"…'
+                      readOnly={configLocked}
+                    />
+                    <p className="mt-1 text-[11px] text-muted">
+                      Steers HOW the plan is built — the PRD above describes WHAT the app does; this is for
+                      directives on how Healix should approach testing it.
+                    </p>
+                  </div>
+                </div>
+
+                <div className="mt-4 flex min-w-0 items-center justify-between">
+                  {configLocked ? (
+                    <div className="min-w-0 text-xs text-muted">
+                      <span
+                        className="block truncate font-mono"
+                        title={lockedProject?.baseUrl ?? lockedProject?.repoPath ?? undefined}
+                      >
+                        {lockedProject?.baseUrl ?? lockedProject?.repoPath ?? 'no target configured'}
+                      </span>
+                    </div>
+                  ) : (
+                    <>
+                      <div className="min-w-0 text-xs text-muted">
+                        {selectedProject ? (
+                          <span
+                            className="block truncate font-mono"
+                            title={selectedProject.baseUrl ?? selectedProject.repoPath ?? undefined}
+                          >
+                            {selectedProject.baseUrl ?? selectedProject.repoPath ?? 'no target configured'}
+                          </span>
+                        ) : (
+                          'Select a project to begin.'
+                        )}
+                      </div>
+                      {/* Only ever "Start run" for a fresh, never-started compose
+                        form, or "Queue run" when composing this run's config
+                        while a DIFFERENT run is already executing — Cancel/
+                        Pause/Resume live in their own bar below, scoped to
+                        whichever run is actually active/pausable. */}
+                      <div className="flex shrink-0 items-center gap-2">
+                        <Button onClick={startOrQueue} disabled={!projectId}>
+                          {isActive ? <ListPlus className="h-4 w-4" /> : <Play className="h-4 w-4" />}
+                          {isActive ? 'Queue run' : 'Start run'}
+                        </Button>
+                      </div>
+                    </>
+                  )}
+                </div>
+              </CardContent>
+            )}
+          </Card>
+
+          {queueError && (
+            <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+              <p>{queueError}</p>
+              <button
+                type="button"
+                onClick={() => setQueueError(null)}
+                aria-label="Dismiss"
+                className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
           )}
-        </Card>
 
-        {queueError && (
-          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
-            <p>{queueError}</p>
-            <button
-              type="button"
-              onClick={() => setQueueError(null)}
-              aria-label="Dismiss"
-              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        )}
+          {runDeleteError && (
+            <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+              <p>{runDeleteError}</p>
+              <button
+                type="button"
+                onClick={() => setRunDeleteError(null)}
+                aria-label="Dismiss"
+                className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
 
-        {runDeleteError && (
-          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
-            <p>{runDeleteError}</p>
-            <button
-              type="button"
-              onClick={() => setRunDeleteError(null)}
-              aria-label="Dismiss"
-              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        )}
+          <RunQueuePanel
+            queue={queue.queue}
+            projectsById={projectsById}
+            onRemove={(id) => void queue.remove(id)}
+            error={queue.error}
+            onDismissError={queue.clearError}
+          />
 
-        <RunQueuePanel
-          queue={queue.queue}
-          projectsById={projectsById}
-          onRemove={(id) => void queue.remove(id)}
-          error={queue.error}
-          onDismissError={queue.clearError}
-        />
-
-        {/* Collapse toggle: centered chevron on a divider. Collapsing "Start a
+          {/* Collapse toggle: centered chevron on a divider. Collapsing "Start a
             run" down to just its header hands most of the column's height to
             the report/timeline section below. */}
-        <div className="relative my-1 flex shrink-0 items-center">
-          <div className="h-px flex-1 bg-border" />
-          <button
-            type="button"
-            onClick={() => setFormCollapsed((v) => !v)}
-            aria-label={formCollapsed ? 'Expand start-a-run panel' : 'Collapse start-a-run panel'}
-            className="mx-2 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-border bg-panel text-muted transition-colors hover:border-muted/50 hover:text-fg"
-          >
-            {formCollapsed ? <ChevronDown className="h-3.5 w-3.5" /> : <ChevronUp className="h-3.5 w-3.5" />}
-          </button>
-          <div className="h-px flex-1 bg-border" />
-        </div>
+          <div className="relative my-1 flex shrink-0 items-center">
+            <div className="h-px flex-1 bg-border" />
+            <button
+              type="button"
+              onClick={() => setFormCollapsed((v) => !v)}
+              aria-label={formCollapsed ? 'Expand start-a-run panel' : 'Collapse start-a-run panel'}
+              className="mx-2 flex h-6 w-6 shrink-0 items-center justify-center rounded-full border border-border bg-panel text-muted transition-colors hover:border-muted/50 hover:text-fg"
+            >
+              {formCollapsed ? (
+                <ChevronDown className="h-3.5 w-3.5" />
+              ) : (
+                <ChevronUp className="h-3.5 w-3.5" />
+              )}
+            </button>
+            <div className="h-px flex-1 bg-border" />
+          </div>
 
-        {/* Plan gate: only while parked or still streaming in, AND only for the
+          {/* Plan gate: only while parked or still streaming in, AND only for the
             run currently being shown — a rehydrated pending approval must not
             bleed into every other history row's view (see showLiveSurface).
             Mounted during 'plan-streaming' too so the reviewer can start
             approving/editing items as batches land, though the overall
             Approve/Reject actions stay locked (via `streaming`) until every
             batch has arrived. */}
-        {showLiveSurface &&
-          engine.workingPlan &&
-          (engine.phase === 'awaiting-approval' || engine.phase === 'plan-streaming') && (
-            <div className="mt-4 shrink-0">
-              <PlanGate
-                plan={engine.workingPlan}
-                decided={engine.planDecided}
-                streaming={engine.phase === 'plan-streaming'}
-                batchProgress={engine.planBatchProgress}
-                revisingItemIds={engine.revisingItemIds}
-                reviseErrors={engine.reviseErrors}
-                onApproveItem={engine.approveItem}
-                onRejectItem={engine.rejectItem}
-                onEditItem={engine.editItem}
-                onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
-                onApproveAndContinue={() => void engine.approveAndContinue()}
-                onRejectAll={() => void engine.rejectAll()}
-              />
-            </div>
-          )}
+          {showLiveSurface &&
+            engine.workingPlan &&
+            (engine.phase === 'awaiting-approval' || engine.phase === 'plan-streaming') && (
+              <div className="mt-4 shrink-0">
+                <PlanGate
+                  plan={engine.workingPlan}
+                  decided={engine.planDecided}
+                  streaming={engine.phase === 'plan-streaming'}
+                  batchProgress={engine.planBatchProgress}
+                  revisingItemIds={engine.revisingItemIds}
+                  reviseErrors={engine.reviseErrors}
+                  onApproveItem={engine.approveItem}
+                  onRejectItem={engine.rejectItem}
+                  onEditItem={engine.editItem}
+                  onReviseItem={(itemId, suggestion) => void engine.reviseItem(itemId, suggestion, projectId)}
+                  onApproveAndContinue={() => void engine.approveAndContinue()}
+                  onRejectAll={() => void engine.rejectAll()}
+                />
+              </div>
+            )}
 
-        {/* Scoped the same way as the plan gate: only for the run currently
+          {/* Scoped the same way as the plan gate: only for the run currently
             being shown, so an error from one run doesn't linger while
             browsing an unrelated one. Dismissable since some of these
             (e.g. an orphaned approve/cancel) aren't otherwise self-clearing. */}
-        {showLiveSurface && engine.error && (
-          <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
-            <p>{engine.error}</p>
-            <button
-              type="button"
-              onClick={engine.clearError}
-              aria-label="Dismiss"
-              className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
-            >
-              <X className="h-4 w-4" />
-            </button>
-          </div>
-        )}
+          {showLiveSurface && engine.error && (
+            <div className="mt-4 flex shrink-0 items-start justify-between gap-2 rounded-md border border-err/40 bg-err/10 px-3 py-2 text-sm text-err">
+              <p>{engine.error}</p>
+              <button
+                type="button"
+                onClick={engine.clearError}
+                aria-label="Dismiss"
+                className="shrink-0 rounded p-0.5 text-err/70 hover:text-err"
+              >
+                <X className="h-4 w-4" />
+              </button>
+            </div>
+          )}
 
-        {/* Pause/Resume bar: scoped to whichever run is currently being viewed
-            — live-tracked (running, or just paused and still selected) or a
-            paused row picked from history. `detail` tracks selectedRunId
-            regardless of which branch below is showing, so this covers both
-            without duplicating anything in each branch. Exactly one of the
-            two buttons is ever enabled: Pause while it's actually running,
-            Resume while it's actually paused — never both at once. */}
-        {(() => {
-          const viewedIsActive = showLiveSurface && isActive;
-          const viewedIsPaused = detail?.run?.id === selectedRunId && detail.run.status === 'paused';
-          if (!viewedIsActive && !viewedIsPaused) return null;
-          return (
+          {/* Cancel/Pause/Resume bar: all three are actions performed on an
+            active run, grouped together. Cancel is scoped to whatever the
+            ENGINE is currently tracking (isActive || paused) regardless of
+            what's currently selected/browsed — e.g. it stays available while
+            composing a different run's config to queue behind it, or while
+            glancing at an unrelated historical row. Pause/Resume stay scoped
+            to whichever run is currently being VIEWED — live-tracked
+            (running, or just paused and still selected) or a paused row
+            picked from history. `detail` tracks selectedRunId regardless of
+            which branch below is showing, so this covers both without
+            duplicating anything in each branch. Exactly one of Pause/Resume
+            is ever enabled: Pause while it's actually running, Resume while
+            it's actually paused — never both at once. */}
+          {(() => {
+            const cancelAvailable = isActive || engine.phase === 'paused';
+            const viewedIsActive = showLiveSurface && isActive;
+            const viewedIsPaused = detail?.run?.id === selectedRunId && detail.run.status === 'paused';
+            if (!cancelAvailable && !viewedIsActive && !viewedIsPaused) return null;
+            return (
+              <div
+                className={cn(
+                  'mt-4 flex shrink-0 items-center justify-between gap-2 rounded-md border px-3 py-2 text-sm',
+                  viewedIsPaused ? 'border-warn/40 bg-warn/10' : 'border-border bg-panel/40 text-muted',
+                )}
+              >
+                <span>
+                  {viewedIsPaused
+                    ? `Paused (${detail?.run?.pauseReason ?? 'unknown'}) — resume to pick up right where it left off.`
+                    : 'Pause to free this up for later — resumes from exactly where it left off, unlike Cancel.'}
+                </span>
+                <div className="flex shrink-0 items-center gap-2">
+                  {/* Also offered while paused — cancelling a paused run is a
+                    real, meaningful choice (give up on it entirely) distinct
+                    from Resume (pick it back up); it uses the same
+                    IPC path either way (run:cancel force-settles it even
+                    with no live controller to abort). */}
+                  {cancelAvailable && (
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      className="border-err/40 text-err hover:border-err/60 hover:bg-err/10"
+                      onClick={cancel}
+                      // No runId yet means there is nothing to abort (still 'starting').
+                      // Also blocked while a pause is already in flight — the abort
+                      // signal only carries ONE reason (AbortController.abort() is a
+                      // no-op once already aborted), so racing both actions
+                      // wouldn't reliably act as either a cancel or a pause.
+                      disabled={cancelling || pausing || !engine.runId}
+                    >
+                      <Square className="h-4 w-4" />
+                      {cancelling ? 'Cancelling…' : 'Cancel'}
+                    </Button>
+                  )}
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={pause}
+                    disabled={!viewedIsActive || pausing || cancelling || !engine.runId}
+                  >
+                    <Pause className="h-4 w-4" />
+                    {pausing ? 'Pausing…' : 'Pause'}
+                  </Button>
+                  <Button
+                    size="sm"
+                    onClick={() => detail?.run && resumePausedRun(detail.run.id)}
+                    disabled={!viewedIsPaused || resuming || isActive}
+                    title={
+                      viewedIsPaused && isActive
+                        ? 'Another run is currently active — try again once it finishes.'
+                        : undefined
+                    }
+                  >
+                    <Play className="h-4 w-4" />
+                    {resuming ? 'Resuming…' : 'Resume'}
+                  </Button>
+                </div>
+              </div>
+            );
+          })()}
+
+          {/* Live surface (active or just-started run) vs. historical detail */}
+          {showLiveSurface ? (
             <div
               className={cn(
-                'mt-4 flex shrink-0 items-center justify-between gap-2 rounded-md border px-3 py-2 text-sm',
-                viewedIsPaused ? 'border-warn/40 bg-warn/10' : 'border-border bg-panel/40 text-muted',
+                'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
+                showLiveBrowserPanel && 'lg:grid-cols-2',
               )}
             >
-              <span>
-                {viewedIsPaused
-                  ? `Paused (${detail?.run?.pauseReason ?? 'unknown'}) — resume to pick up right where it left off.`
-                  : 'Pause to free this up for later — resumes from exactly where it left off, unlike Cancel.'}
-              </span>
-              <div className="flex shrink-0 items-center gap-2">
-                <Button
-                  variant="outline"
-                  size="sm"
-                  onClick={pause}
-                  disabled={!viewedIsActive || pausing || cancelling || !engine.runId}
-                >
-                  <Pause className="h-4 w-4" />
-                  {pausing ? 'Pausing…' : 'Pause'}
-                </Button>
-                <Button
-                  size="sm"
-                  onClick={() => detail?.run && resumePausedRun(detail.run.id)}
-                  disabled={!viewedIsPaused || resuming || isActive}
-                  title={
-                    viewedIsPaused && isActive
-                      ? 'Another run is currently active — try again once it finishes.'
-                      : undefined
-                  }
-                >
-                  <Play className="h-4 w-4" />
-                  {resuming ? 'Resuming…' : 'Resume'}
-                </Button>
+              <div className="flex min-h-0 flex-col">
+                <Label className="mb-1.5 block">Console</Label>
+                <div className="min-h-0 flex-1">
+                  <ConsoleLog
+                    lines={engine.lines}
+                    emptyHint="Start a run to stream live orchestrator events here."
+                  />
+                </div>
               </div>
-            </div>
-          );
-        })()}
-
-        {/* Live surface (active or just-started run) vs. historical detail */}
-        {showLiveSurface ? (
-          <div
-            className={cn(
-              'mt-4 grid min-h-0 flex-1 grid-cols-1 gap-4',
-              showLiveBrowserPanel && 'lg:grid-cols-2',
-            )}
-          >
-            <div className="flex min-h-0 flex-col">
-              <Label className="mb-1.5 block">Console</Label>
-              <div className="min-h-0 flex-1">
-                <ConsoleLog
-                  lines={engine.lines}
-                  emptyHint="Start a run to stream live orchestrator events here."
-                />
-              </div>
-            </div>
-            {/* Skip the panel entirely (rather than show a permanently-empty
+              {/* Skip the panel entirely (rather than show a permanently-empty
                 placeholder) when there's no live URL, or the scope is API-only. */}
-            {showLiveBrowserPanel && (
-              <div className="min-h-0">
-                <LiveBrowser frame={frame} active={isActive} />
-              </div>
-            )}
-          </div>
-        ) : (
-          <div className="mt-4 min-h-0 flex-1">
-            <RunDetailPanel detail={detail} loading={detailLoading} onSelectRun={setSelectedRunId} />
-          </div>
-        )}
+              {showLiveBrowserPanel && (
+                <div className="min-h-0">
+                  <LiveBrowser frame={frame} active={isActive} />
+                </div>
+              )}
+            </div>
+          ) : (
+            <div className="mt-4 min-h-0 flex-1">
+              <RunDetailPanel detail={detail} loading={detailLoading} onSelectRun={setSelectedRunId} />
+            </div>
+          )}
+        </div>
       </div>
-    </div>
+      {sheetPickerFile && (
+        <SheetPickerDialog
+          fileName={sheetPickerFile.fileName}
+          sheets={sheetPickerFile.sheets}
+          onConfirm={(names) => void confirmSheetSelection(names)}
+          onCancel={() => setSheetPickerFile(null)}
+        />
+      )}
+    </>
   );
 }

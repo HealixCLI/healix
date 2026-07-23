@@ -143,6 +143,92 @@ describe('auditSpecQuality', () => {
     expect(auditSpecQuality(source)).toEqual([]);
   });
 
+  it('flags a click on a bare repeatable-role locator with no name filter as an ambiguous-locator-risk warn', () => {
+    const source = block(
+      'navigates via the baz link',
+      `  await page.getByRole('link').click();\n  await expect(page).toHaveURL(/baz/);`,
+    );
+    const findings = auditSpecQuality(source);
+    expect(findings).toEqual([expect.objectContaining({ code: 'ambiguous-locator-risk', severity: 'warn' })]);
+  });
+
+  it('does not flag a role locator narrowed with a name filter', () => {
+    const source = block(
+      'navigates via the baz link',
+      `  await page.getByRole('link', { name: 'Baz' }).click();\n  await expect(page).toHaveURL(/baz/);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('does not flag a bare role locator chained with .first()', () => {
+    const source = block(
+      'navigates via the baz link',
+      `  await page.getByRole('link').first().click();\n  await expect(page).toHaveURL(/baz/);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('flags a click on a short getByText locator as an ambiguous-locator-risk warn', () => {
+    const source = block(
+      'clicks baz',
+      `  await page.getByText('baz').click();\n  await expect(page).toHaveURL(/baz/);`,
+    );
+    const findings = auditSpecQuality(source);
+    expect(findings).toEqual([expect.objectContaining({ code: 'ambiguous-locator-risk', severity: 'warn' })]);
+  });
+
+  it('does not flag a long, sentence-length getByText locator', () => {
+    const source = block(
+      'shows the welcome message',
+      `  await page.getByText('Welcome back, please choose an option below').click();\n  await expect(page).toHaveURL(/home/);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('flags a click on a bare CSS class locator as an ambiguous-locator-risk warn', () => {
+    const source = block(
+      'clicks the alert',
+      `  await page.locator('.alert').click();\n  await expect(page).toHaveURL(/alert/);`,
+    );
+    const findings = auditSpecQuality(source);
+    expect(findings).toEqual([expect.objectContaining({ code: 'ambiguous-locator-risk', severity: 'warn' })]);
+  });
+
+  it('does not flag a locator scoped by a data-testid attribute selector', () => {
+    const source = block(
+      'clicks the alert',
+      `  await page.locator('[data-testid="alert-banner"]').click();\n  await expect(page).toHaveURL(/alert/);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('flags a negative-path API test asserting a fixed 200 status as unvalidated-status-code-assumption', () => {
+    const source = block(
+      'rejects an invalid username with an error',
+      `  const response = await request.post('/authenticate', { data: { username: 'nope', password: 'x' } });\n  expect(response.status()).toBe(200);`,
+    );
+    const findings = auditSpecQuality(source);
+    expect(findings).toEqual([
+      expect.objectContaining({ code: 'unvalidated-status-code-assumption', severity: 'warn' }),
+    ]);
+  });
+
+  it('does not flag a positive-path API test asserting a fixed 200 status', () => {
+    const source = block(
+      'authenticates successfully with valid credentials',
+      `  const response = await request.post('/authenticate', { data: { username: 'ok', password: 'x' } });\n  expect(response.status()).toBe(200);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('does not flag a negative-path API test asserting a non-success status', () => {
+    const source = block(
+      'rejects an invalid username with an error',
+      `  const response = await request.post('/authenticate', { data: { username: 'nope', password: 'x' } });\n  expect(response.status()).toBe(401);`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
   it('audits each block independently across a multi-test file', () => {
     const source = `${HEADER}test('good', async ({ page }) => {\n  await expect(page).toHaveTitle(/Home/);\n});\n\ntest('bad', async ({ page }) => {\n  await page.click('button');\n});\n`;
     const findings = auditSpecQuality(source);

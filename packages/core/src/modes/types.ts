@@ -176,7 +176,9 @@ export type QualityFindingCode =
   | 'hardcoded-credential-literal'
   | 'absolute-url-assertion'
   | 'disabled-button-race-risk'
-  | 'disabled-button-click-race';
+  | 'disabled-button-click-race'
+  | 'ambiguous-locator-risk'
+  | 'unvalidated-status-code-assumption';
 
 export interface QualityFinding {
   code: QualityFindingCode;

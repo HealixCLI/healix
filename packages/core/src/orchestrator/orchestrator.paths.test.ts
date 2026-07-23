@@ -1225,6 +1225,75 @@ describe('orchestrator paths (offline DI seam)', () => {
       expect(opts.signal?.aborted).toBe(false);
     }
   });
+  it('TRIAGE AI BUDGET: escalates the least-confident baseline verdicts first when failures exceed the cap', async () => {
+    // 25 failures: 15 whose deterministic baseline is CONFIDENT (environment rule, 0.75) and 10
+    // whose baseline is the low-confidence ambiguous default (0.3, unrecognized error text) —
+    // more than TRIAGE_AI_LIMIT (20), so the cap actually excludes some. All 10 low-confidence
+    // failures must be escalated (they need AI help most); only 10 of the 15 confident ones
+    // should be, since 5 of that budget's slots go to the failures that need it more.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Triage Budget Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const confidentTitles = Array.from({ length: 15 }, (_, i) => `Confident case ${i}`);
+    const ambiguousTitles = Array.from({ length: 10 }, (_, i) => `Ambiguous case ${i}`);
+
+    const manyFailedOutcome: ExecOutcome = {
+      passed: 0,
+      failed: 25,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        ...confidentTitles.map((title) => ({
+          title,
+          status: 'failed' as const,
+          durationMs: 10,
+          error: 'page.goto: net::ERR_CONNECTION_REFUSED at https://app.example.test/',
+        })),
+        ...ambiguousTitles.map((title) => ({
+          title,
+          status: 'failed' as const,
+          durationMs: 10,
+          error: 'Error: something completely unrecognized happened',
+        })),
+      ],
+    };
+
+    const escalatedPrompts: string[] = [];
+    const triageAwareProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
+        }
+        if (opts && !opts.readOnly) escalatedPrompts.push(prompt);
+        return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: triageAwareProvider,
+      getMode: () => makeFakeMode(manyFailedOutcome),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
+
+    expect(escalatedPrompts.length).toBe(20);
+    const escalatedAmbiguousCount = ambiguousTitles.filter((t) =>
+      escalatedPrompts.some((p) => p.includes(t)),
+    ).length;
+    const escalatedConfidentCount = confidentTitles.filter((t) =>
+      escalatedPrompts.some((p) => p.includes(t)),
+    ).length;
+    expect(escalatedAmbiguousCount).toBe(10);
+    expect(escalatedConfidentCount).toBe(10);
+  });
+
   it('LAUNCH RECOVERY: missing-deps failure installs dependencies and retries the launch once', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

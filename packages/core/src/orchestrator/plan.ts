@@ -115,6 +115,16 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
     for (const u of shownUnits) lines.push(`- [${u.kind}] ${u.label} (unitKey: "${u.key}")`);
     const remainingUnits = units.length - shownUnits.length;
     if (remainingUnits > 0) lines.push(`... and ${remainingUnits} more unit(s) not listed.`);
+    if (tiers.includes('tierC-api')) {
+      lines.push(
+        'RULE for tierC-api items: only pair a tierC-api item with a "[endpoint]"-kind unit above — never a ' +
+          '"[route]" or "[component]"-kind unit. A "[route]" is a frontend client-side navigation path (e.g. a ' +
+          'React Router/Next.js page) that serves HTML/JS, not a JSON API; a raw HTTP request to that same path ' +
+          'will NOT return the data a UI test would see rendered there. If a feature only has a route-kind unit ' +
+          'and no matching backend endpoint was detected, either plan it under a UI tier instead or leave its ' +
+          'unitKey null rather than pairing a tierC-api item with the wrong kind of unit.',
+      );
+    }
   }
   lines.push('');
   lines.push('Respond with exactly one fenced JSON code block of the shape:');

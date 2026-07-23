@@ -1,17 +1,7 @@
 import { StatTile, StatTileRow } from '../components/StatTiles';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '../components/ui/table';
 import { useUsageAggregate } from '../lib/use-usage-aggregate';
-import { formatCreatedAt } from '../lib/run-format';
-
-/** Formats a token count for display; '—' when null (the provider/call reported no usage). */
-function formatTokens(n: number | null): string {
-  return n === null ? '—' : Math.round(n).toLocaleString();
-}
-
-/** Formats a USD cost for display; '—' when null (not every provider reports cost). */
-function formatCost(n: number | null): string {
-  return n === null ? '—' : `$${n < 0.01 && n > 0 ? n.toFixed(4) : n.toFixed(2)}`;
-}
+import { formatCost, formatCreatedAt, formatTokens, sumNullable } from '../lib/run-format';
 
 /**
  * Cross-run usage aggregation: total tokens/cost over time (one row per run,
@@ -25,9 +15,13 @@ export function ReportsUsageView() {
 
   const perRun = aggregate?.perRun ?? [];
   const perPhase = aggregate?.perPhase ?? [];
-  const grandTotalInput = perPhase.reduce((sum, p) => sum + (p.totalInputTokens ?? 0), 0);
-  const grandTotalOutput = perPhase.reduce((sum, p) => sum + (p.totalOutputTokens ?? 0), 0);
-  const grandTotalCost = perPhase.reduce((sum, p) => sum + (p.totalCostUsd ?? 0), 0);
+  const grandTotalInput = sumNullable(perPhase.map((p) => p.totalInputTokens));
+  const grandTotalOutput = sumNullable(perPhase.map((p) => p.totalOutputTokens));
+  const grandTotalCost = sumNullable(perPhase.map((p) => p.totalCostUsd));
+  const grandTotalTokens =
+    grandTotalInput === null && grandTotalOutput === null
+      ? null
+      : (grandTotalInput ?? 0) + (grandTotalOutput ?? 0);
 
   return (
     <div className="mx-auto flex h-full max-w-4xl flex-col gap-6 overflow-auto px-8 pb-8 pt-8">
@@ -49,7 +43,7 @@ export function ReportsUsageView() {
           <section>
             <h2 className="mb-3 text-sm font-semibold text-muted">Totals across every run</h2>
             <StatTileRow className="sm:grid-cols-4">
-              <StatTile label="Total tokens" value={formatTokens(grandTotalInput + grandTotalOutput)} />
+              <StatTile label="Total tokens" value={formatTokens(grandTotalTokens)} />
               <StatTile label="Input" value={formatTokens(grandTotalInput)} />
               <StatTile label="Output" value={formatTokens(grandTotalOutput)} />
               <StatTile label="Cost" value={formatCost(grandTotalCost)} />

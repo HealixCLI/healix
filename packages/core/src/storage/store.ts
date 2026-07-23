@@ -558,7 +558,7 @@ export class HealixStore {
     );
   }
 
-  /** Persist one captured provider.complete() call's token/cost usage. Never throws on a bad runId — the FK just fails silently at the caller's own risk, matching insertResult's best-effort style. */
+  /** Persist one captured provider.complete() call's token/cost usage. Never throws on a bad runId — this schema never enables `PRAGMA foreign_keys`, so the runId REFERENCES is unenforced (like every other FK here); an orphaned row is simply possible, at the caller's own risk, matching insertResult's best-effort style. */
   recordUsage(input: NewUsage): UsageRow {
     const row: UsageRow = {
       id: `usg_${nanoid(10)}`,

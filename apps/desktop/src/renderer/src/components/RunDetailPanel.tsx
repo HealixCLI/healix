@@ -30,12 +30,15 @@ import {
   computeStageDurations,
   computeTotalDurationMs,
   eventLevelColor,
+  formatCost,
   formatDuration,
   formatStageBreakdown,
   formatTime,
+  formatTokens,
   groupArtifacts,
   runStatusTone,
   slugMatches,
+  sumNullable,
   testStatusTone,
 } from '../lib/run-format';
 import type { StageDuration } from '../lib/run-format';
@@ -831,28 +834,12 @@ function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
 
 // ---- Usage --------------------------------------------------------------
 
-/** Formats a token count for display; '—' when null (the provider/call reported no usage). */
-function formatTokens(n: number | null): string {
-  return n === null ? '—' : n.toLocaleString();
-}
-
-/** Formats a USD cost for display; '—' when null (not every provider reports cost). */
-function formatCost(n: number | null): string {
-  return n === null ? '—' : `$${n < 0.01 && n > 0 ? n.toFixed(4) : n.toFixed(2)}`;
-}
-
 interface PhaseUsage {
   phase: string;
   rows: UsageRow[];
   inputTokens: number | null;
   outputTokens: number | null;
   costUsd: number | null;
-}
-
-/** Sums nullable numbers, staying null only when EVERY value is null (vs. 0 when some are 0/absent-but-known). */
-function sumNullable(values: Array<number | null>): number | null {
-  const known = values.filter((v): v is number => v !== null);
-  return known.length > 0 ? known.reduce((a, b) => a + b, 0) : null;
 }
 
 function groupUsageByPhase(usage: UsageRow[]): PhaseUsage[] {

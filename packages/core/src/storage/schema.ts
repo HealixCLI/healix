@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 10;
+export const SCHEMA_VERSION = 11;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -76,7 +76,7 @@ CREATE TABLE IF NOT EXISTS agent_events (
   created_at  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
--- v10: per-call token/cost usage, one row per provider.complete() call captured
+-- v11: per-call token/cost usage, one row per provider.complete() call captured
 -- during a run (plan, gap-fill plan, generate, triage). task is a human label
 -- (e.g. a spec item's title, or 'gap-fill') scoping the row within its phase;
 -- input_tokens/output_tokens/cost_usd are null when the provider (or a

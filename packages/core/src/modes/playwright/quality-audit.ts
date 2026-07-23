@@ -204,6 +204,32 @@ const SUBMIT_CLICK_RE =
   /[^\n;]*(?:submit|login|log-in|sign-?in|register|continue|confirm|save|pokra[cč]ova|odosla|prihl[aá]s|zaregistruj)[^\n;]*\.click\(\s*\)/i;
 
 /**
+ * A single-target interaction — real triage data across multiple runs traced repeat
+ * `test_is_wrong` failures to exactly this shape: a generated locator that LOOKS grounded
+ * (a real observed role/text) but happens to match more than one element on the live page,
+ * so Playwright throws a strict-mode violation instead of performing the action.
+ */
+const SINGULAR_ACTION_LINE_RE = /\.(?:click|dblclick|check|uncheck|hover|selectOption|fill)\(/;
+/** Roles that commonly repeat within a page (nav links, list buttons, table rows) — landmark roles like 'main'/'navigation' are deliberately excluded as low-risk singletons. */
+const GET_BY_ROLE_REPEATABLE_NO_NAME_RE =
+  /getByRole\(\s*['"](?:link|button|checkbox|radio|menuitem|tab|option|listitem|row|cell)['"]\s*\)/;
+/** Short text/labels ("baz", "Edit", "Delete") are the ones observed to collide across a real page; long, sentence-length text is unlikely to duplicate, so is excluded to keep this signal precise. */
+const GET_BY_TEXT_SHORT_RE = /getByText\(\s*['"]([^'"]{1,20})['"]\s*\)/;
+/** A bare class or tag CSS selector (`.btn`, `button`, `a`) — as opposed to an id/data-testid/attribute selector, which is presumed unique. */
+const LOCATOR_CLASS_OR_TAG_RE = /\.locator\(\s*['"](?:\.[a-zA-Z][\w-]*|[a-zA-Z][a-zA-Z0-9]*)['"]\s*\)/;
+/** Any of these on the same line negates the risk: the locator is already scoped to one match. */
+const AMBIGUOUS_LOCATOR_SAFETY_RE =
+  /\.(?:first|last|nth)\(|\{\s*(?:name|exact)\s*:|getByTestId\(|\[(?:data-testid|id)=/;
+
+/**
+ * A second, independent real-data-traced false-failure shape: a tierC-api negative/error-path
+ * scenario asserting a fixed "success-shaped" status code (200/201/204) with no grounding —
+ * many apps correctly respond to a failed request with a redirect (3xx) or an explicit error
+ * status (4xx) instead, so this is exactly as likely to be a wrong test assumption as a real bug.
+ */
+const SUCCESS_STATUS_ASSERTION_RE = /\.status\(\)\s*\)\.toBe\(\s*(?:200|201|204)\s*\)/;
+
+/**
  * Audit a single spec's parse-clean source for quality findings. Returns
  * both block-scoped findings (used for Phase B pruning) and — currently
  * none, but the shape allows it — file-scoped ones.
@@ -283,6 +309,35 @@ export function auditSpecQuality(source: string): QualityFinding[] {
         code: 'disabled-button-click-race',
         severity: 'hard',
         message: `Test "${block.title}" fills invalid input then clicks a submit-like control with no assertion of its disabled/enabled state anywhere in the test — if the app correctly disables the control on invalid input, this click will hang until timeout. Assert the control stays disabled (\`toBeDisabled()\`), or assert the inline validation message without depending on the click succeeding.`,
+        testTitle: block.title,
+        blockRange: [block.start, block.end],
+      });
+    }
+
+    for (const line of block.body.split('\n')) {
+      if (!SINGULAR_ACTION_LINE_RE.test(line)) continue;
+      if (AMBIGUOUS_LOCATOR_SAFETY_RE.test(line)) continue;
+      if (
+        GET_BY_ROLE_REPEATABLE_NO_NAME_RE.test(line) ||
+        GET_BY_TEXT_SHORT_RE.test(line) ||
+        LOCATOR_CLASS_OR_TAG_RE.test(line)
+      ) {
+        findings.push({
+          code: 'ambiguous-locator-risk',
+          severity: 'warn',
+          message: `Test "${block.title || '(untitled)'}" performs a single-target action (click/fill/check/etc.) on a locator that isn't scoped to guarantee exactly one match — a bare role/short-text/class locator with no distinguishing { name: ... }/{ exact: true } filter, data-testid/id, or .first()/.nth()/.last(). If the real page has more than one matching element, Playwright throws a strict-mode violation at runtime instead of performing the action. Narrow the locator or chain .first()/.nth() when a specific match is intended.`,
+          testTitle: block.title,
+          blockRange: [block.start, block.end],
+        });
+        break; // one finding per block is enough signal; avoid noisy duplicates on repeat lines.
+      }
+    }
+
+    if (NEGATIVE_TITLE_HINT_RE.test(block.title) && SUCCESS_STATUS_ASSERTION_RE.test(block.body)) {
+      findings.push({
+        code: 'unvalidated-status-code-assumption',
+        severity: 'warn',
+        message: `Test "${block.title}" reads as a negative/error-path scenario but asserts a fixed success-shaped status code (200/201/204) — many apps respond to a failed request with a redirect (3xx) or an explicit error status (4xx) instead. Unless this exact status is grounded in real observed/spec behavior, prefer asserting what you're sure of (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than a guessed fixed success code.`,
         testTitle: block.title,
         blockRange: [block.start, block.end],
       });

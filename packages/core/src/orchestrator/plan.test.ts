@@ -408,6 +408,36 @@ describe('buildPlanPrompt (repo context)', () => {
     expect(prompt).toContain('one item per distinct route/endpoint');
     expect(prompt).toContain('"unitKey"');
   });
+
+  it('warns against pairing tierC-api items with a route/component-kind unit when tierC-api is in scope', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' },
+      { key: 'endpoint:GET /get-customers', kind: 'endpoint', label: 'GET /get-customers', file: 'src/server.ts' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id, testingScope: 'both' },
+      { summary: 'Framework: next.', files: [], functionality: units },
+    );
+
+    expect(prompt).toContain('RULE for tierC-api items');
+    expect(prompt).toContain('only pair a tierC-api item with a "[endpoint]"-kind unit');
+  });
+
+  it('omits the tierC-api route-pairing rule when tierC-api is out of scope', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id, testingScope: 'frontend' },
+      { summary: 'Framework: next.', files: [], functionality: units },
+    );
+
+    expect(prompt).not.toContain('RULE for tierC-api items');
+  });
 });
 
 describe('buildPlanPrompt (PRD + interactive instructions)', () => {

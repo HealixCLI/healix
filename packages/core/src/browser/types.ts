@@ -23,6 +23,13 @@ export interface InteractiveElement {
   inForm?: boolean;
   /** True when the element is disabled (`disabled` attribute or `aria-disabled="true"`). */
   disabled?: boolean;
+  /**
+   * True when another visible element on the SAME page shares this exact (role, name) pair —
+   * e.g. two links both named "foo". A generated `getByRole(role, { name })` locator would
+   * strict-mode-violate against either one; callers must warn generation to scope further
+   * (`.first()`/`.nth()`/a more specific attribute) rather than assuming role+name is unique.
+   */
+  ambiguousMatch?: boolean;
 }
 
 export interface DomSnapshot {

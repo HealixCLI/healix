@@ -44,6 +44,21 @@ export interface StartRunArgs {
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
   baseRunId?: string;
+  /**
+   * Opt-in for the coverage feedback loop's iterative re-plan/generate/execute
+   * retry — off by default (each iteration can add a full extra cycle, up to
+   * 4). Coverage is still measured once regardless; this only gates whether
+   * the loop retries to chase the target higher. No effect for suiteMode 'reuse'.
+   */
+  coverageLoopEnabled?: boolean;
+  /** Overrides the coverage loop's target ratio (0-1) when coverageLoopEnabled is true. */
+  coverageTarget?: number;
+  /**
+   * Targeted regeneration for the results-page Retry-pass/Repair actions:
+   * when set (requires suiteMode 'topup'), only these base-run plan item ids
+   * are regenerated — everything else is carried forward untouched.
+   */
+  retryItemIds?: string[];
 }
 
 /** Result of attempting to launch a provider's subscription login flow. */
@@ -144,6 +159,12 @@ export interface RunConfigSnapshot {
   prdFileName?: string;
   /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
   prdSelectedSheets?: string[];
+  /** Whether the coverage feedback loop's iterative retry was enabled for this run. */
+  coverageLoopEnabled?: boolean;
+  /** The coverage target this run used, when coverageLoopEnabled. */
+  coverageTarget?: number;
+  /** Plan item ids this run targeted for regeneration (Retry-pass/Repair), when set. */
+  retryItemIds?: string[];
 }
 
 /**
@@ -169,6 +190,8 @@ export interface RunReportShape {
   fallbackReason?: string;
   generation?: { requestedItems: number; acceptedItems: number };
   coverage?: { ratio: number; target: number } | null;
+  /** End-of-run AI synthesis across every triaged failure — see @healix/core's triage/grouping.ts. */
+  groupingSummary?: string | null;
 }
 
 /** Best-effort narrowing of the opaque report.json payload. Returns null when unusable. */
@@ -208,6 +231,7 @@ export function asRunReport(value: unknown): RunReportShape | null {
       coverage && typeof coverage.ratio === 'number' && typeof coverage.target === 'number'
         ? { ratio: coverage.ratio, target: coverage.target }
         : null,
+    groupingSummary: typeof v.groupingSummary === 'string' ? v.groupingSummary : null,
   };
 }
 
@@ -252,6 +276,14 @@ export interface SuiteDiffSummary {
   carriedCount: number;
   removedCount: number;
   totalCount: number;
+}
+
+/** A base-run plan item whose spec never got generated (Retry-pass) or whose test was triaged test_is_wrong (Repair) — a regeneration candidate. */
+export interface GenerationGapItem {
+  id: string;
+  title: string;
+  tier: string;
+  reqTag?: string;
 }
 
 export interface TestCaseHistoryEntry {

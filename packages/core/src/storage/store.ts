@@ -8,6 +8,7 @@ import type {
   EventLevel,
   NewProject,
   NewProjectCredential,
+  NewTriageResult,
   NewUsage,
   PauseReason,
   Project,
@@ -18,6 +19,7 @@ import type {
   TestCase,
   TestResult,
   TestStatus,
+  TriageResultRow,
   UsageAggregate,
   UsageRow,
 } from './types.js';
@@ -177,17 +179,23 @@ export class HealixStore {
           'DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?))',
         )
         .run(id);
-      // 2. agent_events of runs of this project
+      // 2. triage_results whose test belongs to a test of a run of this project
+      this.db
+        .prepare(
+          'DELETE FROM triage_results WHERE test_id IN (SELECT id FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?))',
+        )
+        .run(id);
+      // 3. agent_events of runs of this project
       this.db
         .prepare('DELETE FROM agent_events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)')
         .run(id);
-      // 3. tests of runs of this project
+      // 4. tests of runs of this project
       this.db.prepare('DELETE FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
-      // 4. runs of this project
+      // 5. runs of this project
       this.db.prepare('DELETE FROM runs WHERE project_id = ?').run(id);
-      // 5. this project's credentials
+      // 6. this project's credentials
       this.db.prepare('DELETE FROM project_credentials WHERE project_id = ?').run(id);
-      // 6. the project row itself
+      // 7. the project row itself
       this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
       this.db.exec('COMMIT');
     } catch (err) {
@@ -369,13 +377,17 @@ export class HealixStore {
     try {
       // 1. results whose test belongs to this run
       this.db.prepare('DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)').run(id);
-      // 2. agent_events of this run
+      // 2. triage_results whose test belongs to this run
+      this.db
+        .prepare('DELETE FROM triage_results WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)')
+        .run(id);
+      // 3. agent_events of this run
       this.db.prepare('DELETE FROM agent_events WHERE run_id = ?').run(id);
-      // 3. usage rows of this run
+      // 4. usage rows of this run
       this.db.prepare('DELETE FROM usage WHERE run_id = ?').run(id);
-      // 4. tests of this run
+      // 5. tests of this run
       this.db.prepare('DELETE FROM tests WHERE run_id = ?').run(id);
-      // 5. the run row itself
+      // 6. the run row itself
       this.db.prepare('DELETE FROM runs WHERE id = ?').run(id);
       this.db.exec('COMMIT');
     } catch (err) {
@@ -390,11 +402,12 @@ export class HealixStore {
 
   // ---- tests + results ----
   insertTest(
-    test: Omit<TestCase, 'id' | 'specPath' | 'description' | 'details'> & {
+    test: Omit<TestCase, 'id' | 'specPath' | 'description' | 'details' | 'specCode'> & {
       id?: string;
       specPath?: string | null;
       description?: string | null;
       details?: string | null;
+      specCode?: string | null;
     },
   ): TestCase {
     const full: TestCase = {
@@ -403,10 +416,11 @@ export class HealixStore {
       specPath: test.specPath ?? null,
       description: test.description ?? null,
       details: test.details ?? null,
+      specCode: test.specCode ?? null,
     };
     this.db
       .prepare(
-        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path, description, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path, description, details, spec_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         full.id,
@@ -418,6 +432,7 @@ export class HealixStore {
         full.specPath,
         full.description,
         full.details,
+        full.specCode,
       );
     return full;
   }
@@ -499,6 +514,42 @@ export class HealixStore {
         .prepare('SELECT r.* FROM results r JOIN tests t ON r.test_id = t.id WHERE t.run_id = ?')
         .all(runId) as Array<Record<string, unknown>>
     ).map(rowToResult);
+  }
+
+  /**
+   * Persist one FK-keyed triage verdict for a test. Best-effort by design
+   * (mirrors recordUsage/insertResult's own style) — a bad testId or a store
+   * fault here must never block report-writing, since report.json's
+   * title-joined ReportTriageEntry already carries the verdict either way;
+   * this is an additional, queryable record, not the source of truth.
+   */
+  recordTriageResult(input: NewTriageResult): TriageResultRow {
+    const row: TriageResultRow = {
+      id: `trg_${nanoid(10)}`,
+      testId: input.testId,
+      verdict: input.verdict,
+      confidence: input.confidence,
+      rationale: input.rationale,
+      suggestedPatch: input.suggestedPatch ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        'INSERT INTO triage_results (id, test_id, verdict, confidence, rationale, suggested_patch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(row.id, row.testId, row.verdict, row.confidence, row.rationale, row.suggestedPatch, row.createdAt);
+    return row;
+  }
+
+  /** All triage-result rows for a run, joined through tests (triage_results has no run_id of its own). */
+  listTriageResults(runId: string): TriageResultRow[] {
+    return (
+      this.db
+        .prepare(
+          'SELECT tr.* FROM triage_results tr JOIN tests t ON tr.test_id = t.id WHERE t.run_id = ? ORDER BY tr.created_at ASC, tr.rowid ASC',
+        )
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToTriageResult);
   }
 
   /**
@@ -795,6 +846,7 @@ function rowToTest(r: Record<string, unknown>): TestCase {
     specPath: s(r.spec_path),
     description: s(r.description),
     details: s(r.details),
+    specCode: s(r.spec_code),
   };
 }
 
@@ -809,6 +861,18 @@ function rowToResult(r: Record<string, unknown>): TestResult {
     description: s(r.description),
     details: s(r.details),
     stepsJson: s(r.steps_json),
+  };
+}
+
+function rowToTriageResult(r: Record<string, unknown>): TriageResultRow {
+  return {
+    id: String(r.id),
+    testId: String(r.test_id),
+    verdict: String(r.verdict) as TriageResultRow['verdict'],
+    confidence: Number(r.confidence),
+    rationale: String(r.rationale),
+    suggestedPatch: s(r.suggested_patch),
+    createdAt: String(r.created_at),
   };
 }
 

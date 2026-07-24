@@ -18,7 +18,14 @@
  * and truncation must still apply.
  */
 import { describe, it, expect } from 'vitest';
-import { buildTriagePrompt, parseTriageReply } from './prompt.js';
+import {
+  buildBatchTriagePrompt,
+  buildTriagePrompt,
+  looksLikeTruncatedBatchReply,
+  parseBatchTriageReply,
+  parseTriageReply,
+} from './prompt.js';
+import type { TriageBatchItem } from './types.js';
 
 describe('parseTriageReply — JSON extraction', () => {
   it('parses a plain fenced ```json code block', () => {
@@ -257,5 +264,94 @@ describe('buildTriagePrompt — matched source-context file citation', () => {
     const prompt = buildTriagePrompt({ title: 't', error: 'boom', sourceFile: 'routes/userRoutes.js' });
     expect(prompt).toContain('--- MATCHED SOURCE FILE: routes/userRoutes.js ---');
     expect(prompt).toContain('(file content unavailable)');
+  });
+});
+
+describe('buildBatchTriagePrompt / parseBatchTriageReply — batched triage round-trip', () => {
+  const ITEMS: TriageBatchItem[] = [
+    { id: 'a', input: { title: 'Login works', error: 'expect(locator).toBeVisible() failed' } },
+    { id: 'b', input: { title: 'Checkout completes', error: '500 Internal Server Error' } },
+    { id: 'c', input: { title: 'Search returns results', error: 'timeout waiting for selector' } },
+  ];
+
+  it('includes every item’s own evidence block, tagged with its id, in one prompt', () => {
+    const prompt = buildBatchTriagePrompt(ITEMS);
+    expect(prompt).toContain('=== FAILURE 1 (id: "a") ===');
+    expect(prompt).toContain('=== FAILURE 2 (id: "b") ===');
+    expect(prompt).toContain('=== FAILURE 3 (id: "c") ===');
+    expect(prompt).toContain('Login works');
+    expect(prompt).toContain('Checkout completes');
+    expect(prompt).toContain('Search returns results');
+    // Instructions ask for an array, not a single object.
+    expect(prompt).toContain('JSON');
+    expect(prompt).toContain('ARRAY');
+  });
+
+  it('round-trips a full, well-formed array reply — every id present with its own verdict', () => {
+    const reply = [
+      '```json',
+      JSON.stringify([
+        { id: 'a', verdict: 'test_is_wrong', confidence: 0.9, rationale: 'stale selector' },
+        { id: 'b', verdict: 'app_is_wrong', confidence: 0.85, rationale: '5xx is a real regression' },
+        { id: 'c', verdict: 'flaky', confidence: 0.4, rationale: 'timing-sensitive' },
+      ]),
+      '```',
+    ].join('\n');
+
+    const parsed = parseBatchTriageReply(reply);
+    expect(parsed.size).toBe(3);
+    expect(parsed.get('a')?.verdict).toBe('test_is_wrong');
+    expect(parsed.get('b')?.verdict).toBe('app_is_wrong');
+    expect(parsed.get('c')?.confidence).toBe(0.4);
+  });
+
+  it('MISSING-ENTRY: a reply that omits one id still returns the others', () => {
+    const reply = JSON.stringify([
+      { id: 'a', verdict: 'test_is_wrong', confidence: 0.9, rationale: 'stale selector' },
+      // 'b' omitted entirely — e.g. the model skipped one failure.
+      { id: 'c', verdict: 'ambiguous', confidence: 0.3, rationale: 'insufficient evidence' },
+    ]);
+
+    const parsed = parseBatchTriageReply(reply);
+    expect(parsed.size).toBe(2);
+    expect(parsed.has('a')).toBe(true);
+    expect(parsed.has('b')).toBe(false);
+    expect(parsed.has('c')).toBe(true);
+  });
+
+  it('MALFORMED-ENTRY: one entry missing a valid verdict is dropped, the rest still parse', () => {
+    const reply = JSON.stringify([
+      { id: 'a', verdict: 'test_is_wrong', confidence: 0.9, rationale: 'stale selector' },
+      { id: 'b', verdict: 'not_a_real_verdict', confidence: 0.5, rationale: 'garbage' },
+      { id: 'c', verdict: 'flaky', confidence: 0.4, rationale: 'timing-sensitive' },
+    ]);
+
+    const parsed = parseBatchTriageReply(reply);
+    expect(parsed.size).toBe(2);
+    expect(parsed.has('a')).toBe(true);
+    expect(parsed.has('b')).toBe(false);
+    expect(parsed.has('c')).toBe(true);
+  });
+
+  it('returns an empty map (not null/throw) for garbled, non-JSON-array text', () => {
+    expect(parseBatchTriageReply('canned text (no actionable json)').size).toBe(0);
+    expect(parseBatchTriageReply('').size).toBe(0);
+  });
+});
+
+describe('looksLikeTruncatedBatchReply', () => {
+  it('is true for a reply that opens an array but is cut off mid-object', () => {
+    const cutOff = '```json\n[\n  { "id": "a", "verdict": "test_is_wrong", "confidence": 0.9';
+    expect(looksLikeTruncatedBatchReply(cutOff)).toBe(true);
+  });
+
+  it('is false for a complete, well-formed array reply', () => {
+    const complete = JSON.stringify([{ id: 'a', verdict: 'test_is_wrong', confidence: 0.9, rationale: 'x' }]);
+    expect(looksLikeTruncatedBatchReply(complete)).toBe(false);
+  });
+
+  it('is false for garbled prose with no array structure at all — a smaller batch would not fix it', () => {
+    expect(looksLikeTruncatedBatchReply('canned text (no actionable json)')).toBe(false);
+    expect(looksLikeTruncatedBatchReply('')).toBe(false);
   });
 });

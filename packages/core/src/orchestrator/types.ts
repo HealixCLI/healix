@@ -71,6 +71,33 @@ export interface RunOptions {
    */
   baseRunId?: string;
   /**
+   * Opt-in for the coverage feedback loop's ITERATIVE re-plan/generate/execute
+   * retry (see index.ts's "COVERAGE FEEDBACK LOOP" section) — off by default,
+   * since each iteration can add a full extra plan+generate+execute cycle (up
+   * to COVERAGE_MAX_ITERATIONS). Coverage is still MEASURED once regardless of
+   * this flag (the report always needs a real number to show); this only gates
+   * whether the loop retries to chase the target higher. No effect in 'reuse'
+   * mode, which never plans/generates at all.
+   */
+  coverageLoopEnabled?: boolean;
+  /**
+   * Overrides the coverage loop's target ratio (0-1) when coverageLoopEnabled
+   * is true. Defaults to FRESH_COVERAGE_TARGET/TOPUP_COVERAGE_TARGET (coverage.ts)
+   * per suiteMode when omitted.
+   */
+  coverageTarget?: number;
+  /**
+   * Targeted regeneration for results-page "Retry-pass"/"Repair" actions:
+   * when set (requires suiteMode 'topup' and a resolvable base run), planning
+   * skips AI entirely and reuses ONLY the base run's plan items whose id is
+   * in this list, instead of the full re-plan. Generation's existing
+   * base-run diff (topup.ts's diffAgainstBase) then naturally regenerates
+   * just those items and carries everything else forward untouched. Ids that
+   * don't match anything in the base plan are silently ignored; if none
+   * match at all, falls back to a full re-plan.
+   */
+  retryItemIds?: string[];
+  /**
    * Cooperative cancellation. When aborted, the run stops at the next phase
    * boundary (and in-flight provider/suite work is killed), the run row is
    * marked 'cancelled', and run() resolves with that summary — it never rejects.

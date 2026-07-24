@@ -112,7 +112,16 @@ export default defineConfig({
   // to register as flaky). Default to 1 locally too — gating on CI meant flaky
   // was never detectable on a local \`healix run\`. Override with HEALIX_RETRIES.
   retries: process.env.HEALIX_RETRIES ? Number(process.env.HEALIX_RETRIES) : process.env.CI ? 2 : 1,
-  workers: process.env.CI ? 1 : computeWorkers(),
+  // CI defaults to fully serial (1 worker) since that's the safest default for
+  // a shared runner, but it also means CI test execution time scales linearly
+  // with suite size. Override with HEALIX_WORKERS when the CI environment can
+  // actually support more parallelism; outside CI, fall back to the headroom-
+  // aware computeWorkers() above rather than a fixed number.
+  workers: process.env.HEALIX_WORKERS
+    ? Number(process.env.HEALIX_WORKERS)
+    : process.env.CI
+      ? 1
+      : computeWorkers(),
   timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: [

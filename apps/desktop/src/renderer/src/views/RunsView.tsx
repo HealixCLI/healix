@@ -7,6 +7,8 @@ import { Badge, type BadgeTone } from '../components/ui/badge';
 import { Select } from '../components/ui/select';
 import { Label } from '../components/ui/label';
 import { Textarea } from '../components/ui/textarea';
+import { Switch } from '../components/ui/switch';
+import { Input } from '../components/ui/input';
 import { SheetPickerDialog } from '../components/ui/sheet-picker-dialog';
 import { ConsoleLog } from '../components/ConsoleLog';
 import { PlanGate } from '../components/PlanGate';
@@ -23,7 +25,7 @@ import { cn } from '../lib/utils';
 import { formatCreatedAt, isTerminalRun } from '../lib/run-format';
 import { SUITE_MODES, TESTING_SCOPES, type RunEngine, type RunPhase } from '../lib/run-engine';
 import type { RunQueue } from '../lib/run-queue';
-import type { SheetPreview } from '../lib/ipc-types';
+import type { SheetPreview, StartRunArgs } from '../lib/ipc-types';
 
 const PHASE_TONE: Record<RunPhase, BadgeTone> = {
   idle: 'muted',
@@ -130,6 +132,12 @@ export function RunsView({
   const [projectId, setProjectId] = useState<string>('');
   const [testingScope, setTestingScope] = useState<TestingScope>('both');
   const [suiteMode, setSuiteMode] = useState<SuiteMode>('fresh');
+  // Off by default — each iteration of the coverage feedback loop can add a
+  // full extra plan+generate+execute cycle (up to 4). coverageTargetPct is the
+  // user-facing 0-100 override; empty means "use the backend's own default"
+  // (80% fresh / 98% top-up) rather than duplicating those constants here.
+  const [coverageLoopEnabled, setCoverageLoopEnabled] = useState(false);
+  const [coverageTargetPct, setCoverageTargetPct] = useState('');
   const [prd, setPrd] = useState('');
   // Set once a PRD file is successfully uploaded; cleared if the user edits the
   // textarea by hand, since the displayed text no longer matches the file.
@@ -190,6 +198,11 @@ export function RunsView({
   useEffect(() => {
     if (!hasSuite && suiteMode !== 'fresh') setSuiteMode('fresh');
   }, [hasSuite, suiteMode]);
+  // 'reuse' never plans/generates at all, so the coverage loop has nothing to
+  // retry — force the toggle off rather than showing it inertly enabled.
+  useEffect(() => {
+    if (suiteMode === 'reuse' && coverageLoopEnabled) setCoverageLoopEnabled(false);
+  }, [suiteMode, coverageLoopEnabled]);
   // Refresh "last successful run" once a run just settled, so the toggle picks
   // up a run that only just became eligible as a top-up/reuse base.
   useEffect(() => {
@@ -421,6 +434,10 @@ export function RunsView({
       prdSourceKind: prd.trim() ? (prdSourceKind ?? 'text') : undefined,
       prdFileName: prd.trim() ? (prdFileName ?? undefined) : undefined,
       prdSelectedSheets: prd.trim() ? (prdSelectedSheets ?? undefined) : undefined,
+      // No effect in 'reuse' mode (never plans/generates), but harmless to send.
+      coverageLoopEnabled,
+      coverageTarget:
+        coverageLoopEnabled && coverageTargetPct.trim() ? Number(coverageTargetPct) / 100 : undefined,
     };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
@@ -435,6 +452,26 @@ export function RunsView({
     setSelectedRunId(null);
     // Auto-collapse "Start a run" so the live console gets the column's full
     // height immediately, instead of making the user click the chevron themselves.
+    setFormCollapsed(true);
+    void engine.start(args);
+  };
+
+  /**
+   * Start (or queue) a Retry-pass/Repair run: RunDetailPanel resolves which
+   * plan item ids to target (generation gaps or triaged-wrong tests) and
+   * hands back a ready-to-send StartRunArgs; this just runs it through the
+   * exact same engine start-or-queue mechanics as startOrQueue above, so the
+   * new run gets full live-console/browser tracking like any other run.
+   */
+  const startRetryPass = (args: StartRunArgs): void => {
+    if (isActive) {
+      setQueueError(null);
+      void engine.queueRun(args).catch((err) => {
+        setQueueError(err instanceof Error ? err.message : String(err));
+      });
+      return;
+    }
+    setSelectedRunId(null);
     setFormCollapsed(true);
     void engine.start(args);
   };
@@ -600,6 +637,14 @@ export function RunsView({
     ? (detail?.runConfig?.suiteMode ?? detail?.run?.suiteMode ?? 'fresh')
     : suiteMode;
   const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
+  const effectiveCoverageLoopEnabled = viewingHistoricalRun
+    ? (detail?.runConfig?.coverageLoopEnabled ?? false)
+    : coverageLoopEnabled;
+  const effectiveCoverageTargetPct = viewingHistoricalRun
+    ? detail?.runConfig?.coverageTarget !== undefined
+      ? String(Math.round(detail.runConfig.coverageTarget * 100))
+      : ''
+    : coverageTargetPct;
   const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
   // "Source: TestCases.xlsx (sheets: Login, Signup)" for a spreadsheet-sourced
   // run, falling back to plain filename-only display otherwise. Historical
@@ -644,6 +689,8 @@ export function RunsView({
     setInstructions('');
     setTestingScope('both');
     setSuiteMode('fresh');
+    setCoverageLoopEnabled(false);
+    setCoverageTargetPct('');
     setFormCollapsed(false);
   }, []);
 
@@ -787,6 +834,42 @@ export function RunsView({
                       <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
                         Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
                       </p>
+                    )}
+                  </div>
+                  <div>
+                    <div className="flex items-center justify-between">
+                      <Label htmlFor="coverage-loop-toggle" className="mb-0">
+                        Coverage feedback loop
+                      </Label>
+                      <Switch
+                        id="coverage-loop-toggle"
+                        checked={effectiveCoverageLoopEnabled}
+                        onCheckedChange={setCoverageLoopEnabled}
+                        disabled={configLocked || suiteMode === 'reuse'}
+                        aria-label="Enable coverage feedback loop"
+                      />
+                    </div>
+                    <p className="mt-1 text-[11px] text-muted">
+                      {effectiveSuiteMode === 'reuse'
+                        ? 'Not applicable — reuse never plans or generates.'
+                        : 'Off by default. When on, re-plans and regenerates just the uncovered units, up to 4 extra passes, until the target below is reached.'}
+                    </p>
+                    {effectiveCoverageLoopEnabled && effectiveSuiteMode !== 'reuse' && (
+                      <div className="mt-2">
+                        <Label htmlFor="coverage-target" className="mb-1.5 block">
+                          Target coverage %
+                        </Label>
+                        <Input
+                          id="coverage-target"
+                          type="number"
+                          min={1}
+                          max={100}
+                          placeholder={effectiveSuiteMode === 'topup' ? 'default: 98' : 'default: 80'}
+                          value={effectiveCoverageTargetPct}
+                          onChange={(e) => setCoverageTargetPct(e.target.value)}
+                          disabled={configLocked}
+                        />
+                      </div>
                     )}
                   </div>
                   <div className="sm:col-span-3">
@@ -1126,7 +1209,12 @@ export function RunsView({
             </div>
           ) : (
             <div className="mt-4 min-h-0 flex-1">
-              <RunDetailPanel detail={detail} loading={detailLoading} onSelectRun={setSelectedRunId} />
+              <RunDetailPanel
+                detail={detail}
+                loading={detailLoading}
+                onSelectRun={setSelectedRunId}
+                onRetryPass={startRetryPass}
+              />
             </div>
           )}
         </div>

@@ -1269,7 +1269,10 @@ describe('orchestrator paths (offline DI seam)', () => {
         if (opts?.mode === 'plan') {
           return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
         }
-        if (opts && !opts.readOnly) escalatedPrompts.push(prompt);
+        // Isolate batched-triage-escalation calls specifically — the run also
+        // makes ONE additional 'triage-summary' call afterward (the end-of-run
+        // grouping summary), which is not what this test measures.
+        if (opts && !opts.readOnly && opts.taskType === 'triage') escalatedPrompts.push(prompt);
         return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
       },
     };
@@ -1283,7 +1286,11 @@ describe('orchestrator paths (offline DI seam)', () => {
 
     await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
 
-    expect(escalatedPrompts.length).toBe(20);
+    // 20 candidates triaged in TRIAGE_AI_BATCH_SIZE(5)-sized batches = 4 calls,
+    // not 20 — each batched call covers up to 5 failures' full evidence in one
+    // provider round trip instead of one call per failure (see
+    // TriageEngine.analyzeBatch).
+    expect(escalatedPrompts.length).toBe(4);
     const escalatedAmbiguousCount = ambiguousTitles.filter((t) =>
       escalatedPrompts.some((p) => p.includes(t)),
     ).length;

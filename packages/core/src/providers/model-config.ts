@@ -44,6 +44,7 @@ export const DEFAULT_MODEL_CONFIG: ModelEffortConfig = {
   codegen: { model: 'sonnet', effort: 'high' },
   'mock-response': { model: 'haiku', effort: 'high' },
   triage: { model: 'haiku', effort: 'high' },
+  'triage-summary': { model: 'haiku', effort: 'high' },
   'health-probe': { model: 'haiku', effort: 'low' },
 };
 

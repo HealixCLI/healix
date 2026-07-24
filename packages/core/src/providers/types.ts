@@ -16,6 +16,7 @@ export type TaskType =
   | 'codegen'
   | 'mock-response'
   | 'triage'
+  | 'triage-summary'
   | 'health-probe';
 
 export interface DetectResult {

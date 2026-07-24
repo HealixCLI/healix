@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 13;
+export const SCHEMA_VERSION = 14;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -51,7 +51,8 @@ CREATE TABLE IF NOT EXISTS tests (
   status      TEXT,
   spec_path   TEXT,
   description TEXT,
-  details     TEXT
+  details     TEXT,
+  spec_code   TEXT
 );
 
 CREATE TABLE IF NOT EXISTS results (
@@ -102,10 +103,28 @@ CREATE TABLE IF NOT EXISTS usage (
   created_at                  TEXT NOT NULL DEFAULT (datetime('now'))
 );
 
+-- v14: FK-keyed triage verdicts (one row per triaged test) alongside
+-- report.json's title-joined ReportTriageEntry — additive, not a replacement.
+-- Lets a later feature (Repair/Fix-up) query "which tests in this run were
+-- triaged test_is_wrong" directly via test_id instead of re-deriving it from
+-- report.json's fuzzy title join. tests.spec_code carries the generated
+-- spec's full source alongside its row, for the same "give me everything
+-- about this failed test in one lookup" reason.
+CREATE TABLE IF NOT EXISTS triage_results (
+  id              TEXT PRIMARY KEY,
+  test_id         TEXT NOT NULL REFERENCES tests(id),
+  verdict         TEXT NOT NULL,
+  confidence      REAL NOT NULL,
+  rationale       TEXT NOT NULL,
+  suggested_patch TEXT,
+  created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
 CREATE INDEX IF NOT EXISTS idx_credentials_project ON project_credentials(project_id);
 CREATE INDEX IF NOT EXISTS idx_runs_project ON runs(project_id);
 CREATE INDEX IF NOT EXISTS idx_tests_run ON tests(run_id);
 CREATE INDEX IF NOT EXISTS idx_results_test ON results(test_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_usage_run ON usage(run_id);
+CREATE INDEX IF NOT EXISTS idx_triage_results_test ON triage_results(test_id);
 `;

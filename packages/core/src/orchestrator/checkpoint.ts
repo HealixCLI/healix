@@ -28,6 +28,9 @@ export interface ResumeCheckpoint {
     prdSourceKind?: 'text' | 'file' | 'spreadsheet';
     prdFileName?: string;
     prdSelectedSheets?: string[];
+    coverageLoopEnabled?: boolean;
+    coverageTarget?: number;
+    retryItemIds?: string[];
   };
   /** The finalized, human-approved plan — resume never re-plans or re-shows the approval gate. */
   plan: TestPlan;

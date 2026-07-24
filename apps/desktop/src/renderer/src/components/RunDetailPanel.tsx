@@ -11,6 +11,8 @@ import {
   History,
   Image as ImageIcon,
   PackageOpen,
+  RotateCcw,
+  Wrench,
   X,
 } from 'lucide-react';
 import { Badge } from './ui/badge';
@@ -19,7 +21,7 @@ import { StatTile, StatTileRow } from './StatTiles';
 import { TestCaseHistoryDrawer } from './TestCaseHistoryDrawer';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
-import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
+import type { RunDetail, ReportTriageEntryShape, StartRunArgs } from '../lib/ipc-types';
 import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
 import { SHOW_TOKEN_USAGE } from '../lib/feature-flags';
 import { cn } from '../lib/utils';
@@ -58,14 +60,22 @@ export function RunDetailPanel({
   detail,
   loading,
   onSelectRun,
+  onRetryPass,
 }: {
   detail: RunDetail | null;
   loading: boolean;
   /** Jump to a different run (e.g. from the Test Case History drawer). Omit to disable those jumps. */
   onSelectRun?: (runId: string) => void;
+  /**
+   * Start a targeted regeneration run (Retry-pass/Repair): given a ready
+   * StartRunArgs (suiteMode 'topup', baseRunId this run, retryItemIds set),
+   * the caller runs it through the same start-or-queue path as any other
+   * run. Omit to hide the Retry-pass/Repair buttons entirely.
+   */
+  onRetryPass?: (args: StartRunArgs) => void;
 }) {
   const [tab, setTab] = useState<DetailTab>('timeline');
-  const [busy, setBusy] = useState<'reveal' | 'export' | null>(null);
+  const [busy, setBusy] = useState<'reveal' | 'export' | 'retry' | 'repair' | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
   const [historyCaseKey, setHistoryCaseKey] = useState<{ reqTag: string | null; title: string } | null>(null);
@@ -161,6 +171,74 @@ export function RunDetailPanel({
     }
   };
 
+  /**
+   * Regenerate ONLY the plan items from this run that never got a test
+   * generated, OR got generated but never actually executed (a spec was
+   * registered, then the run errored out before EXECUTE produced a result
+   * for it — see main/index.ts's runs:generationGaps / matchGenerationGaps's
+   * doc comment) — a targeted top-up instead of a full re-plan. No-op (with
+   * an explanatory note) when this run's plan had no gaps to fill.
+   */
+  const startRetryPass = async (): Promise<void> => {
+    if (!onRetryPass || !detail?.run) return;
+    setBusy('retry');
+    setNote(null);
+    try {
+      const gaps = await window.healix.generationGaps(detail.run.id);
+      if (gaps.length === 0) {
+        setNote('Nothing to retry — every planned item already has a generated, executed test.');
+        return;
+      }
+      onRetryPass({
+        projectId: detail.run.projectId,
+        testingScope: detail.runConfig?.testingScope,
+        provider: detail.runConfig?.provider,
+        suiteMode: 'topup',
+        baseRunId: detail.run.id,
+        autoApprove: true,
+        retryItemIds: gaps.map((g) => g.id),
+      });
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /**
+   * Regenerate ONLY the tests this run's triage verdicted 'test_is_wrong' —
+   * the test itself is the problem (not the app), so a fresh generation
+   * attempt is the fix, not a re-run. Reuses Retry-pass's exact
+   * retryItemIds mechanism (see main/index.ts's runs:repairCandidates,
+   * built on the same base-plan-id matching as runs:generationGaps), just
+   * with triage verdicts as the candidate source instead of generation gaps.
+   */
+  const startRepair = async (): Promise<void> => {
+    if (!onRetryPass || !detail?.run) return;
+    setBusy('repair');
+    setNote(null);
+    try {
+      const candidates = await window.healix.repairCandidates(detail.run.id);
+      if (candidates.length === 0) {
+        setNote('Nothing to repair — no tests were triaged "test is wrong" for this run.');
+        return;
+      }
+      onRetryPass({
+        projectId: detail.run.projectId,
+        testingScope: detail.runConfig?.testingScope,
+        provider: detail.runConfig?.provider,
+        suiteMode: 'topup',
+        baseRunId: detail.run.id,
+        autoApprove: true,
+        retryItemIds: candidates.map((c) => c.id),
+      });
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   if (!detail && loading) {
     return <div className="flex h-full items-center justify-center text-sm text-muted">Loading run…</div>;
   }
@@ -223,6 +301,30 @@ export function RunDetailPanel({
             <PackageOpen className="h-4 w-4" />
             {busy === 'export' ? 'Exporting…' : 'Export suite'}
           </Button>
+          {onRetryPass && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void startRetryPass()}
+              disabled={busy !== null}
+              title="Regenerate only the plan items from this run that never got a test, or never got executed"
+            >
+              <RotateCcw className="h-4 w-4" />
+              {busy === 'retry' ? 'Checking…' : 'Retry-pass'}
+            </Button>
+          )}
+          {onRetryPass && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void startRepair()}
+              disabled={busy !== null}
+              title="Regenerate only the tests this run's triage marked 'test is wrong'"
+            >
+              <Wrench className="h-4 w-4" />
+              {busy === 'repair' ? 'Checking…' : 'Repair'}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -279,6 +381,11 @@ export function RunDetailPanel({
         )}
         {tab === 'triage' && (
           <div className="min-h-0 flex-1 overflow-auto">
+            {report?.groupingSummary && (
+              <p className="mb-3 rounded-lg border border-border bg-panel/40 px-3 py-2 text-sm italic text-fg">
+                {report.groupingSummary}
+              </p>
+            )}
             <TriageList entries={triage} />
           </div>
         )}

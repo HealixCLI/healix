@@ -50,6 +50,13 @@ export interface RunReport {
   generation?: GenerationStats;
   /** Functionality-unit coverage reached by the coverage-feedback loop; null when it didn't run (e.g. reuse mode, or no functionality inventory). */
   coverage: ReportCoverageSummary | null;
+  /**
+   * End-of-run AI synthesis across every triaged failure (see
+   * triage/grouping.ts's summarizeTriageGroups) — cross-failure patterns a
+   * single failure's own triage never sees. Null when there were fewer than 2
+   * failures to compare, or the summary call failed/was skipped.
+   */
+  groupingSummary?: string | null;
   generatedAt: string;
 }
 
@@ -65,6 +72,7 @@ export function buildReport(input: {
   mockedRequestCounts?: Record<string, number>;
   generation?: GenerationStats;
   coverage?: ReportCoverageSummary | null;
+  groupingSummary?: string | null;
 }): RunReport {
   return {
     run: input.run,
@@ -78,6 +86,7 @@ export function buildReport(input: {
     mockedRequestCounts: input.mockedRequestCounts ?? {},
     generation: input.generation,
     coverage: input.coverage ?? null,
+    groupingSummary: input.groupingSummary ?? null,
     generatedAt: new Date().toISOString(),
   };
 }
@@ -290,7 +299,18 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
  */
 export function renderReportHtml(report: RunReport, opts: { reportDir?: string } = {}): string {
   const { reportDir } = opts;
-  const { run, project, plan, outcome, triage, tests, dependencies, mockedRequestCounts, coverage } = report;
+  const {
+    run,
+    project,
+    plan,
+    outcome,
+    triage,
+    tests,
+    dependencies,
+    mockedRequestCounts,
+    coverage,
+    groupingSummary,
+  } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
@@ -431,6 +451,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   section.degraded { border: 1px solid #9a670066; background: #9a67000f; border-radius: 8px; padding: .25rem 1rem 1rem; }
   section.degraded h2 { color: #9a6700; }
   section.degraded ul { margin: 0; padding-left: 1.25rem; }
+  .grouping-summary { background: #8884; border-radius: 8px; padding: .6rem .8rem; font-style: italic; }
   .err-summary { font-weight: 600; }
   .diagnosis { margin-top: .35rem; font-size: .8rem; }
   .diagnosis .hist { display: inline; }
@@ -502,6 +523,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
     triage.length > 0
       ? `<section>
     <h2>Triage</h2>
+    ${groupingSummary ? `<p class="grouping-summary">${esc(groupingSummary)}</p>` : ''}
     <table>
       <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>

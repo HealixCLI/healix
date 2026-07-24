@@ -65,9 +65,11 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     expect(cfg).toContain('process.env.CI ? 2 : 1');
   });
 
-  it('sizes workers dynamically off CPU/RAM locally, but keeps a fixed count on CI', () => {
+  it('sizes workers dynamically off CPU/RAM locally, but keeps a fixed count on CI, unless HEALIX_WORKERS overrides both', () => {
     const cfg = playwrightConfigContents();
-    expect(cfg).toContain('workers: process.env.CI ? 1 : computeWorkers()');
+    expect(cfg).toContain('process.env.HEALIX_WORKERS');
+    expect(cfg).toContain('process.env.CI');
+    expect(cfg).toContain('computeWorkers()');
     expect(cfg).toContain('cpus().length');
     expect(cfg).toContain('freemem()');
     // Leaves one core free for the host OS/desktop app, never claims 0 workers.

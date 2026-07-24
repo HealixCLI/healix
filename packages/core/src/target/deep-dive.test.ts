@@ -121,6 +121,47 @@ describe('enrichSourceContextForPlan', () => {
     expect(enriched).toBe(ctx);
   });
 
+  it("scopes each of two units backed by the SAME file to its own handler, never leaking a sibling handler's signals (regression for the file-level conflation bug)", async () => {
+    const dir = makeRepo();
+    write(
+      dir,
+      'routes/users.js',
+      `
+        router.get('/users', (req, res) => {
+          res.status(200).json([]);
+        });
+        router.delete('/users/:id', (req, res) => {
+          if (!found) return res.status(404).send('not found');
+          res.status(204).send();
+        });
+      `,
+    );
+    const ctx = baseCtx({
+      units: [
+        { key: 'endpoint:GET /users', kind: 'endpoint', label: 'GET /users', file: 'routes/users.js' },
+        {
+          key: 'endpoint:DELETE /users/:id',
+          kind: 'endpoint',
+          label: 'DELETE /users/:id',
+          file: 'routes/users.js',
+        },
+      ],
+    });
+
+    const enriched = await enrichSourceContextForPlan(dir, ctx, [
+      item('endpoint:GET /users'),
+      item('endpoint:DELETE /users/:id'),
+    ]);
+
+    const getUnit = enriched.units.find((u) => u.key === 'endpoint:GET /users');
+    const deleteUnit = enriched.units.find((u) => u.key === 'endpoint:DELETE /users/:id');
+    // Before the fix, both units (sharing one file) would have received the UNION of every
+    // handler's status codes in the file ([200, 204, 404] on both) — each must now see only its
+    // own handler's signals instead.
+    expect(getUnit?.observedStatusCodes).toEqual([200]);
+    expect(deleteUnit?.observedStatusCodes).toEqual([204, 404]);
+  });
+
   it('is best-effort: an unreadable/missing file does not throw and just leaves that unit unenriched', async () => {
     const dir = makeRepo();
     const ctx = baseCtx({

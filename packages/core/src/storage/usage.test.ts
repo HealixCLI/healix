@@ -399,7 +399,7 @@ describe('HealixStore usage tracking', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(13);
+    expect(info.version).toBe(14);
     expect(info.tables).toContain('usage');
 
     // Prove it's actually usable, not just present.
@@ -433,7 +433,7 @@ describe('HealixStore usage tracking', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(13);
+    expect(info.version).toBe(14);
 
     // Prove the retrofitted columns are actually usable, not just present.
     const project = s.createProject({ name: 'retrofit-v12-project', baseUrl: 'https://retrofit-v12.test' });
@@ -469,7 +469,7 @@ describe('HealixStore usage tracking', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(13);
+    expect(info.version).toBe(14);
 
     // Prove the retrofitted column is actually usable, not just present.
     const project = s.createProject({ name: 'retrofit-v13-project', baseUrl: 'https://retrofit-v13.test' });

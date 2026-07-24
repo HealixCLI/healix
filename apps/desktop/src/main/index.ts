@@ -17,6 +17,7 @@ import {
 import mammoth from 'mammoth';
 import pdfParse from 'pdf-parse';
 import { extractSheets, previewSheets, type SheetPreview } from './spreadsheet.js';
+import { matchGenerationGaps, matchRepairCandidates, type GenerationGapItem } from './repair-candidates.js';
 import {
   doctor,
   ProviderRouter,
@@ -391,6 +392,12 @@ export interface StartRunArgs {
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
   baseRunId?: string;
+  /** Opt-in for the coverage feedback loop's iterative re-plan/generate/execute retry — off by default. */
+  coverageLoopEnabled?: boolean;
+  /** Overrides the coverage loop's target ratio (0-1) when coverageLoopEnabled is true. */
+  coverageTarget?: number;
+  /** Targeted regeneration for the results-page Retry-pass/Repair actions — see RunOptions.retryItemIds. */
+  retryItemIds?: string[];
 }
 
 /**
@@ -422,6 +429,9 @@ async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunS
         prdSelectedSheets: args.prdSelectedSheets,
         suiteMode: args.suiteMode,
         baseRunId: args.baseRunId,
+        coverageLoopEnabled: args.coverageLoopEnabled,
+        coverageTarget: args.coverageTarget,
+        retryItemIds: args.retryItemIds,
         signal: controller.signal,
       },
       {
@@ -1247,6 +1257,60 @@ ipcMain.handle('runs:suiteDiff', async (_e, payload: { runId: string }): Promise
 
   return { runId: run.id, baseRunId: run.baseRunId, addedCount, carriedCount, removedCount, totalCount };
 });
+
+/**
+ * Plan items from this run's OWN plan.json that either never got a matching
+ * test row (generation silently dropped) or never got EXECUTED (a spec was
+ * generated but the run errored out before its result was recorded — see
+ * matchGenerationGaps's doc comment for the full 'pending'-status
+ * reasoning). Feeds the results-page Retry-pass button. See
+ * matchGenerationGaps (repair-candidates.js) for why this matches by
+ * id/reqTag directly rather than via topup.ts's diffAgainstBase.
+ */
+ipcMain.handle(
+  'runs:generationGaps',
+  async (_e, payload: { runId: string }): Promise<GenerationGapItem[]> => {
+    const store = await getStore();
+    if (!store || !payload?.runId) return [];
+    const run = store.getRun(payload.runId);
+    if (!run) return [];
+
+    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
+    const plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
+    if (!plan || plan.items.length === 0) return [];
+
+    return matchGenerationGaps(plan, store.listTests(run.id));
+  },
+);
+
+/**
+ * Plan items from this run whose test was triaged 'test_is_wrong' — feeds
+ * the results-page Repair button, which reuses Retry-pass's exact
+ * retryItemIds mechanism with this as its candidate source.
+ */
+ipcMain.handle(
+  'runs:repairCandidates',
+  async (_e, payload: { runId: string }): Promise<GenerationGapItem[]> => {
+    const store = await getStore();
+    if (!store || !payload?.runId) return [];
+    const run = store.getRun(payload.runId);
+    if (!run) return [];
+
+    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
+    const plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
+    if (!plan || plan.items.length === 0) return [];
+
+    const wrongTestIds = new Set(
+      store
+        .listTriageResults(run.id)
+        .filter((t) => t.verdict === 'test_is_wrong')
+        .map((t) => t.testId),
+    );
+    if (wrongTestIds.size === 0) return [];
+
+    return matchRepairCandidates(plan, store.listTests(run.id), wrongTestIds);
+  },
+);
 
 /**
  * Delete a single historical run: its DB rows (tests/results/agent_events,

@@ -1,4 +1,5 @@
 import type { ProviderId } from '../providers/types.js';
+import type { Verdict } from '../triage/types.js';
 
 /** Test-engine identifier (Playwright first; Selenium/XYZ later). */
 export type ModeId = 'playwright' | 'selenium' | (string & {});
@@ -131,6 +132,8 @@ export interface TestCase {
   description: string | null;
   /** The broader feature intent (TestPlanItem.intent) this test belongs to — why it exists. Null when no plan item was matched. */
   details: string | null;
+  /** The generated spec file's full source (GeneratedSpec.contents) at GENERATE time — null for rows predating this column, or a fallback row with no known spec. */
+  specCode: string | null;
 }
 
 export interface TestResult {
@@ -262,4 +265,31 @@ export interface NewProject {
   baseUrl?: string | null;
   /** Replace-all semantics: the full desired credential set, not a delta. Omitted = leave/create with none. */
   credentials?: NewProjectCredential[];
+}
+
+/**
+ * One triage verdict, FK-keyed to the `tests` row it's about (unlike
+ * report.json's ReportTriageEntry, which is joined back to a result by
+ * fuzzy title matching). Additive alongside report.json — not a replacement
+ * — so existing title-joined report rendering is untouched; this is what
+ * lets Repair/Fix-up (a later results-page action) query "which tests in
+ * this run were triaged test_is_wrong" directly instead of re-deriving it.
+ */
+export interface TriageResultRow {
+  id: string;
+  testId: string;
+  verdict: Verdict;
+  confidence: number;
+  rationale: string;
+  suggestedPatch: string | null;
+  createdAt: string;
+}
+
+/** Input shape for recordTriageResult — id/createdAt are assigned on persist. */
+export interface NewTriageResult {
+  testId: string;
+  verdict: Verdict;
+  confidence: number;
+  rationale: string;
+  suggestedPatch?: string | null;
 }

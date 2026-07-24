@@ -141,6 +141,11 @@ function migrate(db: DatabaseSync): void {
     // to an existing usage table via ensureColumn (the CREATE above only
     // helps fresh installs).
     ensureColumn(db, 'usage', 'model', 'TEXT');
+    // v14: spec_code on tests (the generated spec's full source, added via
+    // ensureColumn for existing DBs) + the new triage_results table — no
+    // ensureColumn needed for the table itself, same reasoning as v11's usage
+    // table: CREATE TABLE IF NOT EXISTS already retrofits it.
+    ensureColumn(db, 'tests', 'spec_code', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

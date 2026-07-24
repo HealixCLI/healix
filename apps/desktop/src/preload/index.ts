@@ -89,6 +89,9 @@ const api = {
     prdSelectedSheets?: string[];
     suiteMode?: string;
     baseRunId?: string;
+    coverageLoopEnabled?: boolean;
+    coverageTarget?: number;
+    retryItemIds?: string[];
   }) => ipcRenderer.invoke('run:start', args),
   approveRun: (runId: string, decision: { decision: 'cancel' } | { decision: 'proceed'; plan: unknown }) =>
     ipcRenderer.invoke('run:approve', { runId, ...decision }),
@@ -106,6 +109,8 @@ const api = {
   deleteRun: (runId: string) => ipcRenderer.invoke('runs:delete', { runId }),
   lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),
   suiteDiff: (runId: string) => ipcRenderer.invoke('runs:suiteDiff', { runId }),
+  generationGaps: (runId: string) => ipcRenderer.invoke('runs:generationGaps', { runId }),
+  repairCandidates: (runId: string) => ipcRenderer.invoke('runs:repairCandidates', { runId }),
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
     ipcRenderer.invoke('runs:caseHistory', { projectId, ...key }),
   projectMetrics: (projectId: string) => ipcRenderer.invoke('runs:projectMetrics', { projectId }),

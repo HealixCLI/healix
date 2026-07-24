@@ -438,6 +438,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         specPath: null,
         description: 'user submits valid credentials',
         details: 'Verify the login flow authenticates a user and redirects to the dashboard.',
+        specCode: null,
       },
     ];
     const report = buildReport({ run, project, plan, outcome, triage: [], tests });
@@ -472,6 +473,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         specPath: 'tests/tierA-public/example.spec.ts',
         description: 'Navigate and assert the heading is visible',
         details: 'Verify the page renders correctly.',
+        specCode: null,
       },
       {
         id: 'tst_orphan',
@@ -483,6 +485,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         specPath: null,
         description: null,
         details: null,
+        specCode: null,
       },
     ];
     const report = buildReport({ run, project, plan, outcome, triage: [], tests });
@@ -667,5 +670,70 @@ describe('report — step-by-step breakdown, for passed tests too', () => {
     // matching the actual rendered usage, not the CSS rule declarations.
     expect(html.match(/class="step-mark step-mark-ok"/g)?.length).toBe(2);
     expect(html.match(/class="step-mark step-mark-fail"/g)?.length).toBe(1);
+  });
+});
+
+describe('groupingSummary — round-trips through buildReport/renderReportHtml', () => {
+  const run = makeRun();
+  const project = makeProject();
+  const plan = REAL_PLAN;
+  const outcome: ExecOutcome = {
+    passed: 0,
+    failed: 2,
+    blocked: 0,
+    flaky: 0,
+    results: [
+      { title: 'A', status: 'failed', durationMs: 1, error: 'boom' },
+      { title: 'B', status: 'failed', durationMs: 1, error: 'boom' },
+    ],
+  };
+  const triage = [
+    {
+      title: 'A',
+      error: 'boom',
+      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+    },
+    {
+      title: 'B',
+      error: 'boom',
+      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+    },
+  ];
+
+  it('defaults to null when omitted', () => {
+    const report = buildReport({ run, project, plan, outcome, triage });
+    expect(report.groupingSummary).toBeNull();
+  });
+
+  it('carries a provided summary through to the report object', () => {
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage,
+      groupingSummary: 'Both failures share the same broken /api/x endpoint.',
+    });
+    expect(report.groupingSummary).toBe('Both failures share the same broken /api/x endpoint.');
+  });
+
+  it('renders the summary as prose inside the Triage section of the HTML', () => {
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage,
+      groupingSummary: 'Both failures share the same broken /api/x endpoint.',
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<p class="grouping-summary">');
+    expect(html).toContain('Both failures share the same broken /api/x endpoint.');
+  });
+
+  it('omits the grouping-summary paragraph element when null (the CSS rule itself is always present)', () => {
+    const report = buildReport({ run, project, plan, outcome, triage });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('<p class="grouping-summary">');
   });
 });

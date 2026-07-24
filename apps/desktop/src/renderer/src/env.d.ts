@@ -29,6 +29,7 @@ import type {
   StartRunResult,
   RunChannelMessage,
   SuiteDiffSummary,
+  GenerationGapItem,
   TestCaseHistory,
   ProjectMetrics,
 } from './lib/ipc-types';
@@ -95,6 +96,8 @@ export interface HealixBridge {
   deleteRun: (runId: string) => Promise<{ ok: true; assetsRemoved: boolean }>;
   lastSuccessfulRun: (projectId: string) => Promise<Run | null>;
   suiteDiff: (runId: string) => Promise<SuiteDiffSummary | null>;
+  generationGaps: (runId: string) => Promise<GenerationGapItem[]>;
+  repairCandidates: (runId: string) => Promise<GenerationGapItem[]>;
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) => Promise<TestCaseHistory>;
   projectMetrics: (projectId: string) => Promise<ProjectMetrics | null>;
   usageCrossRun: (projectId?: string) => Promise<UsageAggregate>;

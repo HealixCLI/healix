@@ -13,7 +13,7 @@ import { describe, expect, it } from 'vitest';
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../providers/types.js';
 import { indexSource } from '../target/source-index.js';
 import { createTriageEngine } from './index.js';
-import type { TriageInput } from './types.js';
+import type { TriageBatchItem, TriageInput } from './types.js';
 
 function fakeProvider(complete: ProviderAdapter['complete']): ProviderAdapter {
   return {
@@ -103,6 +103,101 @@ describe('createTriageEngine().analyze — signal forwarding', () => {
     // throws/leaks on an aborted call, it degrades to the rule-based baseline.
     expect(result.verdict).toBeDefined();
     expect(result.confidence).toBeGreaterThanOrEqual(0);
+  });
+});
+
+describe('createTriageEngine().analyzeBatch', () => {
+  const ITEMS: TriageBatchItem[] = [
+    { id: 'a', input: { title: 'Login works', error: 'expect(locator).toBeVisible() failed' } },
+    { id: 'b', input: { title: 'Checkout completes', error: '500 Internal Server Error' } },
+  ];
+
+  it('makes exactly ONE provider call for the whole batch, reconciling each id against its own rule baseline', async () => {
+    let callCount = 0;
+    let seenPrompt = '';
+    const provider = fakeProvider(async (prompt) => {
+      callCount += 1;
+      seenPrompt = prompt;
+      return {
+        provider: 'claude',
+        ok: true,
+        text: JSON.stringify([
+          { id: 'a', verdict: 'test_is_wrong', confidence: 0.9, rationale: 'stale selector' },
+          { id: 'b', verdict: 'app_is_wrong', confidence: 0.85, rationale: '5xx is a real regression' },
+        ]),
+        raw: null,
+        detail: '',
+      };
+    });
+
+    const { results, truncated } = await createTriageEngine().analyzeBatch(ITEMS, provider);
+
+    expect(callCount).toBe(1);
+    expect(seenPrompt).toContain('Login works');
+    expect(seenPrompt).toContain('Checkout completes');
+    expect(truncated).toBe(false);
+    expect(results.get('a')?.verdict).toBe('test_is_wrong');
+    expect(results.get('b')?.verdict).toBe('app_is_wrong');
+  });
+
+  it('PARTIAL: an id missing from the reply is simply absent from the result map — not a failure', async () => {
+    const provider = fakeProvider(async () => ({
+      provider: 'claude',
+      ok: true,
+      text: JSON.stringify([{ id: 'a', verdict: 'test_is_wrong', confidence: 0.9, rationale: 'x' }]),
+      raw: null,
+      detail: '',
+    }));
+
+    const { results, truncated } = await createTriageEngine().analyzeBatch(ITEMS, provider);
+
+    expect(truncated).toBe(false);
+    expect(results.has('a')).toBe(true);
+    expect(results.has('b')).toBe(false);
+  });
+
+  it('TRUNCATED: a reply cut off mid-array is reported as truncated, with an empty result map', async () => {
+    const provider = fakeProvider(async () => ({
+      provider: 'claude',
+      ok: true,
+      text: '```json\n[\n  { "id": "a", "verdict": "test_is_wrong", "confidence": 0.9',
+      raw: null,
+      detail: '',
+    }));
+
+    const { results, truncated } = await createTriageEngine().analyzeBatch(ITEMS, provider);
+
+    expect(truncated).toBe(true);
+    expect(results.size).toBe(0);
+  });
+
+  it('GARBLED (not truncated): a non-JSON reply reports truncated:false — a smaller batch would not help', async () => {
+    const provider = fakeProvider(async () => ({
+      provider: 'claude',
+      ok: true,
+      text: 'canned text (no actionable json)',
+      raw: null,
+      detail: '',
+    }));
+
+    const { results, truncated } = await createTriageEngine().analyzeBatch(ITEMS, provider);
+
+    expect(truncated).toBe(false);
+    expect(results.size).toBe(0);
+  });
+
+  it('returns empty/not-truncated for an empty items array without calling the provider', async () => {
+    let called = false;
+    const provider = fakeProvider(async () => {
+      called = true;
+      return { provider: 'claude', ok: true, text: '[]', raw: null, detail: '' };
+    });
+
+    const { results, truncated } = await createTriageEngine().analyzeBatch([], provider);
+
+    expect(called).toBe(false);
+    expect(results.size).toBe(0);
+    expect(truncated).toBe(false);
   });
 });
 

@@ -12,9 +12,15 @@
  */
 import type { ProviderAdapter } from '../providers/types.js';
 import type { UsageRecorder } from '../providers/usage.js';
-import type { TriageEngine, TriageInput, TriageResult } from './types.js';
+import type { TriageBatchItem, TriageEngine, TriageInput, TriageResult } from './types.js';
 import { classifyByRules } from './rules.js';
-import { buildTriagePrompt, parseTriageReply } from './prompt.js';
+import {
+  buildBatchTriagePrompt,
+  buildTriagePrompt,
+  looksLikeTruncatedBatchReply,
+  parseBatchTriageReply,
+  parseTriageReply,
+} from './prompt.js';
 
 export * from './types.js';
 
@@ -89,6 +95,53 @@ export function createTriageEngine(): TriageEngine {
       }
 
       return reconcile(parsed, baseline);
+    },
+
+    async analyzeBatch(
+      items: TriageBatchItem[],
+      provider: ProviderAdapter,
+      signal?: AbortSignal,
+      onUsage?: UsageRecorder,
+      cwd?: string,
+    ): Promise<{ results: Map<string, TriageResult>; truncated: boolean }> {
+      const empty = { results: new Map<string, TriageResult>(), truncated: false };
+      if (items.length === 0) return empty;
+
+      let prompt: string;
+      try {
+        prompt = buildBatchTriagePrompt(items);
+      } catch {
+        return empty;
+      }
+
+      let reply: Awaited<ReturnType<ProviderAdapter['complete']>>;
+      try {
+        reply = await provider.complete(prompt, {
+          timeoutMs: ANALYZE_TIMEOUT_MS,
+          cwd,
+          signal,
+          taskType: 'triage',
+        });
+        onUsage?.('triage', `batch:${items.map((i) => i.id).join(',')}`, provider.id, reply.raw);
+      } catch {
+        // Provider threw — not a truncation signature, just an outage; the
+        // caller keeps every item's rule baseline rather than retry-splitting.
+        return empty;
+      }
+
+      if (!reply || reply.ok !== true || !reply.text) {
+        return empty;
+      }
+
+      // Each parsed entry is reconciled against ITS OWN item's rule baseline
+      // (a suggestedPatch fallback), exactly as the solo analyze() path does.
+      const parsedById = parseBatchTriageReply(reply.text);
+      const results = new Map<string, TriageResult>();
+      for (const item of items) {
+        const ai = parsedById.get(item.id);
+        if (ai) results.set(item.id, reconcile(ai, classifyByRules(item.input)));
+      }
+      return { results, truncated: results.size === 0 && looksLikeTruncatedBatchReply(reply.text) };
     },
   };
 }

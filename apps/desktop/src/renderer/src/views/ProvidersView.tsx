@@ -28,6 +28,7 @@ const TASK_LABELS: Record<keyof ModelEffortConfig, string> = {
   codegen: 'Spec code generation',
   'mock-response': 'Mock response generation',
   triage: 'Failure triage/analysis',
+  'triage-summary': 'End-of-run failure grouping summary',
   'health-probe': 'Health probe (auth check)',
 };
 

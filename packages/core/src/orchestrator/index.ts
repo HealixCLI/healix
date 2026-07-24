@@ -1153,8 +1153,15 @@ async function runPipeline(
         // rather than re-indexing — this used to be an independent second indexFunctionality call.
         // Endpoint (tierC, no DOM route) units are split out for their own HTTP reachability
         // probe instead of a wasted browser navigation — see splitStaticUnitsForExplore.
+        // Directed exploration: the approved plan's unitKeys are already known here, so route/
+        // endpoint units the plan actually needs are prioritized ahead of everything else BEFORE
+        // any truncation, instead of exploring in arbitrary first-N discovery order.
+        const priorityUnitKeys = new Set(
+          planForGeneration.items.map((it) => it.unitKey).filter((k): k is string => Boolean(k)),
+        );
         const { routePaths: staticRoutePaths, endpointPaths } = splitStaticUnitsForExplore(
           sourceContext?.units ?? [],
+          priorityUnitKeys,
         );
         if (endpointPaths.length > 0) {
           const probeBaseUrl = effectiveBaseUrl;

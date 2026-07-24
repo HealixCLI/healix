@@ -461,6 +461,76 @@ describe('retry-pass (RunOptions.retryItemIds)', () => {
     expect(tests[0].status).toBe('pending');
   });
 
+  it('Repair case: an item that ALREADY has a covering test is still actually regenerated when targeted, not silently carried forward', async () => {
+    // Regression for a real bug found via isolated real-app verification:
+    // Repair's whole precondition is a `test_is_wrong` verdict, which can only
+    // exist on an already-EXECUTED test — meaning diffAgainstBase's ordinary
+    // "existing test = already covered, don't regenerate" rule would otherwise
+    // always classify a Repair target as covered and carry the old (wrong)
+    // spec forward unchanged, never calling generate() for it at all.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Repair Targeted Regeneration Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // ---- Run 1: fresh, all 3 items succeed and get real covering tests. ----
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+    const run1Tests = store.listTests(run1.runId);
+    expect(run1Tests).toHaveLength(3);
+    expect(run1Tests.every((t) => t.status === 'passed')).toBe(true);
+
+    const plan1 = await readPlan(project.id, run1.runId);
+    const repairTargetItem = plan1.items.find((it) => it.reqTag === 'REQ-B')!;
+    const repairTargetTest = run1Tests.find((t) => t.reqTag === 'REQ-B')!;
+    // Precondition: REQ-B already has a covering test — diffAgainstBase alone
+    // would treat it as covered, exactly the trap Repair must avoid.
+    expect(diffAgainstBase(plan1.items, run1Tests).toGenerate).toHaveLength(0);
+
+    // Simulate a real repair-worthy verdict: REQ-B's test was triaged wrong.
+    store.recordTriageResult({
+      testId: repairTargetTest.id,
+      verdict: 'test_is_wrong',
+      confidence: 0.9,
+      rationale: 'Stale selector.',
+    });
+
+    // ---- Run 2: repair, targeting REQ-B's plan item id via retryItemIds. ----
+    const run2GenerateCalls: TestPlan[] = [];
+    const run2 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({
+      projectId: project.id,
+      suiteMode: 'topup',
+      baseRunId: run1.runId,
+      autoApprove: true,
+      retryItemIds: [repairTargetItem.id],
+    });
+
+    expect(run2.status).toBe('passed');
+    // The targeted item was ACTUALLY regenerated — generate() was invoked for it —
+    // not silently skipped because a covering test already existed.
+    expect(run2GenerateCalls.flatMap((p) => p.items).map((i) => i.reqTag)).toEqual(['REQ-B']);
+
+    // The new run carries the other two items forward and has exactly one
+    // fresh row for REQ-B — the stale original isn't duplicated alongside it.
+    const run2Tests = store.listTests(run2.runId);
+    expect(run2Tests.filter((t) => t.reqTag === 'REQ-B')).toHaveLength(1);
+    expect(run2Tests.filter((t) => t.reqTag === 'REQ-B')[0].id).not.toBe(repairTargetTest.id);
+    expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-A', 'REQ-B', 'REQ-C']));
+  });
+
   it('retryItemIds survives a pause/resume round-trip via the checkpoint', async () => {
     // Direct plumbing check, same shape as orchestrator.coverage-loop.test.ts's
     // equivalent for coverageLoopEnabled/coverageTarget — proves this new

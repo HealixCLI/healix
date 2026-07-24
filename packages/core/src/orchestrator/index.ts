@@ -1440,7 +1440,15 @@ async function runPipeline(
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
         } else if (suiteMode === 'topup') {
-          const diff = diffAgainstBase(planForGeneration.items, baseTestsWithSpec);
+          // Retry-pass/Repair (results-page actions): a retryItemIds-targeted item
+          // must be regenerated even when it already has a covering test — that's
+          // the whole precondition for Repair (a test_is_wrong verdict can only
+          // exist on an already-executed test) — so force it into toGenerate
+          // rather than letting diffAgainstBase's ordinary "existing test = already
+          // covered" rule silently carry the old (possibly wrong) spec forward.
+          const forceRegenerate =
+            opts.retryItemIds && opts.retryItemIds.length > 0 ? new Set(opts.retryItemIds) : undefined;
+          const diff = diffAgainstBase(planForGeneration.items, baseTestsWithSpec, forceRegenerate);
           emit(
             'generate',
             'info',

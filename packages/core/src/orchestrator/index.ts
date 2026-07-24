@@ -53,6 +53,7 @@ import {
 import { estimateUnitWeight, type FunctionalityUnit } from '../target/functionality-index.js';
 import { computeRepoSourceHash, indexSource } from '../target/source-index.js';
 import { loadSourceContext, persistSourceContext } from '../target/context-store.js';
+import { enrichSourceContextForPlan } from '../target/deep-dive.js';
 import type { SourceContext } from '../target/source-context.js';
 import { diffAgainstBase } from './topup.js';
 import {
@@ -1061,6 +1062,28 @@ async function runPipeline(
           noteStoreFailure,
         );
         return { runId, status: 'error', reportPath: summary.reportPath };
+      }
+    }
+
+    // Directed post-approve deep-dive: indexSource()'s own PLAN-phase walk is shallow (path +
+    // method only, no status codes, no handler-body tracing) and covers the WHOLE repo — this
+    // narrower pass, scoped only to the files backing the now-approved plan's unitKey-resolved
+    // units, extracts those deeper signals for exactly what this run is about to generate/triage
+    // against, rather than paying that cost repo-wide. Best-effort: a failure here just means
+    // GENERATE/TRIAGE proceed without the extra signal, same as any other optional grounding step.
+    if (project.repoPath && sourceContext && planForGeneration.items.length > 0) {
+      try {
+        sourceContext = await enrichSourceContextForPlan(
+          project.repoPath,
+          sourceContext,
+          planForGeneration.items,
+        );
+      } catch (err) {
+        emit(
+          'plan',
+          'debug',
+          `Deep-dive handler-signal enrichment failed (continuing without it): ${errMsg(err)}`,
+        );
       }
     }
 

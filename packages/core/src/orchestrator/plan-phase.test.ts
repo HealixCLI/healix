@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runPlanPhase, attemptPlanCompletion, buildWeightedBatches, splitUnitsByWeight } from './index.js';
 import type { OrchestratorEvent } from './types.js';
 import type { PlanRepoContext } from './plan.js';
@@ -66,7 +66,11 @@ function fencedJson(value: unknown): string {
 }
 
 /** A provider whose plan completion fails `failTimes` times, then succeeds. */
-function makeFlakyProvider(failTimes: number, plan: unknown): ProviderAdapter & { calls: number } {
+function makeFlakyProvider(
+  failTimes: number,
+  plan: unknown,
+  failureDetail = 'transient failure',
+): ProviderAdapter & { calls: number } {
   const adapter = {
     id: 'claude' as const,
     label: 'Flaky Fake',
@@ -94,7 +98,7 @@ function makeFlakyProvider(failTimes: number, plan: unknown): ProviderAdapter & 
     async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
       adapter.calls += 1;
       if (opts?.mode === 'plan' && adapter.calls <= failTimes) {
-        return { provider: 'claude', ok: false, text: '', raw: null, detail: 'transient failure' };
+        return { provider: 'claude', ok: false, text: '', raw: null, detail: failureDetail };
       }
       return { provider: 'claude', ok: true, text: fencedJson(plan), raw: plan, detail: 'OK' };
     },
@@ -135,6 +139,52 @@ describe('runPlanPhase resilience', () => {
     expect(plan.items.length).toBeGreaterThan(0);
     expect(provider.calls).toBe(2);
   }, 10_000);
+
+  it('does NOT pause before a same-provider retry for an ordinary transient failure (only credits-exhausted warrants the delay)', async () => {
+    const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'transient failure');
+    const start = Date.now();
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
+    // The gated delay is 2000ms — an ungated retry completes in a small fraction of that.
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 10_000);
+
+  it('pauses before a same-provider retry when the failure is classified credits-exhausted', async () => {
+    const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'Error: insufficient credits — quota exceeded');
+    const start = Date.now();
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
+    expect(Date.now() - start).toBeGreaterThanOrEqual(1900);
+  }, 10_000);
+
+  describe('(fake timers) delay gating — deterministic, no real wall-clock wait', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('does NOT need any timer advance for an ordinary transient failure — the retry is not waiting on anything', async () => {
+      vi.useFakeTimers();
+      const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'transient failure');
+      const plan = await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
+        provider,
+      });
+      // No vi.advanceTimersByTimeAsync(...) call anywhere above — if the retry were still
+      // gated behind the 2s delay, this promise would never have resolved and the test would
+      // time out, since fake timers never advance on their own.
+      expect(plan.planSource).toBe('ai');
+      expect(provider.calls).toBe(2);
+    });
+
+    it('needs the fake clock advanced by the full delay before a credits-exhausted retry resolves', async () => {
+      vi.useFakeTimers();
+      const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'Error: insufficient credits — quota exceeded');
+      const resultPromise = runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
+        provider,
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      const plan = await resultPromise;
+      expect(plan.planSource).toBe('ai');
+      expect(provider.calls).toBe(2);
+    });
+  });
 
   it('attemptPlanCompletion requests taskType "plan-generate" (per-task-type model/effort routing)', async () => {
     let seenTaskType: string | undefined;

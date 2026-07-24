@@ -19,6 +19,7 @@ import type { UsageRecorder } from '../providers/usage.js';
 import { getTestMode } from '../modes/registry.js';
 import type {
   ExecOutcome,
+  ExplorationArtifact,
   ExplorationMode,
   GeneratedSpec,
   SuiteBundle,
@@ -37,6 +38,7 @@ import type { ExternalDependency, MockResponse, MockServerHandle } from '../targ
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
+import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
@@ -51,8 +53,9 @@ import {
   type PlanParseFailureReason,
 } from './plan.js';
 import { estimateUnitWeight, type FunctionalityUnit } from '../target/functionality-index.js';
-import { indexSource } from '../target/source-index.js';
-import { persistSourceContext } from '../target/context-store.js';
+import { computeRepoSourceHash, indexSource } from '../target/source-index.js';
+import { loadSourceContext, persistSourceContext } from '../target/context-store.js';
+import { enrichSourceContextForPlan } from '../target/deep-dive.js';
 import type { SourceContext } from '../target/source-context.js';
 import { diffAgainstBase } from './topup.js';
 import {
@@ -672,6 +675,21 @@ async function runPipeline(
           `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`,
         );
       }
+      // sourceContext (white-box grounding for TRIAGE/GENERATE) is otherwise never recomputed on
+      // resume — formatSourceGrounding would silently return '' for every item without this.
+      // Best-effort, no hash check: even a slightly stale cached context is strictly better than
+      // none, and PLAN (where a fresher one would be computed) is being skipped entirely here.
+      if (project.repoPath) {
+        const cached = loadSourceContext(project.repoPath);
+        if (cached) {
+          sourceContext = cached.context;
+          emit(
+            'plan',
+            'debug',
+            `Resumed cached source context: ${sourceContext.units.length} functionality unit(s).`,
+          );
+        }
+      }
       setStatus('awaiting-approval');
       if (checkCancelled()) return await pauseOrCancel('approve');
       planForGeneration = { ...plan, items: plan.items.filter(isPlanItemIncluded) };
@@ -717,7 +735,23 @@ async function runPipeline(
             emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
           }
           try {
-            sourceContext = await indexSource(project.repoPath);
+            // Skip indexSource()'s full-repo AST walk when the repo's file list/size/mtime
+            // fingerprint hasn't changed since the last time it was persisted — a full walk is
+            // one of the more expensive PLAN-phase steps on a large repo, and re-running it
+            // every single run when nothing changed on disk is pure waste.
+            const currentHash = computeRepoSourceHash(project.repoPath);
+            const cached = loadSourceContext(project.repoPath);
+            if (cached && cached.hash === currentHash) {
+              sourceContext = cached.context;
+              emit(
+                'plan',
+                'debug',
+                `Reused cached source context (unchanged repo fingerprint): ${sourceContext.units.length} functionality unit(s).`,
+              );
+            } else {
+              sourceContext = await indexSource(project.repoPath);
+              persistSourceContext(project.repoPath, currentHash, sourceContext);
+            }
             if (sourceContext.units.length > 0) {
               repoIndex = {
                 ...(repoIndex ?? { summary: '', files: [] }),
@@ -729,7 +763,6 @@ async function runPipeline(
                 `Detected ${sourceContext.units.length} functionality unit(s) for plan grounding.`,
               );
             }
-            persistSourceContext(project.repoPath, sourceContext);
           } catch (err) {
             emit(
               'plan',
@@ -1034,6 +1067,28 @@ async function runPipeline(
       }
     }
 
+    // Directed post-approve deep-dive: indexSource()'s own PLAN-phase walk is shallow (path +
+    // method only, no status codes, no handler-body tracing) and covers the WHOLE repo — this
+    // narrower pass, scoped only to the files backing the now-approved plan's unitKey-resolved
+    // units, extracts those deeper signals for exactly what this run is about to generate/triage
+    // against, rather than paying that cost repo-wide. Best-effort: a failure here just means
+    // GENERATE/TRIAGE proceed without the extra signal, same as any other optional grounding step.
+    if (project.repoPath && sourceContext && planForGeneration.items.length > 0) {
+      try {
+        sourceContext = await enrichSourceContextForPlan(
+          project.repoPath,
+          sourceContext,
+          planForGeneration.items,
+        );
+      } catch (err) {
+        emit(
+          'plan',
+          'debug',
+          `Deep-dive handler-signal enrichment failed (continuing without it): ${errMsg(err)}`,
+        );
+      }
+    }
+
     ctx = {
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
@@ -1100,8 +1155,15 @@ async function runPipeline(
         // rather than re-indexing — this used to be an independent second indexFunctionality call.
         // Endpoint (tierC, no DOM route) units are split out for their own HTTP reachability
         // probe instead of a wasted browser navigation — see splitStaticUnitsForExplore.
+        // Directed exploration: the approved plan's unitKeys are already known here, so route/
+        // endpoint units the plan actually needs are prioritized ahead of everything else BEFORE
+        // any truncation, instead of exploring in arbitrary first-N discovery order.
+        const priorityUnitKeys = new Set(
+          planForGeneration.items.map((it) => it.unitKey).filter((k): k is string => Boolean(k)),
+        );
         const { routePaths: staticRoutePaths, endpointPaths } = splitStaticUnitsForExplore(
           sourceContext?.units ?? [],
+          priorityUnitKeys,
         );
         if (endpointPaths.length > 0) {
           const probeBaseUrl = effectiveBaseUrl;
@@ -1123,20 +1185,38 @@ async function runPipeline(
         }
 
         try {
-          // EXPLORE only needs ONE representative session to find/confirm a login
-          // form — not every role. Prefer a roleless credential (the "default"
-          // session Tier B also falls back to) over a role-tagged one.
-          const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
-          const exploration = await runExplorePhase({
-            browser,
-            baseUrl: effectiveBaseUrl,
-            credentials: defaultCredential
-              ? { username: defaultCredential.username, password: defaultCredential.password }
-              : undefined,
-            staticRoutePaths,
-            emit,
-            onFrame: hooks?.onFrame,
-          });
+          // Exploration caching: rebuilding the whole crawl from scratch on every single run is
+          // pure waste when the target app hasn't changed since the last one. Keyed by baseUrl
+          // with an explicit staleness window (unlike the source-context cache, a live app drifts
+          // independently of anything Healix can fingerprint, so this is never trusted
+          // indefinitely) — see exploration-cache.ts. "Force a fresh crawl" is simply deleting
+          // the cache file; no dedicated option is needed here.
+          const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl);
+          let exploration: ExplorationArtifact;
+          if (cachedExploration) {
+            exploration = cachedExploration;
+            emit(
+              'explore',
+              'info',
+              'Reusing cached exploration artifact (within staleness window) — skipping live crawl.',
+            );
+          } else {
+            // EXPLORE only needs ONE representative session to find/confirm a login
+            // form — not every role. Prefer a roleless credential (the "default"
+            // session Tier B also falls back to) over a role-tagged one.
+            const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            exploration = await runExplorePhase({
+              browser,
+              baseUrl: effectiveBaseUrl,
+              credentials: defaultCredential
+                ? { username: defaultCredential.username, password: defaultCredential.password }
+                : undefined,
+              staticRoutePaths,
+              emit,
+              onFrame: hooks?.onFrame,
+            });
+            persistExplorationCache(project.id, effectiveBaseUrl, exploration);
+          }
           ctx.exploration = exploration;
 
           // Auth-pattern-aware breadcrumb: a recognized auth library was detected in source but
@@ -1988,7 +2068,12 @@ export async function attemptPlanCompletion(
   // often transient, and with a single-provider setup the fallback-provider
   // step below is otherwise a no-op — cheap insurance before giving up.
   emit('plan', 'info', `Retrying plan with the same provider "${provider.id}" after: ${last.reason}`);
-  await delay(PLAN_SAME_PROVIDER_RETRY_DELAY_MS);
+  // Only worth waiting out when the failure is a credits/quota exhaustion that plausibly
+  // clears itself briefly — a truncated-JSON or other transient provider hiccup is not helped
+  // by a fixed pause, so retry it immediately instead of paying the delay unconditionally.
+  if (classifyTransientFailure(last.reason) === 'credits-exhausted') {
+    await delay(PLAN_SAME_PROVIDER_RETRY_DELAY_MS);
+  }
   const retried = await attempt(provider);
   if (retried.plan) return retried;
   last = retried;

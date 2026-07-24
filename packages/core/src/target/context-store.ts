@@ -10,6 +10,14 @@ const MAX_PERSISTED_FORMS = 50;
 const MAX_PERSISTED_AUTH_PATTERNS = 50;
 const MAX_PERSISTED_SELECTOR_HINTS = 200;
 
+/** Persisted envelope: `hash` is computeRepoSourceHash()'s fingerprint of the repo at persist time — a
+ * later caller compares it against a freshly-computed hash to decide whether indexSource()'s
+ * full-repo walk can be skipped in favor of `context`. */
+export interface PersistedSourceContext {
+  hash: string;
+  context: SourceContext;
+}
+
 /** Compact a SourceContext to a bounded slice safe to persist and later reload for triage/generation grounding. */
 function compact(ctx: SourceContext): SourceContext {
   return {
@@ -21,33 +29,38 @@ function compact(ctx: SourceContext): SourceContext {
 }
 
 /**
- * Persist a compacted slice of the source context to `<repoPath>/.healix/source-context.json`,
- * so later stages of the SAME run (or a later run's TRIAGE pass reloading a previous run's
- * context) can reference it as grounding without re-running static analysis. Best-effort: a
- * write failure (read-only repo, disk full, ...) is swallowed rather than failing the caller —
- * this is a convenience artifact, not something any phase strictly depends on to function.
+ * Persist a compacted slice of the source context, alongside the repo-fingerprint hash it was
+ * computed from, to `<repoPath>/.healix/source-context.json` — so later stages of the SAME run,
+ * a resumed run, or a later run's TRIAGE pass reloading a previous run's context can reference it
+ * as grounding without re-running static analysis. Best-effort: a write failure (read-only repo,
+ * disk full, ...) is swallowed rather than failing the caller — this is a convenience artifact,
+ * not something any phase strictly depends on to function.
  */
-export function persistSourceContext(repoPath: string, ctx: SourceContext): void {
+export function persistSourceContext(repoPath: string, hash: string, ctx: SourceContext): void {
   const abs = path.join(repoPath, RELATIVE_PATH);
   try {
     fs.mkdirSync(path.dirname(abs), { recursive: true });
-    fs.writeFileSync(abs, JSON.stringify(compact(ctx), null, 2), 'utf-8');
+    const envelope: PersistedSourceContext = { hash, context: compact(ctx) };
+    fs.writeFileSync(abs, JSON.stringify(envelope, null, 2), 'utf-8');
   } catch {
     /* best-effort — see doc comment above */
   }
 }
 
 /**
- * Load a previously persisted source context, or null when none exists yet or the file is
- * unreadable/malformed. Never throws.
+ * Load a previously persisted {hash, context} envelope, or null when none exists yet or the file
+ * is unreadable/malformed (including a pre-envelope legacy file predating this shape — never
+ * throws, never returns a value missing either field).
  */
-export function loadSourceContext(repoPath: string): SourceContext | null {
+export function loadSourceContext(repoPath: string): PersistedSourceContext | null {
   const abs = path.join(repoPath, RELATIVE_PATH);
   try {
     const raw = fs.readFileSync(abs, 'utf-8');
     const parsed: unknown = JSON.parse(raw);
     if (!parsed || typeof parsed !== 'object') return null;
-    return parsed as SourceContext;
+    const obj = parsed as Partial<PersistedSourceContext>;
+    if (typeof obj.hash !== 'string' || !obj.context || typeof obj.context !== 'object') return null;
+    return { hash: obj.hash, context: obj.context };
   } catch {
     return null;
   }

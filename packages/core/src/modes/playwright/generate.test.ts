@@ -17,14 +17,15 @@ import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../providers/types.js';
-import type { TestModeContext, TestPlan } from '../types.js';
-import type { ProjectCredential } from '../../storage/types.js';
+import type { TestModeContext, TestPlan, TestPlanItem } from '../types.js';
+import type { ProjectCredential, Tier } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import {
   collectGroundTruth,
   demoteEscapeHatchBlocks,
   findForbiddenApis,
   findUngroundedReferences,
+  filterRoutesForItem,
   formatMockContent,
   generate,
   ProviderUnavailableError,
@@ -569,13 +570,13 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(calls[0].opts?.taskType).toBe('codegen');
   });
 
-  it('emits a per-item "Dispatched i/n" event distinct from the batch "Progress" event', async () => {
+  it('emits a per-batch "Dispatched" event distinct from the "Progress" event', async () => {
     const ctx = makeCtx(makeProvider([CLEAN_SPEC], calls));
 
     await generate(ctx, PLAN);
 
     const dispatched = events.find((e) => e.message.includes('Dispatched'));
-    expect(dispatched?.message).toBe(`Dispatched 1/1: Generating "${PLAN.items[0].title}"`);
+    expect(dispatched?.message).toBe('Dispatched batch 1/1: 1 item(s)');
     expect(events.some((e) => e.message === 'Progress: 1/1 done')).toBe(true);
   });
 
@@ -842,6 +843,349 @@ function makeExploration(
   };
 }
 
+// ---- batched generation: multiple same-tier items requested in one provider call -----------
+
+function specFor(reqTag: string, label = 'does the thing'): string {
+  return `import { test, expect } from '@playwright/test';
+
+test('[REQ:${reqTag}] positive: ${label}', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+}
+
+function batchReply(specsByReqTag: Record<string, string>): string {
+  return Object.entries(specsByReqTag)
+    .map(
+      ([reqTag, body]) =>
+        `===== BEGIN SPEC [REQ:${reqTag}] =====\n${body}\n===== END SPEC [REQ:${reqTag}] =====`,
+    )
+    .join('\n\n');
+}
+
+function planItem(id: string, reqTag: string, tier: Tier = 'tierA-public'): TestPlanItem {
+  return {
+    id,
+    title: `Feature ${reqTag}`,
+    reqTag,
+    tier,
+    intent: `${reqTag} renders`,
+    scenarios: [{ kind: 'positive', description: `${reqTag} renders` }],
+  };
+}
+
+describe('generate — batched generation (multiple items per provider call)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-batch-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  it('byte-identical regression pin: batch extraction produces deterministic, repeatable spec contents', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const reply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': specFor('REQ-B'),
+    });
+
+    const specs1 = await generate(makeCtx(makeProvider([reply], calls)), plan);
+    const callCount1 = calls.length;
+
+    // Re-run with identical input - should produce byte-identical output
+    calls = [];
+    const specs2 = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    expect(specs1).toHaveLength(specs2.length);
+    for (let i = 0; i < specs1.length; i++) {
+      expect(specs1[i].contents).toBe(specs2[i].contents);
+      expect(specs1[i].path).toBe(specs2[i].path);
+    }
+    expect(callCount1).toBe(calls.length);
+  });
+
+  it('fake batch provider: all-good batch succeeds without retries', async () => {
+    const plan: TestPlan = {
+      summary: 'three items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B'), planItem('c', 'REQ-C')],
+    };
+    const reply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': specFor('REQ-B'),
+      'REQ-C': specFor('REQ-C'),
+    });
+
+    const specs = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(specs).toHaveLength(3);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
+  });
+
+  it('fake batch provider: missing BEGIN/END markers triggers split into solo retries', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // Reply without proper markers - should trigger split
+    const badReply = 'garbage without markers';
+
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        if (calls.length === 1) {
+          return { provider: 'claude', ok: true, text: badReply, raw: null, detail: '' };
+        }
+        // Solo retries return valid specs
+        const reqTag = prompt.includes('REQ-A') ? 'REQ-A' : 'REQ-B';
+        return { provider: 'claude', ok: true, text: specFor(reqTag), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), plan);
+
+    // 1 batch call + 2 solo retries
+    expect(calls).toHaveLength(3);
+    expect(specs).toHaveLength(2);
+  });
+
+  it('fake batch provider: one item fails validation triggers solo fallback for that item only', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // REQ-A valid, REQ-B invalid (no expect)
+    const badBatchReply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': `import { test, expect } from '@playwright/test';\ntest('[REQ:REQ-B] positive: does nothing', async ({ page }) => {\n  await page.goto('/');\n});\n`,
+    });
+    const soloRetryReply = specFor('REQ-B', 'solo-retried version');
+
+    const specs = await generate(makeCtx(makeProvider([badBatchReply, soloRetryReply], calls)), plan);
+
+    // 1 batch call + 1 solo retry for REQ-B only
+    expect(calls).toHaveLength(2);
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
+  function makeCtx(provider: ProviderAdapter): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider,
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+    };
+  }
+
+  it('requests 3 same-tier items in a single provider call and accepts all 3 specs', async () => {
+    const plan: TestPlan = {
+      summary: 'three items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B'), planItem('c', 'REQ-C')],
+    };
+    const reply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': specFor('REQ-B'),
+      'REQ-C': specFor('REQ-C'),
+    });
+    const specs = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(specs).toHaveLength(3);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
+  });
+
+  it('scales the provider call timeout with batch size instead of reusing the flat single-item budget', async () => {
+    const twoItemPlan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const fiveItemPlan: TestPlan = {
+      summary: 'five items',
+      items: [
+        planItem('a', 'REQ-A'),
+        planItem('b', 'REQ-B'),
+        planItem('c', 'REQ-C'),
+        planItem('d', 'REQ-D'),
+        planItem('e', 'REQ-E'),
+      ],
+    };
+
+    const twoCalls: FakeCall[] = [];
+    await generate(
+      makeCtx(makeProvider([batchReply({ 'REQ-A': specFor('REQ-A'), 'REQ-B': specFor('REQ-B') })], twoCalls)),
+      twoItemPlan,
+    );
+
+    const fiveCalls: FakeCall[] = [];
+    await generate(
+      makeCtx(
+        makeProvider(
+          [
+            // 5 items split into batches of up to GEN_BATCH_SIZE (4): a 4-item batch (A-D) + a
+            // 1-item "batch" (E) that bottoms out straight to generateOne — a plain spec, not a
+            // BEGIN/END-marker batch reply.
+            batchReply({
+              'REQ-A': specFor('REQ-A'),
+              'REQ-B': specFor('REQ-B'),
+              'REQ-C': specFor('REQ-C'),
+              'REQ-D': specFor('REQ-D'),
+            }),
+            specFor('REQ-E'),
+          ],
+          fiveCalls,
+        ),
+      ),
+      fiveItemPlan,
+    );
+
+    // Compare the actual 4-item batch call's timeout against the 2-item batch call's — the
+    // solo-path call for REQ-E (a flat single-item budget, same as the 2-item comparison isn't
+    // about) is irrelevant here.
+    const twoItemBatchCall = twoCalls.find((c) => c.prompt.includes('REQ-A') && c.prompt.includes('REQ-B'));
+    const fourItemBatchCall = fiveCalls.find(
+      (c) =>
+        c.prompt.includes('REQ-A') &&
+        c.prompt.includes('REQ-B') &&
+        c.prompt.includes('REQ-C') &&
+        c.prompt.includes('REQ-D'),
+    );
+    expect(twoItemBatchCall?.opts?.timeoutMs).toBeDefined();
+    expect(fourItemBatchCall?.opts?.timeoutMs).toBeDefined();
+    expect(fourItemBatchCall!.opts!.timeoutMs!).toBeGreaterThan(twoItemBatchCall!.opts!.timeoutMs!);
+  });
+
+  it('never batches items from different tiers into the same provider call', async () => {
+    const plan: TestPlan = {
+      summary: 'two tiers',
+      items: [planItem('a', 'REQ-A', 'tierA-public'), planItem('b', 'REQ-B', 'tierC-api')],
+    };
+    const replies = [batchReply({ 'REQ-A': specFor('REQ-A') }), batchReply({ 'REQ-B': specFor('REQ-B') })];
+    const specs = await generate(makeCtx(makeProvider(replies, calls)), plan);
+
+    expect(calls).toHaveLength(2);
+    expect(specs).toHaveLength(2);
+  });
+
+  it('solo-retries via generateOne only the one item that fails validation within an otherwise-good batch response', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // REQ-A's block is valid; REQ-B's has no expect(...) at all, so it fails validateAndPersist.
+    const badBatchReply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': `import { test, expect } from '@playwright/test';\ntest('[REQ:REQ-B] positive: does nothing', async ({ page }) => {\n  await page.goto('/');\n});\n`,
+    });
+    const soloRetryReply = specFor('REQ-B', 'solo-retried version');
+    const specs = await generate(makeCtx(makeProvider([badBatchReply, soloRetryReply], calls)), plan);
+
+    expect(calls).toHaveLength(2); // 1 batch call + 1 solo retry for REQ-B only
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
+  it('splits a batch in half and retries when the whole response is unusable, eventually succeeding via solo generateOne calls', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // First reply (the batch attempt) is garbage with no BEGIN/END markers at all — a total
+    // parse failure. The batch (size 2) splits into two size-1 sub-batches, run SEQUENTIALLY
+    // (not concurrently — see the concurrency-cap test below for why), each hitting generateOne
+    // directly and succeeding on its own first attempt. A prompt-aware provider (rather than
+    // positional replies) avoids depending on call ordering between the two solo sub-calls.
+    let callIndex = 0;
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        callIndex += 1;
+        if (callIndex === 1) {
+          return { provider: 'claude', ok: true, text: 'not a spec, no markers here', raw: null, detail: '' };
+        }
+        const reqTag = /\[REQ:([^\]]+)\]/.exec(prompt)?.[1] ?? '';
+        return { provider: 'claude', ok: true, text: specFor(reqTag), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), plan);
+
+    expect(calls).toHaveLength(3); // 1 failed batch + 1 solo call per item
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
+  it('never exceeds GEN_CONCURRENCY in-flight provider calls, even when several top-level batches fail and split at the same time', async () => {
+    // 3 top-level batches of 4 (same tier, GEN_CONCURRENCY=3) all fail their batch call with no
+    // markers at all, forcing every one of them to split at the same time. Before the fix,
+    // generateBatch's split recursed via Promise.all — ungoverned by the outer runWithConcurrency
+    // pool — so 3 simultaneously-failing top-level batches could each fan out 2 more concurrent
+    // calls, briefly pushing active calls to 6. The sequential-split fix keeps each top-level
+    // task's OWN recursion to one call at a time, so the true ceiling stays at GEN_CONCURRENCY.
+    const items = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'].map((id) =>
+      planItem(id, `REQ-${id}`),
+    );
+    const plan: TestPlan = { summary: 'twelve items, three batches of four', items };
+
+    let active = 0;
+    let peak = 0;
+    const isBatchPrompt = (prompt: string): boolean => prompt.includes('DIFFERENT, INDEPENDENT features');
+
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        active += 1;
+        peak = Math.max(peak, active);
+        // A short artificial delay forces genuinely-concurrent calls to overlap in wall-clock
+        // time rather than resolving instantly one after another by microtask ordering alone.
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        active -= 1;
+
+        if (isBatchPrompt(prompt)) {
+          // Every batch-shaped call (any size > 1) is unusable — forces a split every time,
+          // all the way down to single-item solo calls.
+          return { provider: 'claude', ok: true, text: 'no markers here at all', raw: null, detail: '' };
+        }
+        const reqTag = /\[REQ:([^\]]+)\]/.exec(prompt)?.[1] ?? '';
+        return { provider: 'claude', ok: true, text: specFor(reqTag), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), plan);
+
+    expect(specs).toHaveLength(12);
+    expect(peak).toBeLessThanOrEqual(3); // GEN_CONCURRENCY
+  });
+});
+
 describe('generate — grounds the prompt in the observed EXPLORE crawl', () => {
   let projectDir: string;
   let calls: FakeCall[];
@@ -975,6 +1319,151 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
   it('omits hash-routing guidance when there is no exploration artifact at all', async () => {
     await generate(ctxWith(undefined), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+  });
+});
+
+// ---- prompt trimming: narrow the tier-wide inventory/routes dump down to a plan item's own unitKey-matched route ----
+
+describe('generate — prompt trimming (per-item route filtering)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-trim-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function twoRouteExploration(): NonNullable<TestModeContext['exploration']> {
+    const routes = [
+      {
+        url: 'https://app.acme.test/checkout',
+        title: 'Checkout',
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        snapshot: {
+          url: 'https://app.acme.test/checkout',
+          title: 'Checkout',
+          interactiveElements: [
+            { role: 'button', name: 'Pay now', selector: '[data-testid="checkout-pay"]' },
+          ],
+        },
+        networkEvents: [],
+      },
+      {
+        url: 'https://app.acme.test/settings',
+        title: 'Settings',
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        snapshot: {
+          url: 'https://app.acme.test/settings',
+          title: 'Settings',
+          interactiveElements: [{ role: 'button', name: 'Save', selector: '[data-testid="settings-save"]' }],
+        },
+        networkEvents: [],
+      },
+    ];
+    return {
+      crawl: {
+        routes,
+        visitedCount: routes.length,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+  }
+
+  function ctxWith(): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration: twoRouteExploration(),
+      sourceContext: {
+        units: [
+          { key: 'route:/checkout', kind: 'route', label: 'route: /checkout', file: 'src/Checkout.tsx' },
+        ],
+        forms: [],
+        authPatterns: [],
+        selectorHints: [],
+        specSources: [],
+        summary: '',
+        truncated: false,
+      },
+    };
+  }
+
+  it('narrows the inventory and observed routes down to only the unitKey-matched route', async () => {
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: 'route:/checkout' }],
+    };
+    await generate(ctxWith(), plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('https://app.acme.test/checkout');
+    expect(prompt).not.toContain('settings-save');
+    expect(prompt).not.toContain('https://app.acme.test/settings');
+  });
+
+  it('falls back to the full tier-wide list when the item has no unitKey', async () => {
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: undefined }],
+    };
+    await generate(ctxWith(), plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('settings-save');
+  });
+
+  it('falls back to the full tier-wide list when the unitKey matches no crawled route', async () => {
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: 'route:/nonexistent' }],
+    };
+    await generate(ctxWith(), plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('settings-save');
+  });
+
+  it('falls back to the full tier-wide list when the unitKey resolves to a non-route (endpoint) unit', async () => {
+    const ctx = ctxWith();
+    ctx.sourceContext = {
+      ...ctx.sourceContext!,
+      units: [
+        {
+          key: 'endpoint:GET /api/checkout',
+          kind: 'endpoint',
+          label: 'GET /api/checkout',
+          file: 'src/server.ts',
+        },
+      ],
+    };
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: 'endpoint:GET /api/checkout' }],
+    };
+    await generate(ctx, plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('settings-save');
   });
 });
 
@@ -1295,8 +1784,10 @@ describe('generate — ProviderUnavailableError (systemic outage signal)', () =>
     const ctx = makeCtx(makeFailingProvider('connect ECONNREFUSED 127.0.0.1:443', calls));
 
     await expect(generate(ctx, TWO_ITEM_PLAN)).rejects.toThrow(ProviderUnavailableError);
-    // Both items each got 2 attempts — never a content-validation stage reached.
-    expect(calls).toHaveLength(4);
+    // Both same-tier items batch into one call first (fails at the provider level, extracting
+    // nothing), which splits into two solo items — each then gets its own 2-attempt retry via
+    // generateOne. 1 (batch) + 2*2 (solo retries) = 5. Never a content-validation stage reached.
+    expect(calls).toHaveLength(5);
   });
 
   it('does NOT throw when zero specs are produced solely due to content-validation failures', async () => {
@@ -1369,6 +1860,49 @@ test('[REQ:${reqTag}] renders', async ({ page }) => {
 // --- Isolated check against a real fixture repo (Item E2) -------------------
 // Runs indexSource() against the real RBAC backend to get a genuine matched unit, then confirms
 // generate() cites its real file and the citation gate rejects a spec that omits it.
+
+describe('filterRoutesForItem — per-item route filtering with never-empty fallback', () => {
+  it('filters routes to those containing the routePath when provided', () => {
+    const routes = [
+      { url: 'https://app.test/home' },
+      { url: 'https://app.test/dashboard' },
+      { url: 'https://app.test/settings' },
+    ];
+    const filtered = filterRoutesForItem(routes, '/dashboard');
+    expect(filtered).toEqual([{ url: 'https://app.test/dashboard' }]);
+  });
+
+  it('returns all routes when routePath is null (no filtering)', () => {
+    const routes = [{ url: 'https://app.test/home' }, { url: 'https://app.test/dashboard' }];
+    const filtered = filterRoutesForItem(routes, null);
+    expect(filtered).toEqual(routes);
+  });
+
+  it('never-empty fallback: returns all routes when filter would leave nothing', () => {
+    const routes = [{ url: 'https://app.test/home' }, { url: 'https://app.test/dashboard' }];
+    const filtered = filterRoutesForItem(routes, '/nonexistent');
+    expect(filtered).toEqual(routes);
+  });
+
+  it('never-empty fallback: returns all routes when no route matches the path', () => {
+    const routes = [{ url: 'https://app.test/home' }, { url: 'https://app.test/dashboard' }];
+    const filtered = filterRoutesForItem(routes, '/admin');
+    expect(filtered).toEqual(routes);
+  });
+
+  it('partial match: filters routes where URL includes the path substring', () => {
+    const routes = [
+      { url: 'https://app.test/user/profile' },
+      { url: 'https://app.test/user/settings' },
+      { url: 'https://app.test/admin' },
+    ];
+    const filtered = filterRoutesForItem(routes, '/user');
+    expect(filtered).toEqual([
+      { url: 'https://app.test/user/profile' },
+      { url: 'https://app.test/user/settings' },
+    ]);
+  });
+});
 
 describe('generate — grounded against a real indexSource() result (isolated check)', () => {
   let projectDir: string;

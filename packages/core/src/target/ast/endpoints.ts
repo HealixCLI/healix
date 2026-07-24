@@ -1,4 +1,5 @@
 import path from 'node:path';
+import type { NodePath } from '@babel/traverse';
 import type { CallExpression, File } from '@babel/types';
 import {
   isCallExpression,
@@ -247,6 +248,67 @@ export function resolveExpressEndpointsFromInfo(perFile: Map<string, FileRouterI
     }
   }
   return units;
+}
+
+/**
+ * Locate the single `X.METHOD(pathSuffix, ...handlers)` registration in `ast` responsible for
+ * `fullPath` (a unit's complete, possibly mount-prefixed route, e.g. "/api/users/:id"), for
+ * callers (target/ast/handler-signals.ts) that need to scope a deeper scan to just THAT handler's
+ * function body instead of the whole file — this file may register several distinct routes, and a
+ * file-wide scan would conflate every handler's signals onto every unit mapped to this file.
+ *
+ * Reuses the exact router-variable detection and `X.method(...)` call-matching
+ * extractExpressRouterInfoFromAst already does, so the two stay in lockstep — a route this
+ * function fails to recognize is one extractExpressRouterInfoFromAst wouldn't have registered as
+ * a unit in the first place.
+ *
+ * `fullPath` may carry a mount prefix this file's own registration never sees (the mount happens
+ * in a DIFFERENT file — see resolveExpressEndpointsFromInfo), so a registration's own literal path
+ * argument is accepted when it either equals `fullPath` exactly (the no-mount case) or is a
+ * non-trivial suffix of it (the mounted case, e.g. local "/:id" for full "/api/users/:id"). A bare
+ * "/" registration only matches when `fullPath` itself has no further path segments beyond the
+ * mount point, since a bare "/" would otherwise trivially match every path via naive suffix
+ * matching. When more than one local registration could plausibly match, the longest (most
+ * specific) pathSuffix wins. Returns null when nothing matches — callers should fall back to a
+ * file-level scan rather than treat null as "this file has no relevant handlers."
+ */
+export function findRouteHandlerPath(
+  ast: File,
+  method: string,
+  fullPath: string,
+): NodePath<CallExpression> | null {
+  const routerVarNames = collectRouterVarNames(ast);
+  const wantMethod = method.toLowerCase();
+  const lastSegment = fullPath.slice(fullPath.lastIndexOf('/') + 1);
+
+  const best: { path: NodePath<CallExpression> | null; suffixLen: number } = { path: null, suffixLen: -1 };
+
+  traverse(ast, {
+    CallExpression(callPath) {
+      const call = callPath.node;
+      const callee = call.callee;
+      if (!isMemberExpression(callee) || !isIdentifier(callee.object) || !isIdentifier(callee.property))
+        return;
+      if (!routerVarNames.has(callee.object.name)) return;
+      if (callee.property.name.toLowerCase() !== wantMethod) return;
+
+      const first = call.arguments[0];
+      if (!isStringLiteral(first)) return;
+      const pathSuffix = first.value;
+
+      const matches =
+        pathSuffix === fullPath ||
+        (pathSuffix !== '/' && fullPath.endsWith(pathSuffix)) ||
+        (pathSuffix === '/' && lastSegment === '');
+      if (!matches) return;
+      if (pathSuffix.length > best.suffixLen) {
+        best.path = callPath;
+        best.suffixLen = pathSuffix.length;
+      }
+    },
+  });
+
+  return best.path;
 }
 
 /**

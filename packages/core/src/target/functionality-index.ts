@@ -26,6 +26,10 @@ export interface FunctionalityUnit {
   responseSchema?: unknown;
   /** Whether this endpoint/route requires auth, when derivable from a spec's security scheme. */
   authRequired?: boolean;
+  /** Distinct HTTP status codes this unit's handler body explicitly sets — see target/ast/handler-signals.ts. Populated only by the post-approve deep-dive pass (target/deep-dive.ts), scoped to approved plan items; absent otherwise. */
+  observedStatusCodes?: number[];
+  /** Distinct thrown-error messages from this unit's handler body — same deep-dive-only provenance as observedStatusCodes. */
+  thrownErrorMessages?: string[];
 }
 
 export interface FunctionalityIndex {

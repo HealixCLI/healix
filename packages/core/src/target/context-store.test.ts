@@ -36,13 +36,13 @@ function sampleContext(overrides?: Partial<SourceContext>): SourceContext {
 }
 
 describe('persistSourceContext / loadSourceContext', () => {
-  it('round-trips a context through .healix/source-context.json', () => {
+  it('round-trips a context (and its hash) through .healix/source-context.json', () => {
     const dir = makeDir();
     const ctx = sampleContext();
-    persistSourceContext(dir, ctx);
+    persistSourceContext(dir, 'hash-abc123', ctx);
 
     expect(fs.existsSync(path.join(dir, '.healix', 'source-context.json'))).toBe(true);
-    expect(loadSourceContext(dir)).toEqual(ctx);
+    expect(loadSourceContext(dir)).toEqual({ hash: 'hash-abc123', context: ctx });
   });
 
   it('returns null when nothing has been persisted yet', () => {
@@ -55,6 +55,17 @@ describe('persistSourceContext / loadSourceContext', () => {
     fs.mkdirSync(path.join(dir, '.healix'), { recursive: true });
     fs.writeFileSync(path.join(dir, '.healix', 'source-context.json'), 'not valid json {{{', 'utf-8');
     expect(() => loadSourceContext(dir)).not.toThrow();
+    expect(loadSourceContext(dir)).toBeNull();
+  });
+
+  it('returns null for a legacy pre-envelope file (bare SourceContext, no hash/context wrapper)', () => {
+    const dir = makeDir();
+    fs.mkdirSync(path.join(dir, '.healix'), { recursive: true });
+    fs.writeFileSync(
+      path.join(dir, '.healix', 'source-context.json'),
+      JSON.stringify(sampleContext()),
+      'utf-8',
+    );
     expect(loadSourceContext(dir)).toBeNull();
   });
 
@@ -73,11 +84,11 @@ describe('persistSourceContext / loadSourceContext', () => {
         value: `hint-${i}`,
       })),
     });
-    persistSourceContext(dir, ctx);
+    persistSourceContext(dir, 'hash-abc123', ctx);
     const loaded = loadSourceContext(dir);
-    expect(loaded?.forms.length).toBe(50);
-    expect(loaded?.authPatterns.length).toBe(50);
-    expect(loaded?.selectorHints.length).toBe(200);
+    expect(loaded?.context.forms.length).toBe(50);
+    expect(loaded?.context.authPatterns.length).toBe(50);
+    expect(loaded?.context.selectorHints.length).toBe(200);
   });
 
   it('swallows a write failure rather than throwing (best-effort persistence)', () => {
@@ -85,7 +96,46 @@ describe('persistSourceContext / loadSourceContext', () => {
     vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
       throw new Error('disk full');
     });
-    expect(() => persistSourceContext(dir, sampleContext())).not.toThrow();
+    expect(() => persistSourceContext(dir, 'hash-abc123', sampleContext())).not.toThrow();
+  });
+
+  describe('hash-based cache invalidation', () => {
+    it('hash change forces recompute: different hash means cached context is not reused', () => {
+      const dir = makeDir();
+      const ctx1 = sampleContext({
+        units: [{ key: 'route:/v1', kind: 'route', label: 'route: /v1', file: 'src/v1.tsx' }],
+      });
+      persistSourceContext(dir, 'hash-v1', ctx1);
+
+      const loaded = loadSourceContext(dir);
+      expect(loaded?.hash).toBe('hash-v1');
+      expect(loaded?.context.units[0]?.key).toBe('route:/v1');
+
+      // Simulate a hash change (e.g., file modified)
+      const ctx2 = sampleContext({
+        units: [{ key: 'route:/v2', kind: 'route', label: 'route: /v2', file: 'src/v2.tsx' }],
+      });
+      persistSourceContext(dir, 'hash-v2', ctx2);
+
+      const reloaded = loadSourceContext(dir);
+      expect(reloaded?.hash).toBe('hash-v2');
+      expect(reloaded?.context.units[0]?.key).toBe('route:/v2');
+    });
+
+    it('unchanged hash skips recompute: same hash means cached context can be reused', () => {
+      const dir = makeDir();
+      const ctx = sampleContext();
+      const hash = 'hash-stable';
+
+      persistSourceContext(dir, hash, ctx);
+      const firstLoad = loadSourceContext(dir);
+
+      // Simulate a second load with the same hash - should return the same cached context
+      const secondLoad = loadSourceContext(dir);
+
+      expect(firstLoad?.hash).toBe(secondLoad?.hash);
+      expect(firstLoad?.context.units).toEqual(secondLoad?.context.units);
+    });
   });
 });
 
@@ -110,13 +160,14 @@ describe.skipIf(!fs.existsSync(RBAC_ROOT))(
       const ctx = await indexSource(RBAC_ROOT, { maxUnits: 500 });
       const scratch = makeDir();
 
-      persistSourceContext(scratch, ctx);
+      persistSourceContext(scratch, 'hash-abc123', ctx);
       const loaded = loadSourceContext(scratch);
 
       expect(loaded).not.toBeNull();
-      expect(loaded?.units.length).toBeGreaterThan(0);
-      expect(loaded?.units.map((u) => u.key)).toContain('endpoint:GET /api/users/:id');
-      expect(loaded?.authPatterns.some((a) => a.libraries.includes('jsonwebtoken'))).toBe(true);
+      expect(loaded?.hash).toBe('hash-abc123');
+      expect(loaded?.context.units.length).toBeGreaterThan(0);
+      expect(loaded?.context.units.map((u) => u.key)).toContain('endpoint:GET /api/users/:id');
+      expect(loaded?.context.authPatterns.some((a) => a.libraries.includes('jsonwebtoken'))).toBe(true);
     });
   },
 );

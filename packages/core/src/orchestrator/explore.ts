@@ -69,20 +69,53 @@ export function assessExplorationUsefulness(result: CrawlWithAuthResult): {
 const MAX_ENDPOINT_PROBES = 10;
 
 /**
+ * Stable-partition `units` so any unit whose key is in `priorityKeys` comes first, preserving
+ * relative order within each of the two groups — never a full re-sort, which would scramble the
+ * meaningful discovery order of everything NOT prioritized. A no-op (returns `units` as-is) when
+ * `priorityKeys` is absent/empty, so callers with nothing to prioritize pay no cost.
+ */
+function stablePartitionByPriority(
+  units: FunctionalityUnit[],
+  priorityKeys?: ReadonlySet<string>,
+): FunctionalityUnit[] {
+  if (!priorityKeys || priorityKeys.size === 0) return units;
+  const priority: FunctionalityUnit[] = [];
+  const rest: FunctionalityUnit[] = [];
+  for (const u of units) (priorityKeys.has(u.key) ? priority : rest).push(u);
+  return [...priority, ...rest];
+}
+
+/**
  * Split a static-analysis unit inventory (see target/source-index.ts) into the two shapes EXPLORE
  * needs: `route` units seed the browser crawl (they render a page), while `endpoint` (tierC, no
  * DOM route) units get a lightweight HTTP reachability probe instead — driving a browser to an
  * API-only path wastes a navigation on something that was never going to render a page. Endpoint
  * paths are capped at MAX_ENDPOINT_PROBES so a large API surface doesn't turn this into its own
  * slow crawl.
+ *
+ * `priorityKeys` (typically the approved plan's item.unitKey set) moves plan-selected units to
+ * the front of each list BEFORE any truncation: MAX_ENDPOINT_PROBES here for endpoints, and
+ * downstream crawl()'s own maxRoutes/FIFO-queue truncation for routes (crawler.ts's queue treats
+ * input order as visitation priority, so putting plan-relevant routes first is enough — no
+ * crawler.ts change needed). Without this, discovery order was arbitrary first-N order, so a
+ * route the approved plan actually needs could silently lose the coin flip to one nothing plans
+ * to test.
  */
-export function splitStaticUnitsForExplore(units: FunctionalityUnit[]): {
+export function splitStaticUnitsForExplore(
+  units: FunctionalityUnit[],
+  priorityKeys?: ReadonlySet<string>,
+): {
   routePaths: string[];
   endpointPaths: string[];
 } {
-  const routePaths = units.filter((u) => u.kind === 'route').map((u) => u.key.replace(/^route:/, ''));
-  const endpointPaths = units
-    .filter((u) => u.kind === 'endpoint')
+  const routePaths = stablePartitionByPriority(
+    units.filter((u) => u.kind === 'route'),
+    priorityKeys,
+  ).map((u) => u.key.replace(/^route:/, ''));
+  const endpointPaths = stablePartitionByPriority(
+    units.filter((u) => u.kind === 'endpoint'),
+    priorityKeys,
+  )
     .map((u) => u.key.replace(/^endpoint:(?:[A-Z]+ )?/, ''))
     .slice(0, MAX_ENDPOINT_PROBES);
   return { routePaths, endpointPaths };

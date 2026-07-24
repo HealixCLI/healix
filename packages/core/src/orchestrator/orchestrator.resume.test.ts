@@ -8,6 +8,8 @@ import { createOrchestrator } from './index.js';
 import { readCheckpoint } from './checkpoint.js';
 import { projectsDir } from '../env/app-data.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
+import { persistSourceContext } from '../target/context-store.js';
+import type { SourceContext } from '../target/source-context.js';
 import type {
   CompleteOptions,
   CompletionResult,
@@ -152,6 +154,8 @@ const fakeBrowser: BrowserSurface = {
 interface ExecuteProbe {
   generateCalls: number;
   executeCalls: number;
+  /** sourceContext seen by each generate() call, in call order — undefined entries mean none was passed. */
+  sourceContextsSeen?: Array<SourceContext | undefined>;
 }
 
 /** TestMode whose execute() throws once (simulating an interruption), then succeeds on any later call. */
@@ -165,6 +169,7 @@ function makeInterruptibleMode(probe: ExecuteProbe, shouldFail: boolean, failMes
     // from disk, so the fixture has to actually put them there.
     async generate(ctx: TestModeContext, _plan: TestPlan): Promise<GeneratedSpec[]> {
       probe.generateCalls += 1;
+      (probe.sourceContextsSeen ??= []).push(ctx.sourceContext);
       const specs: GeneratedSpec[] = [];
       for (const s of CANNED_SPECS) {
         const abs = join(ctx.projectDir, s.path);
@@ -436,6 +441,79 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     expect(summary.status).toBe('passed');
     expect(probe.generateCalls).toBe(1);
     expect(probe.executeCalls).toBe(1);
+  });
+
+  it('resume() reloads the cached source context so GENERATE is not silently ungrounded post-resume', async () => {
+    const repoDir = mkdtempSync(join(tmpdir(), 'healix-orch-resume-repo-'));
+    try {
+      const store = (await getStore()) as HealixStore;
+      const project = store.createProject({
+        name: 'Resume Source-Context Demo',
+        mode: 'playwright',
+        repoPath: repoDir,
+      });
+
+      let generateCalls = 0;
+      const failingMode: TestMode = {
+        id: 'playwright',
+        async scaffold(): Promise<void> {},
+        async generate(): Promise<GeneratedSpec[]> {
+          generateCalls += 1;
+          throw new Error('ECONNREFUSED 127.0.0.1:443');
+        },
+        async execute(): Promise<ExecOutcome> {
+          return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+        },
+        async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+          return { dir: 'artifacts', files: [] };
+        },
+        async export(): Promise<SuiteBundle> {
+          return { dir: 'export', files: [] };
+        },
+      };
+      const orchestrator = createOrchestrator({
+        provider: fakeProvider,
+        getMode: () => failingMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      });
+
+      const paused = await orchestrator.run({
+        projectId: project.id,
+        autoApprove: true,
+        testingScope: 'both',
+      });
+      expect(paused.status).toBe('paused');
+      expect(generateCalls).toBe(1);
+
+      // Overwrite whatever the initial (real, near-empty) indexSource() pass persisted with a
+      // controlled context carrying a distinctive unit — resume() must reload exactly this, not
+      // silently proceed with sourceContext undefined (the bug being fixed here).
+      const knownContext: SourceContext = {
+        units: [{ key: 'route:/known', kind: 'route', label: 'route: /known', file: 'src/Known.tsx' }],
+        forms: [],
+        authPatterns: [],
+        selectorHints: [],
+        specSources: [],
+        summary: 'Detected functionality: 1 route(s), 0 endpoint(s).',
+        truncated: false,
+      };
+      persistSourceContext(repoDir, 'irrelevant-for-resume', knownContext);
+
+      const probe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
+      const resumeOrchestrator = createOrchestrator({
+        provider: fakeProvider,
+        getMode: () => makeInterruptibleMode(probe, false, ''),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      });
+      const summary = await resumeOrchestrator.resume(paused.runId);
+      expect(summary.status).toBe('passed');
+      expect(probe.generateCalls).toBe(1);
+      expect(probe.sourceContextsSeen?.[0]?.units).toEqual(knownContext.units);
+    } finally {
+      rmSync(repoDir, { recursive: true, force: true });
+    }
   });
 
   it('MANUAL PAUSE mid-execute (no throw): an aborted-but-returned outcome settles paused/manual, not a false "complete"', async () => {

@@ -1,7 +1,8 @@
 import fs from 'node:fs';
 import path from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { extractExpressRouterInfo, resolveExpressEndpoints } from './endpoints.js';
+import { extractExpressRouterInfo, findRouteHandlerPath, resolveExpressEndpoints } from './endpoints.js';
+import { parseModule } from './parse.js';
 
 describe('extractExpressRouterInfo', () => {
   it('extracts single-file app.METHOD(...) registrations', () => {
@@ -56,6 +57,35 @@ describe('extractExpressRouterInfo', () => {
   it('returns null (not a throw) on malformed source', () => {
     expect(() => extractExpressRouterInfo('function ( { [[[', 'broken.js')).not.toThrow();
     expect(extractExpressRouterInfo('function ( { [[[', 'broken.js')).toBeNull();
+  });
+});
+
+describe('findRouteHandlerPath', () => {
+  it('picks the exact match over a shorter suffix match when both are plausible', () => {
+    const source = `
+      router.get('/users', (req, res) => res.status(1).send());
+      router.get('/api/users', (req, res) => res.status(2).send());
+    `;
+    const ast = parseModule(source, 'routes.js')!;
+    // '/api/users' both equals one registration exactly AND ends with the other's '/users' suffix
+    // — the exact/longest match ('/api/users' itself) must win, not the shorter '/users' one.
+    const found = findRouteHandlerPath(ast, 'GET', '/api/users');
+    expect(found).not.toBeNull();
+    const arg = found!.node.arguments[1];
+    expect(arg?.type).toBe('ArrowFunctionExpression');
+  });
+
+  it('returns null when no registration matches the method or path', () => {
+    const source = `router.get('/users', (req, res) => res.status(200).send());`;
+    const ast = parseModule(source, 'routes.js')!;
+    expect(findRouteHandlerPath(ast, 'POST', '/users')).toBeNull();
+    expect(findRouteHandlerPath(ast, 'GET', '/orders')).toBeNull();
+  });
+
+  it("doesn't match a bare '/' registration against an unrelated deeper path via naive suffix matching", () => {
+    const source = `router.get('/', (req, res) => res.status(200).send());`;
+    const ast = parseModule(source, 'routes.js')!;
+    expect(findRouteHandlerPath(ast, 'GET', '/users/:id')).toBeNull();
   });
 });
 

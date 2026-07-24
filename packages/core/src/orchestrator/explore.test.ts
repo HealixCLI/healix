@@ -150,6 +150,40 @@ describe('splitStaticUnitsForExplore()', () => {
     expect(result.endpointPaths).toHaveLength(10);
     expect(result.routePaths).toHaveLength(20);
   });
+
+  it('directed exploration: moves priority-keyed routes to the front, preserving relative order within each group', () => {
+    const { routePaths } = splitStaticUnitsForExplore(
+      [
+        unit('route', 'route:/home'),
+        unit('route', 'route:/dashboard'),
+        unit('route', 'route:/settings'),
+        unit('route', 'route:/checkout'),
+      ],
+      new Set(['route:/settings', 'route:/checkout']),
+    );
+    expect(routePaths).toEqual(['/settings', '/checkout', '/home', '/dashboard']);
+  });
+
+  it('directed exploration: a priority-keyed endpoint survives the MAX_ENDPOINT_PROBES truncation even when it would otherwise be cut off', () => {
+    const units = Array.from({ length: 20 }, (_, i) => unit('endpoint', `endpoint:GET /api/e${i}`));
+    // e15 is well past the 10-item cap in plain discovery order.
+    const { endpointPaths } = splitStaticUnitsForExplore(units, new Set(['endpoint:GET /api/e15']));
+    expect(endpointPaths).toContain('/api/e15');
+    expect(endpointPaths).toHaveLength(10);
+  });
+
+  it('directed exploration: an absent/empty priority set behaves identically to no priority at all', () => {
+    const units = [unit('route', 'route:/a'), unit('route', 'route:/b')];
+    expect(splitStaticUnitsForExplore(units, new Set())).toEqual(splitStaticUnitsForExplore(units));
+    expect(splitStaticUnitsForExplore(units, undefined)).toEqual(splitStaticUnitsForExplore(units));
+  });
+
+  it('directed exploration: a priority key matching nothing has no effect', () => {
+    const units = [unit('route', 'route:/a'), unit('route', 'route:/b')];
+    expect(splitStaticUnitsForExplore(units, new Set(['route:/nonexistent']))).toEqual(
+      splitStaticUnitsForExplore(units),
+    );
+  });
 });
 
 describe('assessExplorationUsefulness()', () => {

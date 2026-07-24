@@ -1985,7 +1985,12 @@ export async function attemptPlanCompletion(
   // often transient, and with a single-provider setup the fallback-provider
   // step below is otherwise a no-op — cheap insurance before giving up.
   emit('plan', 'info', `Retrying plan with the same provider "${provider.id}" after: ${last.reason}`);
-  await delay(PLAN_SAME_PROVIDER_RETRY_DELAY_MS);
+  // Only worth waiting out when the failure is a credits/quota exhaustion that plausibly
+  // clears itself briefly — a truncated-JSON or other transient provider hiccup is not helped
+  // by a fixed pause, so retry it immediately instead of paying the delay unconditionally.
+  if (classifyTransientFailure(last.reason) === 'credits-exhausted') {
+    await delay(PLAN_SAME_PROVIDER_RETRY_DELAY_MS);
+  }
   const retried = await attempt(provider);
   if (retried.plan) return retried;
   last = retried;

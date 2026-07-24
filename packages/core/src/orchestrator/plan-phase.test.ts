@@ -66,7 +66,11 @@ function fencedJson(value: unknown): string {
 }
 
 /** A provider whose plan completion fails `failTimes` times, then succeeds. */
-function makeFlakyProvider(failTimes: number, plan: unknown): ProviderAdapter & { calls: number } {
+function makeFlakyProvider(
+  failTimes: number,
+  plan: unknown,
+  failureDetail = 'transient failure',
+): ProviderAdapter & { calls: number } {
   const adapter = {
     id: 'claude' as const,
     label: 'Flaky Fake',
@@ -94,7 +98,7 @@ function makeFlakyProvider(failTimes: number, plan: unknown): ProviderAdapter & 
     async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
       adapter.calls += 1;
       if (opts?.mode === 'plan' && adapter.calls <= failTimes) {
-        return { provider: 'claude', ok: false, text: '', raw: null, detail: 'transient failure' };
+        return { provider: 'claude', ok: false, text: '', raw: null, detail: failureDetail };
       }
       return { provider: 'claude', ok: true, text: fencedJson(plan), raw: plan, detail: 'OK' };
     },
@@ -134,6 +138,21 @@ describe('runPlanPhase resilience', () => {
     // The literal synthesizePlan() smoke items — this IS the "few smoke tests" symptom.
     expect(plan.items.length).toBeGreaterThan(0);
     expect(provider.calls).toBe(2);
+  }, 10_000);
+
+  it('does NOT pause before a same-provider retry for an ordinary transient failure (only credits-exhausted warrants the delay)', async () => {
+    const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'transient failure');
+    const start = Date.now();
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
+    // The gated delay is 2000ms — an ungated retry completes in a small fraction of that.
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 10_000);
+
+  it('pauses before a same-provider retry when the failure is classified credits-exhausted', async () => {
+    const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'Error: insufficient credits — quota exceeded');
+    const start = Date.now();
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
+    expect(Date.now() - start).toBeGreaterThanOrEqual(1900);
   }, 10_000);
 
   it('attemptPlanCompletion requests taskType "plan-generate" (per-task-type model/effort routing)', async () => {

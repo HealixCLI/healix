@@ -298,7 +298,7 @@ export interface TestMode {
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
   /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
   validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
-  execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: Tier }): Promise<ExecOutcome>;
+  execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;
 }

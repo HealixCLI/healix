@@ -524,7 +524,7 @@ async function runPipeline(
    * redo GENERATE from scratch (nothing was lost); specs present means resume
    * can jump straight to EXECUTE.
    */
-  const buildCheckpoint = (completedTiers: Tier[]): ResumeCheckpoint => {
+  const buildCheckpoint = (executeComplete: boolean): ResumeCheckpoint => {
     const effectivePlan: TestPlan = plan ?? { summary: 'No plan yet.', items: [] };
     const suiteDir = ctx?.projectDir ?? join(runDir, 'suite');
     return {
@@ -553,7 +553,7 @@ async function runPipeline(
         reqTag: s.reqTag,
         tier: s.tier,
       })),
-      completedTiers,
+      executeComplete,
       partialOutcome: outcome
         ? {
             passed: outcome.passed,
@@ -572,9 +572,9 @@ async function runPipeline(
   const pauseRun = async (
     phase: OrchestratorPhase | string,
     reason: PauseReason,
-    completedTiers: Tier[] = [],
+    executeComplete = false,
   ): Promise<RunSummary> => {
-    await writeCheckpoint(runDir, buildCheckpoint(completedTiers));
+    await writeCheckpoint(runDir, buildCheckpoint(executeComplete));
     emit(phase, 'warn', `Run paused (${reason}); checkpoint saved for resume.`, { reason });
     setStatus('paused', { finishedAt: nowIso(), pauseReason: reason });
     return { runId, status: 'paused' };
@@ -583,11 +583,11 @@ async function runPipeline(
   /** At a cancellation boundary: honor a live pause request as 'paused' (resumable); otherwise cancel as today. */
   const pauseOrCancel = (
     phase: OrchestratorPhase | string,
-    completedTiers: Tier[] = [],
+    executeComplete = false,
     cancelMessage?: string,
   ): Promise<RunSummary> =>
     isPauseRequested()
-      ? pauseRun(phase, 'manual', completedTiers)
+      ? pauseRun(phase, 'manual', executeComplete)
       : Promise.resolve(cancelMessage ? cancelRun(phase, cancelMessage) : cancelRun(phase));
 
   try {
@@ -842,7 +842,7 @@ async function runPipeline(
           // gate's eventual result is simply discarded after an abort.
           const gate = await raceAbort(hooks.onPlan(plan), signal);
           if (gate === ABORTED) {
-            return await pauseOrCancel('approve', [], 'Run cancelled while awaiting approval.');
+            return await pauseOrCancel('approve', false, 'Run cancelled while awaiting approval.');
           }
           result = gate;
         } catch (err) {
@@ -1399,7 +1399,7 @@ async function runPipeline(
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
-        await writeCheckpoint(runDir, buildCheckpoint([]));
+        await writeCheckpoint(runDir, buildCheckpoint(false));
       } catch (err) {
         // A pause request aborts ctx.signal, which is exactly what kills an
         // in-flight provider call — so a live pause surfaces here as some
@@ -1407,14 +1407,14 @@ async function runPipeline(
         // signature. Check isPauseRequested() FIRST: it's the direct cause,
         // regardless of what the resulting error message happens to say.
         if (isPauseRequested()) {
-          return await pauseRun('generate', 'manual', []);
+          return await pauseRun('generate', 'manual', false);
         }
         // Otherwise, a systemic provider outage (see ProviderUnavailableError/
         // generate.ts) is worth pausing+resuming rather than hard-failing —
         // anything else (a genuine bug/bad config) keeps failing as before.
         const classified = classifyTransientFailure(errMsg(err));
         if (classified) {
-          return await pauseRun('generate', classified, []);
+          return await pauseRun('generate', classified, false);
         }
         emit('generate', 'error', `Generation failed: ${errMsg(err)}`, { stack: errStack(err) });
         setStatus('error', { finishedAt: nowIso() });
@@ -1439,75 +1439,78 @@ async function runPipeline(
     }
 
     // ---- 8. EXECUTE ----
-    // Split into one Playwright invocation per in-scope tier (mode.execute's
-    // `onlyTier` option) rather than one call for the whole suite: Playwright's
-    // JSON reporter doesn't give reliable partial results if the process dies
-    // mid-suite, so a tier boundary is the finest granularity a checkpoint can
-    // safely rely on. Already-completed tiers (from a resumed checkpoint) are
-    // skipped entirely.
+    // All in-scope tiers run in a SINGLE Playwright invocation instead of one
+    // process per tier — Playwright's own scheduler runs independent tiers
+    // concurrently and sequences tierB-auth after auth-setup via each
+    // project's own `dependencies` (see playwrightConfigContents in
+    // templates.ts), so there's no correctness reason to force them apart at
+    // the orchestrator level. Resume no longer needs tier-level bookkeeping
+    // here either: mode.execute() carries its own write-through, test-level
+    // checkpoint (see modes/playwright/execute.ts and templates.ts's
+    // checkpointReporterContents()) and transparently skips whatever already
+    // finished in an earlier, interrupted attempt — this only needs to know
+    // whether the WHOLE execute step is done yet.
     if (checkCancelled()) return await pauseOrCancel('execute');
     setStatus('executing');
-    const alreadyDoneTiers = new Set<Tier>(
-      resumeFrom?.checkpoint.phase === 'execute' ? resumeFrom.checkpoint.completedTiers : [],
-    );
-    const tiersToRun = tiersForScope(opts.testingScope ?? 'both').filter(
-      (t) => !alreadyDoneTiers.has(t) && specs.some((s) => s.tier === t),
-    );
     if (!outcome) outcome = { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
-    const completedTiers: Tier[] = [...alreadyDoneTiers];
-    emit(
-      'execute',
-      'info',
-      `Executing ${specs.length} spec(s) across ${tiersToRun.length} tier(s)` +
-        (completedTiers.length > 0 ? ` (${completedTiers.length} tier(s) already done).` : '.'),
-    );
-    try {
-      for (const tier of tiersToRun) {
-        if (checkCancelled()) return await pauseOrCancel('execute', completedTiers);
-        const tierSpecs = specs.filter((s) => s.tier === tier);
-        emit('execute', 'info', `Executing tier ${tier} (${tierSpecs.length} spec(s)).`);
-        const tierOutcome = await mode.execute(ctx, tierSpecs, { onlyTier: tier });
-        persistResults(store, runId, tierSpecs, tierOutcome, testIdByKey, noteStoreOk, noteStoreFailure);
-        outcome = mergeExecOutcomes(outcome, tierOutcome);
-        completedTiers.push(tier);
-        await writeCheckpoint(runDir, buildCheckpoint(completedTiers));
+    let executeComplete =
+      resumeFrom?.checkpoint.phase === 'execute' ? resumeFrom.checkpoint.executeComplete : false;
+    if (executeComplete) {
+      emit('execute', 'info', 'Execute phase already complete (resumed); skipping re-execution.');
+    } else {
+      emit('execute', 'info', `Executing ${specs.length} spec(s).`);
+      try {
+        const freshOutcome = await mode.execute(ctx, specs);
+        // A live pause/cancel aborts ctx.signal, which is what makes an
+        // in-flight Playwright invocation return early — as a normal
+        // (non-throwing) zeroed/aborted outcome, not an exception (see
+        // modes/playwright/execute.ts's abortedOutcome()). checkCancelled()
+        // reads the orchestrator's OWN signal directly, independent of
+        // whatever the mode happened to return, so this catches that case
+        // correctly instead of misreading an aborted call as a genuinely
+        // completed (zero passed, zero failed) execute phase.
+        if (checkCancelled()) return await pauseOrCancel('execute', executeComplete);
+        outcome = freshOutcome;
+        persistResults(store, runId, specs, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
+        executeComplete = true;
+        await writeCheckpoint(runDir, buildCheckpoint(executeComplete));
+        emit('execute', 'info', `Execution complete: ${outcome.passed} passed, ${outcome.failed} failed.`, {
+          passed: outcome.passed,
+          failed: outcome.failed,
+          blocked: outcome.blocked,
+          flaky: outcome.flaky,
+        });
+      } catch (err) {
+        // Same reasoning as GENERATE's catch: a live pause aborts ctx.signal,
+        // which is what actually kills an in-flight Playwright invocation — so
+        // check isPauseRequested() before trying to pattern-match the error text.
+        if (isPauseRequested()) {
+          return await pauseRun('execute', 'manual', executeComplete);
+        }
+        const classified = classifyTransientFailure(errMsg(err));
+        if (classified) {
+          return await pauseRun('execute', classified, executeComplete);
+        }
+        emit('execute', 'error', `Execution failed: ${errMsg(err)}`, { stack: errStack(err) });
+        setStatus('error', { finishedAt: nowIso() });
+        const summary = await finalizeReport(
+          store,
+          runDir,
+          run,
+          project,
+          currentStatus,
+          plan,
+          outcome,
+          triageEntries,
+          artifactFiles,
+          externalDependencies,
+          computeMockedRequestCounts(mockServerHandle),
+          noteStoreOk,
+          noteStoreFailure,
+          { generationStats, coverage: coverageSummary },
+        );
+        return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
       }
-      emit('execute', 'info', `Execution complete: ${outcome.passed} passed, ${outcome.failed} failed.`, {
-        passed: outcome.passed,
-        failed: outcome.failed,
-        blocked: outcome.blocked,
-        flaky: outcome.flaky,
-      });
-    } catch (err) {
-      // Same reasoning as GENERATE's catch: a live pause aborts ctx.signal,
-      // which is what actually kills an in-flight Playwright invocation — so
-      // check isPauseRequested() before trying to pattern-match the error text.
-      if (isPauseRequested()) {
-        return await pauseRun('execute', 'manual', completedTiers);
-      }
-      const classified = classifyTransientFailure(errMsg(err));
-      if (classified) {
-        return await pauseRun('execute', classified, completedTiers);
-      }
-      emit('execute', 'error', `Execution failed: ${errMsg(err)}`, { stack: errStack(err) });
-      setStatus('error', { finishedAt: nowIso() });
-      const summary = await finalizeReport(
-        store,
-        runDir,
-        run,
-        project,
-        currentStatus,
-        plan,
-        outcome,
-        triageEntries,
-        artifactFiles,
-        externalDependencies,
-        computeMockedRequestCounts(mockServerHandle),
-        noteStoreOk,
-        noteStoreFailure,
-        { generationStats, coverage: coverageSummary },
-      );
-      return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
     }
 
     // ---- 8b. COLLECT ARTIFACTS (best-effort) ----
@@ -1534,7 +1537,7 @@ async function runPipeline(
     // since they are strictly additive within the tiers/scope already approved
     // in the initial plan — every iteration still emits a clear message so this
     // is never silent about what it's adding or why it stopped.
-    if (checkCancelled()) return await pauseOrCancel('generate', completedTiers);
+    if (checkCancelled()) return await pauseOrCancel('generate', executeComplete);
     if (suiteMode === 'reuse' || !repoIndex?.functionality || repoIndex.functionality.length === 0) {
       emit('generate', 'debug', 'Skipping coverage loop (reuse mode or no functionality inventory).');
     } else {
@@ -1679,7 +1682,7 @@ async function runPipeline(
     // Blocked outcomes are triaged too: a blocked test is precisely where
     // classification is least certain (was it really a prerequisite failure,
     // or a mislabeled defect?), so skipping them hid defects from the report.
-    if (checkCancelled()) return await pauseOrCancel('triage', completedTiers);
+    if (checkCancelled()) return await pauseOrCancel('triage', executeComplete);
     setStatus('triaging');
     try {
       const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
@@ -1788,7 +1791,7 @@ async function runPipeline(
     }
 
     // ---- 10. REPORT ----
-    if (checkCancelled()) return await pauseOrCancel('report', completedTiers);
+    if (checkCancelled()) return await pauseOrCancel('report', executeComplete);
     setStatus('reporting');
     if (generationStats.requestedItems > generationStats.acceptedItems) {
       const dropped = generationStats.requestedItems - generationStats.acceptedItems;
@@ -1822,7 +1825,7 @@ async function runPipeline(
     // ---- 11. EXPORT (best-effort) ----
     // Prefer the mode's own export() for the suite bundle; fall back to the
     // standalone exportSuite() if it throws. Either way, never abort the run.
-    if (checkCancelled()) return await pauseOrCancel('export', completedTiers);
+    if (checkCancelled()) return await pauseOrCancel('export', executeComplete);
     let suite: RunSummary['suite'];
     try {
       emit('export', 'info', 'Exporting suite bundle.');

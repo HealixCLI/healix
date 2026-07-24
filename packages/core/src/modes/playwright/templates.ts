@@ -4,6 +4,16 @@ import type { MockResponse } from '../../target/types.js';
 /** The three tiers a scaffolded suite always provisions, in execution order. */
 export const TIERS: Tier[] = ['tierA-public', 'tierB-auth', 'tierC-api'];
 
+/**
+ * Write-through per-test checkpoint file (see checkpointReporterContents()),
+ * read back by execute.ts to resume mid-suite after an interruption. Lives at
+ * the suite's project root, alongside results.json — not under fixtures/.
+ */
+export const EXEC_CHECKPOINT_FILENAME = 'healix-exec-checkpoint.ndjson';
+
+/** `--test-list-invert` file execute.ts builds from EXEC_CHECKPOINT_FILENAME's entries before a resumed run. */
+export const EXEC_CHECKPOINT_INVERT_FILENAME = 'healix-completed-tests.txt';
+
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -68,11 +78,32 @@ export function playwrightConfigContents(opts: ConfigOptions = {}): string {
     : "process.env.HEALIX_BASE_URL || 'http://localhost:3000'";
 
   return `import { defineConfig, devices } from '@playwright/test';
+import { cpus, freemem } from 'node:os';
 
 /**
  * Healix-generated Playwright config.
  * Projects mirror the Healix tiers; edit baseURL via HEALIX_BASE_URL or below.
  */
+
+// Workers are sized to the machine's own headroom instead of a fixed number:
+// this suite runs on the user's own desktop (often alongside their IDE/
+// browser/other apps, not a dedicated CI runner), so saturating every core or
+// every free byte of RAM would make the whole machine sluggish mid-run rather
+// than just finishing tests faster. Leaves one core free for the OS/host app,
+// and bounds by free RAM since each worker launches its own Chromium instance
+// (memory-hungry, especially with video/trace recording always on — see the
+// \`use\` block below). CI keeps a fixed worker count instead of trusting
+// os.cpus()/os.freemem() — containerized CI runners often report the HOST's
+// full capacity while only being allotted a cgroup-limited slice of it.
+function computeWorkers() {
+  const cpuCount = cpus().length;
+  const freeMemGB = freemem() / 1024 ** 3;
+  const GB_PER_WORKER = 0.75; // headed Chromium + video/trace recording, empirically ample
+  const cpuBound = Math.max(1, cpuCount - 1);
+  const memBound = Math.max(1, Math.floor(freeMemGB / GB_PER_WORKER));
+  return Math.max(1, Math.min(cpuBound, memBound));
+}
+
 export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
@@ -81,7 +112,7 @@ export default defineConfig({
   // to register as flaky). Default to 1 locally too — gating on CI meant flaky
   // was never detectable on a local \`healix run\`. Override with HEALIX_RETRIES.
   retries: process.env.HEALIX_RETRIES ? Number(process.env.HEALIX_RETRIES) : process.env.CI ? 2 : 1,
-  workers: process.env.CI ? 1 : undefined,
+  workers: process.env.CI ? 1 : computeWorkers(),
   timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: [
@@ -95,6 +126,14 @@ export default defineConfig({
     // test actually did (clicked, filled, navigated, asserted...) step by
     // step, for passed tests too, not just failures.
     ['./fixtures/steps-reporter.cjs'],
+    // Write-through per-test checkpoint (see fixtures/checkpoint-reporter.cjs's
+    // own doc comment) — lets an interrupted run resume by skipping only the
+    // tests that already finished, instead of redoing the whole suite. This is
+    // also what makes it safe for all three tiers to run in a single combined
+    // invocation below (instead of one Playwright process per tier): a crash
+    // mid-run no longer loses per-tier progress, since progress is now tracked
+    // per test regardless of which tier(s) were still in flight together.
+    ['./fixtures/checkpoint-reporter.cjs'],
   ],
   use: {
     baseURL: ${baseUrlLiteral},
@@ -207,6 +246,89 @@ class HealixStepsReporter {
 }
 
 module.exports = HealixStepsReporter;
+`;
+}
+
+/**
+ * Custom Playwright reporter that persists every FINISHED test's identity to
+ * disk THE MOMENT it finishes, instead of buffering until onEnd() like
+ * HealixStepsReporter above (which exists purely for cosmetic step detail and
+ * can afford to lose everything on a crash). This file is what makes resuming
+ * a killed/paused execution safe: execute.ts reads it back and passes
+ * `--test-list-invert` on the next attempt so already-finished tests are never
+ * re-run. Without a write-through reporter, a mid-run crash loses every result
+ * Playwright already produced, forcing a resume to redo the entire suite from
+ * scratch — the same problem that used to require one Playwright invocation
+ * PER TIER just to get a coarse, tier-boundary checkpoint.
+ *
+ * Only appends once a test's fate is TRULY final — `result.status ===
+ * 'passed'` (no more retries needed) OR `result.retry >= test.retries` (every
+ * configured retry has been used) — never on an earlier failing attempt that
+ * still has retries left. `test.outcome()` looks tempting for this, but it
+ * reflects only the attempts seen SO FAR: verified empirically that a test
+ * failing on attempt 1 of a 2-retry config already reports outcome() ===
+ * 'unexpected', even though Playwright hasn't given up on it yet. Treating
+ * that as final would wrongly skip a test on resume that deserved another
+ * retry attempt.
+ *
+ * The key format ("[project] › file › describe › test") matches EXACTLY what
+ * `npx playwright test --list` / `--test-list-invert` expect — verified
+ * against a real Playwright run — built straight from test.titlePath() rather
+ * than hand-reconstructed from file paths, so it stays correct across
+ * Playwright versions rather than depending on this code guessing right.
+ */
+export function checkpointReporterContents(): string {
+  return `const fs = require('node:fs');
+const path = require('node:path');
+
+const CHECKPOINT_FILE = ${JSON.stringify(EXEC_CHECKPOINT_FILENAME)};
+// Same pattern as steps-reporter.cjs: Playwright's error messages carry
+// terminal color escape codes by default — left unstripped they render as
+// garbled control characters wherever this checkpoint's error text surfaces
+// (e.g. a Tier B row restored from an interrupted attempt, in execute.ts's
+// checkpointEntriesToOutcome).
+const ANSI_RE = /[\\u001b\\u009b][[\\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+function stripAnsi(text) {
+  return (text || '').replace(ANSI_RE, '');
+}
+
+function titleInfo(test) {
+  const parts = test.titlePath().slice(1); // drop the leading '' root entry
+  return {
+    project: parts[0],
+    specFile: parts[1],
+    title: parts[parts.length - 1],
+    key: '[' + parts[0] + '] \\u203a ' + parts.slice(1).join(' \\u203a '),
+  };
+}
+
+class HealixCheckpointReporter {
+  onTestEnd(test, result) {
+    const isFinal = result.status === 'passed' || result.retry >= test.retries;
+    if (!isFinal) return;
+    try {
+      const info = titleInfo(test);
+      const errorText = result.error
+        ? stripAnsi(result.error.stack || result.error.message || String(result.error))
+        : undefined;
+      const line =
+        JSON.stringify({
+          key: info.key,
+          title: info.title,
+          project: info.project,
+          specFile: info.specFile,
+          status: test.outcome(),
+          durationMs: Math.round(result.duration || 0),
+          error: errorText,
+        }) + '\\n';
+      fs.appendFileSync(path.join(process.cwd(), CHECKPOINT_FILE), line, 'utf-8');
+    } catch {
+      // best-effort — never fail the actual test run over this
+    }
+  }
+}
+
+module.exports = HealixCheckpointReporter;
 `;
 }
 

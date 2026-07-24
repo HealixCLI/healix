@@ -32,7 +32,7 @@ const SAMPLE: ResumeCheckpoint = {
   plan: { summary: 'plan', items: [] },
   generatedItemIds: ['pli_1'],
   generatedSpecs: [{ path: 'tests/tierA-public/foo.spec.ts', title: 'Foo', tier: 'tierA-public' }],
-  completedTiers: [],
+  executeComplete: false,
   updatedAt: new Date(2024, 0, 1).toISOString(),
 };
 
@@ -51,6 +51,35 @@ describe('checkpoint read/write', () => {
 
   it('never throws when the directory is unwritable/missing', async () => {
     await expect(writeCheckpoint('/nonexistent/deeply/nested/path', SAMPLE)).resolves.toBeUndefined();
+  });
+
+  it('reads a pre-PR-#58 checkpoint.json (completedTiers, no executeComplete) without throwing', async () => {
+    // Shape written by the OLD tier-level-resume code, before executeComplete
+    // replaced completedTiers. A run paused right before this change deployed
+    // would leave exactly this file on disk.
+    const dir = makeRunDir();
+    const legacy = {
+      runId: 'run_legacy',
+      projectId: 'prj_1',
+      phase: 'execute',
+      runOptions: { testingScope: 'both', suiteMode: 'fresh' },
+      plan: { summary: 'plan', items: [] },
+      generatedItemIds: ['pli_1'],
+      generatedSpecs: [{ path: 'tests/tierA-public/foo.spec.ts', title: 'Foo', tier: 'tierA-public' }],
+      completedTiers: ['tierA-public'],
+      updatedAt: new Date(2024, 0, 1).toISOString(),
+    };
+    fs.writeFileSync(path.join(dir, 'checkpoint.json'), JSON.stringify(legacy, null, 2), 'utf-8');
+
+    const read = await readCheckpoint(dir);
+    expect(read).not.toBeNull();
+    // No `executeComplete` key was ever written by the old shape — reading it
+    // back is `undefined`, which orchestrator/index.ts's resume logic
+    // (`resumeFrom?.checkpoint.executeComplete`) naturally treats as falsy,
+    // i.e. "not complete". This is the actual, intentional degradation path:
+    // an in-flight pre-upgrade paused run resumes by fully re-executing the
+    // suite rather than crashing or misreading stale per-tier bookkeeping.
+    expect(read?.executeComplete).toBeUndefined();
   });
 });
 

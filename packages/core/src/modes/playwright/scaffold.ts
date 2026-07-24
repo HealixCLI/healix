@@ -7,6 +7,7 @@ import {
   TIERS,
   actionHighlighterFixtureContents,
   authSetupContents,
+  checkpointReporterContents,
   gitignoreContents,
   mockFixtureContents,
   packageJsonContents,
@@ -140,6 +141,7 @@ export async function scaffold(ctx: TestModeContext): Promise<void> {
     [join(fixturesDir, 'auth.setup.ts'), authSetupContents()],
     [join(fixturesDir, 'action-highlighter.ts'), actionHighlighterFixtureContents()],
     [join(fixturesDir, 'steps-reporter.cjs'), stepsReporterContents()],
+    [join(fixturesDir, 'checkpoint-reporter.cjs'), checkpointReporterContents()],
     [join(projectDir, 'README.md'), suiteReadmeContents({ baseUrl: ctx.baseUrl })],
     [join(projectDir, '.gitignore'), gitignoreContents()],
   ];

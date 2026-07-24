@@ -1645,6 +1645,30 @@ describe('orchestrator paths (offline DI seam)', () => {
         { onEvent: (e) => events3.push(e) },
       );
       expect(reusedMessage(events3)).toBeUndefined();
+
+      // Run 4: repo untouched again since run 3 — must reuse (re-establishes a clean baseline).
+      const events4: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events4.push(e) },
+      );
+      expect(reusedMessage(events4)).toBeDefined();
+
+      // Spec-only edit: no .js file touched, only a Postman collection — indexSource() treats
+      // spec files as AUTHORITATIVE, so this alone must invalidate the cache too (regression
+      // check for computeRepoSourceHash folding findSpecFiles() into its fingerprint).
+      writeFileSync(
+        join(repoPath, 'API.postman_collection.json'),
+        JSON.stringify({ info: { name: 'API' }, item: [] }),
+      );
+
+      // Run 5: only the spec file changed — must recompute (no "Reused" message).
+      const events5: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events5.push(e) },
+      );
+      expect(reusedMessage(events5)).toBeUndefined();
     } finally {
       rmSync(repoPath, { recursive: true, force: true });
     }

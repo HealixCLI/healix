@@ -40,19 +40,28 @@ const WALK_HARD_CAP = 5000;
  * NEVER content (hashing every file's bytes would cost close to what indexSource() itself
  * costs, defeating the point of a cache check). Mirrors indexSource()'s own walkSourceFiles()
  * call (same cap, same extra extensions) so the hash reflects exactly the file set indexSource()
- * would process — a file added/removed/touched anywhere in that set changes the hash.
+ * would process — a file added/removed/touched anywhere in that set changes the hash. Also folds
+ * in findSpecFiles()'s OpenAPI/Postman/GraphQL spec files: indexSource() treats those as
+ * AUTHORITATIVE (a spec-derived unit always overrides a code-derived one on a key collision), so
+ * editing one must invalidate the cache exactly like editing a route file does — omitting them
+ * would silently serve a stale, incorrect sourceContext after a spec-only change.
  */
 export function computeRepoSourceHash(repoPath: string): string {
   const root = path.resolve(repoPath);
   const { files } = walkSourceFiles(root, WALK_HARD_CAP, { extraExtensions: MULTILANG_EXTENSIONS });
-  const parts = files.map((f) => {
+  const specFiles = findSpecFiles(root);
+  const fingerprint = (abs: string, rel: string): string => {
     try {
-      const st = fs.statSync(f.abs);
-      return `${f.rel}:${st.size}:${st.mtimeMs}`;
+      const st = fs.statSync(abs);
+      return `${rel}:${st.size}:${st.mtimeMs}`;
     } catch {
-      return `${f.rel}:?:?`;
+      return `${rel}:?:?`;
     }
-  });
+  };
+  const parts = [
+    ...files.map((f) => fingerprint(f.abs, f.rel)),
+    ...specFiles.map((abs) => fingerprint(abs, path.relative(root, abs).split(path.sep).join('/'))),
+  ];
   parts.sort();
   return createHash('sha256').update(parts.join('\n')).digest('hex');
 }

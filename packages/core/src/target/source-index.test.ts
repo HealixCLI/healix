@@ -52,6 +52,32 @@ describe('computeRepoSourceHash', () => {
 
     expect(computeRepoSourceHash(dir)).not.toBe(before);
   });
+
+  // indexSource() treats spec files as AUTHORITATIVE (a spec-derived unit always overrides a
+  // code-derived one on a key collision) — the hash must notice a spec-only edit even when no
+  // regular source file changed, or a stale sourceContext would silently keep serving pre-edit
+  // spec-derived units forever.
+  it('changes when a Postman collection is added (spec files are authoritative, not just source)', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    const before = computeRepoSourceHash(dir);
+    write(dir, 'API.postman_collection.json', '{"info":{"name":"API"},"item":[]}');
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
+
+  it('changes when an existing OpenAPI spec is modified, with no other file touched', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    write(dir, 'docs/openapi.yaml', 'openapi: 3.0.0\npaths: {}\n');
+    const before = computeRepoSourceHash(dir);
+
+    const abs = path.join(dir, 'docs', 'openapi.yaml');
+    fs.writeFileSync(abs, 'openapi: 3.0.0\npaths:\n  /new:\n    get: {}\n', 'utf-8');
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(abs, future, future);
+
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
 });
 
 describe('indexSource', () => {

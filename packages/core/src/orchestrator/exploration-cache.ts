@@ -75,7 +75,7 @@ export function loadExplorationCache(
     const cachedAtMs = Date.parse(obj.cachedAt);
     if (!Number.isFinite(cachedAtMs)) return null;
     const age = Date.now() - cachedAtMs;
-    if (age < 0 || age > maxAgeMs) return null;
+    if (age < 0 || age >= maxAgeMs) return null;
     return obj.artifact;
   } catch {
     return null;

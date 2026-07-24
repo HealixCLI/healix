@@ -686,7 +686,7 @@ function routePathForItem(ctx: TestModeContext, item: TestPlanItem | undefined):
  * FULL list whenever nothing matches (no route path to filter by, or the filter would leave
  * nothing) — grounding must never go from "too much" to "none" just because the match missed.
  */
-function filterRoutesForItem<T extends { url: string }>(routes: T[], routePath: string | null): T[] {
+export function filterRoutesForItem<T extends { url: string }>(routes: T[], routePath: string | null): T[] {
   if (!routePath) return routes;
   const matched = routes.filter((r) => r.url.includes(routePath));
   return matched.length > 0 ? matched : routes;

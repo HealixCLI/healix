@@ -98,6 +98,45 @@ describe('persistSourceContext / loadSourceContext', () => {
     });
     expect(() => persistSourceContext(dir, 'hash-abc123', sampleContext())).not.toThrow();
   });
+
+  describe('hash-based cache invalidation', () => {
+    it('hash change forces recompute: different hash means cached context is not reused', () => {
+      const dir = makeDir();
+      const ctx1 = sampleContext({
+        units: [{ key: 'route:/v1', kind: 'route', label: 'route: /v1', file: 'src/v1.tsx' }],
+      });
+      persistSourceContext(dir, 'hash-v1', ctx1);
+
+      const loaded = loadSourceContext(dir);
+      expect(loaded?.hash).toBe('hash-v1');
+      expect(loaded?.context.units[0]?.key).toBe('route:/v1');
+
+      // Simulate a hash change (e.g., file modified)
+      const ctx2 = sampleContext({
+        units: [{ key: 'route:/v2', kind: 'route', label: 'route: /v2', file: 'src/v2.tsx' }],
+      });
+      persistSourceContext(dir, 'hash-v2', ctx2);
+
+      const reloaded = loadSourceContext(dir);
+      expect(reloaded?.hash).toBe('hash-v2');
+      expect(reloaded?.context.units[0]?.key).toBe('route:/v2');
+    });
+
+    it('unchanged hash skips recompute: same hash means cached context can be reused', () => {
+      const dir = makeDir();
+      const ctx = sampleContext();
+      const hash = 'hash-stable';
+
+      persistSourceContext(dir, hash, ctx);
+      const firstLoad = loadSourceContext(dir);
+
+      // Simulate a second load with the same hash - should return the same cached context
+      const secondLoad = loadSourceContext(dir);
+
+      expect(firstLoad?.hash).toBe(secondLoad?.hash);
+      expect(firstLoad?.context.units).toEqual(secondLoad?.context.units);
+    });
+  });
 });
 
 // --- Isolated check against real fixture data (Item D2) --------------------

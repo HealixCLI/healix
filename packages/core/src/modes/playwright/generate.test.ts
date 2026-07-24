@@ -25,6 +25,7 @@ import {
   demoteEscapeHatchBlocks,
   findForbiddenApis,
   findUngroundedReferences,
+  filterRoutesForItem,
   formatMockContent,
   generate,
   ProviderUnavailableError,
@@ -887,6 +888,102 @@ describe('generate — batched generation (multiple items per provider call)', (
     await rm(projectDir, { recursive: true, force: true });
   });
 
+  it('byte-identical regression pin: batch extraction produces deterministic, repeatable spec contents', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const reply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': specFor('REQ-B'),
+    });
+
+    const specs1 = await generate(makeCtx(makeProvider([reply], calls)), plan);
+    const callCount1 = calls.length;
+
+    // Re-run with identical input - should produce byte-identical output
+    calls = [];
+    const specs2 = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    expect(specs1).toHaveLength(specs2.length);
+    for (let i = 0; i < specs1.length; i++) {
+      expect(specs1[i].contents).toBe(specs2[i].contents);
+      expect(specs1[i].path).toBe(specs2[i].path);
+    }
+    expect(callCount1).toBe(calls.length);
+  });
+
+  it('fake batch provider: all-good batch succeeds without retries', async () => {
+    const plan: TestPlan = {
+      summary: 'three items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B'), planItem('c', 'REQ-C')],
+    };
+    const reply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': specFor('REQ-B'),
+      'REQ-C': specFor('REQ-C'),
+    });
+
+    const specs = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(specs).toHaveLength(3);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
+  });
+
+  it('fake batch provider: missing BEGIN/END markers triggers split into solo retries', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // Reply without proper markers - should trigger split
+    const badReply = 'garbage without markers';
+
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        if (calls.length === 1) {
+          return { provider: 'claude', ok: true, text: badReply, raw: null, detail: '' };
+        }
+        // Solo retries return valid specs
+        const reqTag = prompt.includes('REQ-A') ? 'REQ-A' : 'REQ-B';
+        return { provider: 'claude', ok: true, text: specFor(reqTag), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), plan);
+
+    // 1 batch call + 2 solo retries
+    expect(calls).toHaveLength(3);
+    expect(specs).toHaveLength(2);
+  });
+
+  it('fake batch provider: one item fails validation triggers solo fallback for that item only', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // REQ-A valid, REQ-B invalid (no expect)
+    const badBatchReply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': `import { test, expect } from '@playwright/test';\ntest('[REQ:REQ-B] positive: does nothing', async ({ page }) => {\n  await page.goto('/');\n});\n`,
+    });
+    const soloRetryReply = specFor('REQ-B', 'solo-retried version');
+
+    const specs = await generate(makeCtx(makeProvider([badBatchReply, soloRetryReply], calls)), plan);
+
+    // 1 batch call + 1 solo retry for REQ-B only
+    expect(calls).toHaveLength(2);
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
   function makeCtx(provider: ProviderAdapter): TestModeContext {
     return {
       projectDir,
@@ -1655,6 +1752,58 @@ test('[REQ:${reqTag}] renders', async ({ page }) => {
 // --- Isolated check against a real fixture repo (Item E2) -------------------
 // Runs indexSource() against the real RBAC backend to get a genuine matched unit, then confirms
 // generate() cites its real file and the citation gate rejects a spec that omits it.
+
+describe('filterRoutesForItem — per-item route filtering with never-empty fallback', () => {
+  it('filters routes to those containing the routePath when provided', () => {
+    const routes = [
+      { url: 'https://app.test/home' },
+      { url: 'https://app.test/dashboard' },
+      { url: 'https://app.test/settings' },
+    ];
+    const filtered = filterRoutesForItem(routes, '/dashboard');
+    expect(filtered).toEqual([{ url: 'https://app.test/dashboard' }]);
+  });
+
+  it('returns all routes when routePath is null (no filtering)', () => {
+    const routes = [
+      { url: 'https://app.test/home' },
+      { url: 'https://app.test/dashboard' },
+    ];
+    const filtered = filterRoutesForItem(routes, null);
+    expect(filtered).toEqual(routes);
+  });
+
+  it('never-empty fallback: returns all routes when filter would leave nothing', () => {
+    const routes = [
+      { url: 'https://app.test/home' },
+      { url: 'https://app.test/dashboard' },
+    ];
+    const filtered = filterRoutesForItem(routes, '/nonexistent');
+    expect(filtered).toEqual(routes);
+  });
+
+  it('never-empty fallback: returns all routes when no route matches the path', () => {
+    const routes = [
+      { url: 'https://app.test/home' },
+      { url: 'https://app.test/dashboard' },
+    ];
+    const filtered = filterRoutesForItem(routes, '/admin');
+    expect(filtered).toEqual(routes);
+  });
+
+  it('partial match: filters routes where URL includes the path substring', () => {
+    const routes = [
+      { url: 'https://app.test/user/profile' },
+      { url: 'https://app.test/user/settings' },
+      { url: 'https://app.test/admin' },
+    ];
+    const filtered = filterRoutesForItem(routes, '/user');
+    expect(filtered).toEqual([
+      { url: 'https://app.test/user/profile' },
+      { url: 'https://app.test/user/settings' },
+    ]);
+  });
+});
 
 describe('generate — grounded against a real indexSource() result (isolated check)', () => {
   let projectDir: string;

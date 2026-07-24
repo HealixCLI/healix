@@ -39,7 +39,7 @@ import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '
  */
 interface PlanItemSeed {
   title: string;
-  reqTag: string;
+  reqTag?: string;
   tier: string;
   intent: string;
   scenarios?: Array<{ kind: string; description: string }>;
@@ -106,25 +106,35 @@ function makeRealisticFakeMode(
       generateCalls.push(plan);
       const specs: GeneratedSpec[] = [];
       for (const item of plan.items) {
-        const relPath = join('tests', item.tier, `${item.reqTag}.spec.ts`);
+        // Mirrors generate.ts's real fallback (`item.reqTag ?? item.id`) — a
+        // reqTag-less item still needs a stable, unique-per-item spec.reqTag for
+        // THIS run's own file naming/bookkeeping, even though registerSpecRows
+        // must NOT persist it as the test row's actual reqTag (see its own
+        // comments) — same pattern as orchestrator.retry-pass.test.ts's makeFakeMode.
+        const specReqTag = item.reqTag ?? item.id;
+        const relPath = join('tests', item.tier, `${specReqTag}.spec.ts`);
         const absPath = join(ctx.projectDir, relPath);
         await mkdir(dirname(absPath), { recursive: true });
-        // One `test(...)` marker line per scenario — real generate.ts emits one
-        // test() per planned scenario, and execute() below counts these markers
-        // to decide how many results to return. Writing them into the actual
-        // file (rather than tracking scenario counts in a JS-side map) means a
-        // carried-forward spec (copied byte-for-byte by hydrateCarriedSpecs,
-        // read back from disk) still reports its true scenario count even
+        // One `test(...)` marker line per scenario, each literally carrying the
+        // `[REQ:tag]` marker in its title string — real generate.ts emits one
+        // test() per planned scenario, tagged the same way, and execute() below
+        // counts these markers to decide how many results to return. Writing
+        // them into the actual file (rather than tracking scenario counts in a
+        // JS-side map) means a carried-forward spec (copied byte-for-byte by
+        // hydrateCarriedSpecs, read back from disk) still reports its true
+        // scenario count, and still carries the tag in its own file bytes, even
         // though this mode's own generate() never ran for it.
-        const scenarioCount = Math.max(item.scenarios?.length ?? 0, 1);
+        const scenarios = item.scenarios?.length
+          ? item.scenarios
+          : [{ kind: 'positive', description: 'default' }];
         const contents =
-          `// spec for ${item.title} (${item.reqTag})\n` +
-          Array.from({ length: scenarioCount }, (_, i) => `test('scenario ${i + 1}');\n`).join('');
+          `// spec for ${item.title} (${specReqTag})\n` +
+          scenarios.map((s) => `test('[REQ:${specReqTag}] ${s.kind}: ${s.description}');\n`).join('');
         await writeFile(absPath, contents, 'utf-8');
         specs.push({
           path: absPath,
-          title: `[REQ:${item.reqTag}] ${item.title}`,
-          reqTag: item.reqTag,
+          title: `[REQ:${specReqTag}] ${item.title}`,
+          reqTag: specReqTag,
           tier: item.tier,
           contents,
         });
@@ -756,6 +766,91 @@ describe('orchestrator top-up / reuse suite modes', () => {
 
     // Each row has exactly one result attached to it — not zero (orphaned) and not
     // several (repeated overwrites landing on the same colliding row).
+    const run2Results = store.listResults(run2.runId);
+    for (const t of run2Tests) {
+      expect(run2Results.filter((r) => r.testId === t.id)).toHaveLength(1);
+    }
+  });
+
+  it('MULTI-SCENARIO CARRY-FORWARD, REQTAG-LESS: a reqTag-less item carried forward keeps all its scenario rows, not just 1 (regression)', async () => {
+    // Same shape as the REQ-100 test above, but the plan item has NO reqTag —
+    // the AI never assigned one, which is common for simple frontend apps. In
+    // that case registerSpecRows deliberately persists reqTag: null (so
+    // cross-run Top-up identity matching still works by title — see that
+    // function's own comments), so on carry-forward the DB gives back no tag
+    // at all, while the copied spec file's own text still carries the ORIGINAL
+    // run's synthetic per-run tag (`item.reqTag ?? item.id`) baked into every
+    // one of its `test()` titles. Before the fix, registerSpecRows had no way
+    // to recover that tag for a carried spec, so it keyed carried rows by
+    // title while persistResults (which recovers the tag straight from the
+    // executed test's title) keyed by tag — two different keyspaces that never
+    // matched, collapsing all 3 scenario results onto 1 row via the fallback
+    // path's insert-then-delete-by-testId semantics.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Multi Scenario Carry Demo (reqTag-less)',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // ---- Run 1: fresh, one reqTag-less item with 3 scenarios. ----
+    const run1GenerateCalls: TestPlan[] = [];
+    const run1Provider = fakeProviderWithPlan(
+      [
+        {
+          title: 'Logout',
+          tier: 'tierA-public',
+          intent: 'Logout flow works.',
+          scenarios: [
+            { kind: 'positive', description: 'logs out from the account menu' },
+            { kind: 'negative', description: 'blocks protected pages after logout' },
+            { kind: 'edge', description: 'logs out cleanly from multiple open tabs' },
+          ],
+        },
+      ],
+      [],
+    );
+    const run1Orchestrator = createOrchestrator({
+      provider: run1Provider,
+      getMode: () => makeRealisticFakeMode(run1GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run1 = await run1Orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    const run1Tests = store.listTests(run1.runId);
+    expect(run1Tests).toHaveLength(3);
+    // Persisted reqTag is null, not the ephemeral per-run item id.
+    expect(run1Tests.every((t) => t.reqTag === null)).toBe(true);
+
+    // ---- Run 2: reuse. The whole 3-scenario spec carries forward. ----
+    const run2Calls: CompleteOptions[] = [];
+    const run2GenerateCalls: TestPlan[] = [];
+    const run2Provider = fakeProviderWithPlan([], run2Calls);
+    const run2Orchestrator = createOrchestrator({
+      provider: run2Provider,
+      getMode: () => makeRealisticFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+
+    // All 3 scenario rows carry forward — not collapsed to 1.
+    const run2Tests = store.listTests(run2.runId);
+    expect(run2Tests).toHaveLength(3);
+    expect(run2Tests.every((t) => t.reqTag === null)).toBe(true);
+
+    // Every carried row must actually receive its own real result.
+    expect(run2Tests.every((t) => t.status === 'passed')).toBe(true);
+
+    // Each row has exactly one result attached to it.
     const run2Results = store.listResults(run2.runId);
     for (const t of run2Tests) {
       expect(run2Results.filter((r) => r.testId === t.id)).toHaveLength(1);

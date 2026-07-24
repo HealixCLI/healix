@@ -112,7 +112,19 @@ function makeFakeMode(generateCalls: TestPlan[], dropReqTags: ReadonlySet<string
         const relPath = join('tests', item.tier, `${specReqTag}.spec.ts`);
         const absPath = join(ctx.projectDir, relPath);
         await mkdir(dirname(absPath), { recursive: true });
-        const contents = `// spec for ${item.title} (${specReqTag})\ntest('scenario 1');\n`;
+        // One `test(...)` line per scenario, each literally carrying the
+        // `[REQ:tag]` marker in its title text (mirrors real generate.ts's
+        // per-test tagging requirement). Baking it into the actual file bytes,
+        // not just this spec's in-memory title, matters once the spec is
+        // carried forward: hydrateCarriedSpecs copies the file byte-for-byte,
+        // and that's the only place left for a reqTag-less item's tag to
+        // survive for registerSpecRows to recover.
+        const scenarios = item.scenarios?.length
+          ? item.scenarios
+          : [{ kind: 'positive', description: 'default' }];
+        const contents =
+          `// spec for ${item.title} (${specReqTag})\n` +
+          scenarios.map((s) => `test('[REQ:${specReqTag}] ${s.kind}: ${s.description}');\n`).join('');
         await writeFile(absPath, contents, 'utf-8');
         specs.push({
           path: absPath,
@@ -125,7 +137,22 @@ function makeFakeMode(generateCalls: TestPlan[], dropReqTags: ReadonlySet<string
       return specs;
     },
     async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-      const results = specs.map((s) => ({ title: s.title, status: 'passed' as const, durationMs: 1 }));
+      // Real Playwright discovers test files from disk and runs each physical
+      // file exactly once, regardless of how many bookkeeping entries the JS
+      // side has for it — hydrateCarriedSpecs deliberately pushes one
+      // GeneratedSpec per carried TEST ROW, so a multi-scenario carried spec
+      // can appear multiple times here for the same file. Dedupe by path
+      // before counting scenarios (same pattern as orchestrator.topup.test.ts),
+      // or a carried multi-scenario spec's results get multiplied.
+      const uniqueSpecs = [...new Map(specs.map((s) => [s.path, s])).values()];
+      const results = uniqueSpecs.flatMap((s) => {
+        const scenarioCount = Math.max((s.contents.match(/^test\(/gm) ?? []).length, 1);
+        return Array.from({ length: scenarioCount }, () => ({
+          title: s.title,
+          status: 'passed' as const,
+          durationMs: 1,
+        }));
+      });
       return { passed: results.length, failed: 0, blocked: 0, flaky: 0, results };
     },
     async collectArtifacts(_ctx: TestModeContext): Promise<{ dir: string; files: string[] }> {
@@ -529,6 +556,84 @@ describe('retry-pass (RunOptions.retryItemIds)', () => {
     expect(run2Tests.filter((t) => t.reqTag === 'REQ-B')).toHaveLength(1);
     expect(run2Tests.filter((t) => t.reqTag === 'REQ-B')[0].id).not.toBe(repairTargetTest.id);
     expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-A', 'REQ-B', 'REQ-C']));
+  });
+
+  it('MULTI-SCENARIO CARRY-FORWARD, REQTAG-LESS: a reqTag-less item merely carried forward during Retry-pass keeps all its scenario rows (regression)', async () => {
+    // Retry-pass carries every NON-targeted item forward through the exact
+    // same hydrateCarriedSpecs/registerSpecRows path real Top-up uses (see
+    // orchestrator.topup.test.ts's own REQTAG-LESS regression test for the
+    // full mechanism). This locks down that a reqTag-less, multi-scenario item
+    // NOT targeted by retryItemIds doesn't collapse to 1 row when a DIFFERENT
+    // item is the one actually being repaired/regenerated — Retry-pass is a
+    // distinct caller of the same carry-forward code, worth covering on its own.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Carry ReqTag-less Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const SEED_WITH_MULTI_SCENARIO_ITEM = [
+      ...SEED_ITEMS,
+      {
+        title: 'Logout',
+        tier: 'tierA-public',
+        intent: 'Logout flow works.',
+        scenarios: [
+          { kind: 'positive', description: 'logs out from the account menu' },
+          { kind: 'negative', description: 'blocks protected pages after logout' },
+          { kind: 'edge', description: 'logs out cleanly from multiple open tabs' },
+        ],
+      },
+    ];
+
+    // ---- Run 1: fresh — 3 real-reqTag items + 1 reqTag-less, 3-scenario item. ----
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([], SEED_WITH_MULTI_SCENARIO_ITEM),
+      getMode: () => makeFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+    const run1Tests = store.listTests(run1.runId);
+    // 3 single-scenario items + 1 three-scenario item = 6 rows.
+    expect(run1Tests).toHaveLength(6);
+    expect(run1Tests.filter((t) => t.reqTag === null)).toHaveLength(3);
+
+    const plan1 = await readPlan(project.id, run1.runId);
+    const repairTargetItem = plan1.items.find((it) => it.reqTag === 'REQ-B')!;
+
+    // ---- Run 2: retry-pass targeting only REQ-B; the reqTag-less item is untouched, merely carried. ----
+    const run2GenerateCalls: TestPlan[] = [];
+    const run2 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({
+      projectId: project.id,
+      suiteMode: 'topup',
+      baseRunId: run1.runId,
+      autoApprove: true,
+      retryItemIds: [repairTargetItem.id],
+    });
+
+    expect(run2.status).toBe('passed');
+    // Only REQ-B was actually regenerated — the reqTag-less item was carried, not regenerated.
+    expect(run2GenerateCalls.flatMap((p) => p.items).map((i) => i.reqTag)).toEqual(['REQ-B']);
+
+    const run2Tests = store.listTests(run2.runId);
+    expect(run2Tests).toHaveLength(6);
+
+    // The reqTag-less item's 3 scenario rows carried forward — not collapsed to 1.
+    const run2LogoutTests = run2Tests.filter((t) => t.reqTag === null);
+    expect(run2LogoutTests).toHaveLength(3);
+    expect(run2LogoutTests.every((t) => t.status === 'passed')).toBe(true);
+    const run2Results = store.listResults(run2.runId);
+    for (const t of run2LogoutTests) {
+      expect(run2Results.filter((r) => r.testId === t.id)).toHaveLength(1);
+    }
   });
 
   it('retryItemIds survives a pause/resume round-trip via the checkpoint', async () => {

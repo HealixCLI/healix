@@ -2698,10 +2698,19 @@ function registerSpecRows(
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
 ): void {
-  const reqTag = (spec.reqTag ?? '').trim();
+  // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
+  // deliberately never persists the per-run synthetic tag — see persistedReqTag
+  // below), but the spec file's own text still carries the original run's
+  // `[REQ:<tag>]` markers on every one of its scenarios. Recovering that tag from
+  // spec.contents (rather than treating this spec as tag-less) is what lets `base`
+  // land on the same key persistResults will later re-derive from the executed
+  // test's title via the same extractReqTag() — without it, registration keys by
+  // title while matching keys by tag, and every carried scenario after the first
+  // collides on persistResults' fallback path (see that function's comments).
+  const reqTag = (spec.reqTag ?? extractReqTag(spec.contents) ?? '').trim();
   const item = reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined;
   const specPath = relative(projectDir, spec.path);
-  const base = stableKey(spec.reqTag, spec.title);
+  const base = stableKey(reqTag, spec.title);
   // The PERSISTED reqTag is the plan item's true reqTag (or null when it
   // never had one) — NOT spec.reqTag, which generate.ts fills in with the
   // item's own id when a real reqTag is absent (`item.reqTag ?? item.id`),

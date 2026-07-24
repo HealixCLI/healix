@@ -17,8 +17,8 @@ import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 
 import type { CompleteOptions, CompletionResult, ProviderAdapter } from '../../providers/types.js';
-import type { TestModeContext, TestPlan } from '../types.js';
-import type { ProjectCredential } from '../../storage/types.js';
+import type { TestModeContext, TestPlan, TestPlanItem } from '../types.js';
+import type { ProjectCredential, Tier } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import {
   collectGroundTruth,
@@ -569,13 +569,13 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(calls[0].opts?.taskType).toBe('codegen');
   });
 
-  it('emits a per-item "Dispatched i/n" event distinct from the batch "Progress" event', async () => {
+  it('emits a per-batch "Dispatched" event distinct from the "Progress" event', async () => {
     const ctx = makeCtx(makeProvider([CLEAN_SPEC], calls));
 
     await generate(ctx, PLAN);
 
     const dispatched = events.find((e) => e.message.includes('Dispatched'));
-    expect(dispatched?.message).toBe(`Dispatched 1/1: Generating "${PLAN.items[0].title}"`);
+    expect(dispatched?.message).toBe('Dispatched batch 1/1: 1 item(s)');
     expect(events.some((e) => e.message === 'Progress: 1/1 done')).toBe(true);
   });
 
@@ -841,6 +841,148 @@ function makeExploration(
     observedEndpoints: [],
   };
 }
+
+// ---- batched generation: multiple same-tier items requested in one provider call -----------
+
+function specFor(reqTag: string, label = 'does the thing'): string {
+  return `import { test, expect } from '@playwright/test';
+
+test('[REQ:${reqTag}] positive: ${label}', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+}
+
+function batchReply(specsByReqTag: Record<string, string>): string {
+  return Object.entries(specsByReqTag)
+    .map(
+      ([reqTag, body]) =>
+        `===== BEGIN SPEC [REQ:${reqTag}] =====\n${body}\n===== END SPEC [REQ:${reqTag}] =====`,
+    )
+    .join('\n\n');
+}
+
+function planItem(id: string, reqTag: string, tier: Tier = 'tierA-public'): TestPlanItem {
+  return {
+    id,
+    title: `Feature ${reqTag}`,
+    reqTag,
+    tier,
+    intent: `${reqTag} renders`,
+    scenarios: [{ kind: 'positive', description: `${reqTag} renders` }],
+  };
+}
+
+describe('generate — batched generation (multiple items per provider call)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-batch-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function makeCtx(provider: ProviderAdapter): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider,
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+    };
+  }
+
+  it('requests 3 same-tier items in a single provider call and accepts all 3 specs', async () => {
+    const plan: TestPlan = {
+      summary: 'three items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B'), planItem('c', 'REQ-C')],
+    };
+    const reply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': specFor('REQ-B'),
+      'REQ-C': specFor('REQ-C'),
+    });
+    const specs = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(specs).toHaveLength(3);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
+  });
+
+  it('never batches items from different tiers into the same provider call', async () => {
+    const plan: TestPlan = {
+      summary: 'two tiers',
+      items: [planItem('a', 'REQ-A', 'tierA-public'), planItem('b', 'REQ-B', 'tierC-api')],
+    };
+    const replies = [
+      batchReply({ 'REQ-A': specFor('REQ-A') }),
+      batchReply({ 'REQ-B': specFor('REQ-B') }),
+    ];
+    const specs = await generate(makeCtx(makeProvider(replies, calls)), plan);
+
+    expect(calls).toHaveLength(2);
+    expect(specs).toHaveLength(2);
+  });
+
+  it('solo-retries via generateOne only the one item that fails validation within an otherwise-good batch response', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // REQ-A's block is valid; REQ-B's has no expect(...) at all, so it fails validateAndPersist.
+    const badBatchReply = batchReply({
+      'REQ-A': specFor('REQ-A'),
+      'REQ-B': `import { test, expect } from '@playwright/test';\ntest('[REQ:REQ-B] positive: does nothing', async ({ page }) => {\n  await page.goto('/');\n});\n`,
+    });
+    const soloRetryReply = specFor('REQ-B', 'solo-retried version');
+    const specs = await generate(makeCtx(makeProvider([badBatchReply, soloRetryReply], calls)), plan);
+
+    expect(calls).toHaveLength(2); // 1 batch call + 1 solo retry for REQ-B only
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
+  it('splits a batch in half and retries when the whole response is unusable, eventually succeeding via solo generateOne calls', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    // First reply (the batch attempt) is garbage with no BEGIN/END markers at all — a total
+    // parse failure. The batch (size 2) splits into two size-1 sub-batches, run concurrently via
+    // Promise.all, each hitting generateOne directly and succeeding on its own first attempt.
+    // A prompt-aware provider (rather than positional replies) avoids depending on which of the
+    // two concurrent solo calls happens to reach the fake provider first.
+    let callIndex = 0;
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        callIndex += 1;
+        if (callIndex === 1) {
+          return { provider: 'claude', ok: true, text: 'not a spec, no markers here', raw: null, detail: '' };
+        }
+        const reqTag = /\[REQ:([^\]]+)\]/.exec(prompt)?.[1] ?? '';
+        return { provider: 'claude', ok: true, text: specFor(reqTag), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), plan);
+
+    expect(calls).toHaveLength(3); // 1 failed batch + 1 solo call per item
+    expect(specs).toHaveLength(2);
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+});
 
 describe('generate — grounds the prompt in the observed EXPLORE crawl', () => {
   let projectDir: string;
@@ -1435,8 +1577,10 @@ describe('generate — ProviderUnavailableError (systemic outage signal)', () =>
     const ctx = makeCtx(makeFailingProvider('connect ECONNREFUSED 127.0.0.1:443', calls));
 
     await expect(generate(ctx, TWO_ITEM_PLAN)).rejects.toThrow(ProviderUnavailableError);
-    // Both items each got 2 attempts — never a content-validation stage reached.
-    expect(calls).toHaveLength(4);
+    // Both same-tier items batch into one call first (fails at the provider level, extracting
+    // nothing), which splits into two solo items — each then gets its own 2-attempt retry via
+    // generateOne. 1 (batch) + 2*2 (solo retries) = 5. Never a content-validation stage reached.
+    expect(calls).toHaveLength(5);
   });
 
   it('does NOT throw when zero specs are produced solely due to content-validation failures', async () => {

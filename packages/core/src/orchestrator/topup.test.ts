@@ -82,3 +82,53 @@ describe('diffAgainstBase (reqTag-less plan items)', () => {
     expect(diff.toGenerate.map((it) => it.id)).toEqual(['pli_new2']);
   });
 });
+
+describe('diffAgainstBase (forceRegenerate — Repair/Retry-pass targeted regeneration)', () => {
+  it('an already-covered item is normally carried forward, never regenerated', () => {
+    const planItems = [planItem({ id: 'pli_1', title: 'Home loads' })];
+    const baseTests = [testCase({ id: 'tst_1', title: '[REQ:pli_1] Home loads — positive: renders' })];
+
+    const diff = diffAgainstBase(planItems, baseTests);
+
+    expect(diff.toGenerate).toHaveLength(0);
+    expect(diff.carried).toEqual(baseTests);
+  });
+
+  it('forces an already-covered item into toGenerate when its id is in forceRegenerate (the Repair case)', () => {
+    const planItems = [
+      planItem({ id: 'pli_1', title: 'Home loads' }),
+      planItem({ id: 'pli_2', title: 'Checkout works' }),
+    ];
+    const baseTests = [
+      testCase({ id: 'tst_1', title: '[REQ:pli_1] Home loads — positive: renders' }),
+      testCase({ id: 'tst_2', title: '[REQ:pli_2] Checkout works — positive: completes checkout' }),
+    ];
+
+    const diff = diffAgainstBase(planItems, baseTests, new Set(['pli_1']));
+
+    expect(diff.toGenerate.map((it) => it.id)).toEqual(['pli_1']);
+    // The forced item's own stale covering test must NOT ride along next to
+    // its fresh replacement — only the untouched item's test is carried.
+    expect(diff.carried).toEqual([baseTests[1]]);
+  });
+
+  it('has no effect on an item already genuinely uncovered — it lands in toGenerate either way, exactly once', () => {
+    const planItems = [planItem({ id: 'pli_new', title: 'Brand new feature' })];
+    const baseTests: ReturnType<typeof testCase>[] = [];
+
+    const diff = diffAgainstBase(planItems, baseTests, new Set(['pli_new']));
+
+    expect(diff.toGenerate.map((it) => it.id)).toEqual(['pli_new']);
+    expect(diff.carried).toEqual([]);
+  });
+
+  it('an empty forceRegenerate set behaves identically to omitting it', () => {
+    const planItems = [planItem({ id: 'pli_1', title: 'Home loads' })];
+    const baseTests = [testCase({ id: 'tst_1', title: '[REQ:pli_1] Home loads — positive: renders' })];
+
+    const diff = diffAgainstBase(planItems, baseTests, new Set());
+
+    expect(diff.toGenerate).toHaveLength(0);
+    expect(diff.carried).toEqual(baseTests);
+  });
+});

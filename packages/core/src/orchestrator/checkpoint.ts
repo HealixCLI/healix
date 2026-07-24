@@ -14,8 +14,14 @@ import type { TestingScope, TestPlan } from '../modes/types.js';
 export interface ResumeCheckpoint {
   runId: string;
   projectId: string;
-  /** Orchestrator phase to resume INTO — always past planning/approval, which never re-run on resume. */
-  phase: 'generate' | 'execute' | 'triage' | 'report';
+  /**
+   * Orchestrator phase to resume INTO. Almost always past planning/approval
+   * (never re-run on a normal resume) — 'plan' is the one exception, written
+   * only while a LARGE, multi-batch plan is still in progress (see
+   * runPlanPhase's per-batch checkpointing), so a crash mid-PLAN doesn't have
+   * to redo every batch already paid for.
+   */
+  phase: 'plan' | 'generate' | 'execute' | 'triage' | 'report';
   /** The run's original request, so resume continues with identical configuration. */
   runOptions: {
     testingScope?: TestingScope;
@@ -31,9 +37,28 @@ export interface ResumeCheckpoint {
     coverageLoopEnabled?: boolean;
     coverageTarget?: number;
     retryItemIds?: string[];
+    maxCostUsd?: number;
+    maxTokens?: number;
   };
-  /** The finalized, human-approved plan — resume never re-plans or re-shows the approval gate. */
+  /**
+   * The finalized, human-approved plan once `phase` is past 'plan' — resume
+   * never re-plans or re-shows the approval gate in that case. While `phase`
+   * IS 'plan' (see planProgress below), this is only the batches' worth of
+   * items accumulated SO FAR, not a finished/approved plan.
+   */
   plan: TestPlan;
+  /**
+   * Present only while `phase === 'plan'`: which of runPlanPhase's top-level
+   * weighted batches have already resolved (succeeded OR permanently
+   * failed — either way, resuming must not re-ask the AI for it), so a
+   * crash mid-batch-loop only redoes the batches that never got a chance to
+   * run rather than every batch already paid for. Absent once PLAN fully
+   * completes and `phase` moves past it.
+   */
+  planProgress?: {
+    completedBatchIndices: number[];
+    failedBatches: string[];
+  };
   /** Plan item ids whose spec has already been generated and accepted — skipped on resume's GENERATE pass. */
   generatedItemIds: string[];
   /** Enough to reconstruct GeneratedSpec[] for already-generated items without re-invoking the AI. */

@@ -89,12 +89,15 @@ export type RunStatus =
   | 'paused';
 
 /**
- * Why a 'paused' run stopped. 'manual' is the only reason boot-time
- * reconciliation must never auto-resume — the user paused it on purpose and
- * must explicitly resume it themselves. The other three are transient
- * interruptions Healix can safely retry on its own.
+ * Why a 'paused' run stopped. 'manual' and 'budget-exceeded' are the reasons
+ * boot-time reconciliation must never auto-resume — the user paused it on
+ * purpose, or a self-imposed spend ceiling was reached and blindly resuming
+ * would just hit the same ceiling again on the very next dispatch, so both
+ * need a human decision (resume as-is, or raise the ceiling) rather than an
+ * automatic retry. The other two ('network', 'credits-exhausted') are
+ * transient interruptions Healix can safely retry on its own.
  */
-export type PauseReason = 'manual' | 'network' | 'credits-exhausted' | 'crashed';
+export type PauseReason = 'manual' | 'network' | 'credits-exhausted' | 'crashed' | 'budget-exceeded';
 
 /** How a run's suite was produced: fully regenerated, topped-up from a prior run, or re-executed as-is. */
 export type SuiteMode = 'fresh' | 'topup' | 'reuse';

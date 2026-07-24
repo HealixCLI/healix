@@ -42,8 +42,7 @@ import {
   type PlanApprovalResult,
   type RunSummary,
   type Run,
-  type PauseReason,
-  readCheckpoint,
+  reconcileRuns,
   readRunConfigSnapshot,
   type RunConfigSnapshot,
   type SuiteMode,
@@ -1610,33 +1609,15 @@ async function reconcileRunsOnBoot(): Promise<void> {
   const store = await getStore();
   if (!store) return;
 
-  const toResume: Run[] = [...store.listAutoResumableRuns()];
-  let failedNow = 0;
-  for (const run of store.listInFlightRuns()) {
-    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
-    const checkpoint = await readCheckpoint(runDir);
-    if (!checkpoint) {
-      store.updateRunStatus(run.id, 'error', { finishedAt: new Date().toISOString() });
-      try {
-        store.appendEvent(
-          run.id,
-          'done',
-          'Run interrupted (app closed or crashed) before any checkpoint existed — nothing to resume from.',
-          { level: 'error' },
-        );
-      } catch {
-        /* best-effort */
-      }
-      failedNow += 1;
-      continue;
-    }
-    const pauseReason: PauseReason = 'crashed';
-    store.updateRunStatus(run.id, 'paused', { pauseReason, finishedAt: new Date().toISOString() });
-    toResume.push({ ...run, status: 'paused', pauseReason });
-  }
-  if (failedNow > 0) {
+  // The "figure out what needs attention" half now lives in @healix/core (see
+  // reconcileRuns's doc comment) so the CLI can run the exact same
+  // reconciliation — this function keeps only the desktop-specific half:
+  // actually driving each returned run through resume(), broadcast over IPC,
+  // and respecting the single-active-run queue.
+  const { toResume, markedError, orphansReaped } = await reconcileRuns(store);
+  if (markedError > 0) {
     console.log(
-      `[healix] boot: marked ${failedNow} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
+      `[healix] boot: marked ${markedError} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
     );
   }
 
@@ -1660,15 +1641,7 @@ async function reconcileRunsOnBoot(): Promise<void> {
   // with the NEXT boot-time resume, reintroducing the same bug in a new spot.
   if (toResume.length > 0) void startNextQueued();
 
-  // Fallback janitor for anything the pass above didn't touch (e.g. storage
-  // was briefly unavailable) — still age-buffered (default 6h) so it never
-  // reaps a run genuinely still in flight in another process (e.g. the CLI).
-  try {
-    const reaped = store.failOrphanedRuns();
-    if (reaped > 0) console.log(`[healix] janitor: marked ${reaped} orphaned run(s) as error`);
-  } catch {
-    /* best-effort */
-  }
+  if (orphansReaped > 0) console.log(`[healix] janitor: marked ${orphansReaped} orphaned run(s) as error`);
 }
 
 app.whenReady().then(() => {

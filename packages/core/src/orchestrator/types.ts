@@ -98,6 +98,18 @@ export interface RunOptions {
    */
   retryItemIds?: string[];
   /**
+   * Proactive spend ceiling(s) for this run's AI usage. Checked after every
+   * recorded usage row (plan/gap-fill plan, generate, triage); once running
+   * cost/tokens for the run reaches either configured limit, the run pauses
+   * cleanly (pauseReason: 'budget-exceeded') before its next PLAN/GENERATE/
+   * TRIAGE dispatch — the same clean checkpoint-and-stop path a manual pause
+   * uses — rather than continuing to spend unbounded. Either knob alone is
+   * enough to trip the ceiling; omit both to run with no ceiling (default).
+   */
+  maxCostUsd?: number;
+  /** Combined input+output token ceiling — see maxCostUsd. */
+  maxTokens?: number;
+  /**
    * Cooperative cancellation. When aborted, the run stops at the next phase
    * boundary (and in-flight provider/suite work is killed), the run row is
    * marked 'cancelled', and run() resolves with that summary — it never rejects.

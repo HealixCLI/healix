@@ -11,7 +11,7 @@
  *     mutate the user's repo).
  */
 import { existsSync } from 'node:fs';
-import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
@@ -21,6 +21,7 @@ import type { TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import type { ProjectCredential, Tier } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import {
+  clearGenerateCheckpoint,
   collectGroundTruth,
   demoteEscapeHatchBlocks,
   findForbiddenApis,
@@ -28,7 +29,10 @@ import {
   filterRoutesForItem,
   formatMockContent,
   generate,
+  GEN_CHECKPOINT_FILENAME,
+  type GenCheckpointEntry,
   ProviderUnavailableError,
+  readGenerateCheckpointEntries,
   type GroundTruth,
 } from './generate.js';
 
@@ -1183,6 +1187,206 @@ describe('generate — batched generation (multiple items per provider call)', (
 
     expect(specs).toHaveLength(12);
     expect(peak).toBeLessThanOrEqual(3); // GEN_CONCURRENCY
+  });
+});
+
+describe('generate — write-through per-item checkpoint (resume mid-phase without redoing finished items)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-checkpoint-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function makeCtx(provider: ProviderAdapter, signal?: AbortSignal): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider,
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      signal,
+    };
+  }
+
+  async function seedEntry(entry: GenCheckpointEntry): Promise<void> {
+    await writeFile(join(projectDir, GEN_CHECKPOINT_FILENAME), `${JSON.stringify(entry)}\n`, 'utf-8');
+  }
+
+  it('readGenerateCheckpointEntries returns an empty array when no checkpoint file exists', async () => {
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
+  });
+
+  it('round-trips entries written as NDJSON (one JSON object per line)', async () => {
+    const a: GenCheckpointEntry = {
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    };
+    const b: GenCheckpointEntry = {
+      itemId: 'b',
+      title: 'Feature B',
+      reqTag: 'REQ-B',
+      tier: 'tierA-public',
+      status: 'skipped',
+      reason: 'no valid spec with an expect(...) after retry',
+    };
+    await writeFile(
+      join(projectDir, GEN_CHECKPOINT_FILENAME),
+      `${JSON.stringify(a)}\n${JSON.stringify(b)}\n`,
+      'utf-8',
+    );
+    const entries = await readGenerateCheckpointEntries(projectDir);
+    expect(entries.map((e) => e.itemId).sort()).toEqual(['a', 'b']);
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    const good: GenCheckpointEntry = {
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'skipped',
+      reason: 'boom',
+    };
+    await writeFile(
+      join(projectDir, GEN_CHECKPOINT_FILENAME),
+      `${JSON.stringify(good)}\nnot valid json\n\n`,
+      'utf-8',
+    );
+    const entries = await readGenerateCheckpointEntries(projectDir);
+    expect(entries).toEqual([good]);
+  });
+
+  it('clearGenerateCheckpoint removes the file and never throws when already absent', async () => {
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'skipped',
+      reason: 'boom',
+    });
+    await clearGenerateCheckpoint(projectDir);
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
+    await expect(clearGenerateCheckpoint(projectDir)).resolves.toBeUndefined();
+  });
+
+  it('resume skips an already-generated item, restoring its spec from disk without re-invoking the provider', async () => {
+    const specPath = join(projectDir, 'tests/tierA-public/req-a.spec.ts');
+    await mkdir(join(projectDir, 'tests/tierA-public'), { recursive: true });
+    await writeFile(specPath, specFor('REQ-A', 'restored from a prior attempt'), 'utf-8');
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature REQ-A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath,
+      specTitle: '[REQ:REQ-A] Feature REQ-A',
+    });
+
+    const plan: TestPlan = {
+      summary: 'two items, one already done',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const reply = specFor('REQ-B');
+    const specs = await generate(makeCtx(makeProvider([reply], calls)), plan);
+
+    // Only item "b" should have gone to the provider — "a" was restored from disk.
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt).toContain('REQ-B');
+    expect(calls[0].prompt).not.toContain('Feature REQ-A');
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+    expect(specs.find((s) => s.reqTag === 'REQ-A')?.title).toBe('[REQ:REQ-A] Feature REQ-A');
+
+    // A clean, uninterrupted completion clears the checkpoint — nothing left to resume.
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
+  });
+
+  it('resume skips an already-skipped (permanently rejected) item without retrying it', async () => {
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature REQ-A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'skipped',
+      reason: 'no valid spec with an expect(...) after retry',
+    });
+
+    const plan: TestPlan = {
+      summary: 'two items, one already permanently skipped',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const specs = await generate(makeCtx(makeProvider([specFor('REQ-B')], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt).toContain('REQ-B');
+    expect(specs.map((s) => s.reqTag)).toEqual(['REQ-B']);
+  });
+
+  it('records each item as its batch finalizes, so re-seeding just item "a" as done skips it on the next call', async () => {
+    const plan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const reply = batchReply({ 'REQ-A': specFor('REQ-A'), 'REQ-B': specFor('REQ-B') });
+    const firstSpecs = await generate(makeCtx(makeProvider([reply], calls)), plan);
+    const aSpec = firstSpecs.find((s) => s.reqTag === 'REQ-A')!;
+
+    // generate() ran to a clean completion, so the checkpoint is cleared — but
+    // we can observe the write-through behavior by re-seeding (pointing at the
+    // spec file the first call actually wrote) and confirming a SECOND,
+    // independent generate() call over the same plan does no new work for it.
+    calls = [];
+    const secondReply = batchReply({ 'REQ-A': specFor('REQ-A'), 'REQ-B': specFor('REQ-B') });
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature REQ-A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: aSpec.path,
+      specTitle: aSpec.title,
+    });
+    const specs = await generate(makeCtx(makeProvider([secondReply], calls)), plan);
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt).not.toContain('Feature REQ-A');
+    expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
+  it('an aborted signal leaves the checkpoint in place (does not clear it) and records no new entries', async () => {
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature REQ-A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'skipped',
+      reason: 'previously rejected',
+    });
+
+    const controller = new AbortController();
+    controller.abort();
+    const plan: TestPlan = {
+      summary: 'one remaining item, run under an already-aborted signal',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    await generate(makeCtx(makeProvider([specFor('REQ-B')], calls), controller.signal), plan);
+
+    // Item "b" was processed by the (abort-oblivious) fake provider, but its
+    // outcome must NOT be recorded as final — an aborted run shouldn't write
+    // off an item it never got a fair, uninterrupted attempt at.
+    const entries = await readGenerateCheckpointEntries(projectDir);
+    expect(entries.map((e) => e.itemId)).toEqual(['a']);
   });
 });
 

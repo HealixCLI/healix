@@ -11,6 +11,7 @@ import type {
   TestCase,
   TestStatus,
   Tier,
+  TriageResultRow,
 } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
@@ -226,6 +227,8 @@ async function resumePipeline(
     coverageLoopEnabled: checkpoint.runOptions.coverageLoopEnabled,
     coverageTarget: checkpoint.runOptions.coverageTarget,
     retryItemIds: checkpoint.runOptions.retryItemIds,
+    maxCostUsd: checkpoint.runOptions.maxCostUsd,
+    maxTokens: checkpoint.runOptions.maxTokens,
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
@@ -358,31 +361,6 @@ async function runPipeline(
     }
   };
 
-  // Captures token/cost usage for every provider.complete() call this run makes
-  // (plan, gap-fill plan, generate, triage — see UsageRecorder's call sites),
-  // feeding the Usage tab / Reports page. Best-effort like every other store
-  // write here: a bad extraction or a DB fault must never affect the run itself.
-  const recordUsage: UsageRecorder = (phase, task, providerId, raw) => {
-    try {
-      const usage = extractUsage(raw);
-      store.recordUsage({
-        runId,
-        phase,
-        task,
-        provider: providerId,
-        inputTokens: usage?.inputTokens ?? null,
-        outputTokens: usage?.outputTokens ?? null,
-        costUsd: usage?.costUsd ?? null,
-        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
-        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
-        model: usage?.model ?? null,
-      });
-      noteStoreOk();
-    } catch (err) {
-      noteStoreFailure('recordUsage', err);
-    }
-  };
-
   const setStatus = (
     status: RunStatus,
     patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
@@ -420,6 +398,91 @@ async function runPipeline(
   const ctxEmit = (phase: string, message: string, data?: unknown): void =>
     emit(phase, 'info', message, data);
 
+  // Proactive credit-budget ceiling (opts.maxCostUsd/opts.maxTokens): an
+  // internal AbortController combined with the caller's own signal via
+  // AbortSignal.any(), tripped once this run's running spend crosses either
+  // configured ceiling. opts.signal is reassigned to the combined signal
+  // (rather than threading a second signal parameter everywhere) so every
+  // existing signal-checked boundary below — PLAN's batch loop, TRIAGE's AI
+  // batch loop, GENERATE's dispatch queue, every phase-boundary
+  // checkCancelled() — treats a budget breach exactly like a pause request,
+  // stopping the run before its NEXT AI dispatch rather than letting cost
+  // run unbounded. No separate plumbing needed anywhere else.
+  const budgetController = new AbortController();
+  // Only wrap opts.signal when a ceiling is actually configured — otherwise
+  // opts.signal stays the EXACT reference the caller passed in, unchanged
+  // from before this feature existed (no combined-signal indirection for
+  // the common case where no ceiling is set).
+  if (opts.maxCostUsd !== undefined || opts.maxTokens !== undefined) {
+    opts = {
+      ...opts,
+      signal: AbortSignal.any(
+        opts.signal ? [opts.signal, budgetController.signal] : [budgetController.signal],
+      ),
+    };
+  }
+
+  // Running totals for THIS run, seeded from any usage already recorded
+  // before an earlier crash/pause — so a resume doesn't reset the ceiling
+  // back to zero and let a run blow straight past it a second time — then
+  // incremented as recordUsage persists each new row.
+  let totalCostUsd = 0;
+  let totalTokens = 0;
+  if (resumeFrom) {
+    try {
+      for (const u of store.listUsageForRun(runId)) {
+        totalCostUsd += u.costUsd ?? 0;
+        totalTokens += (u.inputTokens ?? 0) + (u.outputTokens ?? 0);
+      }
+    } catch {
+      /* best-effort seeding; worst case the ceiling under-counts prior spend by one resume */
+    }
+  }
+
+  /** Trips budgetController the first time a configured ceiling is crossed — a no-op every call after. */
+  const checkBudget = (phase: OrchestratorPhase | string): void => {
+    if (budgetController.signal.aborted) return;
+    const overCost = opts.maxCostUsd !== undefined && totalCostUsd >= opts.maxCostUsd;
+    const overTokens = opts.maxTokens !== undefined && totalTokens >= opts.maxTokens;
+    if (!overCost && !overTokens) return;
+    emit(
+      phase,
+      'warn',
+      `Spend ceiling reached (cost $${totalCostUsd.toFixed(4)}` +
+        `${opts.maxCostUsd !== undefined ? ` / limit $${opts.maxCostUsd}` : ''}, tokens ${totalTokens}` +
+        `${opts.maxTokens !== undefined ? ` / limit ${opts.maxTokens}` : ''}); pausing run for review.`,
+    );
+    budgetController.abort('budget');
+  };
+
+  // Captures token/cost usage for every provider.complete() call this run makes
+  // (plan, gap-fill plan, generate, triage — see UsageRecorder's call sites),
+  // feeding the Usage tab / Reports page. Best-effort like every other store
+  // write here: a bad extraction or a DB fault must never affect the run itself.
+  const recordUsage: UsageRecorder = (phase, task, providerId, raw) => {
+    try {
+      const usage = extractUsage(raw);
+      store.recordUsage({
+        runId,
+        phase,
+        task,
+        provider: providerId,
+        inputTokens: usage?.inputTokens ?? null,
+        outputTokens: usage?.outputTokens ?? null,
+        costUsd: usage?.costUsd ?? null,
+        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
+        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
+        model: usage?.model ?? null,
+      });
+      totalCostUsd += usage?.costUsd ?? 0;
+      totalTokens += (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('recordUsage', err);
+    }
+    checkBudget(phase);
+  };
+
   // Cooperative cancellation. checkCancelled() is polled at every phase
   // boundary; in-flight provider/suite work additionally receives the signal
   // directly (ctx.signal, CompleteOptions.signal) so long-running phases can
@@ -436,8 +499,10 @@ async function runPipeline(
   // A pause shares the same AbortController/signal as cancel — the caller
   // distinguishes them via controller.abort('pause') vs. plain abort() — so
   // every existing checkCancelled() boundary can also honor a pause request
-  // without a second signal to plumb through ctx/provider calls.
-  const isPauseRequested = (): boolean => checkCancelled() && signal?.reason === 'pause';
+  // without a second signal to plumb through ctx/provider calls. A budget
+  // breach (budgetController.abort('budget')) is recognized the same way.
+  const isPauseRequested = (): boolean =>
+    checkCancelled() && (signal?.reason === 'pause' || signal?.reason === 'budget');
 
   try {
     await mkdir(join(runDir, 'plan'), { recursive: true });
@@ -466,6 +531,8 @@ async function runPipeline(
     coverageLoopEnabled: opts.coverageLoopEnabled,
     coverageTarget: opts.coverageTarget,
     retryItemIds: opts.retryItemIds,
+    maxCostUsd: opts.maxCostUsd,
+    maxTokens: opts.maxTokens,
   });
 
   if (!resumeFrom) {
@@ -565,6 +632,8 @@ async function runPipeline(
         coverageLoopEnabled: opts.coverageLoopEnabled,
         coverageTarget: opts.coverageTarget,
         retryItemIds: opts.retryItemIds,
+        maxCostUsd: opts.maxCostUsd,
+        maxTokens: opts.maxTokens,
       },
       plan: effectivePlan,
       generatedItemIds: effectivePlan.items
@@ -603,14 +672,14 @@ async function runPipeline(
     return { runId, status: 'paused' };
   };
 
-  /** At a cancellation boundary: honor a live pause request as 'paused' (resumable); otherwise cancel as today. */
+  /** At a cancellation boundary: honor a live pause/budget request as 'paused' (resumable); otherwise cancel as today. */
   const pauseOrCancel = (
     phase: OrchestratorPhase | string,
     executeComplete = false,
     cancelMessage?: string,
   ): Promise<RunSummary> =>
     isPauseRequested()
-      ? pauseRun(phase, 'manual', executeComplete)
+      ? pauseRun(phase, signal?.reason === 'budget' ? 'budget-exceeded' : 'manual', executeComplete)
       : Promise.resolve(cancelMessage ? cancelRun(phase, cancelMessage) : cancelRun(phase));
 
   try {
@@ -657,12 +726,19 @@ async function runPipeline(
       }
     }
 
-    if (resumeFrom) {
+    // A checkpoint whose phase is still 'plan' means PLAN itself was
+    // interrupted mid-batch-loop (see runPlanPhase's resumeState/
+    // onBatchProgress) — there is no finalized/approved plan to skip ahead
+    // to yet, so this takes the SAME path a fresh run does (repo indexing,
+    // dependency detection, etc. all still need to happen), just seeded with
+    // whichever batches already succeeded rather than starting from zero.
+    const resumingPastPlan = resumeFrom !== undefined && resumeFrom.checkpoint.phase !== 'plan';
+    if (resumingPastPlan) {
       // Resuming: the plan was already finalized and approved before the
       // pause/interruption — replanning or re-showing the approval gate would
       // waste tokens and re-litigate an already-made decision. Only the
       // provider needs re-resolving (cheap: a health probe, no tokens spent).
-      emit('plan', 'info', `Resuming run (paused at "${resumeFrom.checkpoint.phase}").`);
+      emit('plan', 'info', `Resuming run (paused at "${resumeFrom!.checkpoint.phase}").`);
       provider = overrides?.provider ?? (await resolveProvider(opts.provider, emit));
       if (!provider) {
         emit('plan', 'error', 'No ready provider available to resume.');
@@ -875,9 +951,71 @@ async function runPipeline(
             );
           }
         }
+        // A plan-phase resume seeds runPlanPhase with whichever batches
+        // already succeeded (or permanently failed) before the interruption;
+        // a fresh run just starts from an empty position. Either way,
+        // progress is checkpointed again as each further batch resolves, so
+        // a SECOND interruption doesn't lose ground either.
+        const planResumeState =
+          resumeFrom && resumeFrom.checkpoint.phase === 'plan'
+            ? {
+                completedBatchIndices: new Set(
+                  resumeFrom.checkpoint.planProgress?.completedBatchIndices ?? [],
+                ),
+                items: resumeFrom.checkpoint.plan.items,
+                failedBatches: resumeFrom.checkpoint.planProgress?.failedBatches ?? [],
+              }
+            : undefined;
+        const onPlanBatchProgress = async (progress: PlanBatchProgress): Promise<void> => {
+          await writeCheckpoint(runDir, {
+            runId,
+            projectId: project.id,
+            phase: 'plan',
+            runOptions: {
+              testingScope: opts.testingScope,
+              suiteMode: opts.suiteMode,
+              baseRunId: opts.baseRunId,
+              provider: opts.provider,
+              autoApprove: opts.autoApprove,
+              prd: opts.prd,
+              instructions: opts.instructions,
+              prdSourceKind: opts.prdSourceKind,
+              prdFileName: opts.prdFileName,
+              prdSelectedSheets: opts.prdSelectedSheets,
+              coverageLoopEnabled: opts.coverageLoopEnabled,
+              coverageTarget: opts.coverageTarget,
+              retryItemIds: opts.retryItemIds,
+              maxCostUsd: opts.maxCostUsd,
+              maxTokens: opts.maxTokens,
+            },
+            plan: {
+              summary: `Planning in progress: ${progress.items.length} item(s) so far.`,
+              items: progress.items,
+              planSource: 'ai',
+            },
+            planProgress: {
+              completedBatchIndices: progress.completedBatchIndices,
+              failedBatches: progress.failedBatches,
+            },
+            generatedItemIds: [],
+            generatedSpecs: [],
+            executeComplete: false,
+            updatedAt: nowIso(),
+          });
+        };
         plan =
           retryPassPlan ??
-          (await runPlanPhase(provider, project, opts, emit, overrides, repoIndex, recordUsage));
+          (await runPlanPhase(
+            provider,
+            project,
+            opts,
+            emit,
+            overrides,
+            repoIndex,
+            recordUsage,
+            planResumeState,
+            onPlanBatchProgress,
+          ));
         // Enforce the testing-scope boundary as a backstop: plan.ts already asks
         // the model for (and normalizes tiers to) only in-scope tiers, but this
         // is the hard guarantee — filtered here, before approval/persistence, so
@@ -1349,6 +1487,15 @@ async function runPipeline(
         return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
       }
     } else {
+      // Write a checkpoint marking phase='generate' BEFORE the (possibly
+      // long-running, AI-driven) generate() call itself — without this, an
+      // uncooperative crash mid-GENERATE (no exception, no catch block runs)
+      // would leave no checkpoint.json on disk at all for resume to find,
+      // regardless of how much per-item progress generate.ts's own
+      // write-through checkpoint (see modes/playwright/generate.ts) preserved
+      // on the filesystem. `specs` is still empty here, so buildCheckpoint's
+      // phase resolves to 'generate' exactly as intended.
+      await writeCheckpoint(runDir, buildCheckpoint(false));
       emit('generate', 'info', 'Scaffolding suite.');
       try {
         await mode.scaffold(ctx);
@@ -1364,7 +1511,15 @@ async function runPipeline(
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
         } else if (suiteMode === 'topup') {
-          const diff = diffAgainstBase(planForGeneration.items, baseTestsWithSpec);
+          // Retry-pass/Repair (results-page actions): a retryItemIds-targeted item
+          // must be regenerated even when it already has a covering test — that's
+          // the whole precondition for Repair (a test_is_wrong verdict can only
+          // exist on an already-executed test) — so force it into toGenerate
+          // rather than letting diffAgainstBase's ordinary "existing test = already
+          // covered" rule silently carry the old (possibly wrong) spec forward.
+          const forceRegenerate =
+            opts.retryItemIds && opts.retryItemIds.length > 0 ? new Set(opts.retryItemIds) : undefined;
+          const diff = diffAgainstBase(planForGeneration.items, baseTestsWithSpec, forceRegenerate);
           emit(
             'generate',
             'info',
@@ -1380,6 +1535,26 @@ async function runPipeline(
           newSpecs = await mode.generate(ctx, planForGeneration);
           newSpecItems = planForGeneration.items;
           trackGeneration(planForGeneration.items.length, newSpecs.length);
+        }
+
+        // A live pause/budget-ceiling abort can stop mode.generate() from
+        // dispatching further batches WITHOUT throwing (see generate.ts's
+        // runWithConcurrency shouldStop) — unlike an abort that kills an
+        // in-flight call (caught below), this returns normally with a
+        // PARTIAL newSpecs list. Catch it here, before `specs` (outer) is
+        // ever assigned: buildCheckpoint's phase resolves to 'execute' the
+        // moment specs.length > 0, and resume treats phase:'execute' as
+        // "GENERATE fully done, never call mode.generate() again" — locking
+        // in a partial specs list forever would silently ship an incomplete
+        // suite. Pausing here instead leaves `specs` empty, so the
+        // checkpoint stays phase:'generate' and resume re-invokes
+        // mode.generate(), which skips already-done items via its own
+        // write-through checkpoint and finishes the remainder. A plain
+        // cancel (not a pause/budget request) still cancels, same as every
+        // other checkCancelled() boundary — pauseOrCancel already makes
+        // that distinction.
+        if (checkCancelled()) {
+          return await pauseOrCancel('generate', false);
         }
 
         // Pre-execution validation gate: generate.ts's regex/string gates
@@ -1471,7 +1646,11 @@ async function runPipeline(
         // signature. Check isPauseRequested() FIRST: it's the direct cause,
         // regardless of what the resulting error message happens to say.
         if (isPauseRequested()) {
-          return await pauseRun('generate', 'manual', false);
+          return await pauseRun(
+            'generate',
+            signal?.reason === 'budget' ? 'budget-exceeded' : 'manual',
+            false,
+          );
         }
         // Otherwise, a systemic provider outage (see ProviderUnavailableError/
         // generate.ts) is worth pausing+resuming rather than hard-failing —
@@ -1549,7 +1728,11 @@ async function runPipeline(
         // which is what actually kills an in-flight Playwright invocation — so
         // check isPauseRequested() before trying to pattern-match the error text.
         if (isPauseRequested()) {
-          return await pauseRun('execute', 'manual', executeComplete);
+          return await pauseRun(
+            'execute',
+            signal?.reason === 'budget' ? 'budget-exceeded' : 'manual',
+            executeComplete,
+          );
         }
         const classified = classifyTransientFailure(errMsg(err));
         if (classified) {
@@ -1761,169 +1944,251 @@ async function runPipeline(
     try {
       const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
-        emit('triage', 'info', `Triaging ${failed.length} failure(s)/blocked outcome(s).`);
         const engine = createTriageEngine();
 
-        // classify() is synchronous/deterministic — run it for every failure up
-        // front as the baseline (and the fallback if AI enrichment below fails).
-        const baseline = failed.map((r) => {
-          // Recover the originating spec (by normalized title) to ground the triage
-          // input with its requirement tag and source.
-          const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
-          // Surface a captured trace/screenshot to the AI prompt (see
-          // prompt.ts's "TRACE PATH" block) — this was collected by execute.ts
-          // but never threaded through before, so triage only ever "knew" a
-          // trace existed by chance, never which file.
-          const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
-          // Recover the plan item this spec was generated from, to find the source-context unit
-          // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
-          // candidates below, since most failures never reach that stage.
-          const planItem = planForGeneration.items.find(
-            (it) => (spec?.reqTag && it.reqTag === spec.reqTag) || it.title === r.title,
-          );
-          const unit = planItem?.unitKey
-            ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
-            : undefined;
-          const input: TriageInput = {
-            title: r.title,
-            error: r.error ?? '',
-            ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
-            ...(spec?.contents ? { specSource: spec.contents } : {}),
-            ...(tracePath ? { tracePath } : {}),
-          };
-          let triage: ReportTriageEntry['triage'] | null = null;
-          try {
-            triage = engine.classify(input);
-          } catch (err) {
-            emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
-          }
-          return { r, input, triage, unit };
-        });
-
-        // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
-        // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
-        // AbortController) rather than one at a time OR all at once — triage was previously
-        // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
-        // child process (providers/claude.ts's runCli), so an unbounded burst of
-        // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
-        // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
-        // failures that most need it (low-confidence/ambiguous baselines) rather than on
-        // whichever failures happen to execute first — a rule-confident test_is_wrong near
-        // the top of the results array was previously "spending" a slot that a genuinely
-        // ambiguous failure further down needed far more.
-        const aiCandidates = baseline
-          .filter((b) => b.triage !== null)
-          .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
-          .slice(0, TRIAGE_AI_LIMIT);
-
-        /**
-         * Triage one group with a SINGLE batched provider call (see
-         * TriageEngine.analyzeBatch). Only a genuinely TRUNCATED reply (cut off
-         * mid-array — the same signature attemptPlanCompletion's batch-split
-         * reacts to) triggers a halve-and-retry; a reply that simply came back
-         * garbled/unusable (no array structure at all) is NOT retried, since a
-         * smaller batch has no reason to fix that — it would only multiply
-         * calls for no benefit. A partial result (some ids present, others
-         * not) is likewise never retried: every missing id simply keeps its
-         * already-computed rule-baseline verdict, since triage (unlike
-         * Generate) always has one.
-         */
-        const enrichBatch = async (batchCandidates: typeof aiCandidates, depth: number): Promise<void> => {
-          // Read each candidate's matched source-context unit lazily — only
-          // AI-enriched candidates need it (classify()'s deterministic rules
-          // never look at source), so most failures never pay this read.
-          for (const b of batchCandidates) {
-            if (b.unit && project.repoPath) {
-              try {
-                const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
-                b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
-              } catch (err) {
-                emit(
-                  'triage',
-                  'debug',
-                  `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
-                );
-              }
-            }
-          }
-
-          // Ids are positional and scoped to THIS call only — stable enough to
-          // join the reply back to its candidate, never persisted or compared
-          // across calls (each recursive split builds its own fresh set).
-          const items: TriageBatchItem[] = batchCandidates.map((b, i) => ({ id: String(i), input: b.input }));
-          const controller = new AbortController();
-          let outcome: { results: Map<string, TriageResult>; truncated: boolean };
-          try {
-            outcome = await withTimeoutAbort(
-              engine.analyzeBatch(
-                items,
-                provider,
-                controller.signal,
-                recordUsage,
-                project.repoPath ?? undefined,
-              ),
-              TRIAGE_ANALYZE_TIMEOUT_MS,
-              controller,
-            );
-          } catch (err) {
-            emit('triage', 'debug', `Batched AI triage failed: ${errMsg(err)}`);
-            outcome = { results: new Map(), truncated: false };
-          }
-
-          if (outcome.truncated && batchCandidates.length > 1 && depth < TRIAGE_MAX_SPLIT_DEPTH) {
-            const mid = Math.ceil(batchCandidates.length / 2);
-            emit(
-              'triage',
-              'debug',
-              `Batched triage of ${batchCandidates.length} failure(s) came back truncated; ` +
-                `splitting and retrying.`,
-            );
-            await enrichBatch(batchCandidates.slice(0, mid), depth + 1);
-            await enrichBatch(batchCandidates.slice(mid), depth + 1);
-            return;
-          }
-
-          batchCandidates.forEach((b, i) => {
-            const enriched = outcome.results.get(String(i));
-            if (enriched) b.triage = enriched;
-            // else: keep the already-computed rule-baseline verdict (b.triage is already set).
-          });
-        };
-
-        for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
-          const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
-          await enrichBatch(batch, 0);
-        }
-
-        for (const b of baseline) {
-          if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
-        }
-        emit('triage', 'info', `Triaged ${triageEntries.length} failure(s).`);
-
-        // Best-effort FK-keyed persistence alongside report.json's title-joined
-        // entries above — matched to `tests` rows by title, exact at this point
-        // in the pipeline (titles are already finalized by EXECUTE). Never
-        // blocks report-writing: a bad testId or store fault here is no worse
-        // than report.json simply being the only surviving record, same as
-        // today.
+        // Built up front — used both to persist incrementally below (matched
+        // by title, exact at this point in the pipeline since titles are
+        // already finalized by EXECUTE) and to detect, on resume, which
+        // failures a prior crashed TRIAGE pass already recorded a verdict
+        // for (per-batch persistence, see recordTriageResult below).
+        let testIdByTitle: Map<string, string> | null = null;
         try {
-          const testIdByTitle = new Map(store.listTests(runId).map((t) => [t.title, t.id]));
-          for (const b of baseline) {
-            if (!b.triage) continue;
-            const testId = testIdByTitle.get(b.r.title);
-            if (!testId) continue;
-            store.recordTriageResult({
-              testId,
-              verdict: b.triage.verdict,
-              confidence: b.triage.confidence,
-              rationale: b.triage.rationale,
-              suggestedPatch: b.triage.suggestedPatch ?? null,
-            });
-          }
+          testIdByTitle = new Map(store.listTests(runId).map((t) => [t.title, t.id]));
           noteStoreOk();
         } catch (err) {
           noteStoreFailure('recordTriageResult', err);
         }
+
+        // Resume support: skip re-triaging (and re-spending AI budget on) a
+        // failure whose test already has a persisted verdict — mirrors
+        // Generate/Execute's item-level resume skip. recordTriageResult
+        // upserts by testId, so this is purely an efficiency/AI-spend
+        // optimization, not a correctness requirement — but without it a
+        // resumed mid-TRIAGE crash would needlessly re-run classify()/AI
+        // enrichment for every already-done failure.
+        const alreadyTriaged = new Map<string, TriageResultRow>();
+        if (testIdByTitle) {
+          try {
+            const rowsByTestId = new Map(store.listTriageResults(runId).map((row) => [row.testId, row]));
+            for (const [title, testId] of testIdByTitle) {
+              const row = rowsByTestId.get(testId);
+              if (row) alreadyTriaged.set(title, row);
+            }
+            noteStoreOk();
+          } catch (err) {
+            noteStoreFailure('recordTriageResult', err);
+          }
+        }
+        for (const r of failed) {
+          const row = alreadyTriaged.get(r.title);
+          if (!row) continue;
+          triageEntries.push({
+            title: r.title,
+            error: r.error ?? '',
+            triage: {
+              verdict: row.verdict,
+              confidence: row.confidence,
+              rationale: row.rationale,
+              ...(row.suggestedPatch ? { suggestedPatch: row.suggestedPatch } : {}),
+            },
+          });
+        }
+        if (alreadyTriaged.size > 0) {
+          emit(
+            'triage',
+            'info',
+            `Resuming: ${alreadyTriaged.size} failure(s) already triaged; skipping them this run.`,
+          );
+        }
+        const toTriage =
+          alreadyTriaged.size > 0 ? failed.filter((r) => !alreadyTriaged.has(r.title)) : failed;
+
+        if (toTriage.length > 0) {
+          emit('triage', 'info', `Triaging ${toTriage.length} failure(s)/blocked outcome(s).`);
+
+          // classify() is synchronous/deterministic — run it for every failure up
+          // front as the baseline (and the fallback if AI enrichment below fails).
+          const baseline = toTriage.map((r) => {
+            // Recover the originating spec (by normalized title) to ground the triage
+            // input with its requirement tag and source.
+            const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
+            // Surface a captured trace/screenshot to the AI prompt (see
+            // prompt.ts's "TRACE PATH" block) — this was collected by execute.ts
+            // but never threaded through before, so triage only ever "knew" a
+            // trace existed by chance, never which file.
+            const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+            // Recover the plan item this spec was generated from, to find the source-context unit
+            // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
+            // candidates below, since most failures never reach that stage.
+            const planItem = planForGeneration.items.find(
+              (it) => (spec?.reqTag && it.reqTag === spec.reqTag) || it.title === r.title,
+            );
+            const unit = planItem?.unitKey
+              ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
+              : undefined;
+            const input: TriageInput = {
+              title: r.title,
+              error: r.error ?? '',
+              ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
+              ...(spec?.contents ? { specSource: spec.contents } : {}),
+              ...(tracePath ? { tracePath } : {}),
+            };
+            let triage: ReportTriageEntry['triage'] | null = null;
+            try {
+              triage = engine.classify(input);
+            } catch (err) {
+              emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
+            }
+            return { r, input, triage, unit };
+          });
+
+          // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
+          // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
+          // AbortController) rather than one at a time OR all at once — triage was previously
+          // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
+          // child process (providers/claude.ts's runCli), so an unbounded burst of
+          // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
+          // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
+          // failures that most need it (low-confidence/ambiguous baselines) rather than on
+          // whichever failures happen to execute first — a rule-confident test_is_wrong near
+          // the top of the results array was previously "spending" a slot that a genuinely
+          // ambiguous failure further down needed far more.
+          const aiCandidates = baseline
+            .filter((b) => b.triage !== null)
+            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
+            .slice(0, TRIAGE_AI_LIMIT);
+          const aiCandidateSet = new Set(aiCandidates);
+
+          /**
+           * Best-effort FK-keyed persistence alongside report.json's title-joined
+           * triageEntries built below. Never blocks report-writing: a bad testId
+           * or store fault here is no worse than report.json simply being the
+           * only surviving record, same as before.
+           */
+          const persistTriageResult = (b: (typeof baseline)[number]): void => {
+            if (!b.triage || !testIdByTitle) return;
+            const testId = testIdByTitle.get(b.r.title);
+            if (!testId) return;
+            try {
+              store.recordTriageResult({
+                testId,
+                verdict: b.triage.verdict,
+                confidence: b.triage.confidence,
+                rationale: b.triage.rationale,
+                suggestedPatch: b.triage.suggestedPatch ?? null,
+              });
+              noteStoreOk();
+            } catch (err) {
+              noteStoreFailure('recordTriageResult', err);
+            }
+          };
+
+          // Every failure NOT selected for AI enrichment already has its FINAL
+          // verdict (classify() is synchronous and nothing below ever touches
+          // it) — persist these right away rather than holding them until the
+          // whole TRIAGE phase finishes just to batch up a single write pass.
+          for (const b of baseline) {
+            if (!aiCandidateSet.has(b)) persistTriageResult(b);
+          }
+
+          /**
+           * Triage one group with a SINGLE batched provider call (see
+           * TriageEngine.analyzeBatch). Only a genuinely TRUNCATED reply (cut off
+           * mid-array — the same signature attemptPlanCompletion's batch-split
+           * reacts to) triggers a halve-and-retry; a reply that simply came back
+           * garbled/unusable (no array structure at all) is NOT retried, since a
+           * smaller batch has no reason to fix that — it would only multiply
+           * calls for no benefit. A partial result (some ids present, others
+           * not) is likewise never retried: every missing id simply keeps its
+           * already-computed rule-baseline verdict, since triage (unlike
+           * Generate) always has one.
+           */
+          const enrichBatch = async (batchCandidates: typeof aiCandidates, depth: number): Promise<void> => {
+            // Read each candidate's matched source-context unit lazily — only
+            // AI-enriched candidates need it (classify()'s deterministic rules
+            // never look at source), so most failures never pay this read.
+            for (const b of batchCandidates) {
+              if (b.unit && project.repoPath) {
+                try {
+                  const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
+                  b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
+                } catch (err) {
+                  emit(
+                    'triage',
+                    'debug',
+                    `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
+                  );
+                }
+              }
+            }
+
+            // Ids are positional and scoped to THIS call only — stable enough to
+            // join the reply back to its candidate, never persisted or compared
+            // across calls (each recursive split builds its own fresh set).
+            const items: TriageBatchItem[] = batchCandidates.map((b, i) => ({
+              id: String(i),
+              input: b.input,
+            }));
+            const controller = new AbortController();
+            let outcome: { results: Map<string, TriageResult>; truncated: boolean };
+            try {
+              outcome = await withTimeoutAbort(
+                engine.analyzeBatch(
+                  items,
+                  provider,
+                  controller.signal,
+                  recordUsage,
+                  project.repoPath ?? undefined,
+                ),
+                TRIAGE_ANALYZE_TIMEOUT_MS,
+                controller,
+              );
+            } catch (err) {
+              emit('triage', 'debug', `Batched AI triage failed: ${errMsg(err)}`);
+              outcome = { results: new Map(), truncated: false };
+            }
+
+            if (outcome.truncated && batchCandidates.length > 1 && depth < TRIAGE_MAX_SPLIT_DEPTH) {
+              const mid = Math.ceil(batchCandidates.length / 2);
+              emit(
+                'triage',
+                'debug',
+                `Batched triage of ${batchCandidates.length} failure(s) came back truncated; ` +
+                  `splitting and retrying.`,
+              );
+              await enrichBatch(batchCandidates.slice(0, mid), depth + 1);
+              await enrichBatch(batchCandidates.slice(mid), depth + 1);
+              return;
+            }
+
+            batchCandidates.forEach((b, i) => {
+              const enriched = outcome.results.get(String(i));
+              if (enriched) b.triage = enriched;
+              // else: keep the already-computed rule-baseline verdict (b.triage is already set).
+            });
+          };
+
+          for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
+            // Mirrors PLAN's own batch loop: a live pause/budget-ceiling abort
+            // stops further AI batches from dispatching, rather than only
+            // taking effect at the next phase boundary (before REPORT) — the
+            // remaining candidates simply keep their rule-baseline verdict.
+            if (checkCancelled()) break;
+            const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
+            await enrichBatch(batch, 0);
+            // Persist this batch's candidates now, with whatever verdict
+            // enrichBatch settled on (AI-enriched, or the rule baseline if
+            // enrichment didn't pan out) — a crash before the NEXT batch starts
+            // still leaves this one's rows durably recorded, instead of the
+            // whole phase being all-or-nothing.
+            for (const b of batch) persistTriageResult(b);
+          }
+
+          for (const b of baseline) {
+            if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
+          }
+        }
+        emit('triage', 'info', `Triaged ${triageEntries.length} failure(s).`);
       } else {
         emit('triage', 'debug', 'No failures to triage.');
       }
@@ -2344,6 +2609,13 @@ export function splitUnitsByWeight(units: FunctionalityUnit[]): [FunctionalityUn
   return [units.slice(0, cut), units.slice(cut)];
 }
 
+/** Snapshot of PLAN's batch-loop progress — see runPlanPhase's resumeState/onBatchProgress params. */
+export interface PlanBatchProgress {
+  completedBatchIndices: number[];
+  items: TestPlanItem[];
+  failedBatches: string[];
+}
+
 export async function runPlanPhase(
   provider: ProviderAdapter,
   project: Project,
@@ -2352,6 +2624,10 @@ export async function runPlanPhase(
   overrides?: OrchestratorOverrides,
   repoIndex?: PlanRepoContext,
   recordUsage?: UsageRecorder,
+  /** Resume a previously interrupted batch loop: skip these batch indices, and start from these already-accumulated items/failures instead of empty. */
+  resumeState?: { completedBatchIndices: Set<number>; items: TestPlanItem[]; failedBatches: string[] },
+  /** Fires after each top-level batch resolves (succeeded OR permanently failed) — lets the caller checkpoint progress so a crash mid-loop doesn't redo already-paid-for batches. */
+  onBatchProgress?: (progress: PlanBatchProgress) => void | Promise<void>,
 ): Promise<TestPlan> {
   const units = repoIndex?.functionality ?? [];
   const totalWeight = units.reduce((sum, u) => sum + estimateUnitWeight(u), 0);
@@ -2384,8 +2660,16 @@ export async function runPlanPhase(
     `Planning ${units.length} unit(s) across ${batches.length} batch(es) (weight budget ${PLAN_BATCH_WEIGHT_BUDGET}, max ${PLAN_BATCH_MAX_UNITS} unit(s)/batch).`,
   );
 
-  const items: TestPlanItem[] = [];
-  const failedBatches: string[] = [];
+  const items: TestPlanItem[] = resumeState ? [...resumeState.items] : [];
+  const failedBatches: string[] = resumeState ? [...resumeState.failedBatches] : [];
+  const completedBatchIndices = new Set<number>(resumeState?.completedBatchIndices ?? []);
+  if (resumeState && completedBatchIndices.size > 0) {
+    emit(
+      'plan',
+      'info',
+      `Resuming PLAN: ${completedBatchIndices.size}/${batches.length} batch(es) already completed; continuing with the remainder.`,
+    );
+  }
 
   // Plans one batch, splitting it in half by weight and retrying each half
   // (up to PLAN_MAX_SPLIT_DEPTH times) if attemptPlanCompletion exhausts its
@@ -2460,7 +2744,16 @@ export async function runPlanPhase(
 
   for (let i = 0; i < batches.length; i++) {
     if (opts.signal?.aborted) break;
+    if (completedBatchIndices.has(i)) continue;
     await planBatch(batches[i]!, i, `${i + 1}/${batches.length}`, 0);
+    completedBatchIndices.add(i);
+    if (onBatchProgress) {
+      await onBatchProgress({
+        completedBatchIndices: [...completedBatchIndices],
+        items: [...items],
+        failedBatches: [...failedBatches],
+      });
+    }
   }
 
   if (items.length === 0) {
@@ -2508,10 +2801,19 @@ function registerSpecRows(
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
 ): void {
-  const reqTag = (spec.reqTag ?? '').trim();
+  // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
+  // deliberately never persists the per-run synthetic tag — see persistedReqTag
+  // below), but the spec file's own text still carries the original run's
+  // `[REQ:<tag>]` markers on every one of its scenarios. Recovering that tag from
+  // spec.contents (rather than treating this spec as tag-less) is what lets `base`
+  // land on the same key persistResults will later re-derive from the executed
+  // test's title via the same extractReqTag() — without it, registration keys by
+  // title while matching keys by tag, and every carried scenario after the first
+  // collides on persistResults' fallback path (see that function's comments).
+  const reqTag = (spec.reqTag ?? extractReqTag(spec.contents) ?? '').trim();
   const item = reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined;
   const specPath = relative(projectDir, spec.path);
-  const base = stableKey(spec.reqTag, spec.title);
+  const base = stableKey(reqTag, spec.title);
   // The PERSISTED reqTag is the plan item's true reqTag (or null when it
   // never had one) — NOT spec.reqTag, which generate.ts fills in with the
   // item's own id when a real reqTag is absent (`item.reqTag ?? item.id`),

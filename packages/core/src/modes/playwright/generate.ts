@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
@@ -1006,6 +1006,127 @@ interface GenOneOutcome {
   providerFailureDetail?: string;
 }
 
+// ---- Write-through per-item checkpoint (mirrors execute.ts's write-through
+// per-test checkpoint — see templates.ts's checkpointReporterContents() for
+// the rationale). GENERATE has no separate subprocess/reporter the way
+// EXECUTE does (every call here happens in-process), so the read/append/clear
+// helpers live directly alongside the code that produces each item's outcome. ----
+
+/** File name for GENERATE's own write-through checkpoint, at the suite project root (alongside EXEC_CHECKPOINT_FILENAME). */
+export const GEN_CHECKPOINT_FILENAME = 'healix-generate-checkpoint.ndjson';
+
+/**
+ * One plan item's FINAL generation outcome, persisted the moment it's decided
+ * (see recordGenOutcome) instead of only after the whole GENERATE phase
+ * returns. Without this, a crash mid-phase loses every item's progress even
+ * though their spec FILES already survived on disk — resume would have to
+ * re-ask the AI for all of them again, batches it had already paid for
+ * included. 'skipped' is recorded only for an item that exhausted its retries
+ * under NORMAL operation (content genuinely rejected); an item still in
+ * flight when a pause/abort hits is deliberately left unrecorded (see
+ * recordGenOutcome) so it's retried fresh next time, not written off.
+ */
+export interface GenCheckpointEntry {
+  itemId: string;
+  title: string;
+  reqTag: string;
+  tier: Tier;
+  status: 'generated' | 'skipped';
+  /** Absolute path to the written spec file — only present when status === 'generated'. */
+  specPath?: string;
+  /** The reqTag-prefixed report title (matches GeneratedSpec.title) — only present when status === 'generated'. */
+  specTitle?: string;
+  /** Why the item was skipped — only present when status === 'skipped'. */
+  reason?: string;
+}
+
+function genCheckpointFilePath(projectDir: string): string {
+  return join(projectDir, GEN_CHECKPOINT_FILENAME);
+}
+
+/** Best-effort read; a missing/corrupt file just means "nothing finished yet" — same tolerance as execute.ts's readCheckpointEntries. */
+export async function readGenerateCheckpointEntries(projectDir: string): Promise<GenCheckpointEntry[]> {
+  let raw: string;
+  try {
+    raw = await readFile(genCheckpointFilePath(projectDir), 'utf-8');
+  } catch {
+    return [];
+  }
+  const byId = new Map<string, GenCheckpointEntry>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as GenCheckpointEntry;
+      if (entry && typeof entry.itemId === 'string') byId.set(entry.itemId, entry);
+    } catch {
+      // One malformed line (e.g. a write truncated by the same crash this file exists to survive)
+      // must not lose every other entry in it.
+    }
+  }
+  return [...byId.values()];
+}
+
+// Serializes appends per projectDir: GEN_CONCURRENCY runs multiple batch tasks
+// concurrently IN THIS SAME PROCESS (unlike execute.ts's reporter, which is
+// naturally serialized by Playwright's single main-process reporter model), so
+// without this queue two concurrent appendFile calls could interleave partial
+// writes to the same file.
+const appendQueues = new Map<string, Promise<void>>();
+
+async function appendGenerateCheckpointEntry(projectDir: string, entry: GenCheckpointEntry): Promise<void> {
+  const line = `${JSON.stringify(entry)}\n`;
+  const prior = appendQueues.get(projectDir) ?? Promise.resolve();
+  const next = prior
+    .then(() => appendFile(genCheckpointFilePath(projectDir), line, 'utf-8'))
+    .catch(() => {
+      // best-effort — never fail generation over a checkpoint write
+    });
+  appendQueues.set(projectDir, next);
+  await next;
+}
+
+/** Best-effort cleanup once generate() completes without being interrupted — nothing left to resume. */
+export async function clearGenerateCheckpoint(projectDir: string): Promise<void> {
+  await unlink(genCheckpointFilePath(projectDir)).catch(() => {});
+}
+
+/**
+ * Records an item's outcome as FINAL, unless a pause/abort is the reason
+ * we're looking at it right now — in which case nothing is written, so the
+ * item is retried fresh (not written off as permanently skipped) the next
+ * time generate() runs. This is the per-item analogue of execute.ts's
+ * `cmd.aborted || ctx.signal?.aborted` check gating its own checkpoint logic.
+ */
+async function recordGenOutcome(
+  ctx: TestModeContext,
+  item: TestPlanItem,
+  outcome: GenOneOutcome,
+): Promise<void> {
+  if (ctx.signal?.aborted) return;
+  const entry: GenCheckpointEntry = {
+    itemId: item.id,
+    title: item.title,
+    reqTag: item.reqTag ?? item.id,
+    tier: resolveTier(item.tier),
+    status: outcome.spec ? 'generated' : 'skipped',
+    ...(outcome.spec ? { specPath: outcome.spec.path, specTitle: outcome.spec.title } : {}),
+    ...(!outcome.spec && outcome.reason ? { reason: outcome.reason } : {}),
+  };
+  await appendGenerateCheckpointEntry(ctx.projectDir, entry);
+}
+
+/** Reconstructs a GeneratedSpec for an already-finished item from an earlier, interrupted generate() call — by re-reading its spec file rather than re-asking the AI. Returns null (best-effort) if the file is gone or the entry wasn't a 'generated' one. */
+async function restoreGeneratedSpec(entry: GenCheckpointEntry): Promise<GeneratedSpec | null> {
+  if (entry.status !== 'generated' || !entry.specPath || !entry.specTitle) return null;
+  try {
+    const contents = await readFile(entry.specPath, 'utf-8');
+    return { path: entry.specPath, title: entry.specTitle, reqTag: entry.reqTag, tier: entry.tier, contents };
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Compute a collision-free relative spec path within a tier. Tracks already-used
  * paths and suffixes -2/-3/... on collision so two same-tier items with the same
@@ -1407,7 +1528,9 @@ async function generateBatch(
 ): Promise<Array<{ item: TestPlanItem } & GenOneOutcome>> {
   if (batchItems.length === 1) {
     const item = batchItems[0]!;
-    return [{ item, ...(await generateOne(ctx, item, usedPaths)) }];
+    const outcome = await generateOne(ctx, item, usedPaths);
+    await recordGenOutcome(ctx, item, outcome);
+    return [{ item, ...outcome }];
   }
 
   const tier = resolveTier(batchItems[0]!.tier);
@@ -1458,7 +1581,9 @@ async function generateBatch(
     const itemText = extracted.get(reqTag);
     if (!itemText) {
       emit(ctx, `Batched response was missing a spec for "${item.title}"; solo-retrying.`);
-      results.push({ item, ...(await generateOne(ctx, item, usedPaths)) });
+      const soloOutcome = await generateOne(ctx, item, usedPaths);
+      await recordGenOutcome(ctx, item, soloOutcome);
+      results.push({ item, ...soloOutcome });
       continue;
     }
     const validated = await validateAndPersist(ctx, item, itemText, usedPaths);
@@ -1469,6 +1594,8 @@ async function generateBatch(
       );
     }
     if (validated.spec) {
+      const outcome: GenOneOutcome = { spec: validated.spec };
+      await recordGenOutcome(ctx, item, outcome);
       results.push({ item, spec: validated.spec });
       continue;
     }
@@ -1477,7 +1604,9 @@ async function generateBatch(
       `Batched output for "${item.title}" failed validation (${validated.reason}); solo-retrying via the single-item path.`,
       { ...(validated.violations ? { violations: validated.violations } : {}) },
     );
-    results.push({ item, ...(await generateOne(ctx, item, usedPaths)) });
+    const soloOutcome = await generateOne(ctx, item, usedPaths);
+    await recordGenOutcome(ctx, item, soloOutcome);
+    results.push({ item, ...soloOutcome });
   }
   return results;
 }
@@ -1487,14 +1616,25 @@ const GEN_CONCURRENCY = 3;
 
 /**
  * Run up to `concurrency` promises at a time from `tasks`. Returns results in
- * the same order as `tasks` regardless of completion order.
+ * the same order as `tasks` regardless of completion order. `shouldStop`
+ * (checked before each task is popped, e.g. a live pause or a proactive
+ * credit-budget ceiling tripping mid-GENERATE — see orchestrator/index.ts's
+ * checkBudget) lets a worker stop pulling NEW batches without disturbing
+ * batches already in flight; a task never dispatched simply leaves its slot
+ * `undefined` — callers must filter those out before use (see generate()'s
+ * `.filter(Boolean)` below).
  */
-async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+  shouldStop?: () => boolean,
+): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   let nextIndex = 0;
 
   async function worker(): Promise<void> {
     while (nextIndex < tasks.length) {
+      if (shouldStop?.()) return;
       const i = nextIndex++;
       results[i] = await tasks[i]();
     }
@@ -1520,12 +1660,28 @@ async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency
 export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
   const items = plan.items ?? [];
 
+  // Restore whatever finished in an earlier, interrupted generate() call (see
+  // recordGenOutcome/readGenerateCheckpointEntries above) — only entries for
+  // items still present in THIS plan count, so a later, unrelated generate()
+  // call reusing the same projectDir never inherits stale entries (same
+  // precedent as execute.ts's clearExecCheckpoint doc comment).
+  const priorEntriesAll = await readGenerateCheckpointEntries(ctx.projectDir);
+  const currentItemIds = new Set(items.map((it) => it.id));
+  const priorEntries = priorEntriesAll.filter((e) => currentItemIds.has(e.itemId));
+  const doneIds = new Set(priorEntries.map((e) => e.itemId));
+  const remainingItems = items.filter((it) => !doneIds.has(it.id));
+  if (priorEntries.length > 0) {
+    emit(ctx, `Resuming: ${priorEntries.length} item(s) already finished; skipping them this run.`, {
+      alreadyFinished: priorEntries.length,
+    });
+  }
+
   // Batch same-tier items together so a shared tier-wide/app-wide context (rules, tier guidance,
   // mock note, routing guidance) is paid for ONCE per batch instead of once per item — items from
   // different tiers are never mixed into the same batch, since their tier guidance genuinely
   // differs (see buildBatchPrompt).
   const byTier = new Map<Tier, TestPlanItem[]>();
-  for (const item of items) {
+  for (const item of remainingItems) {
     const tier = resolveTier(item.tier);
     const list = byTier.get(tier) ?? [];
     list.push(item);
@@ -1540,14 +1696,14 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
 
   emit(
     ctx,
-    `Generating ${items.length} spec(s) across ${batches.length} batch(es) of up to ${GEN_BATCH_SIZE} (up to ${GEN_CONCURRENCY} batch(es) in parallel)`,
-    { count: items.length, batches: batches.length },
+    `Generating ${remainingItems.length} spec(s) across ${batches.length} batch(es) of up to ${GEN_BATCH_SIZE} (up to ${GEN_CONCURRENCY} batch(es) in parallel)`,
+    { count: remainingItems.length, batches: batches.length },
   );
 
   const specs: GeneratedSpec[] = [];
   const usedPaths = new Set<string>();
   let completed = 0;
-  const total = items.length;
+  const total = remainingItems.length;
 
   // Path de-dup happens inside validateAndPersist/generateOne (before writeFile) via the shared
   // usedPaths set, so each accepted spec persists to a unique file on disk even when several
@@ -1563,7 +1719,12 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
     return batchOutcomes;
   });
 
-  const outcomes = (await runWithConcurrency(tasks, GEN_CONCURRENCY)).flat();
+  // shouldStop lets a live pause/budget-ceiling abort stop new batches from
+  // being dispatched (batches already in flight still finish); a batch never
+  // dispatched leaves an undefined slot, filtered out before flattening.
+  const outcomes = (await runWithConcurrency(tasks, GEN_CONCURRENCY, () => ctx.signal?.aborted === true))
+    .filter((r): r is NonNullable<typeof r> => r !== undefined)
+    .flat();
 
   let lastProviderFailureDetail: string | undefined;
   for (const { item, spec, reason, violations, providerFailureDetail } of outcomes) {
@@ -1587,10 +1748,18 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // providerFailureDetail — a partial mix of provider- and content-failures
   // is ordinary generation, not this). Only then is this a network/credits
   // interruption worth checkpointing, rather than "the model produced
-  // nothing usable," which stays today's normal zero-specs outcome.
+  // nothing usable," which stays today's normal zero-specs outcome. Scoped to
+  // remainingItems: if everything was already finished in an earlier attempt,
+  // there's nothing left to dispatch and therefore nothing to classify.
+  // outcomes.length > 0 guards against Array.prototype.every's vacuous-true
+  // on an empty array: a signal already aborted before any batch even
+  // dispatched (runWithConcurrency's shouldStop, e.g. a live pause/budget
+  // ceiling) leaves outcomes empty — that's "we were told to stop", not a
+  // provider outage, and must not be misclassified as one.
   if (
-    items.length > 0 &&
+    remainingItems.length > 0 &&
     specs.length === 0 &&
+    outcomes.length > 0 &&
     outcomes.every((o) => o.providerFailureDetail !== undefined)
   ) {
     throw new ProviderUnavailableError(
@@ -1598,9 +1767,27 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
     );
   }
 
+  // Fold in whatever finished during an earlier, interrupted attempt (and was
+  // therefore skipped this run) so the returned list covers the WHOLE
+  // GENERATE phase, not just what this particular invocation produced —
+  // mirrors execute.ts's equivalent merge of checkpoint-restored entries.
+  if (priorEntries.length > 0) {
+    const restored = await Promise.all(priorEntries.map((e) => restoreGeneratedSpec(e)));
+    for (const spec of restored) if (spec) specs.push(spec);
+  }
+
   emit(ctx, `Generation complete: ${specs.length}/${items.length} spec(s) accepted`, {
     accepted: specs.length,
     requested: items.length,
   });
+
+  // Completed without interruption — nothing left to resume. A pause/abort
+  // leaves the write-through checkpoint IN PLACE (not cleared) so the NEXT
+  // generate() call resumes from it instead of redoing already-finished work;
+  // only a clean, uninterrupted completion clears it — same condition
+  // execute.ts's clearExecCheckpoint call site uses.
+  if (!ctx.signal?.aborted) {
+    await clearGenerateCheckpoint(ctx.projectDir);
+  }
   return specs;
 }

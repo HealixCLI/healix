@@ -37,11 +37,35 @@ export interface SuiteDiff {
  * on top. A plan item only needs a fresh AI generation when no carried test
  * already covers its identity key — i.e. it's new/missing functionality;
  * an existing test's prior status is never a reason to regenerate it.
+ *
+ * `forceRegenerate` is the escape hatch Repair (and, degenerately, Retry-pass)
+ * need from that last rule: a Repair-targeted item, by definition, already HAS
+ * a covering test — that's the whole precondition for a `test_is_wrong`
+ * verdict to exist — so without this override it would always be classified
+ * "already covered" and silently carried forward unchanged, never actually
+ * regenerated. Any plan item whose id is in `forceRegenerate` is forced into
+ * `toGenerate` regardless of coverage, and its own identity-matching base
+ * test(s) are excluded from `carried` so the fresh replacement doesn't ride
+ * alongside the stale one it's meant to replace.
  */
-export function diffAgainstBase(planItems: TestPlanItem[], baseTests: TestCase[]): SuiteDiff {
+export function diffAgainstBase(
+  planItems: TestPlanItem[],
+  baseTests: TestCase[],
+  forceRegenerate?: ReadonlySet<string>,
+): SuiteDiff {
   const coveredKeys = new Set(baseTests.map((t) => computeIdentityKey(t.reqTag, t.title)));
   const toGenerate = planItems.filter(
-    (item) => !coveredKeys.has(computeIdentityKey(item.reqTag, item.title)),
+    (item) => forceRegenerate?.has(item.id) || !coveredKeys.has(computeIdentityKey(item.reqTag, item.title)),
   );
-  return { toGenerate, carried: baseTests };
+
+  if (!forceRegenerate || forceRegenerate.size === 0) {
+    return { toGenerate, carried: baseTests };
+  }
+  const forcedKeys = new Set(
+    planItems
+      .filter((item) => forceRegenerate.has(item.id))
+      .map((item) => computeIdentityKey(item.reqTag, item.title)),
+  );
+  const carried = baseTests.filter((t) => !forcedKeys.has(computeIdentityKey(t.reqTag, t.title)));
+  return { toGenerate, carried };
 }

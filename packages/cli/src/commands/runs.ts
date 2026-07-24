@@ -5,6 +5,7 @@ import {
   createOrchestrator,
   getStore,
   projectsDir,
+  reconcileRuns,
   type AgentEvent,
   type Run,
   type RunStatus,
@@ -12,6 +13,7 @@ import {
   type TestStatus,
 } from '@healix/core';
 import { isTerminalRunStatus, reportPathFor, runExitCode, shapeRunShow } from '../lib/helpers.js';
+import { installInterruptHandler } from '../lib/interrupt.js';
 import { printSummary, streamEvent } from './run.js';
 
 /** Print a friendly hint when the local SQLite store is unavailable. */
@@ -314,6 +316,11 @@ export function registerRuns(program: Command): void {
         return;
       }
 
+      const interrupt = installInterruptHandler(() => {
+        console.log('');
+        console.log(pc.yellow('  ⚠ Interrupt received — pausing run (checkpoint will be saved)…'));
+      });
+
       const orchestrator = createOrchestrator();
       console.log('');
       console.log(
@@ -322,7 +329,7 @@ export function registerRuns(program: Command): void {
       console.log('');
 
       try {
-        const summary = await orchestrator.resume(runId, { onEvent: streamEvent });
+        const summary = await orchestrator.resume(runId, { onEvent: streamEvent }, interrupt.signal);
         printSummary(summary);
         process.exitCode = runExitCode(summary.status);
       } catch (err) {
@@ -330,6 +337,8 @@ export function registerRuns(program: Command): void {
         console.log(pc.red(`  ✖ Resume failed: ${err instanceof Error ? err.message : String(err)}`));
         console.log('');
         process.exitCode = 1;
+      } finally {
+        interrupt.dispose();
       }
     });
 
@@ -360,6 +369,81 @@ export function registerRuns(program: Command): void {
       );
       console.log(pc.dim('    On-disk artifacts under the project folder are kept.'));
       console.log('');
+    });
+
+  /**
+   * The CLI's equivalent of the desktop app's boot-time reconciliation (see
+   * apps/desktop/src/main/index.ts's reconcileRunsOnBoot / @healix/core's
+   * reconcileRuns): the CLI has no persistent "app start" moment to hook
+   * this into automatically, so it's a command instead — run it after an
+   * unclean shutdown (a killed `healix run`/`healix runs resume`, a crash, a
+   * system restart) to reclassify whatever was left mid-flight and resume
+   * anything that's actually resumable, one run at a time.
+   */
+  cmd
+    .command('reconcile')
+    .description(
+      'Reconcile runs left mid-flight by an unclean shutdown (crash/kill/restart): mark unrecoverable ones as error, resume the rest',
+    )
+    .action(async () => {
+      const store = await getStore();
+      if (!store) {
+        storeUnavailable();
+        process.exitCode = 1;
+        return;
+      }
+
+      console.log('');
+      console.log(pc.bold('  Reconciling runs'));
+      console.log('');
+
+      const { toResume, markedError, orphansReaped } = await reconcileRuns(store);
+      if (markedError > 0) {
+        console.log(
+          pc.yellow(
+            `  ⚠ Marked ${markedError} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
+          ),
+        );
+      }
+      if (orphansReaped > 0) {
+        console.log(pc.yellow(`  ⚠ Janitor marked ${orphansReaped} stale orphaned run(s) as error.`));
+      }
+      if (toResume.length === 0) {
+        console.log(pc.dim('  Nothing to resume.'));
+        console.log('');
+        return;
+      }
+      console.log(pc.dim(`  Resuming ${toResume.length} run(s), one at a time…`));
+      console.log('');
+
+      const orchestrator = createOrchestrator();
+      let anyUnpassed = false;
+      // One at a time, same as the desktop app's boot-time reconciliation —
+      // there's no reason a CLI batch run needs that same single-active-run
+      // guarantee, but doing several orchestrator pipelines concurrently
+      // from one process hasn't been exercised/tested, so stay conservative.
+      for (const run of toResume) {
+        console.log(
+          `  ${pc.bold('Resuming')} ${pc.dim(run.id)} ${pc.dim(`(paused: ${run.pauseReason ?? 'unknown'})`)}`,
+        );
+        const interrupt = installInterruptHandler(() => {
+          console.log('');
+          console.log(pc.yellow('  ⚠ Interrupt received — pausing run (checkpoint will be saved)…'));
+        });
+        try {
+          const summary = await orchestrator.resume(run.id, { onEvent: streamEvent }, interrupt.signal);
+          printSummary(summary);
+          if (summary.status !== 'passed') anyUnpassed = true;
+        } catch (err) {
+          console.log('');
+          console.log(pc.red(`  ✖ Resume failed: ${err instanceof Error ? err.message : String(err)}`));
+          console.log('');
+          anyUnpassed = true;
+        } finally {
+          interrupt.dispose();
+        }
+      }
+      process.exitCode = anyUnpassed ? 1 : 0;
     });
 }
 

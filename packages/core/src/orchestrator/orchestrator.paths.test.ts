@@ -2,7 +2,7 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createOrchestrator } from './index.js';
 import type { OrchestratorEvent, PlanApprovalResult } from './types.js';
@@ -1299,6 +1299,80 @@ describe('orchestrator paths (offline DI seam)', () => {
     ).length;
     expect(escalatedAmbiguousCount).toBe(10);
     expect(escalatedConfidentCount).toBe(10);
+  });
+
+  it('TRIAGE PERSISTENCE: recordTriageResult is written incrementally per batch, not once at phase end, and never duplicated', async () => {
+    // 12 failures, all with unrecognized error text so every one is AI-eligible
+    // (low-confidence ambiguous baseline) — with TRIAGE_AI_BATCH_SIZE=5 that's
+    // 3 AI batches (5 + 5 + 2), enough to observe persistence interleaved
+    // between batches rather than only after the whole phase finishes.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Triage Persistence Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const titles = Array.from({ length: 12 }, (_, i) => `Ambiguous case ${i}`);
+    const manyFailedOutcome: ExecOutcome = {
+      passed: 0,
+      failed: 12,
+      blocked: 0,
+      flaky: 0,
+      results: titles.map((title) => ({
+        title,
+        status: 'failed' as const,
+        durationMs: 10,
+        error: 'Error: something completely unrecognized happened',
+      })),
+    };
+
+    // recordTriageResult calls already made by the time each AI batch's
+    // provider call fires — captured BEFORE that call resolves, so a spy
+    // count of 0 for the first batch and >0 for later ones proves rows land
+    // between batches, not only after the loop finishes.
+    const recordCallsSeenBeforeBatch: number[] = [];
+    let recordCalls = 0;
+    const recordSpy = vi.spyOn(store, 'recordTriageResult');
+
+    const triageAwareProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
+        }
+        if (opts && !opts.readOnly && opts.taskType === 'triage') {
+          recordCalls = recordSpy.mock.calls.length;
+          recordCallsSeenBeforeBatch.push(recordCalls);
+        }
+        return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: triageAwareProvider,
+      getMode: () => makeFakeMode(manyFailedOutcome),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
+
+    // 3 AI batches (5 + 5 + 2) plus 1 end-of-run triage-summary call.
+    expect(recordCallsSeenBeforeBatch.length).toBeGreaterThanOrEqual(3);
+    // The FIRST batch fires before anything has been persisted yet (nothing
+    // to persist before any batch has resolved), but at least one LATER
+    // batch must see calls already recorded from an earlier one — proving
+    // persistence happens as each batch finishes, not only at phase end.
+    expect(recordCallsSeenBeforeBatch[0]).toBe(0);
+    expect(Math.max(...recordCallsSeenBeforeBatch)).toBeGreaterThan(0);
+
+    // Exactly one row per triaged failure — never duplicated (e.g. once for
+    // the rule baseline, again after AI enrichment).
+    const rows = store.listTriageResults(summary.runId);
+    expect(rows.length).toBe(titles.length);
+    const testIds = rows.map((r) => r.testId);
+    expect(new Set(testIds).size).toBe(testIds.length);
   });
 
   it('LAUNCH RECOVERY: missing-deps failure installs dependencies and retries the launch once', async () => {

@@ -1,3 +1,4 @@
+import { mkdirSync, writeFileSync } from 'node:fs';
 import { mkdtemp, readFile, rm } from 'node:fs/promises';
 import { createRequire } from 'node:module';
 import { tmpdir } from 'node:os';
@@ -22,11 +23,10 @@ function evalComputeWorkers(cpuCount: number, freeMemBytes: number): number {
   const cfg = playwrightConfigContents();
   const match = /function computeWorkers\(\) \{[\s\S]*?\n\}/.exec(cfg);
   if (!match) throw new Error('computeWorkers() not found in generated config');
-  const fn = new Function(
-    'cpus',
-    'freemem',
-    `${match[0]}\nreturn computeWorkers();`,
-  ) as (cpus: () => unknown[], freemem: () => number) => number;
+  const fn = new Function('cpus', 'freemem', `${match[0]}\nreturn computeWorkers();`) as (
+    cpus: () => unknown[],
+    freemem: () => number,
+  ) => number;
   return fn(
     () => Array.from({ length: cpuCount }),
     () => freeMemBytes,
@@ -190,7 +190,7 @@ describe('checkpointReporterContents', () => {
 
     function loadReporter(): new () => { onTestEnd(test: unknown, result: unknown): void } {
       const reporterPath = join(dir, 'checkpoint-reporter.cjs');
-      require('node:fs').writeFileSync(reporterPath, checkpointReporterContents(), 'utf-8');
+      writeFileSync(reporterPath, checkpointReporterContents(), 'utf-8');
       const req = createRequire(import.meta.url);
       delete req.cache[req.resolve(reporterPath)];
       return req(reporterPath);
@@ -302,7 +302,7 @@ describe('checkpointReporterContents', () => {
       // Make the checkpoint file's own path a directory, so appendFileSync
       // throws EISDIR — without touching cwd itself (deleting cwd is
       // unreliable across platforms, notably Windows).
-      require('node:fs').mkdirSync(join(dir, EXEC_CHECKPOINT_FILENAME));
+      mkdirSync(join(dir, EXEC_CHECKPOINT_FILENAME));
       process.chdir(dir);
       try {
         expect(() =>

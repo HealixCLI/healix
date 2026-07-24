@@ -1,4 +1,4 @@
-import type { ChildProcess } from 'node:child_process';
+import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { access, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
@@ -234,14 +234,30 @@ function runPlaywright(ctx: TestModeContext, invertFilePath?: string | null): Pr
       stderr: Buffer.concat(stderrChunks).toString('utf8'),
     });
 
+    // Kill the whole process tree, not just the direct `npx` process. On
+    // POSIX the child is its own process-group leader (detached: true above)
+    // so `-pid` signals the group. Windows has no process-group signal, so
+    // `taskkill /T` walks and force-kills the tree by PID/PPID instead —
+    // otherwise only the top-level npx process dies, leaving the node process
+    // actually running Playwright (and the browsers it launched) running to
+    // real completion in the background. Same pattern as target/launcher.ts's
+    // and exec/run-cli.ts's own killTree().
     const kill = (signal: NodeJS.Signals): void => {
       if (!child.pid) return;
-      try {
-        if (process.platform === 'win32') {
-          child.kill(signal);
-        } else {
-          process.kill(-child.pid, signal);
+      if (process.platform === 'win32') {
+        try {
+          nodeSpawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+        } catch {
+          try {
+            child.kill(signal);
+          } catch {
+            /* already exited */
+          }
         }
+        return;
+      }
+      try {
+        process.kill(-child.pid, signal);
       } catch {
         try {
           child.kill(signal);
@@ -347,11 +363,43 @@ export function runCommand(
         // Allowlisted env only — same rationale as runPlaywright: install
         // scripts run arbitrary code and must not inherit host secrets.
         env: suiteEnv(ctx),
+        // POSIX: own process-group leader so killTree() below can signal the
+        // whole group (install scripts / browser downloaders spawn their own
+        // children) — see runPlaywright's identical rationale.
+        detached: process.platform !== 'win32',
       });
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: String(err), aborted: false });
       return;
     }
+
+    // Kill the whole process tree, not just the direct npm/npx process — same
+    // pattern as runPlaywright's kill() above (and target/launcher.ts's /
+    // exec/run-cli.ts's own killTree()). Without this, a killed install
+    // leaves its actual install script or browser-downloader process running.
+    const killTree = (): void => {
+      if (!child.pid) return;
+      if (process.platform === 'win32') {
+        try {
+          nodeSpawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+          return;
+        } catch {
+          /* fall through to plain kill below */
+        }
+      } else {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+          return;
+        } catch {
+          /* fall through to plain kill below */
+        }
+      }
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already exited */
+      }
+    };
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -374,11 +422,7 @@ export function runCommand(
     };
 
     const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already exited */
-      }
+      killTree();
       const { stdout, stderr } = decoded();
       finish({
         code: null,
@@ -390,11 +434,7 @@ export function runCommand(
 
     // Cooperative cancellation: same kill-and-finish path as the timeout above.
     const onAbort = (): void => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already exited */
-      }
+      killTree();
       const { stdout, stderr } = decoded();
       finish({ code: null, stdout, stderr: `${stderr}\n[aborted]`, aborted: true });
     };

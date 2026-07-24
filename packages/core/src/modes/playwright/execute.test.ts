@@ -26,10 +26,21 @@ vi.mock('cross-spawn', async (importOriginal) => {
   return { ...actual, default: vi.fn(actual.default) };
 });
 
+// execute.ts's killTree helpers spawn `taskkill` via node:child_process's own
+// spawn (not cross-spawn) on Windows — see runPlaywright's/runCommand's kill
+// logic. Spied the same way as cross-spawn above, so tests that fake a killed
+// child process don't invoke a REAL taskkill against a made-up pid.
+vi.mock('node:child_process', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('node:child_process')>();
+  return { ...actual, spawn: vi.fn(actual.spawn) };
+});
+
 import spawn from 'cross-spawn';
+import { spawn as nodeSpawn } from 'node:child_process';
 import type { GeneratedSpec, TestModeContext } from '../types.js';
 import {
   execute,
+  runCommand,
   suiteEnv,
   parseReport,
   findAuthSetupOutcome,
@@ -1019,7 +1030,13 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
 
   it('resume: merges checkpoint-restored entries with a fresh partial report, passing --test-list-invert', async () => {
     writeCheckpointEntries([
-      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+      {
+        key: 'k-a',
+        title: 'a',
+        project: 'tierA-public',
+        specFile: 'tests/tierA-public/a.spec.ts',
+        status: 'expected',
+      },
     ]);
 
     let seenArgs: string[] = [];
@@ -1043,8 +1060,20 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
 
   it('fully-resumed run with nothing left to execute does not emit a false "no results" error', async () => {
     writeCheckpointEntries([
-      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
-      { key: 'k-b', title: 'b', project: 'tierA-public', specFile: 'tests/tierA-public/b.spec.ts', status: 'expected' },
+      {
+        key: 'k-a',
+        title: 'a',
+        project: 'tierA-public',
+        specFile: 'tests/tierA-public/a.spec.ts',
+        status: 'expected',
+      },
+      {
+        key: 'k-b',
+        title: 'b',
+        project: 'tierA-public',
+        specFile: 'tests/tierA-public/b.spec.ts',
+        status: 'expected',
+      },
     ]);
 
     const events: Array<{ message: string; data?: unknown }> = [];
@@ -1096,7 +1125,13 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
 
   it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {
     writeCheckpointEntries([
-      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+      {
+        key: 'k-a',
+        title: 'a',
+        project: 'tierA-public',
+        specFile: 'tests/tierA-public/a.spec.ts',
+        status: 'expected',
+      },
     ]);
     vi.mocked(spawn).mockImplementationOnce(() => {
       writeFileSync(
@@ -1114,16 +1149,23 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
 
   it('preserves the checkpoint (does not clear it) when the run is aborted mid-flight', async () => {
     writeCheckpointEntries([
-      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+      {
+        key: 'k-a',
+        title: 'a',
+        project: 'tierA-public',
+        specFile: 'tests/tierA-public/a.spec.ts',
+        status: 'expected',
+      },
     ]);
     const controller = new AbortController();
+    let proc!: ChildProcess;
     vi.mocked(spawn).mockImplementationOnce(() => {
       // Unlike fakeChildProcess(), this one only closes once killed — so the
       // abort (queued right after this mock returns, but processed by
       // runPlaywright's signal listener, which is attached synchronously
       // right after spawn() returns) reliably happens BEFORE any close event,
       // instead of racing an auto-close microtask scheduled at construction.
-      const proc = new EventEmitter() as unknown as ChildProcess;
+      proc = new EventEmitter() as unknown as ChildProcess;
       (proc as unknown as { stdout: EventEmitter }).stdout = new EventEmitter();
       (proc as unknown as { stderr: EventEmitter }).stderr = new EventEmitter();
       (proc as unknown as { pid: number }).pid = 4243;
@@ -1134,6 +1176,14 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
       queueMicrotask(() => controller.abort());
       return proc;
     });
+    // On this (win32) platform, kill() shells out to `taskkill` via
+    // node:child_process's spawn instead of calling child.kill() directly —
+    // simulate a successful kill by emitting the fake child's own close
+    // event, same effect a real taskkill terminating the tracked pid would have.
+    vi.mocked(nodeSpawn).mockImplementationOnce(() => {
+      queueMicrotask(() => proc.emit('close', null, 'SIGTERM'));
+      return new EventEmitter() as unknown as ChildProcess;
+    });
 
     const outcome = await execute(makeCtx({ projectDir: dir, signal: controller.signal }), SPECS);
 
@@ -1141,5 +1191,119 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     const remaining = await readCheckpointEntries(dir);
     expect(remaining).toHaveLength(1);
     expect(remaining[0].title).toBe('a');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Windows process-tree kill: an aborted/timed-out run must terminate the
+// WHOLE process tree (npx -> node -> browsers), not just the top-level
+// process — see runPlaywright's and runCommand's kill()/killTree() doc
+// comments. platform is stubbed per-test so this is exercised identically on
+// every CI OS, not just whichever one happens to run it.
+// ---------------------------------------------------------------------------
+describe('kill() / killTree() — Windows uses taskkill /F /T, not a bare child.kill()', () => {
+  function stubPlatform(value: NodeJS.Platform): () => void {
+    const original = Object.getOwnPropertyDescriptor(process, 'platform')!;
+    Object.defineProperty(process, 'platform', { value, configurable: true });
+    return () => Object.defineProperty(process, 'platform', original);
+  }
+
+  function fakeChildProcess(): ChildProcess {
+    const proc = new EventEmitter() as unknown as ChildProcess;
+    (proc as unknown as { stdout: EventEmitter }).stdout = new EventEmitter();
+    (proc as unknown as { stderr: EventEmitter }).stderr = new EventEmitter();
+    (proc as unknown as { pid: number }).pid = 9999;
+    (proc as unknown as { kill: () => boolean }).kill = vi.fn(() => {
+      queueMicrotask(() => proc.emit('close', null, 'SIGTERM'));
+      return true;
+    });
+    return proc;
+  }
+
+  it('runPlaywright: aborting on a win32-stubbed platform shells out to taskkill /F /T /PID, not child.kill()', async () => {
+    const restore = stubPlatform('win32');
+    try {
+      const controller = new AbortController();
+      let proc!: ChildProcess;
+      vi.mocked(spawn).mockImplementationOnce(() => {
+        proc = fakeChildProcess();
+        queueMicrotask(() => controller.abort());
+        return proc;
+      });
+      vi.mocked(nodeSpawn).mockImplementationOnce(() => {
+        queueMicrotask(() => proc.emit('close', null, 'SIGTERM'));
+        return new EventEmitter() as unknown as ChildProcess;
+      });
+
+      const dir = mkdtempSync(join(tmpdir(), 'healix-killtree-'));
+      try {
+        mkdirSync(join(dir, 'node_modules', '@playwright'), { recursive: true });
+        const outcome = await execute(makeCtx({ projectDir: dir, signal: controller.signal }), [
+          { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+        ]);
+        expect((outcome.raw as { aborted?: boolean } | undefined)?.aborted).toBe(true);
+      } finally {
+        rmSync(dir, { recursive: true, force: true });
+      }
+
+      expect(nodeSpawn).toHaveBeenCalledWith(
+        'taskkill',
+        ['/F', '/T', '/PID', '9999'],
+        expect.objectContaining({ stdio: 'ignore' }),
+      );
+      // The load-bearing regression check: the old buggy code called
+      // child.kill() directly on Windows instead of tearing down the tree.
+      expect(proc.kill).not.toHaveBeenCalled();
+    } finally {
+      restore();
+    }
+  });
+
+  it('runCommand: spawns detached on POSIX but not on a win32-stubbed platform, and kills via taskkill on win32', async () => {
+    const restorePosix = stubPlatform('linux');
+    let seenOptions: Record<string, unknown> = {};
+    vi.mocked(spawn).mockImplementationOnce((_cmd, _args, opts) => {
+      seenOptions = opts as Record<string, unknown>;
+      const proc = fakeChildProcess();
+      queueMicrotask(() => proc.emit('close', 0, null));
+      return proc;
+    });
+    await runCommand(makeCtx({ projectDir: '/nonexistent' }), 'npm', ['install'], 5_000);
+    expect(seenOptions.detached).toBe(true);
+    restorePosix();
+
+    const restoreWin = stubPlatform('win32');
+    try {
+      const controller = new AbortController();
+      let proc!: ChildProcess;
+      vi.mocked(spawn).mockImplementationOnce((_cmd, _args, opts) => {
+        seenOptions = opts as Record<string, unknown>;
+        proc = fakeChildProcess();
+        queueMicrotask(() => controller.abort());
+        return proc;
+      });
+      vi.mocked(nodeSpawn).mockImplementationOnce(() => {
+        queueMicrotask(() => proc.emit('close', null, 'SIGTERM'));
+        return new EventEmitter() as unknown as ChildProcess;
+      });
+
+      const result = await runCommand(
+        makeCtx({ projectDir: '/nonexistent', signal: controller.signal }),
+        'npm',
+        ['install'],
+        5_000,
+      );
+
+      expect(seenOptions.detached).toBe(false);
+      expect(result.aborted).toBe(true);
+      expect(nodeSpawn).toHaveBeenCalledWith(
+        'taskkill',
+        ['/F', '/T', '/PID', '9999'],
+        expect.objectContaining({ stdio: 'ignore' }),
+      );
+      expect(proc.kill).not.toHaveBeenCalled();
+    } finally {
+      restoreWin();
+    }
   });
 });

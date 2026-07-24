@@ -517,11 +517,18 @@ export class HealixStore {
   }
 
   /**
-   * Persist one FK-keyed triage verdict for a test. Best-effort by design
-   * (mirrors recordUsage/insertResult's own style) — a bad testId or a store
-   * fault here must never block report-writing, since report.json's
-   * title-joined ReportTriageEntry already carries the verdict either way;
-   * this is an additional, queryable record, not the source of truth.
+   * Persist one FK-keyed triage verdict for a test — upserts by testId (one
+   * current verdict per test), rather than accumulating a new row every call.
+   * Best-effort by design (mirrors recordUsage/insertResult's own style) — a
+   * bad testId or a store fault here must never block report-writing, since
+   * report.json's title-joined ReportTriageEntry already carries the verdict
+   * either way; this is an additional, queryable record, not the source of
+   * truth. The upsert matters because triage can legitimately run against the
+   * same test more than once — a resumed mid-TRIAGE crash re-triages
+   * candidates the orchestrator doesn't track as already-done (unlike
+   * Generate/Execute's item-level skip), and Retry-pass/Repair re-triage a
+   * targeted test outright — so a plain INSERT would leave stale duplicate
+   * rows for the same test rather than replacing them.
    */
   recordTriageResult(input: NewTriageResult): TriageResultRow {
     const row: TriageResultRow = {
@@ -533,11 +540,31 @@ export class HealixStore {
       suggestedPatch: input.suggestedPatch ?? null,
       createdAt: new Date().toISOString(),
     };
-    this.db
-      .prepare(
-        'INSERT INTO triage_results (id, test_id, verdict, confidence, rationale, suggested_patch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
-      )
-      .run(row.id, row.testId, row.verdict, row.confidence, row.rationale, row.suggestedPatch, row.createdAt);
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM triage_results WHERE test_id = ?').run(row.testId);
+      this.db
+        .prepare(
+          'INSERT INTO triage_results (id, test_id, verdict, confidence, rationale, suggested_patch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          row.id,
+          row.testId,
+          row.verdict,
+          row.confidence,
+          row.rationale,
+          row.suggestedPatch,
+          row.createdAt,
+        );
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* best-effort rollback */
+      }
+      throw err;
+    }
     return row;
   }
 

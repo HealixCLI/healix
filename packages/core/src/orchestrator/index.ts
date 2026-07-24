@@ -11,6 +11,7 @@ import type {
   TestCase,
   TestStatus,
   Tier,
+  TriageResultRow,
 } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
 import type { ProviderAdapter } from '../providers/types.js';
@@ -1845,66 +1846,13 @@ async function runPipeline(
     try {
       const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
-        emit('triage', 'info', `Triaging ${failed.length} failure(s)/blocked outcome(s).`);
         const engine = createTriageEngine();
 
-        // classify() is synchronous/deterministic — run it for every failure up
-        // front as the baseline (and the fallback if AI enrichment below fails).
-        const baseline = failed.map((r) => {
-          // Recover the originating spec (by normalized title) to ground the triage
-          // input with its requirement tag and source.
-          const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
-          // Surface a captured trace/screenshot to the AI prompt (see
-          // prompt.ts's "TRACE PATH" block) — this was collected by execute.ts
-          // but never threaded through before, so triage only ever "knew" a
-          // trace existed by chance, never which file.
-          const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
-          // Recover the plan item this spec was generated from, to find the source-context unit
-          // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
-          // candidates below, since most failures never reach that stage.
-          const planItem = planForGeneration.items.find(
-            (it) => (spec?.reqTag && it.reqTag === spec.reqTag) || it.title === r.title,
-          );
-          const unit = planItem?.unitKey
-            ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
-            : undefined;
-          const input: TriageInput = {
-            title: r.title,
-            error: r.error ?? '',
-            ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
-            ...(spec?.contents ? { specSource: spec.contents } : {}),
-            ...(tracePath ? { tracePath } : {}),
-          };
-          let triage: ReportTriageEntry['triage'] | null = null;
-          try {
-            triage = engine.classify(input);
-          } catch (err) {
-            emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
-          }
-          return { r, input, triage, unit };
-        });
-
-        // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
-        // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
-        // AbortController) rather than one at a time OR all at once — triage was previously
-        // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
-        // child process (providers/claude.ts's runCli), so an unbounded burst of
-        // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
-        // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
-        // failures that most need it (low-confidence/ambiguous baselines) rather than on
-        // whichever failures happen to execute first — a rule-confident test_is_wrong near
-        // the top of the results array was previously "spending" a slot that a genuinely
-        // ambiguous failure further down needed far more.
-        const aiCandidates = baseline
-          .filter((b) => b.triage !== null)
-          .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
-          .slice(0, TRIAGE_AI_LIMIT);
-        const aiCandidateSet = new Set(aiCandidates);
-
-        // Built once, up front, so incremental persistence below (rather than
-        // one pass after the WHOLE phase finishes) can look up each result's
-        // testId as soon as its verdict is final — matched by title, exact at
-        // this point in the pipeline (titles are already finalized by EXECUTE).
+        // Built up front — used both to persist incrementally below (matched
+        // by title, exact at this point in the pipeline since titles are
+        // already finalized by EXECUTE) and to detect, on resume, which
+        // failures a prior crashed TRIAGE pass already recorded a verdict
+        // for (per-batch persistence, see recordTriageResult below).
         let testIdByTitle: Map<string, string> | null = null;
         try {
           testIdByTitle = new Map(store.listTests(runId).map((t) => [t.title, t.id]));
@@ -1913,125 +1861,229 @@ async function runPipeline(
           noteStoreFailure('recordTriageResult', err);
         }
 
-        /**
-         * Best-effort FK-keyed persistence alongside report.json's title-joined
-         * triageEntries built below. Never blocks report-writing: a bad testId
-         * or store fault here is no worse than report.json simply being the
-         * only surviving record, same as before.
-         */
-        const persistTriageResult = (b: (typeof baseline)[number]): void => {
-          if (!b.triage || !testIdByTitle) return;
-          const testId = testIdByTitle.get(b.r.title);
-          if (!testId) return;
+        // Resume support: skip re-triaging (and re-spending AI budget on) a
+        // failure whose test already has a persisted verdict — mirrors
+        // Generate/Execute's item-level resume skip. recordTriageResult
+        // upserts by testId, so this is purely an efficiency/AI-spend
+        // optimization, not a correctness requirement — but without it a
+        // resumed mid-TRIAGE crash would needlessly re-run classify()/AI
+        // enrichment for every already-done failure.
+        const alreadyTriaged = new Map<string, TriageResultRow>();
+        if (testIdByTitle) {
           try {
-            store.recordTriageResult({
-              testId,
-              verdict: b.triage.verdict,
-              confidence: b.triage.confidence,
-              rationale: b.triage.rationale,
-              suggestedPatch: b.triage.suggestedPatch ?? null,
-            });
+            const rowsByTestId = new Map(store.listTriageResults(runId).map((row) => [row.testId, row]));
+            for (const [title, testId] of testIdByTitle) {
+              const row = rowsByTestId.get(testId);
+              if (row) alreadyTriaged.set(title, row);
+            }
             noteStoreOk();
           } catch (err) {
             noteStoreFailure('recordTriageResult', err);
           }
-        };
-
-        // Every failure NOT selected for AI enrichment already has its FINAL
-        // verdict (classify() is synchronous and nothing below ever touches
-        // it) — persist these right away rather than holding them until the
-        // whole TRIAGE phase finishes just to batch up a single write pass.
-        for (const b of baseline) {
-          if (!aiCandidateSet.has(b)) persistTriageResult(b);
         }
+        for (const r of failed) {
+          const row = alreadyTriaged.get(r.title);
+          if (!row) continue;
+          triageEntries.push({
+            title: r.title,
+            error: r.error ?? '',
+            triage: {
+              verdict: row.verdict,
+              confidence: row.confidence,
+              rationale: row.rationale,
+              ...(row.suggestedPatch ? { suggestedPatch: row.suggestedPatch } : {}),
+            },
+          });
+        }
+        if (alreadyTriaged.size > 0) {
+          emit(
+            'triage',
+            'info',
+            `Resuming: ${alreadyTriaged.size} failure(s) already triaged; skipping them this run.`,
+          );
+        }
+        const toTriage =
+          alreadyTriaged.size > 0 ? failed.filter((r) => !alreadyTriaged.has(r.title)) : failed;
 
-        /**
-         * Triage one group with a SINGLE batched provider call (see
-         * TriageEngine.analyzeBatch). Only a genuinely TRUNCATED reply (cut off
-         * mid-array — the same signature attemptPlanCompletion's batch-split
-         * reacts to) triggers a halve-and-retry; a reply that simply came back
-         * garbled/unusable (no array structure at all) is NOT retried, since a
-         * smaller batch has no reason to fix that — it would only multiply
-         * calls for no benefit. A partial result (some ids present, others
-         * not) is likewise never retried: every missing id simply keeps its
-         * already-computed rule-baseline verdict, since triage (unlike
-         * Generate) always has one.
-         */
-        const enrichBatch = async (batchCandidates: typeof aiCandidates, depth: number): Promise<void> => {
-          // Read each candidate's matched source-context unit lazily — only
-          // AI-enriched candidates need it (classify()'s deterministic rules
-          // never look at source), so most failures never pay this read.
-          for (const b of batchCandidates) {
-            if (b.unit && project.repoPath) {
-              try {
-                const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
-                b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
-              } catch (err) {
-                emit(
-                  'triage',
-                  'debug',
-                  `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
-                );
+        if (toTriage.length > 0) {
+          emit('triage', 'info', `Triaging ${toTriage.length} failure(s)/blocked outcome(s).`);
+
+          // classify() is synchronous/deterministic — run it for every failure up
+          // front as the baseline (and the fallback if AI enrichment below fails).
+          const baseline = toTriage.map((r) => {
+            // Recover the originating spec (by normalized title) to ground the triage
+            // input with its requirement tag and source.
+            const spec = specs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
+            // Surface a captured trace/screenshot to the AI prompt (see
+            // prompt.ts's "TRACE PATH" block) — this was collected by execute.ts
+            // but never threaded through before, so triage only ever "knew" a
+            // trace existed by chance, never which file.
+            const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+            // Recover the plan item this spec was generated from, to find the source-context unit
+            // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
+            // candidates below, since most failures never reach that stage.
+            const planItem = planForGeneration.items.find(
+              (it) => (spec?.reqTag && it.reqTag === spec.reqTag) || it.title === r.title,
+            );
+            const unit = planItem?.unitKey
+              ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
+              : undefined;
+            const input: TriageInput = {
+              title: r.title,
+              error: r.error ?? '',
+              ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
+              ...(spec?.contents ? { specSource: spec.contents } : {}),
+              ...(tracePath ? { tracePath } : {}),
+            };
+            let triage: ReportTriageEntry['triage'] | null = null;
+            try {
+              triage = engine.classify(input);
+            } catch (err) {
+              emit('triage', 'warn', `Triage classify failed for "${r.title}": ${errMsg(err)}`);
+            }
+            return { r, input, triage, unit };
+          });
+
+          // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
+          // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
+          // AbortController) rather than one at a time OR all at once — triage was previously
+          // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
+          // child process (providers/claude.ts's runCli), so an unbounded burst of
+          // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
+          // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
+          // failures that most need it (low-confidence/ambiguous baselines) rather than on
+          // whichever failures happen to execute first — a rule-confident test_is_wrong near
+          // the top of the results array was previously "spending" a slot that a genuinely
+          // ambiguous failure further down needed far more.
+          const aiCandidates = baseline
+            .filter((b) => b.triage !== null)
+            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
+            .slice(0, TRIAGE_AI_LIMIT);
+          const aiCandidateSet = new Set(aiCandidates);
+
+          /**
+           * Best-effort FK-keyed persistence alongside report.json's title-joined
+           * triageEntries built below. Never blocks report-writing: a bad testId
+           * or store fault here is no worse than report.json simply being the
+           * only surviving record, same as before.
+           */
+          const persistTriageResult = (b: (typeof baseline)[number]): void => {
+            if (!b.triage || !testIdByTitle) return;
+            const testId = testIdByTitle.get(b.r.title);
+            if (!testId) return;
+            try {
+              store.recordTriageResult({
+                testId,
+                verdict: b.triage.verdict,
+                confidence: b.triage.confidence,
+                rationale: b.triage.rationale,
+                suggestedPatch: b.triage.suggestedPatch ?? null,
+              });
+              noteStoreOk();
+            } catch (err) {
+              noteStoreFailure('recordTriageResult', err);
+            }
+          };
+
+          // Every failure NOT selected for AI enrichment already has its FINAL
+          // verdict (classify() is synchronous and nothing below ever touches
+          // it) — persist these right away rather than holding them until the
+          // whole TRIAGE phase finishes just to batch up a single write pass.
+          for (const b of baseline) {
+            if (!aiCandidateSet.has(b)) persistTriageResult(b);
+          }
+
+          /**
+           * Triage one group with a SINGLE batched provider call (see
+           * TriageEngine.analyzeBatch). Only a genuinely TRUNCATED reply (cut off
+           * mid-array — the same signature attemptPlanCompletion's batch-split
+           * reacts to) triggers a halve-and-retry; a reply that simply came back
+           * garbled/unusable (no array structure at all) is NOT retried, since a
+           * smaller batch has no reason to fix that — it would only multiply
+           * calls for no benefit. A partial result (some ids present, others
+           * not) is likewise never retried: every missing id simply keeps its
+           * already-computed rule-baseline verdict, since triage (unlike
+           * Generate) always has one.
+           */
+          const enrichBatch = async (batchCandidates: typeof aiCandidates, depth: number): Promise<void> => {
+            // Read each candidate's matched source-context unit lazily — only
+            // AI-enriched candidates need it (classify()'s deterministic rules
+            // never look at source), so most failures never pay this read.
+            for (const b of batchCandidates) {
+              if (b.unit && project.repoPath) {
+                try {
+                  const content = await readFile(join(project.repoPath, b.unit.file), 'utf-8');
+                  b.input = { ...b.input, sourceFile: b.unit.file, sourceExcerpt: content };
+                } catch (err) {
+                  emit(
+                    'triage',
+                    'debug',
+                    `Could not read matched source file "${b.unit.file}": ${errMsg(err)}`,
+                  );
+                }
               }
             }
+
+            // Ids are positional and scoped to THIS call only — stable enough to
+            // join the reply back to its candidate, never persisted or compared
+            // across calls (each recursive split builds its own fresh set).
+            const items: TriageBatchItem[] = batchCandidates.map((b, i) => ({
+              id: String(i),
+              input: b.input,
+            }));
+            const controller = new AbortController();
+            let outcome: { results: Map<string, TriageResult>; truncated: boolean };
+            try {
+              outcome = await withTimeoutAbort(
+                engine.analyzeBatch(
+                  items,
+                  provider,
+                  controller.signal,
+                  recordUsage,
+                  project.repoPath ?? undefined,
+                ),
+                TRIAGE_ANALYZE_TIMEOUT_MS,
+                controller,
+              );
+            } catch (err) {
+              emit('triage', 'debug', `Batched AI triage failed: ${errMsg(err)}`);
+              outcome = { results: new Map(), truncated: false };
+            }
+
+            if (outcome.truncated && batchCandidates.length > 1 && depth < TRIAGE_MAX_SPLIT_DEPTH) {
+              const mid = Math.ceil(batchCandidates.length / 2);
+              emit(
+                'triage',
+                'debug',
+                `Batched triage of ${batchCandidates.length} failure(s) came back truncated; ` +
+                  `splitting and retrying.`,
+              );
+              await enrichBatch(batchCandidates.slice(0, mid), depth + 1);
+              await enrichBatch(batchCandidates.slice(mid), depth + 1);
+              return;
+            }
+
+            batchCandidates.forEach((b, i) => {
+              const enriched = outcome.results.get(String(i));
+              if (enriched) b.triage = enriched;
+              // else: keep the already-computed rule-baseline verdict (b.triage is already set).
+            });
+          };
+
+          for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
+            const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
+            await enrichBatch(batch, 0);
+            // Persist this batch's candidates now, with whatever verdict
+            // enrichBatch settled on (AI-enriched, or the rule baseline if
+            // enrichment didn't pan out) — a crash before the NEXT batch starts
+            // still leaves this one's rows durably recorded, instead of the
+            // whole phase being all-or-nothing.
+            for (const b of batch) persistTriageResult(b);
           }
 
-          // Ids are positional and scoped to THIS call only — stable enough to
-          // join the reply back to its candidate, never persisted or compared
-          // across calls (each recursive split builds its own fresh set).
-          const items: TriageBatchItem[] = batchCandidates.map((b, i) => ({ id: String(i), input: b.input }));
-          const controller = new AbortController();
-          let outcome: { results: Map<string, TriageResult>; truncated: boolean };
-          try {
-            outcome = await withTimeoutAbort(
-              engine.analyzeBatch(
-                items,
-                provider,
-                controller.signal,
-                recordUsage,
-                project.repoPath ?? undefined,
-              ),
-              TRIAGE_ANALYZE_TIMEOUT_MS,
-              controller,
-            );
-          } catch (err) {
-            emit('triage', 'debug', `Batched AI triage failed: ${errMsg(err)}`);
-            outcome = { results: new Map(), truncated: false };
+          for (const b of baseline) {
+            if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
           }
-
-          if (outcome.truncated && batchCandidates.length > 1 && depth < TRIAGE_MAX_SPLIT_DEPTH) {
-            const mid = Math.ceil(batchCandidates.length / 2);
-            emit(
-              'triage',
-              'debug',
-              `Batched triage of ${batchCandidates.length} failure(s) came back truncated; ` +
-                `splitting and retrying.`,
-            );
-            await enrichBatch(batchCandidates.slice(0, mid), depth + 1);
-            await enrichBatch(batchCandidates.slice(mid), depth + 1);
-            return;
-          }
-
-          batchCandidates.forEach((b, i) => {
-            const enriched = outcome.results.get(String(i));
-            if (enriched) b.triage = enriched;
-            // else: keep the already-computed rule-baseline verdict (b.triage is already set).
-          });
-        };
-
-        for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
-          const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
-          await enrichBatch(batch, 0);
-          // Persist this batch's candidates now, with whatever verdict
-          // enrichBatch settled on (AI-enriched, or the rule baseline if
-          // enrichment didn't pan out) — a crash before the NEXT batch starts
-          // still leaves this one's rows durably recorded, instead of the
-          // whole phase being all-or-nothing.
-          for (const b of batch) persistTriageResult(b);
-        }
-
-        for (const b of baseline) {
-          if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
         }
         emit('triage', 'info', `Triaged ${triageEntries.length} failure(s).`);
       } else {

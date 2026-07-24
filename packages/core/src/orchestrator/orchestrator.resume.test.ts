@@ -387,6 +387,115 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     expect(resumeProbe.executeCalls).toBe(0);
   });
 
+  it('TRIAGE resume: a failure already triaged by a prior (crashed) pass is skipped, not re-triaged or duplicated', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Resume Demo Triage',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const controller = new AbortController();
+    const probe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
+    const mode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        probe.generateCalls += 1;
+        const specs: GeneratedSpec[] = [];
+        for (const s of CANNED_SPECS) {
+          const abs = join(ctx.projectDir, s.path);
+          await mkdir(dirname(abs), { recursive: true });
+          await writeFile(abs, s.contents, 'utf-8');
+          specs.push({ ...s, path: abs });
+        }
+        return specs;
+      },
+      async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        probe.executeCalls += 1;
+        // Both fail, so both are triage candidates.
+        const results = specs.map((s) => ({
+          title: s.title,
+          status: 'failed' as const,
+          durationMs: 5,
+          error: 'Error: something completely unrecognized happened',
+        }));
+        return { passed: 0, failed: results.length, blocked: 0, flaky: 0, results };
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        // Pause right after execute (executeComplete: true), before TRIAGE ever runs.
+        controller.abort('pause');
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const paused = await orchestrator.run({
+      projectId: project.id,
+      autoApprove: true,
+      signal: controller.signal,
+    });
+    expect(paused.status).toBe('paused');
+
+    // Simulate a prior TRIAGE pass that crashed after persisting a verdict
+    // for exactly one of the two failures (per-batch persistence means a
+    // resumed run's TRIAGE phase can find some — but not all — candidates
+    // already recorded).
+    const tests = store.listTests(paused.runId);
+    const homeTest = tests.find((t) => t.title === 'Home loads');
+    if (!homeTest) throw new Error('expected a "Home loads" test row to exist after pause');
+    store.recordTriageResult({
+      testId: homeTest.id,
+      verdict: 'flaky',
+      confidence: 0.42,
+      rationale: 'Recorded by a prior, crashed TRIAGE pass.',
+    });
+
+    // Capture every triage-mode prompt sent during resume, to prove the
+    // already-triaged failure's title never appears in one.
+    const triagePrompts: string[] = [];
+    const triageCapturingProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts && !opts.readOnly && opts.taskType === 'triage') triagePrompts.push(prompt);
+        return fakeProvider.complete(prompt, opts);
+      },
+    };
+    const resumeOrchestrator = createOrchestrator({
+      provider: triageCapturingProvider,
+      getMode: () => makeInterruptibleMode({ generateCalls: 0, executeCalls: 0 }, false, ''),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await resumeOrchestrator.resume(paused.runId);
+
+    expect(summary.status).toBe('failed');
+    // Resume must not re-triage (or re-spend AI budget on) the already-done
+    // failure — its title never appears in a triage-mode prompt this run.
+    expect(triagePrompts.some((p) => p.includes('Home loads'))).toBe(false);
+    // The other failure is still triaged normally.
+    expect(triagePrompts.some((p) => p.includes('Login works'))).toBe(true);
+
+    // Exactly one row per failure — the pre-existing verdict was neither
+    // duplicated nor lost.
+    const rows = store.listTriageResults(summary.runId);
+    expect(rows.length).toBe(2);
+    const testIds = rows.map((r) => r.testId);
+    expect(new Set(testIds).size).toBe(testIds.length);
+    const preserved = rows.find((r) => r.testId === homeTest.id);
+    expect(preserved?.verdict).toBe('flaky');
+    expect(preserved?.rationale).toBe('Recorded by a prior, crashed TRIAGE pass.');
+  });
+
   it('GENERATE network interruption: pauses before anything is generated; resume redoes GENERATE then executes once', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

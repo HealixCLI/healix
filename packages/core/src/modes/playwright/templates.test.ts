@@ -2,6 +2,8 @@ import { describe, expect, it } from 'vitest';
 import {
   actionHighlighterFixtureContents,
   authSetupContents,
+  checkpointReporterContents,
+  EXEC_CHECKPOINT_FILENAME,
   mockFixtureContents,
   playwrightConfigContents,
   stepsReporterContents,
@@ -37,6 +39,21 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     // as flaky; CI gets 2; HEALIX_RETRIES overrides both.
     expect(cfg).toContain('process.env.HEALIX_RETRIES');
     expect(cfg).toContain('process.env.CI ? 2 : 1');
+  });
+
+  it('sizes workers dynamically off CPU/RAM locally, but keeps a fixed count on CI', () => {
+    const cfg = playwrightConfigContents();
+    expect(cfg).toContain('workers: process.env.CI ? 1 : computeWorkers()');
+    expect(cfg).toContain('cpus().length');
+    expect(cfg).toContain('freemem()');
+    // Leaves one core free for the host OS/desktop app, never claims 0 workers.
+    expect(cfg).toContain('Math.max(1, cpuCount - 1)');
+  });
+
+  it('registers the write-through checkpoint reporter alongside steps-reporter', () => {
+    const cfg = playwrightConfigContents();
+    expect(cfg).toContain("['./fixtures/steps-reporter.cjs']");
+    expect(cfg).toContain("['./fixtures/checkpoint-reporter.cjs']");
   });
 });
 
@@ -82,6 +99,38 @@ describe('stepsReporterContents', () => {
     // its own — see toStepItem's category check.
     expect(src).toContain("s.category === 'test.step'");
     expect(src).toContain('.map(toStepItem)');
+  });
+});
+
+describe('checkpointReporterContents', () => {
+  it('only appends once a test is truly final (passed, or every configured retry used)', () => {
+    const src = checkpointReporterContents();
+    // Verified empirically against a real Playwright run: test.outcome() is
+    // NOT reliable mid-retry (it reports 'unexpected' even on attempt 1 of a
+    // 2-retry config) — result.retry >= test.retries is what's actually safe.
+    expect(src).toContain("result.status === 'passed' || result.retry >= test.retries");
+  });
+
+  it('builds the key from test.titlePath(), matching --list/--test-list-invert format exactly', () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain('test.titlePath()');
+    expect(src).toContain("'[' + parts[0] + '] \\u203a '");
+  });
+
+  it('writes to the shared EXEC_CHECKPOINT_FILENAME constant, not a hardcoded string', () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain(JSON.stringify(EXEC_CHECKPOINT_FILENAME));
+  });
+
+  it('strips ANSI color codes from a persisted error, same as steps-reporter.cjs', () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain('stripAnsi(result.error.stack || result.error.message');
+    expect(src).toContain('ANSI_RE');
+  });
+
+  it('never throws the test run over a write failure', () => {
+    const src = checkpointReporterContents();
+    expect(src).toMatch(/catch\s*\{/);
   });
 });
 

@@ -36,8 +36,23 @@ export interface ResumeCheckpoint {
   /** Enough to reconstruct GeneratedSpec[] for already-generated items without re-invoking the AI. */
   generatedSpecs: Array<{ path: string; title: string; reqTag?: string; tier: Tier }>;
   /** Tiers whose Playwright invocation already completed and was persisted — skipped on resume's EXECUTE pass. */
-  completedTiers: Tier[];
-  /** Accumulated results from completedTiers, merged with newly-executed tiers on resume. */
+  /**
+   * Whether the (now single, merged-invocation) execute step has fully
+   * finished — replaces the old per-tier `completedTiers` now that all tiers
+   * run together in one Playwright invocation with its OWN test-level
+   * write-through checkpoint (see modes/playwright/execute.ts and
+   * templates.ts's checkpointReporterContents()). Resume no longer needs
+   * tier-level bookkeeping here at all: if execute isn't complete, the
+   * orchestrator just calls mode.execute() again, which transparently skips
+   * whatever already finished via its own on-disk checkpoint file.
+   */
+  executeComplete: boolean;
+  /**
+   * Snapshot of `outcome` as of the last checkpoint write. Once
+   * `executeComplete` is true, this IS the final outcome — resuming into a
+   * later phase (triage/report/export) reads it directly instead of calling
+   * mode.execute() again.
+   */
   partialOutcome?: {
     passed: number;
     failed: number;

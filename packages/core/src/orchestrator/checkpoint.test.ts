@@ -32,7 +32,7 @@ const SAMPLE: ResumeCheckpoint = {
   plan: { summary: 'plan', items: [] },
   generatedItemIds: ['pli_1'],
   generatedSpecs: [{ path: 'tests/tierA-public/foo.spec.ts', title: 'Foo', tier: 'tierA-public' }],
-  completedTiers: [],
+  executeComplete: false,
   updatedAt: new Date(2024, 0, 1).toISOString(),
 };
 

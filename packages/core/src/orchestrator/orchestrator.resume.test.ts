@@ -35,9 +35,12 @@ import type {
 import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '../browser/types.js';
 
 // ---------------------------------------------------------------------------
-// Same offline-DI-seam fake pattern as orchestrator.paths.test.ts. Two tiers
-// (tierA-public, tierB-auth) so EXECUTE's per-tier loop has something to
-// actually split across — the whole point of these tests.
+// Same offline-DI-seam fake pattern as orchestrator.paths.test.ts. All tiers
+// run in a SINGLE mode.execute() call now (see modes/playwright/execute.ts —
+// tier-level splitting was replaced by that mode's own test-level, write-
+// through checkpoint), so these tests exercise the ORCHESTRATOR's contract
+// with mode.execute() (called once per attempt, resumed by calling it again)
+// rather than per-tier bookkeeping, which no longer exists at this layer.
 // ---------------------------------------------------------------------------
 
 const CANNED_PLAN = {
@@ -148,15 +151,11 @@ const fakeBrowser: BrowserSurface = {
 
 interface ExecuteProbe {
   generateCalls: number;
-  executeCallsByTier: string[];
+  executeCalls: number;
 }
 
-/** TestMode whose execute() throws for a specific tier's call (once), simulating a mid-suite interruption. */
-function makeInterruptibleMode(
-  probe: ExecuteProbe,
-  failOnTier: string | null,
-  failMessage: string,
-): TestMode {
+/** TestMode whose execute() throws once (simulating an interruption), then succeeds on any later call. */
+function makeInterruptibleMode(probe: ExecuteProbe, shouldFail: boolean, failMessage: string): TestMode {
   let failed = false;
   return {
     id: 'playwright',
@@ -175,14 +174,9 @@ function makeInterruptibleMode(
       }
       return specs;
     },
-    async execute(
-      _ctx: TestModeContext,
-      specs: GeneratedSpec[],
-      opts?: { onlyTier?: string },
-    ): Promise<ExecOutcome> {
-      const tier = opts?.onlyTier ?? specs[0]?.tier ?? 'unknown';
-      probe.executeCallsByTier.push(tier);
-      if (!failed && failOnTier !== null && tier === failOnTier) {
+    async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+      probe.executeCalls += 1;
+      if (!failed && shouldFail) {
         failed = true;
         throw new Error(failMessage);
       }
@@ -218,7 +212,7 @@ afterEach(() => {
 });
 
 describe('orchestrator pause/resume (offline DI seam)', () => {
-  it('EXECUTE network interruption: pauses (not errors) after the completed tier, checkpoint reflects progress', async () => {
+  it('EXECUTE interruption: pauses (not errors), checkpoint reflects executeComplete: false', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Resume Demo',
@@ -226,11 +220,10 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
       baseUrl: 'https://app.example.test',
     });
 
-    const probe: ExecuteProbe = { generateCalls: 0, executeCallsByTier: [] };
+    const probe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
     const orchestrator = createOrchestrator({
       provider: fakeProvider,
-      getMode: () =>
-        makeInterruptibleMode(probe, 'tierB-auth', 'request to provider failed, reason: fetch failed'),
+      getMode: () => makeInterruptibleMode(probe, true, 'request to provider failed, reason: fetch failed'),
       makeTarget: () => fakeTarget,
       makeBrowser: () => fakeBrowser,
     });
@@ -248,14 +241,14 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     const checkpoint = await readCheckpoint(runDir);
     expect(checkpoint).not.toBeNull();
     expect(checkpoint?.phase).toBe('execute');
-    expect(checkpoint?.completedTiers).toEqual(['tierA-public']);
+    expect(checkpoint?.executeComplete).toBe(false);
     expect(checkpoint?.generatedSpecs.map((s) => s.title).sort()).toEqual(['Home loads', 'Login works']);
 
     expect(probe.generateCalls).toBe(1);
-    expect(probe.executeCallsByTier).toEqual(['tierA-public', 'tierB-auth']);
+    expect(probe.executeCalls).toBe(1);
   });
 
-  it('resume() after an EXECUTE-phase pause: skips GENERATE and the already-done tier, only runs the remaining one', async () => {
+  it('resume() after an EXECUTE-phase pause: skips GENERATE, re-executes the full suite exactly once', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Resume Demo 2',
@@ -263,10 +256,10 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
       baseUrl: 'https://app.example.test',
     });
 
-    const failingProbe: ExecuteProbe = { generateCalls: 0, executeCallsByTier: [] };
+    const failingProbe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
     const failingOrchestrator = createOrchestrator({
       provider: fakeProvider,
-      getMode: () => makeInterruptibleMode(failingProbe, 'tierB-auth', 'socket hang up'),
+      getMode: () => makeInterruptibleMode(failingProbe, true, 'socket hang up'),
       makeTarget: () => fakeTarget,
       makeBrowser: () => fakeBrowser,
     });
@@ -275,10 +268,10 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
 
     // A fresh, healthy mode for the resume attempt — proves resume() doesn't
     // reuse the failing one, and lets us assert exactly what it invokes.
-    const resumeProbe: ExecuteProbe = { generateCalls: 0, executeCallsByTier: [] };
+    const resumeProbe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
     const resumeOrchestrator = createOrchestrator({
       provider: fakeProvider,
-      getMode: () => makeInterruptibleMode(resumeProbe, null, ''),
+      getMode: () => makeInterruptibleMode(resumeProbe, false, ''),
       makeTarget: () => fakeTarget,
       makeBrowser: () => fakeBrowser,
     });
@@ -288,8 +281,11 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     expect(summary.outcome?.passed).toBe(2);
     // GENERATE was fully done before the pause — resume must not regenerate.
     expect(resumeProbe.generateCalls).toBe(0);
-    // tierA-public already completed before the pause — resume runs ONLY tierB-auth.
-    expect(resumeProbe.executeCallsByTier).toEqual(['tierB-auth']);
+    // Tier-level skipping no longer exists at the orchestrator layer — the
+    // WHOLE suite is handed to mode.execute() again in one call; it's that
+    // mode's own on-disk checkpoint (tested separately in execute.test.ts)
+    // that would skip already-finished tests within this single call.
+    expect(resumeProbe.executeCalls).toBe(1);
 
     const run = store.getRun(summary.runId);
     expect(run?.id).toBe(paused.runId);
@@ -306,7 +302,7 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     expect(await readCheckpoint(runDir)).toBeNull();
   });
 
-  it('GENERATE network interruption: pauses before anything is generated; resume redoes GENERATE from scratch', async () => {
+  it('GENERATE network interruption: pauses before anything is generated; resume redoes GENERATE then executes once', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Resume Demo 3',
@@ -347,22 +343,29 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     const runDir = join(projectsDir(), project.id, 'runs', paused.runId);
     const checkpoint = await readCheckpoint(runDir);
     expect(checkpoint?.phase).toBe('generate');
-    expect(checkpoint?.completedTiers).toEqual([]);
+    expect(checkpoint?.executeComplete).toBe(false);
 
-    const probe: ExecuteProbe = { generateCalls: 0, executeCallsByTier: [] };
+    const probe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
     const resumeOrchestrator = createOrchestrator({
       provider: fakeProvider,
-      getMode: () => makeInterruptibleMode(probe, null, ''),
+      getMode: () => makeInterruptibleMode(probe, false, ''),
       makeTarget: () => fakeTarget,
       makeBrowser: () => fakeBrowser,
     });
     const summary = await resumeOrchestrator.resume(paused.runId);
     expect(summary.status).toBe('passed');
     expect(probe.generateCalls).toBe(1);
-    expect(probe.executeCallsByTier.sort()).toEqual(['tierA-public', 'tierB-auth']);
+    expect(probe.executeCalls).toBe(1);
   });
 
-  it('MANUAL PAUSE: aborting with reason "pause" settles paused/manual instead of cancelled', async () => {
+  it('MANUAL PAUSE mid-execute (no throw): an aborted-but-returned outcome settles paused/manual, not a false "complete"', async () => {
+    // Regression for the single-invocation model: the REAL execute.ts detects
+    // ctx.signal aborting mid-run and returns a normal, non-throwing
+    // zeroed/aborted outcome (never an exception) — see abortedOutcome() in
+    // modes/playwright/execute.ts. The orchestrator must recognize that via
+    // its OWN checkCancelled() check right after the await, not just its
+    // catch-block pause handling, or an aborted call would be misread as a
+    // genuinely completed (zero passed, zero failed) execute phase.
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Manual Pause Demo',
@@ -371,21 +374,18 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     });
 
     const controller = new AbortController();
-    let tierACalled = false;
+    let executeCalled = false;
     const mode: TestMode = {
       id: 'playwright',
       async scaffold(): Promise<void> {},
       async generate(): Promise<GeneratedSpec[]> {
         return CANNED_SPECS.map((s) => ({ ...s }));
       },
-      async execute(_ctx, specs: GeneratedSpec[]): Promise<ExecOutcome> {
-        if (specs[0]?.tier === 'tierA-public') {
-          tierACalled = true;
-          // Simulate the user clicking Pause while tier A is running.
-          controller.abort('pause');
-        }
-        const results = specs.map((s) => ({ title: s.title, status: 'passed' as const }));
-        return { passed: results.length, failed: 0, blocked: 0, flaky: 0, results };
+      async execute(): Promise<ExecOutcome> {
+        executeCalled = true;
+        // Simulate the user clicking Pause while Playwright is running.
+        controller.abort('pause');
+        return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [], raw: { aborted: true } };
       },
       async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
         return { dir: 'artifacts', files: [] };
@@ -408,13 +408,13 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
       signal: controller.signal,
     });
 
-    expect(tierACalled).toBe(true);
+    expect(executeCalled).toBe(true);
     expect(summary.status).toBe('paused');
     expect(store.getRun(summary.runId)?.pauseReason).toBe('manual');
 
     const runDir = join(projectsDir(), project.id, 'runs', summary.runId);
     const checkpoint = await readCheckpoint(runDir);
-    expect(checkpoint?.completedTiers).toEqual(['tierA-public']);
+    expect(checkpoint?.executeComplete).toBe(false);
   });
 
   it('MANUAL PAUSE mid-provider-call: an in-flight generate() call killed by the pause abort still settles paused, not error', async () => {
@@ -485,7 +485,7 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
 
     const orchestrator = createOrchestrator({
       provider: fakeProvider,
-      getMode: () => makeInterruptibleMode({ generateCalls: 0, executeCallsByTier: [] }, null, ''),
+      getMode: () => makeInterruptibleMode({ generateCalls: 0, executeCalls: 0 }, false, ''),
       makeTarget: () => fakeTarget,
       makeBrowser: () => fakeBrowser,
     });

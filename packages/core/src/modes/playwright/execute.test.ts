@@ -7,8 +7,8 @@
  *     spawning any subprocess (spawn is spied via a module mock) and without
  *     throwing.
  */
-import { describe, it, expect, vi, afterEach, afterAll } from 'vitest';
-import { mkdtempSync, writeFileSync, rmSync } from 'node:fs';
+import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
+import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -31,9 +31,16 @@ import {
   suiteEnv,
   parseReport,
   findAuthSetupOutcome,
+  findAuthSetupOutcomeFromEntries,
+  checkpointEntriesToOutcome,
+  mergeParsedReports,
+  readCheckpointEntries,
+  writeInvertFile,
+  clearExecCheckpoint,
   playwrightProjectArgs,
   type AuthSignals,
 } from './execute.js';
+import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
 
 function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
   return {
@@ -756,5 +763,184 @@ describe('findAuthSetupOutcome', () => {
       { title: 'authenticate', file: 'fixtures/auth.setup.ts', projectName: 'auth-setup', status: 'passed' },
     ]);
     expect(findAuthSetupOutcome(r)).toEqual({ failed: false, error: '' });
+  });
+});
+
+describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / clearExecCheckpoint', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-exec-checkpoint-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns an empty array when no checkpoint file exists', async () => {
+    expect(await readCheckpointEntries(dir)).toEqual([]);
+  });
+
+  it('round-trips entries written by the reporter (one JSON object per line)', async () => {
+    const a = { key: '[tierA] › a.spec.ts › t1', title: 't1', status: 'expected' };
+    const b = { key: '[tierA] › a.spec.ts › t2', title: 't2', status: 'unexpected', error: 'boom' };
+    writeFileSync(join(dir, EXEC_CHECKPOINT_FILENAME), `${JSON.stringify(a)}\n${JSON.stringify(b)}\n`);
+    const entries = await readCheckpointEntries(dir);
+    expect(entries).toHaveLength(2);
+    expect(entries.map((e) => e.key).sort()).toEqual([a.key, b.key].sort());
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    const good = { key: '[tierA] › a.spec.ts › t1', title: 't1', status: 'expected' };
+    writeFileSync(join(dir, EXEC_CHECKPOINT_FILENAME), `${JSON.stringify(good)}\nnot valid json\n\n`);
+    const entries = await readCheckpointEntries(dir);
+    expect(entries).toEqual([good]);
+  });
+
+  it('writeInvertFile returns null (no flag needed) when there is nothing to skip', async () => {
+    expect(await writeInvertFile(dir, [])).toBeNull();
+  });
+
+  it('writeInvertFile writes one key per line, readable back by the invert-list format', async () => {
+    const entries = [
+      { key: '[tierA] › a.spec.ts › t1', title: 't1', status: 'expected' },
+      { key: '[tierC] › b.spec.ts › t2', title: 't2', status: 'expected' },
+    ];
+    const target = await writeInvertFile(dir, entries);
+    expect(target).toBe(join(dir, EXEC_CHECKPOINT_INVERT_FILENAME));
+    const content = readFileSync(target!, 'utf-8');
+    expect(content.split('\n')).toEqual(entries.map((e) => e.key));
+  });
+
+  it('clearExecCheckpoint removes both files and never throws when they are already absent', async () => {
+    await writeInvertFile(dir, [{ key: 'k', title: 't', status: 'expected' }]);
+    writeFileSync(join(dir, EXEC_CHECKPOINT_FILENAME), '{}\n');
+    await clearExecCheckpoint(dir);
+    expect(await readCheckpointEntries(dir)).toEqual([]);
+    // Second call: both files are already gone — must stay a no-op, not throw.
+    await expect(clearExecCheckpoint(dir)).resolves.toBeUndefined();
+  });
+});
+
+describe('findAuthSetupOutcomeFromEntries', () => {
+  it('detects a failed checkpoint-restored auth-setup entry', () => {
+    const entries = [
+      {
+        key: 'k1',
+        title: 'authenticate',
+        project: 'auth-setup',
+        specFile: 'fixtures/auth.setup.ts',
+        status: 'unexpected',
+        error: 'no email field',
+      },
+    ];
+    expect(findAuthSetupOutcomeFromEntries(entries)).toEqual({ failed: true, error: 'no email field' });
+  });
+
+  it('reports failed:false when no entry is the auth-setup, or it passed', () => {
+    expect(findAuthSetupOutcomeFromEntries([])).toEqual({ failed: false, error: '' });
+    expect(
+      findAuthSetupOutcomeFromEntries([
+        { key: 'k1', title: 'authenticate', project: 'auth-setup', status: 'expected' },
+      ]),
+    ).toEqual({ failed: false, error: '' });
+  });
+});
+
+describe('checkpointEntriesToOutcome', () => {
+  it('counts passed/failed/flaky from Playwright outcome() values via normalizeStatus', () => {
+    const parsed = checkpointEntriesToOutcome(
+      [
+        { key: 'k1', title: 'a', status: 'expected' },
+        { key: 'k2', title: 'b', status: 'unexpected', error: 'boom' },
+        { key: 'k3', title: 'c', status: 'flaky' },
+      ],
+      LOGGED_IN,
+    );
+    expect(parsed.passed).toBe(2); // flaky counts toward passed, same as parseReport
+    expect(parsed.failed).toBe(1);
+    expect(parsed.flaky).toBe(1);
+    expect(parsed.results.map((r) => r.title)).toEqual(['a', 'b', 'c']);
+  });
+
+  it('suppresses a passing auth-setup phantom but keeps a failing one visible', () => {
+    const passing = checkpointEntriesToOutcome(
+      [{ key: 'k1', title: 'authenticate', project: 'auth-setup', status: 'expected' }],
+      LOGGED_IN,
+    );
+    expect(passing.results).toEqual([]);
+
+    const failing = checkpointEntriesToOutcome(
+      [{ key: 'k1', title: 'authenticate', project: 'auth-setup', status: 'unexpected', error: 'bad' }],
+      LOGGED_IN,
+    );
+    expect(failing.results).toHaveLength(1);
+    expect(failing.failed).toBe(1);
+  });
+
+  it('reclassifies a Tier B failure as blocked when auth setup failed — same rule as parseReport', () => {
+    const auth: AuthSignals = { setupFailed: true, setupError: 'no email field', performedLogin: false };
+    const parsed = checkpointEntriesToOutcome(
+      [{ key: 'k1', title: 'login works', project: 'tierB-auth', status: 'unexpected' }],
+      auth,
+    );
+    expect(parsed.blocked).toBe(1);
+    expect(parsed.failed).toBe(0);
+    expect(parsed.results[0].error).toContain('Auth setup failed');
+  });
+
+  it('reclassifies a Tier B failure as blocked when setup ran without credentials', () => {
+    const auth: AuthSignals = { setupFailed: false, setupError: '', performedLogin: false };
+    const parsed = checkpointEntriesToOutcome(
+      [{ key: 'k1', title: 'login works', project: 'tierB-auth', status: 'unexpected' }],
+      auth,
+    );
+    expect(parsed.blocked).toBe(1);
+    expect(parsed.results[0].error).toContain('without credentials');
+  });
+});
+
+describe('mergeParsedReports', () => {
+  it('unions two disjoint result sets and recomputes counts from the union', () => {
+    const a = {
+      results: [{ title: 'a', status: 'passed' as const }],
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+    };
+    const b = {
+      results: [{ title: 'b', status: 'failed' as const }],
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+    };
+    const merged = mergeParsedReports(a, b);
+    expect(merged.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
+    expect(merged.passed).toBe(1);
+    expect(merged.failed).toBe(1);
+  });
+
+  it('keeps b on a specFile+title collision, recomputing counts (never double-counts the same identity)', () => {
+    const a = {
+      results: [{ title: 'a', specFile: 'x.spec.ts', status: 'failed' as const }],
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+    };
+    const b = {
+      results: [{ title: 'a', specFile: 'x.spec.ts', status: 'passed' as const }],
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+    };
+    const merged = mergeParsedReports(a, b);
+    expect(merged.results).toHaveLength(1);
+    expect(merged.results[0].status).toBe('passed');
+    expect(merged.passed).toBe(1);
+    expect(merged.failed).toBe(0);
   });
 });

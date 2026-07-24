@@ -1,10 +1,10 @@
-import type { ChildProcess } from 'node:child_process';
+import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
-import { access, readFile, stat } from 'node:fs/promises';
+import { access, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import spawn from 'cross-spawn';
 
-import type { Tier, TestStatus } from '../../storage/types.js';
+import type { TestStatus } from '../../storage/types.js';
 import type {
   ExecOutcome,
   ExecResultItem,
@@ -14,6 +14,7 @@ import type {
   TestModeContext,
 } from '../types.js';
 import { tiersForScope } from '../types.js';
+import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
 
 const EXEC_TIMEOUT_MS = 30 * 60_000; // generous: full suite across three tiers
 const INSTALL_TIMEOUT_MS = 300_000; // generous: npm install for the scaffolded suite
@@ -160,7 +161,7 @@ interface RawCommand {
 }
 
 /** Spawn the Playwright CLI; capture everything; never reject on test failure. */
-function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawCommand> {
+function runPlaywright(ctx: TestModeContext, invertFilePath?: string | null): Promise<RawCommand> {
   return new Promise<RawCommand>((resolve) => {
     // Cancelled before we even spawned — return immediately; nothing to kill.
     if (ctx.signal?.aborted) {
@@ -178,10 +179,21 @@ function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawComman
     // No --reporter flag: it would OVERRIDE the scaffolded config's reporter
     // list, which is what writes results.json (json) and playwright-report/
     // (html). The config's reporters are the artifact source of truth.
-    // onlyTier (resume's per-tier batching — see execute()'s opts) restricts
-    // to exactly that one tier, overriding the scope-wide project selection.
-    const projectArgs = onlyTier ? ['--project', onlyTier] : playwrightProjectArgs(ctx.testingScope);
-    const args = ['playwright', 'test', ...projectArgs];
+    // All in-scope tiers run together in ONE invocation (Playwright's own
+    // scheduler runs tierA/tierC concurrently and sequences tierB after
+    // auth-setup via each project's own `dependencies` — see
+    // playwrightConfigContents in templates.ts) rather than one process per
+    // tier. invertFilePath (resume's test-level skip-list — see execute()'s
+    // checkpoint handling below) excludes exactly the tests that already
+    // finished in an earlier, interrupted attempt, regardless of which tier
+    // they belonged to.
+    const projectArgs = playwrightProjectArgs(ctx.testingScope);
+    const args = [
+      'playwright',
+      'test',
+      ...projectArgs,
+      ...(invertFilePath ? [`--test-list-invert=${invertFilePath}`] : []),
+    ];
     // Allowlisted env only — generated specs are untrusted; see suiteEnv().
     const env = suiteEnv(ctx);
 
@@ -222,14 +234,30 @@ function runPlaywright(ctx: TestModeContext, onlyTier?: Tier): Promise<RawComman
       stderr: Buffer.concat(stderrChunks).toString('utf8'),
     });
 
+    // Kill the whole process tree, not just the direct `npx` process. On
+    // POSIX the child is its own process-group leader (detached: true above)
+    // so `-pid` signals the group. Windows has no process-group signal, so
+    // `taskkill /T` walks and force-kills the tree by PID/PPID instead —
+    // otherwise only the top-level npx process dies, leaving the node process
+    // actually running Playwright (and the browsers it launched) running to
+    // real completion in the background. Same pattern as target/launcher.ts's
+    // and exec/run-cli.ts's own killTree().
     const kill = (signal: NodeJS.Signals): void => {
       if (!child.pid) return;
-      try {
-        if (process.platform === 'win32') {
-          child.kill(signal);
-        } else {
-          process.kill(-child.pid, signal);
+      if (process.platform === 'win32') {
+        try {
+          nodeSpawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+        } catch {
+          try {
+            child.kill(signal);
+          } catch {
+            /* already exited */
+          }
         }
+        return;
+      }
+      try {
+        process.kill(-child.pid, signal);
       } catch {
         try {
           child.kill(signal);
@@ -335,11 +363,43 @@ export function runCommand(
         // Allowlisted env only — same rationale as runPlaywright: install
         // scripts run arbitrary code and must not inherit host secrets.
         env: suiteEnv(ctx),
+        // POSIX: own process-group leader so killTree() below can signal the
+        // whole group (install scripts / browser downloaders spawn their own
+        // children) — see runPlaywright's identical rationale.
+        detached: process.platform !== 'win32',
       });
     } catch (err) {
       resolve({ code: null, stdout: '', stderr: String(err), aborted: false });
       return;
     }
+
+    // Kill the whole process tree, not just the direct npm/npx process — same
+    // pattern as runPlaywright's kill() above (and target/launcher.ts's /
+    // exec/run-cli.ts's own killTree()). Without this, a killed install
+    // leaves its actual install script or browser-downloader process running.
+    const killTree = (): void => {
+      if (!child.pid) return;
+      if (process.platform === 'win32') {
+        try {
+          nodeSpawn('taskkill', ['/F', '/T', '/PID', String(child.pid)], { stdio: 'ignore' });
+          return;
+        } catch {
+          /* fall through to plain kill below */
+        }
+      } else {
+        try {
+          process.kill(-child.pid, 'SIGKILL');
+          return;
+        } catch {
+          /* fall through to plain kill below */
+        }
+      }
+      try {
+        child.kill('SIGKILL');
+      } catch {
+        /* already exited */
+      }
+    };
 
     const stdoutChunks: Buffer[] = [];
     const stderrChunks: Buffer[] = [];
@@ -362,11 +422,7 @@ export function runCommand(
     };
 
     const timer = setTimeout(() => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already exited */
-      }
+      killTree();
       const { stdout, stderr } = decoded();
       finish({
         code: null,
@@ -378,11 +434,7 @@ export function runCommand(
 
     // Cooperative cancellation: same kill-and-finish path as the timeout above.
     const onAbort = (): void => {
-      try {
-        child.kill('SIGKILL');
-      } catch {
-        /* already exited */
-      }
+      killTree();
       const { stdout, stderr } = decoded();
       finish({ code: null, stdout, stderr: `${stderr}\n[aborted]`, aborted: true });
     };
@@ -646,6 +698,181 @@ interface ParsedReport {
   flaky: number;
 }
 
+// ---- Write-through per-test checkpoint (see templates.ts's checkpointReporterContents()) ----
+
+/**
+ * One test's identity + FINAL outcome, restored from the write-through
+ * checkpoint for a test that finished in an EARLIER, interrupted execute()
+ * attempt and was therefore skipped THIS run via `--test-list-invert`. The
+ * reporter only ever appends once a test's fate is truly final (see its own
+ * doc comment), so `status` here is always Playwright's own settled
+ * `test.outcome()` value ('expected' | 'unexpected' | 'flaky' | 'skipped'),
+ * never a mid-retry snapshot.
+ */
+export interface CheckpointEntry {
+  key: string;
+  title: string;
+  project?: string;
+  specFile?: string;
+  status: string;
+  durationMs?: number;
+  error?: string;
+}
+
+function checkpointFilePath(projectDir: string): string {
+  return join(projectDir, EXEC_CHECKPOINT_FILENAME);
+}
+function invertFilePath(projectDir: string): string {
+  return join(projectDir, EXEC_CHECKPOINT_INVERT_FILENAME);
+}
+
+/** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
+export async function readCheckpointEntries(projectDir: string): Promise<CheckpointEntry[]> {
+  let raw: string;
+  try {
+    raw = await readFile(checkpointFilePath(projectDir), 'utf-8');
+  } catch {
+    return [];
+  }
+  const byKey = new Map<string, CheckpointEntry>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as CheckpointEntry;
+      // A test only ever gets ONE final-attempt line (see the reporter's
+      // isFinal gate), so collisions aren't expected — Map still protects
+      // against a theoretical duplicate by keeping the last line for a key.
+      if (entry && typeof entry.key === 'string') byKey.set(entry.key, entry);
+    } catch {
+      // One malformed line (e.g. a write truncated by the same crash this
+      // file exists to survive) must not lose every other entry in it.
+    }
+  }
+  return [...byKey.values()];
+}
+
+/**
+ * Writes the file `--test-list-invert` reads to skip already-finished tests.
+ * Returns null (no flag needed) when there is nothing to skip, so the caller
+ * can omit `--test-list-invert` entirely on a fresh, non-resumed attempt.
+ */
+export async function writeInvertFile(
+  projectDir: string,
+  entries: CheckpointEntry[],
+): Promise<string | null> {
+  if (entries.length === 0) return null;
+  const target = invertFilePath(projectDir);
+  await writeFile(target, entries.map((e) => e.key).join('\n'), 'utf-8');
+  return target;
+}
+
+/** Best-effort cleanup once execute() completes without being interrupted — nothing left to resume. */
+export async function clearExecCheckpoint(projectDir: string): Promise<void> {
+  await Promise.all([
+    unlink(checkpointFilePath(projectDir)).catch(() => {}),
+    unlink(invertFilePath(projectDir)).catch(() => {}),
+  ]);
+}
+
+/** Same auth-setup detection as findAuthSetupOutcome above, over checkpoint-restored entries instead of a fresh report's suite tree. */
+export function findAuthSetupOutcomeFromEntries(entries: CheckpointEntry[]): {
+  failed: boolean;
+  error: string;
+} {
+  for (const entry of entries) {
+    if (!isAuthSetup(entry.project, entry.specFile)) continue;
+    if (normalizeStatus(entry.status) === 'failed') return { failed: true, error: entry.error ?? '' };
+  }
+  return { failed: false, error: '' };
+}
+
+/**
+ * Converts checkpoint-restored entries into the same shape parseReport()
+ * produces from a fresh report, so the two can be merged (see
+ * mergeParsedReports below). Applies the SAME Tier B blocked-reclassification
+ * parseReport does (see its own doc comment) — a checkpointed Tier B failure
+ * is just as much a victim of a failed/credential-less auth setup as a
+ * freshly-observed one.
+ */
+export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: AuthSignals): ParsedReport {
+  const results: ExecResultItem[] = [];
+  let passed = 0;
+  let failed = 0;
+  let blocked = 0;
+  let flaky = 0;
+
+  for (const entry of entries) {
+    let status = normalizeStatus(entry.status);
+    // Suppress only a passing setup phantom — a failing one stays visible as
+    // the root cause (mirrors parseReport's isSetupSpec handling).
+    if (isAuthSetup(entry.project, entry.specFile) && status !== 'failed') continue;
+
+    let errText = entry.error ?? '';
+    if (projectIsTierB(entry.project)) {
+      if (auth.setupFailed && (status === 'failed' || status === 'skipped')) {
+        status = 'blocked';
+        errText =
+          errText ||
+          `Auth setup failed — Tier B prerequisite not met.${auth.setupError ? `\n${auth.setupError}` : ''}`;
+      } else if (status === 'failed' && auth.performedLogin === false) {
+        status = 'blocked';
+        errText = `Tier B ran without credentials (no HEALIX_TIERB_* configured; anonymous session).\n${errText}`;
+      }
+    }
+
+    results.push({
+      title: entry.title,
+      status,
+      durationMs: entry.durationMs,
+      error: errText || undefined,
+      specFile: entry.specFile,
+    });
+    switch (status) {
+      case 'passed':
+        passed += 1;
+        break;
+      case 'flaky':
+        flaky += 1;
+        passed += 1;
+        break;
+      case 'blocked':
+        blocked += 1;
+        break;
+      case 'failed':
+        failed += 1;
+        break;
+      default:
+        break;
+    }
+  }
+
+  return { results, passed, failed, blocked, flaky };
+}
+
+/**
+ * Merges a freshly-parsed report with checkpoint-restored entries from an
+ * earlier, interrupted attempt. Dedupes by the same specFile+title identity
+ * mergeExecOutcomes uses in the orchestrator, keeping `b`'s result on a
+ * collision — shouldn't normally happen (the invert-list excludes exactly
+ * what's already checkpointed), but a fresh result is preferred over a
+ * checkpointed one if it somehow does.
+ */
+export function mergeParsedReports(a: ParsedReport, b: ParsedReport): ParsedReport {
+  const keyOf = (r: ExecResultItem): string => (r.specFile ? `${r.specFile}#${r.title}` : r.title);
+  const byKey = new Map<string, ExecResultItem>();
+  for (const r of a.results) byKey.set(keyOf(r), r);
+  for (const r of b.results) byKey.set(keyOf(r), r);
+  const results = [...byKey.values()];
+  return {
+    results,
+    passed: results.filter((r) => r.status === 'passed').length,
+    failed: results.filter((r) => r.status === 'failed').length,
+    blocked: results.filter((r) => r.status === 'blocked').length,
+    flaky: results.filter((r) => r.status === 'flaky').length,
+  };
+}
+
 export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNALS): ParsedReport {
   const results: ExecResultItem[] = [];
   let passed = 0;
@@ -896,16 +1123,8 @@ function abortedOutcome(exitCode: number | null = null): ExecOutcome {
  * aborted outcome (raw.aborted) is returned so callers can distinguish
  * "cancelled" from "ran and everything failed".
  */
-export async function execute(
-  ctx: TestModeContext,
-  specs: GeneratedSpec[],
-  opts?: { onlyTier?: Tier },
-): Promise<ExecOutcome> {
-  const onlyTier = opts?.onlyTier;
-  emit(ctx, `Executing ${specs.length} spec(s) via Playwright${onlyTier ? ` (${onlyTier} only)` : ''}`, {
-    count: specs.length,
-    onlyTier,
-  });
+export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+  emit(ctx, `Executing ${specs.length} spec(s) via Playwright`, { count: specs.length });
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');
@@ -920,13 +1139,31 @@ export async function execute(
 
   await ensureSuiteDeps(ctx);
 
+  // Tests that already finished in an EARLIER, interrupted attempt at this
+  // same execute() call — see templates.ts's checkpointReporterContents().
+  // Skipped via --test-list-invert so a resume only redoes what's actually
+  // left, regardless of which tier(s) they belonged to: all in-scope tiers
+  // now run together in one Playwright invocation rather than one process
+  // per tier, so a crash mid-run no longer has to lose an entire tier's
+  // worth of progress just to get a safe resume point.
+  const priorEntries = await readCheckpointEntries(ctx.projectDir);
+  const invertFile = await writeInvertFile(ctx.projectDir, priorEntries);
+  if (priorEntries.length > 0) {
+    emit(ctx, `Resuming: ${priorEntries.length} test(s) already finished; skipping them this run.`, {
+      alreadyFinished: priorEntries.length,
+    });
+  }
+
   emit(ctx, '[execute] running Playwright suite…');
   let startedAt = Date.now();
-  let cmd = await runPlaywright(ctx, onlyTier);
+  let cmd = await runPlaywright(ctx, invertFile);
 
-  // Cancelled during (or right before) the run: partial results are
-  // meaningless and would mislabel interrupted tests as failures — discard
-  // them and surface the abort via a warning event + raw.aborted instead.
+  // Cancelled during (or right before) the run: the write-through checkpoint
+  // already has everything that finished before the abort — left in place
+  // (not cleared) so the NEXT execute() call resumes from it instead of
+  // redoing this work. This return value only represents THIS interrupted
+  // call, so it stays zeroed exactly as before; the durable state lives on
+  // disk, not in what gets returned here.
   if (cmd.aborted || ctx.signal?.aborted) {
     emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
     return abortedOutcome(cmd.code);
@@ -944,7 +1181,7 @@ export async function execute(
     );
     emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
     startedAt = Date.now();
-    cmd = await runPlaywright(ctx, onlyTier);
+    cmd = await runPlaywright(ctx, invertFile);
 
     // The retry run can be cancelled too (as can the install before it).
     if (cmd.aborted || ctx.signal?.aborted) {
@@ -957,22 +1194,37 @@ export async function execute(
   let report = await readResultsJson(ctx.projectDir, startedAt);
   if (!report) report = parseStdoutJson(cmd.stdout);
 
+  // Auth-setup may have run THIS invocation (fresh report has it) or in an
+  // earlier interrupted attempt (checkpoint entries have it instead) — check
+  // both; exactly one will ever have a real signal, since a checkpointed
+  // auth-setup is excluded from this run's --test-list-invert-filtered set.
+  const freshSetup = report ? findAuthSetupOutcome(report) : { failed: false, error: '' };
+  const checkpointSetup = findAuthSetupOutcomeFromEntries(priorEntries);
+  const performedLogin = await readSetupMeta(ctx.projectDir);
+  const auth: AuthSignals = {
+    setupFailed: freshSetup.failed || checkpointSetup.failed,
+    setupError: freshSetup.error || checkpointSetup.error,
+    performedLogin,
+  };
+  if (auth.setupFailed) {
+    emit(ctx, '[execute] auth setup failed; Tier B outcomes classified as blocked', {
+      setupError: auth.setupError.split('\n')[0] ?? '',
+    });
+  } else if (performedLogin === false) {
+    emit(ctx, '[execute] auth setup ran without credentials; Tier B failures classified as blocked');
+  }
+
   let parsed: ParsedReport;
   if (report) {
-    const setup = findAuthSetupOutcome(report);
-    const performedLogin = await readSetupMeta(ctx.projectDir);
-    const auth: AuthSignals = { setupFailed: setup.failed, setupError: setup.error, performedLogin };
-    if (setup.failed) {
-      emit(ctx, '[execute] auth setup failed; Tier B outcomes classified as blocked', {
-        setupError: setup.error.split('\n')[0] ?? '',
-      });
-    } else if (performedLogin === false) {
-      emit(ctx, '[execute] auth setup ran without credentials; Tier B failures classified as blocked');
-    }
     parsed = parseReport(report, auth);
   } else {
     parsed = parseSummaryText(`${cmd.stdout}\n${cmd.stderr}`);
-    if (parsed.results.length === 0 && parsed.passed === 0 && parsed.failed === 0) {
+    if (
+      parsed.results.length === 0 &&
+      parsed.passed === 0 &&
+      parsed.failed === 0 &&
+      priorEntries.length === 0
+    ) {
       const tail = stripAnsi(cmd.stderr || cmd.stdout)
         .split(/\r?\n/)
         .filter(Boolean)
@@ -986,9 +1238,19 @@ export async function execute(
     }
   }
 
+  // Fold in whatever finished during an earlier, interrupted attempt (and was
+  // therefore skipped this run) so the returned outcome covers the WHOLE
+  // execute phase, not just what this particular invocation ran.
+  if (priorEntries.length > 0) {
+    parsed = mergeParsedReports(parsed, checkpointEntriesToOutcome(priorEntries, auth));
+  }
+
   // Best-effort: attach the step-by-step breakdown (see stepsReporterContents()
   // in templates.ts) to each result by title — steps.json is written
   // regardless of whether results.json parsed, so this runs unconditionally.
+  // Only ever has data for tests that actually ran THIS invocation; a
+  // checkpoint-restored result simply keeps no step detail, same as any
+  // result whose title didn't match an entry in steps.json today.
   const stepsByTitle = await readStepsByTitle(ctx.projectDir, startedAt);
   if (stepsByTitle.size > 0) {
     for (const r of parsed.results) {
@@ -1011,6 +1273,12 @@ export async function execute(
       stderrTail: stripAnsi(cmd.stderr).split(/\r?\n/).filter(Boolean).slice(-20),
     },
   };
+
+  // Completed without interruption — nothing left to resume. Cleared so a
+  // LATER, unrelated execute() call reusing this same projectDir (e.g. the
+  // coverage-feedback loop's next gap-fill iteration) never inherits stale
+  // "already finished" entries from this one.
+  await clearExecCheckpoint(ctx.projectDir);
 
   emit(ctx, 'Execution complete', {
     passed: outcome.passed,

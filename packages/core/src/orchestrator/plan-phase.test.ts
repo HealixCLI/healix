@@ -1,5 +1,11 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
-import { runPlanPhase, attemptPlanCompletion, buildWeightedBatches, splitUnitsByWeight } from './index.js';
+import {
+  runPlanPhase,
+  attemptPlanCompletion,
+  buildWeightedBatches,
+  splitUnitsByWeight,
+  type PlanBatchProgress,
+} from './index.js';
 import type { OrchestratorEvent } from './types.js';
 import type { PlanRepoContext } from './plan.js';
 import type { Project } from '../storage/types.js';
@@ -344,6 +350,163 @@ describe('runPlanPhase batching', () => {
     expect(plan.fallbackReason).toContain('batch 2');
     expect(plan.items.length).toBeGreaterThan(0);
     expect(plan.items.length).toBeLessThan(70);
+  }, 10_000);
+});
+
+describe('runPlanPhase resumeState/onBatchProgress (checkpointing a mid-batch-loop interruption)', () => {
+  function unitAwareProvider(): ProviderAdapter & { calls: number } {
+    const adapter = {
+      id: 'claude' as const,
+      label: 'Unit-aware Fake',
+      capabilities: ['plan' as const],
+      calls: 0,
+      async detect(): Promise<DetectResult> {
+        return { installed: true, binPath: '/fake/claude', version: '1.0.0' };
+      },
+      async health(): Promise<HealthResult> {
+        return {
+          provider: 'claude',
+          status: 'ready',
+          installed: true,
+          binPath: '/fake/claude',
+          version: '1.0.0',
+          authenticated: true,
+          model: 'fake',
+          latencyMs: 1,
+          detail: 'OK',
+        };
+      },
+      async plan(): Promise<PlanResult> {
+        return {
+          provider: 'claude',
+          ok: true,
+          plan: fencedJson(SIMPLE_PLAN),
+          raw: SIMPLE_PLAN,
+          detail: 'OK',
+        };
+      },
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        adapter.calls += 1;
+        if (opts?.mode !== 'plan') {
+          return { provider: 'claude', ok: true, text: 'n/a', raw: null, detail: 'OK' };
+        }
+        const keys = [...prompt.matchAll(/unitKey: "([^"]+)"/g)].map((m) => m[1]);
+        const body = {
+          summary: `Batch covering ${keys.length} unit(s).`,
+          items: keys.map((key) => ({
+            title: `Covers ${key}`,
+            tier: 'tierA-public',
+            intent: `Exercises ${key}.`,
+            unitKey: key,
+          })),
+        };
+        return { provider: 'claude', ok: true, text: fencedJson(body), raw: body, detail: 'OK' };
+      },
+    };
+    return adapter;
+  }
+
+  function makeUnits(count: number): FunctionalityUnit[] {
+    return Array.from({ length: count }, (_, i) => ({
+      key: `route:/page-${i}`,
+      kind: 'route' as const,
+      label: `page: /page-${i}`,
+      file: `app/page-${i}/page.tsx`,
+    }));
+  }
+
+  it('onBatchProgress fires once per top-level batch, with cumulative items and growing completedBatchIndices', async () => {
+    const units = makeUnits(70);
+    const provider = unitAwareProvider();
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+    const snapshots: PlanBatchProgress[] = [];
+
+    const plan = await runPlanPhase(
+      provider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider },
+      repoIndex,
+      undefined,
+      undefined,
+      async (progress) => {
+        snapshots.push(progress);
+      },
+    );
+
+    expect(snapshots.length).toBeGreaterThan(1);
+    // completedBatchIndices only ever grows, one more per snapshot.
+    for (let i = 1; i < snapshots.length; i++) {
+      expect(snapshots[i]!.completedBatchIndices.length).toBe(
+        snapshots[i - 1]!.completedBatchIndices.length + 1,
+      );
+    }
+    // The final snapshot already has every item the returned plan does.
+    expect(snapshots[snapshots.length - 1]!.items.length).toBe(plan.items.length);
+  }, 10_000);
+
+  it('resumeState skips already-completed batches — no provider call is made for them', async () => {
+    const units = makeUnits(70);
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+
+    // First pass: capture progress after exactly the FIRST top-level batch resolves.
+    const firstProvider = unitAwareProvider();
+    let firstBatchProgress: PlanBatchProgress | undefined;
+    await runPlanPhase(
+      firstProvider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider: firstProvider },
+      repoIndex,
+      undefined,
+      undefined,
+      async (progress) => {
+        firstBatchProgress ??= progress; // only keep the FIRST snapshot
+      },
+    );
+    expect(firstBatchProgress).toBeDefined();
+    expect(firstBatchProgress!.completedBatchIndices).toEqual([0]);
+    const itemsAfterFirstBatch = firstBatchProgress!.items.length;
+    expect(itemsAfterFirstBatch).toBeGreaterThan(0);
+    expect(itemsAfterFirstBatch).toBeLessThan(70);
+
+    // Second pass ("resume"): a provider that throws if asked to plan batch 1
+    // again — if resumeState didn't actually skip it, this test would fail
+    // with that thrown error instead of a normal result.
+    const resumeProvider = unitAwareProvider();
+    const guardedProvider: ProviderAdapter = {
+      ...resumeProvider,
+      async complete(prompt, opts) {
+        if (opts?.mode === 'plan' && prompt.includes('batch 1 of')) {
+          throw new Error('batch 1 should have been skipped via resumeState — it already completed');
+        }
+        return resumeProvider.complete(prompt, opts);
+      },
+    };
+
+    const resumedPlan = await runPlanPhase(
+      guardedProvider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider: guardedProvider },
+      repoIndex,
+      undefined,
+      {
+        completedBatchIndices: new Set(firstBatchProgress!.completedBatchIndices),
+        items: firstBatchProgress!.items,
+        failedBatches: firstBatchProgress!.failedBatches,
+      },
+    );
+
+    expect(resumedPlan.planSource).toBe('ai');
+    // Every unit still ends up covered exactly once — the resumed batches
+    // plus the carried-forward first batch together cover all 70.
+    expect(resumedPlan.items).toHaveLength(70);
+    const coveredKeys = new Set(resumedPlan.items.map((it) => it.unitKey));
+    expect(coveredKeys.size).toBe(70);
   }, 10_000);
 });
 

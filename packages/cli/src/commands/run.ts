@@ -12,6 +12,7 @@ import {
   type TestPlan,
 } from '@healix/core';
 import { runExitCode } from '../lib/helpers.js';
+import { installInterruptHandler } from '../lib/interrupt.js';
 
 const PHASE_COLOR: Record<string, (s: string) => string> = {
   plan: pc.magenta,
@@ -131,6 +132,16 @@ export function registerRun(program: Command): void {
         if (opts.mode) runOpts.explorationMode = opts.mode as ExplorationMode;
         if (opts.prd) runOpts.prd = opts.prd;
 
+        // Ctrl+C previously just killed the process with no checkpoint
+        // written at all — treating it as a pause request instead means the
+        // orchestrator gets a chance to persist progress before exiting, and
+        // `healix runs resume <runId>` can pick it back up.
+        const interrupt = installInterruptHandler(() => {
+          console.log('');
+          console.log(pc.yellow('  ⚠ Interrupt received — pausing run (checkpoint will be saved)…'));
+        });
+        runOpts.signal = interrupt.signal;
+
         const orchestrator = createOrchestrator();
         console.log('');
         console.log(`  ${pc.bold('Starting run')} ${pc.dim(`for project ${opts.project}`)}`);
@@ -150,6 +161,8 @@ export function registerRun(program: Command): void {
           console.log(pc.red(`  ✖ Run failed: ${err instanceof Error ? err.message : String(err)}`));
           console.log('');
           process.exitCode = 1;
+        } finally {
+          interrupt.dispose();
         }
       },
     );

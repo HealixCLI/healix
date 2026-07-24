@@ -1,11 +1,11 @@
-import { mkdtempSync, rmSync } from 'node:fs';
-import { mkdir, writeFile } from 'node:fs/promises';
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
+import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createOrchestrator } from './index.js';
-import { readCheckpoint } from './checkpoint.js';
+import { readCheckpoint, writeCheckpoint, type ResumeCheckpoint } from './checkpoint.js';
 import { projectsDir } from '../env/app-data.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import { persistSourceContext } from '../target/context-store.js';
@@ -443,6 +443,57 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     expect(probe.executeCalls).toBe(1);
   });
 
+  it('writes a checkpoint (phase: generate, plan populated) BEFORE invoking mode.generate() — so an uncooperative crash mid-call still leaves a resumable checkpoint on disk', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Resume Demo Pre-Generate Checkpoint',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const captured: { checkpoint: ResumeCheckpoint | null } = { checkpoint: null };
+    const crashingMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        // Simulates inspecting disk state the instant before an uncooperative
+        // crash (e.g. SIGKILL) would hit mid-call — nothing after this line
+        // ever runs in that scenario, so whatever's on disk RIGHT NOW is
+        // exactly what a real resume would have to work with. Without the
+        // orchestrator's pre-generate checkpoint write, this would be null:
+        // previously nothing was ever persisted before GENERATE returned.
+        const runDir = dirname(ctx.projectDir);
+        captured.checkpoint = await readCheckpoint(runDir);
+        throw new Error('simulated crash mid-generate');
+      },
+      async execute(): Promise<ExecOutcome> {
+        return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'export', files: [] };
+      },
+    };
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => crashingMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    // An unrecognized error message (not network/credits-shaped) still
+    // hard-fails the run itself — this test only cares about what landed on
+    // disk DURING the call, captured above before that failure surfaced.
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(summary.status).toBe('error');
+    const checkpoint = captured.checkpoint;
+    if (!checkpoint) throw new Error('expected a checkpoint to exist during generate()');
+    expect(checkpoint.phase).toBe('generate');
+    expect(checkpoint.plan.items).toHaveLength(2);
+  });
+
   it('resume() reloads the cached source context so GENERATE is not silently ungrounded post-resume', async () => {
     const repoDir = mkdtempSync(join(tmpdir(), 'healix-orch-resume-repo-'));
     try {
@@ -650,5 +701,130 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
 
     const summary = await orchestrator.resume(run.id);
     expect(summary.status).toBe('error');
+  });
+
+  it('PLAN mid-batch-loop resume: a checkpoint captured after batch 1 lets resume() skip it and only plan the remainder', async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-plan-resume-'));
+    try {
+      mkdirSync(join(repoPath, 'src'), { recursive: true });
+      // 25 real, statically-detectable routes — enough to exceed
+      // PLAN_BATCH_MAX_UNITS (20) and force runPlanPhase's multi-batch path.
+      const routes = Array.from(
+        { length: 25 },
+        (_, i) => `app.get('/route-${i}', (req, res) => res.status(200).send('ok'));`,
+      ).join('\n');
+      writeFileSync(
+        join(repoPath, 'src', 'app.js'),
+        `const express = require('express');\nconst app = express();\n${routes}\n`,
+      );
+
+      const store = (await getStore()) as HealixStore;
+      const project = store.createProject({
+        name: 'Plan Batch Resume Demo',
+        mode: 'playwright',
+        repoPath,
+        baseUrl: 'https://app.example.test',
+      });
+      const run = store.createRun(project.id, { suiteMode: 'fresh' });
+      const runDir = join(projectsDir(), project.id, 'runs', run.id);
+      mkdirSync(runDir, { recursive: true });
+
+      // A realistic mid-PLAN checkpoint: batch 0 already resolved (2 items
+      // accumulated so far), the remaining batch(es) never got a chance to
+      // run before the (simulated) interruption.
+      const seededCheckpoint: ResumeCheckpoint = {
+        runId: run.id,
+        projectId: project.id,
+        phase: 'plan',
+        runOptions: {},
+        plan: {
+          summary: 'Planning in progress: 2 item(s) so far.',
+          items: [
+            {
+              id: 'seed-1',
+              title: 'Seeded item 1',
+              tier: 'tierA-public',
+              intent: 'x',
+              scenarios: [{ kind: 'positive', description: 'x' }],
+            },
+            {
+              id: 'seed-2',
+              title: 'Seeded item 2',
+              tier: 'tierA-public',
+              intent: 'x',
+              scenarios: [{ kind: 'positive', description: 'x' }],
+            },
+          ],
+          planSource: 'ai',
+        },
+        planProgress: { completedBatchIndices: [0], failedBatches: [] },
+        generatedItemIds: [],
+        generatedSpecs: [],
+        executeComplete: false,
+        updatedAt: new Date().toISOString(),
+      };
+      await writeCheckpoint(runDir, seededCheckpoint);
+      store.updateRunStatus(run.id, 'paused', { pauseReason: 'manual' });
+
+      let batch0PromptSeen = false;
+      const guardedProvider: ProviderAdapter = {
+        ...fakeProvider,
+        async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+          if (opts?.mode === 'plan') {
+            if (prompt.includes('batch 1 of')) {
+              // Batch 1 (index 0) already resolved per the seeded checkpoint —
+              // resume must never re-ask for it.
+              batch0PromptSeen = true;
+            }
+            const keys = [...prompt.matchAll(/unitKey: "([^"]+)"/g)].map((m) => m[1]);
+            if (keys.length > 0) {
+              const body = {
+                summary: `Batch covering ${keys.length} unit(s).`,
+                items: keys.map((key) => ({
+                  title: `Covers ${key}`,
+                  tier: 'tierA-public',
+                  intent: `Exercises ${key}.`,
+                  unitKey: key,
+                })),
+              };
+              return {
+                provider: 'claude',
+                ok: true,
+                text: ['```json', JSON.stringify(body), '```'].join('\n'),
+                raw: body,
+                detail: 'OK',
+              };
+            }
+          }
+          return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
+        },
+      };
+
+      const resumeOrchestrator = createOrchestrator({
+        provider: guardedProvider,
+        getMode: () => makeInterruptibleMode({ generateCalls: 0, executeCalls: 0 }, false, ''),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      });
+
+      const summary = await resumeOrchestrator.resume(run.id);
+
+      expect(batch0PromptSeen).toBe(false);
+      expect(summary.status).not.toBe('error');
+      // The two seeded items survive into the finalized plan alongside
+      // whatever the (skipped-batch-0-aware) remaining batches contributed —
+      // read from plan.json rather than the tests table, since the fake
+      // GENERATE mode here (makeInterruptibleMode) ignores the plan content
+      // and always writes its own fixed CANNED_SPECS regardless.
+      const finalizedPlan = JSON.parse(
+        await readFile(join(runDir, 'plan', 'plan.json'), 'utf-8'),
+      ) as TestPlan;
+      const titles = finalizedPlan.items.map((it) => it.title);
+      expect(titles).toContain('Seeded item 1');
+      expect(titles).toContain('Seeded item 2');
+      expect(finalizedPlan.items.length).toBeGreaterThan(2);
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
   });
 });

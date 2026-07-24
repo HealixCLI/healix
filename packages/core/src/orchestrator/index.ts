@@ -657,12 +657,19 @@ async function runPipeline(
       }
     }
 
-    if (resumeFrom) {
+    // A checkpoint whose phase is still 'plan' means PLAN itself was
+    // interrupted mid-batch-loop (see runPlanPhase's resumeState/
+    // onBatchProgress) — there is no finalized/approved plan to skip ahead
+    // to yet, so this takes the SAME path a fresh run does (repo indexing,
+    // dependency detection, etc. all still need to happen), just seeded with
+    // whichever batches already succeeded rather than starting from zero.
+    const resumingPastPlan = resumeFrom !== undefined && resumeFrom.checkpoint.phase !== 'plan';
+    if (resumingPastPlan) {
       // Resuming: the plan was already finalized and approved before the
       // pause/interruption — replanning or re-showing the approval gate would
       // waste tokens and re-litigate an already-made decision. Only the
       // provider needs re-resolving (cheap: a health probe, no tokens spent).
-      emit('plan', 'info', `Resuming run (paused at "${resumeFrom.checkpoint.phase}").`);
+      emit('plan', 'info', `Resuming run (paused at "${resumeFrom!.checkpoint.phase}").`);
       provider = overrides?.provider ?? (await resolveProvider(opts.provider, emit));
       if (!provider) {
         emit('plan', 'error', 'No ready provider available to resume.');
@@ -875,9 +882,69 @@ async function runPipeline(
             );
           }
         }
+        // A plan-phase resume seeds runPlanPhase with whichever batches
+        // already succeeded (or permanently failed) before the interruption;
+        // a fresh run just starts from an empty position. Either way,
+        // progress is checkpointed again as each further batch resolves, so
+        // a SECOND interruption doesn't lose ground either.
+        const planResumeState =
+          resumeFrom && resumeFrom.checkpoint.phase === 'plan'
+            ? {
+                completedBatchIndices: new Set(
+                  resumeFrom.checkpoint.planProgress?.completedBatchIndices ?? [],
+                ),
+                items: resumeFrom.checkpoint.plan.items,
+                failedBatches: resumeFrom.checkpoint.planProgress?.failedBatches ?? [],
+              }
+            : undefined;
+        const onPlanBatchProgress = async (progress: PlanBatchProgress): Promise<void> => {
+          await writeCheckpoint(runDir, {
+            runId,
+            projectId: project.id,
+            phase: 'plan',
+            runOptions: {
+              testingScope: opts.testingScope,
+              suiteMode: opts.suiteMode,
+              baseRunId: opts.baseRunId,
+              provider: opts.provider,
+              autoApprove: opts.autoApprove,
+              prd: opts.prd,
+              instructions: opts.instructions,
+              prdSourceKind: opts.prdSourceKind,
+              prdFileName: opts.prdFileName,
+              prdSelectedSheets: opts.prdSelectedSheets,
+              coverageLoopEnabled: opts.coverageLoopEnabled,
+              coverageTarget: opts.coverageTarget,
+              retryItemIds: opts.retryItemIds,
+            },
+            plan: {
+              summary: `Planning in progress: ${progress.items.length} item(s) so far.`,
+              items: progress.items,
+              planSource: 'ai',
+            },
+            planProgress: {
+              completedBatchIndices: progress.completedBatchIndices,
+              failedBatches: progress.failedBatches,
+            },
+            generatedItemIds: [],
+            generatedSpecs: [],
+            executeComplete: false,
+            updatedAt: nowIso(),
+          });
+        };
         plan =
           retryPassPlan ??
-          (await runPlanPhase(provider, project, opts, emit, overrides, repoIndex, recordUsage));
+          (await runPlanPhase(
+            provider,
+            project,
+            opts,
+            emit,
+            overrides,
+            repoIndex,
+            recordUsage,
+            planResumeState,
+            onPlanBatchProgress,
+          ));
         // Enforce the testing-scope boundary as a backstop: plan.ts already asks
         // the model for (and normalizes tiers to) only in-scope tiers, but this
         // is the hard guarantee — filtered here, before approval/persistence, so
@@ -1349,6 +1416,15 @@ async function runPipeline(
         return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
       }
     } else {
+      // Write a checkpoint marking phase='generate' BEFORE the (possibly
+      // long-running, AI-driven) generate() call itself — without this, an
+      // uncooperative crash mid-GENERATE (no exception, no catch block runs)
+      // would leave no checkpoint.json on disk at all for resume to find,
+      // regardless of how much per-item progress generate.ts's own
+      // write-through checkpoint (see modes/playwright/generate.ts) preserved
+      // on the filesystem. `specs` is still empty here, so buildCheckpoint's
+      // phase resolves to 'generate' exactly as intended.
+      await writeCheckpoint(runDir, buildCheckpoint(false));
       emit('generate', 'info', 'Scaffolding suite.');
       try {
         await mode.scaffold(ctx);
@@ -1815,6 +1891,51 @@ async function runPipeline(
           .filter((b) => b.triage !== null)
           .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
           .slice(0, TRIAGE_AI_LIMIT);
+        const aiCandidateSet = new Set(aiCandidates);
+
+        // Built once, up front, so incremental persistence below (rather than
+        // one pass after the WHOLE phase finishes) can look up each result's
+        // testId as soon as its verdict is final — matched by title, exact at
+        // this point in the pipeline (titles are already finalized by EXECUTE).
+        let testIdByTitle: Map<string, string> | null = null;
+        try {
+          testIdByTitle = new Map(store.listTests(runId).map((t) => [t.title, t.id]));
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('recordTriageResult', err);
+        }
+
+        /**
+         * Best-effort FK-keyed persistence alongside report.json's title-joined
+         * triageEntries built below. Never blocks report-writing: a bad testId
+         * or store fault here is no worse than report.json simply being the
+         * only surviving record, same as before.
+         */
+        const persistTriageResult = (b: (typeof baseline)[number]): void => {
+          if (!b.triage || !testIdByTitle) return;
+          const testId = testIdByTitle.get(b.r.title);
+          if (!testId) return;
+          try {
+            store.recordTriageResult({
+              testId,
+              verdict: b.triage.verdict,
+              confidence: b.triage.confidence,
+              rationale: b.triage.rationale,
+              suggestedPatch: b.triage.suggestedPatch ?? null,
+            });
+            noteStoreOk();
+          } catch (err) {
+            noteStoreFailure('recordTriageResult', err);
+          }
+        };
+
+        // Every failure NOT selected for AI enrichment already has its FINAL
+        // verdict (classify() is synchronous and nothing below ever touches
+        // it) — persist these right away rather than holding them until the
+        // whole TRIAGE phase finishes just to batch up a single write pass.
+        for (const b of baseline) {
+          if (!aiCandidateSet.has(b)) persistTriageResult(b);
+        }
 
         /**
          * Triage one group with a SINGLE batched provider call (see
@@ -1893,37 +2014,18 @@ async function runPipeline(
         for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
           const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
           await enrichBatch(batch, 0);
+          // Persist this batch's candidates now, with whatever verdict
+          // enrichBatch settled on (AI-enriched, or the rule baseline if
+          // enrichment didn't pan out) — a crash before the NEXT batch starts
+          // still leaves this one's rows durably recorded, instead of the
+          // whole phase being all-or-nothing.
+          for (const b of batch) persistTriageResult(b);
         }
 
         for (const b of baseline) {
           if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
         }
         emit('triage', 'info', `Triaged ${triageEntries.length} failure(s).`);
-
-        // Best-effort FK-keyed persistence alongside report.json's title-joined
-        // entries above — matched to `tests` rows by title, exact at this point
-        // in the pipeline (titles are already finalized by EXECUTE). Never
-        // blocks report-writing: a bad testId or store fault here is no worse
-        // than report.json simply being the only surviving record, same as
-        // today.
-        try {
-          const testIdByTitle = new Map(store.listTests(runId).map((t) => [t.title, t.id]));
-          for (const b of baseline) {
-            if (!b.triage) continue;
-            const testId = testIdByTitle.get(b.r.title);
-            if (!testId) continue;
-            store.recordTriageResult({
-              testId,
-              verdict: b.triage.verdict,
-              confidence: b.triage.confidence,
-              rationale: b.triage.rationale,
-              suggestedPatch: b.triage.suggestedPatch ?? null,
-            });
-          }
-          noteStoreOk();
-        } catch (err) {
-          noteStoreFailure('recordTriageResult', err);
-        }
       } else {
         emit('triage', 'debug', 'No failures to triage.');
       }
@@ -2344,6 +2446,13 @@ export function splitUnitsByWeight(units: FunctionalityUnit[]): [FunctionalityUn
   return [units.slice(0, cut), units.slice(cut)];
 }
 
+/** Snapshot of PLAN's batch-loop progress — see runPlanPhase's resumeState/onBatchProgress params. */
+export interface PlanBatchProgress {
+  completedBatchIndices: number[];
+  items: TestPlanItem[];
+  failedBatches: string[];
+}
+
 export async function runPlanPhase(
   provider: ProviderAdapter,
   project: Project,
@@ -2352,6 +2461,10 @@ export async function runPlanPhase(
   overrides?: OrchestratorOverrides,
   repoIndex?: PlanRepoContext,
   recordUsage?: UsageRecorder,
+  /** Resume a previously interrupted batch loop: skip these batch indices, and start from these already-accumulated items/failures instead of empty. */
+  resumeState?: { completedBatchIndices: Set<number>; items: TestPlanItem[]; failedBatches: string[] },
+  /** Fires after each top-level batch resolves (succeeded OR permanently failed) — lets the caller checkpoint progress so a crash mid-loop doesn't redo already-paid-for batches. */
+  onBatchProgress?: (progress: PlanBatchProgress) => void | Promise<void>,
 ): Promise<TestPlan> {
   const units = repoIndex?.functionality ?? [];
   const totalWeight = units.reduce((sum, u) => sum + estimateUnitWeight(u), 0);
@@ -2384,8 +2497,16 @@ export async function runPlanPhase(
     `Planning ${units.length} unit(s) across ${batches.length} batch(es) (weight budget ${PLAN_BATCH_WEIGHT_BUDGET}, max ${PLAN_BATCH_MAX_UNITS} unit(s)/batch).`,
   );
 
-  const items: TestPlanItem[] = [];
-  const failedBatches: string[] = [];
+  const items: TestPlanItem[] = resumeState ? [...resumeState.items] : [];
+  const failedBatches: string[] = resumeState ? [...resumeState.failedBatches] : [];
+  const completedBatchIndices = new Set<number>(resumeState?.completedBatchIndices ?? []);
+  if (resumeState && completedBatchIndices.size > 0) {
+    emit(
+      'plan',
+      'info',
+      `Resuming PLAN: ${completedBatchIndices.size}/${batches.length} batch(es) already completed; continuing with the remainder.`,
+    );
+  }
 
   // Plans one batch, splitting it in half by weight and retrying each half
   // (up to PLAN_MAX_SPLIT_DEPTH times) if attemptPlanCompletion exhausts its
@@ -2460,7 +2581,16 @@ export async function runPlanPhase(
 
   for (let i = 0; i < batches.length; i++) {
     if (opts.signal?.aborted) break;
+    if (completedBatchIndices.has(i)) continue;
     await planBatch(batches[i]!, i, `${i + 1}/${batches.length}`, 0);
+    completedBatchIndices.add(i);
+    if (onBatchProgress) {
+      await onBatchProgress({
+        completedBatchIndices: [...completedBatchIndices],
+        items: [...items],
+        failedBatches: [...failedBatches],
+      });
+    }
   }
 
   if (items.length === 0) {

@@ -1765,28 +1765,19 @@ describe('filterRoutesForItem — per-item route filtering with never-empty fall
   });
 
   it('returns all routes when routePath is null (no filtering)', () => {
-    const routes = [
-      { url: 'https://app.test/home' },
-      { url: 'https://app.test/dashboard' },
-    ];
+    const routes = [{ url: 'https://app.test/home' }, { url: 'https://app.test/dashboard' }];
     const filtered = filterRoutesForItem(routes, null);
     expect(filtered).toEqual(routes);
   });
 
   it('never-empty fallback: returns all routes when filter would leave nothing', () => {
-    const routes = [
-      { url: 'https://app.test/home' },
-      { url: 'https://app.test/dashboard' },
-    ];
+    const routes = [{ url: 'https://app.test/home' }, { url: 'https://app.test/dashboard' }];
     const filtered = filterRoutesForItem(routes, '/nonexistent');
     expect(filtered).toEqual(routes);
   });
 
   it('never-empty fallback: returns all routes when no route matches the path', () => {
-    const routes = [
-      { url: 'https://app.test/home' },
-      { url: 'https://app.test/dashboard' },
-    ];
+    const routes = [{ url: 'https://app.test/home' }, { url: 'https://app.test/dashboard' }];
     const filtered = filterRoutesForItem(routes, '/admin');
     expect(filtered).toEqual(routes);
   });

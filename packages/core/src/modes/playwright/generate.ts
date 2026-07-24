@@ -417,14 +417,14 @@ function extractTestidFromSelector(selector: string): string | null {
 
 /**
  * Build the ground-truth the grounding-validation gate checks a generated spec against.
- * MUST read from the same selectInventoryElements() the model was actually shown (see that
- * function's doc comment) — otherwise this gate could reject a selector the model never had
- * the option to use. Endpoint ground truth is separate: dependency-level (endpoint-less)
- * mocks don't produce a comparable (method, path) pair, so `hasEndpointLevelMocks` tracks
- * whether a real comparison is even possible for this run.
+ * MUST read from the same selectInventoryElements() the model was actually shown, WITH the same
+ * `item` (see that function's doc comment) — otherwise this gate could reject a selector the
+ * model never had the option to use. Endpoint ground truth is separate: dependency-level
+ * (endpoint-less) mocks don't produce a comparable (method, path) pair, so
+ * `hasEndpointLevelMocks` tracks whether a real comparison is even possible for this run.
  */
-export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTruth {
-  const { selected, truncated } = selectInventoryElements(ctx, tier);
+export function collectGroundTruth(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): GroundTruth {
+  const { selected, truncated } = selectInventoryElements(ctx, tier, item);
 
   const testids = new Set<string>();
   const selectors = new Set<string>();
@@ -669,19 +669,50 @@ interface InventorySelection {
 }
 
 /**
+ * The route path a plan item's matched unit encodes, when it's a `route`-kind unit (e.g.
+ * "route:/checkout" -> "/checkout") — the criterion prompt-trimming filters crawled routes/URLs
+ * down to. Returns null for an item with no unitKey, no matching unit, or a non-route unit
+ * (endpoint/component units don't correspond to a crawled DOM route by path).
+ */
+function routePathForItem(ctx: TestModeContext, item: TestPlanItem | undefined): string | null {
+  const unit = item?.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+  if (!unit || unit.kind !== 'route') return null;
+  return unit.key.replace(/^route:/, '');
+}
+
+/**
+ * Narrow `routes` down to the ones actually relevant to a plan item, so its prompt isn't padded
+ * with the same tier-wide dump every other item in the same tier also gets. Falls back to the
+ * FULL list whenever nothing matches (no route path to filter by, or the filter would leave
+ * nothing) — grounding must never go from "too much" to "none" just because the match missed.
+ */
+function filterRoutesForItem<T extends { url: string }>(routes: T[], routePath: string | null): T[] {
+  if (!routePath) return routes;
+  const matched = routes.filter((r) => r.url.includes(routePath));
+  return matched.length > 0 ? matched : routes;
+}
+
+/**
  * Select the interactive-element inventory shown to the model AND checked by the
  * grounding-validation gate (findUngroundedReferences) — the two MUST read from this same
- * function, or the gate could reject a selector the model was never even shown. Applies a
- * per-route cap (MAX_ELEMENTS_PER_ROUTE) so one busy page can't starve every other route's
- * budget, plus an overall ceiling (MAX_SNAPSHOT_ELEMENTS) so a huge crawl can't blow up the
- * prompt. Tier-aware ordering surfaces the most relevant role first: authenticated routes
- * for tierB-auth items, anonymous routes otherwise. Returns an empty selection for the
- * tierC-api tier (must not drive a browser page at all) or when there's no exploration data.
+ * function (with the same `item`, when one is passed), or the gate could reject a selector the
+ * model was never even shown. Applies a per-route cap (MAX_ELEMENTS_PER_ROUTE) so one busy page
+ * can't starve every other route's budget, plus an overall ceiling (MAX_SNAPSHOT_ELEMENTS) so a
+ * huge crawl can't blow up the prompt. Tier-aware ordering surfaces the most relevant role first:
+ * authenticated routes for tierB-auth items, anonymous routes otherwise. Returns an empty
+ * selection for the tierC-api tier (must not drive a browser page at all) or when there's no
+ * exploration data.
+ *
+ * `item`, when passed, narrows the crawled routes to the one(s) its unitKey resolves to (see
+ * filterRoutesForItem) BEFORE the tier-wide ordering/selection below runs — so an item's prompt
+ * is grounded in what's actually relevant to it, not the same tier-wide dump every other item in
+ * the same tier also receives.
  */
-function selectInventoryElements(ctx: TestModeContext, tier: Tier): InventorySelection {
+function selectInventoryElements(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): InventorySelection {
   if (tier === 'tierC-api') return { ordered: [], selected: [], totalCount: 0, truncated: false };
-  const routes = ctx.exploration?.crawl.routes ?? [];
-  if (routes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
 
   const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
   const ordered = [...routes].sort(
@@ -717,8 +748,8 @@ function selectInventoryElements(ctx: TestModeContext, tier: Tier): InventorySel
  * response) has a sanctioned way out that isn't "invent a selector" — this same marker is
  * recognized by findUngroundedReferences() to avoid penalizing an acknowledged gap.
  */
-function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
-  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier);
+function formatSnapshotInventory(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): string {
+  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier, item);
   if (selected.length === 0) return '';
 
   const lines = selected.map(({ route, el }) => {
@@ -778,9 +809,10 @@ const MAX_ROUTES_LISTED = 30;
  * guessed a common convention instead of using the route this list already contains. Returns
  * '' when no exploration data exists (e.g. tierC-api, or a black-box run with nothing crawled).
  */
-function formatObservedRoutes(ctx: TestModeContext): string {
-  const routes = ctx.exploration?.crawl.routes ?? [];
-  if (routes.length === 0) return '';
+function formatObservedRoutes(ctx: TestModeContext, item?: TestPlanItem): string {
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return '';
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
   const urls = Array.from(new Set(routes.map((r) => r.url)));
   const shown = urls.slice(0, MAX_ROUTES_LISTED);
   const omitted = urls.length - shown.length;
@@ -869,9 +901,9 @@ function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retry
   // cache hit on retry instead of the note splicing mid-string and breaking
   // the shared prefix between attempt 1 and attempt 2.
   const strictNote = retryNote ? `\n\nIMPORTANT: ${retryNote}` : '';
-  const inventory = formatSnapshotInventory(ctx, tier);
+  const inventory = formatSnapshotInventory(ctx, tier, item);
   const routingGuidance = formatRoutingGuidance(ctx);
-  const observedRoutes = formatObservedRoutes(ctx);
+  const observedRoutes = formatObservedRoutes(ctx, item);
   const sourceGrounding = formatSourceGrounding(ctx, item, tier);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
@@ -1128,7 +1160,7 @@ async function generateOne(
     // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
     // correspond to anything actually observed during EXPLORE (or statically detected for
     // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
-    const groundTruth = collectGroundTruth(ctx, tier);
+    const groundTruth = collectGroundTruth(ctx, tier, item);
     const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
     if (ungroundedWarn.length > 0) {
       emit(

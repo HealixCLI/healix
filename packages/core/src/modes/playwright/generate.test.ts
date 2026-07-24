@@ -978,6 +978,146 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
   });
 });
 
+// ---- prompt trimming: narrow the tier-wide inventory/routes dump down to a plan item's own unitKey-matched route ----
+
+describe('generate — prompt trimming (per-item route filtering)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-trim-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function twoRouteExploration(): NonNullable<TestModeContext['exploration']> {
+    const routes = [
+      {
+        url: 'https://app.acme.test/checkout',
+        title: 'Checkout',
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        snapshot: {
+          url: 'https://app.acme.test/checkout',
+          title: 'Checkout',
+          interactiveElements: [
+            { role: 'button', name: 'Pay now', selector: '[data-testid="checkout-pay"]' },
+          ],
+        },
+        networkEvents: [],
+      },
+      {
+        url: 'https://app.acme.test/settings',
+        title: 'Settings',
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        snapshot: {
+          url: 'https://app.acme.test/settings',
+          title: 'Settings',
+          interactiveElements: [
+            { role: 'button', name: 'Save', selector: '[data-testid="settings-save"]' },
+          ],
+        },
+        networkEvents: [],
+      },
+    ];
+    return {
+      crawl: {
+        routes,
+        visitedCount: routes.length,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+  }
+
+  function ctxWith(): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration: twoRouteExploration(),
+      sourceContext: {
+        units: [{ key: 'route:/checkout', kind: 'route', label: 'route: /checkout', file: 'src/Checkout.tsx' }],
+        forms: [],
+        authPatterns: [],
+        selectorHints: [],
+        specSources: [],
+        summary: '',
+        truncated: false,
+      },
+    };
+  }
+
+  it('narrows the inventory and observed routes down to only the unitKey-matched route', async () => {
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: 'route:/checkout' }],
+    };
+    await generate(ctxWith(), plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('https://app.acme.test/checkout');
+    expect(prompt).not.toContain('settings-save');
+    expect(prompt).not.toContain('https://app.acme.test/settings');
+  });
+
+  it('falls back to the full tier-wide list when the item has no unitKey', async () => {
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: undefined }],
+    };
+    await generate(ctxWith(), plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('settings-save');
+  });
+
+  it('falls back to the full tier-wide list when the unitKey matches no crawled route', async () => {
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: 'route:/nonexistent' }],
+    };
+    await generate(ctxWith(), plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('settings-save');
+  });
+
+  it('falls back to the full tier-wide list when the unitKey resolves to a non-route (endpoint) unit', async () => {
+    const ctx = ctxWith();
+    ctx.sourceContext = {
+      ...ctx.sourceContext!,
+      units: [
+        { key: 'endpoint:GET /api/checkout', kind: 'endpoint', label: 'GET /api/checkout', file: 'src/server.ts' },
+      ],
+    };
+    const plan: TestPlan = {
+      summary: 'one item',
+      items: [{ ...PLAN.items[0], unitKey: 'endpoint:GET /api/checkout' }],
+    };
+    await generate(ctx, plan);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('checkout-pay');
+    expect(prompt).toContain('settings-save');
+  });
+});
+
 // ---- source-context grounding: ctx.sourceContext feeds real file/schema/form citations --------
 
 const SRC_CITED_SPEC = `import { test, expect } from '@playwright/test';

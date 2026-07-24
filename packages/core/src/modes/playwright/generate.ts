@@ -1097,9 +1097,7 @@ async function validateAndPersist(
   // Source-citation gate: only enforced when this item actually matched a real
   // source-context unit (formatSourceGrounding only demands the citation in that case) — an
   // item with no unitKey/match has no file to cite, so nothing to gate here.
-  const matchedUnit = item.unitKey
-    ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey)
-    : undefined;
+  const matchedUnit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
   if (matchedUnit && !hasSrcCitation(source, matchedUnit.file)) {
     return {
       spec: null,

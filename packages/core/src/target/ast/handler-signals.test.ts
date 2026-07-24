@@ -33,7 +33,7 @@ describe('extractHandlerSignals', () => {
     expect(signals?.observedStatusCodes).toEqual([401]);
   });
 
-  it('does not treat an unrelated object\'s .status(N) call as a response signal', () => {
+  it("does not treat an unrelated object's .status(N) call as a response signal", () => {
     const source = `
       const badge = new Badge();
       badge.status(1);

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest';
+import { afterEach, describe, expect, it, vi } from 'vitest';
 import { runPlanPhase, attemptPlanCompletion, buildWeightedBatches, splitUnitsByWeight } from './index.js';
 import type { OrchestratorEvent } from './types.js';
 import type { PlanRepoContext } from './plan.js';
@@ -154,6 +154,37 @@ describe('runPlanPhase resilience', () => {
     await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
     expect(Date.now() - start).toBeGreaterThanOrEqual(1900);
   }, 10_000);
+
+  describe('(fake timers) delay gating — deterministic, no real wall-clock wait', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('does NOT need any timer advance for an ordinary transient failure — the retry is not waiting on anything', async () => {
+      vi.useFakeTimers();
+      const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'transient failure');
+      const plan = await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
+        provider,
+      });
+      // No vi.advanceTimersByTimeAsync(...) call anywhere above — if the retry were still
+      // gated behind the 2s delay, this promise would never have resolved and the test would
+      // time out, since fake timers never advance on their own.
+      expect(plan.planSource).toBe('ai');
+      expect(provider.calls).toBe(2);
+    });
+
+    it('needs the fake clock advanced by the full delay before a credits-exhausted retry resolves', async () => {
+      vi.useFakeTimers();
+      const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'Error: insufficient credits — quota exceeded');
+      const resultPromise = runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
+        provider,
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      const plan = await resultPromise;
+      expect(plan.planSource).toBe('ai');
+      expect(provider.calls).toBe(2);
+    });
+  });
 
   it('attemptPlanCompletion requests taskType "plan-generate" (per-task-type model/effort routing)', async () => {
     let seenTaskType: string | undefined;

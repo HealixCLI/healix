@@ -919,10 +919,7 @@ describe('generate — batched generation (multiple items per provider call)', (
       summary: 'two tiers',
       items: [planItem('a', 'REQ-A', 'tierA-public'), planItem('b', 'REQ-B', 'tierC-api')],
     };
-    const replies = [
-      batchReply({ 'REQ-A': specFor('REQ-A') }),
-      batchReply({ 'REQ-B': specFor('REQ-B') }),
-    ];
+    const replies = [batchReply({ 'REQ-A': specFor('REQ-A') }), batchReply({ 'REQ-B': specFor('REQ-B') })];
     const specs = await generate(makeCtx(makeProvider(replies, calls)), plan);
 
     expect(calls).toHaveLength(2);
@@ -1161,9 +1158,7 @@ describe('generate — prompt trimming (per-item route filtering)', () => {
         snapshot: {
           url: 'https://app.acme.test/settings',
           title: 'Settings',
-          interactiveElements: [
-            { role: 'button', name: 'Save', selector: '[data-testid="settings-save"]' },
-          ],
+          interactiveElements: [{ role: 'button', name: 'Save', selector: '[data-testid="settings-save"]' }],
         },
         networkEvents: [],
       },
@@ -1195,7 +1190,9 @@ describe('generate — prompt trimming (per-item route filtering)', () => {
       browser: {} as TestModeContext['browser'],
       exploration: twoRouteExploration(),
       sourceContext: {
-        units: [{ key: 'route:/checkout', kind: 'route', label: 'route: /checkout', file: 'src/Checkout.tsx' }],
+        units: [
+          { key: 'route:/checkout', kind: 'route', label: 'route: /checkout', file: 'src/Checkout.tsx' },
+        ],
         forms: [],
         authPatterns: [],
         selectorHints: [],
@@ -1246,7 +1243,12 @@ describe('generate — prompt trimming (per-item route filtering)', () => {
     ctx.sourceContext = {
       ...ctx.sourceContext!,
       units: [
-        { key: 'endpoint:GET /api/checkout', kind: 'endpoint', label: 'GET /api/checkout', file: 'src/server.ts' },
+        {
+          key: 'endpoint:GET /api/checkout',
+          kind: 'endpoint',
+          label: 'GET /api/checkout',
+          file: 'src/server.ts',
+        },
       ],
     };
     const plan: TestPlan = {

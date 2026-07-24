@@ -1586,4 +1586,67 @@ describe('orchestrator paths (offline DI seam)', () => {
     expect(report.dependencies.length).toBe(1);
     expect(report.dependencies[0]?.packageName).toBe('twilio');
   });
+
+  it('SOURCE-CONTEXT CACHE: reuses the cached context when the repo is unchanged, and recomputes after a real edit', async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-srcctx-'));
+    try {
+      mkdirSync(join(repoPath, 'src'), { recursive: true });
+      writeFileSync(
+        join(repoPath, 'src', 'app.js'),
+        "const express = require('express');\nconst app = express();\napp.get('/health', (req, res) => res.status(200).send('ok'));\n",
+      );
+
+      const store = (await getStore()) as HealixStore;
+      const project = store.createProject({
+        name: 'Source Context Cache Demo',
+        mode: 'playwright',
+        repoPath,
+        baseUrl: 'https://app.example.test',
+      });
+
+      const makeRunOrchestrator = (): ReturnType<typeof createOrchestrator> =>
+        createOrchestrator({
+          provider: fakeProvider,
+          getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+          makeTarget: () => fakeTarget,
+          makeBrowser: () => fakeBrowser,
+        });
+
+      const reusedMessage = (events: OrchestratorEvent[]): OrchestratorEvent | undefined =>
+        events.find((e) => e.message.includes('Reused cached source context'));
+
+      // Run 1: nothing persisted yet — must compute fresh (no "Reused" message).
+      const events1: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events1.push(e) },
+      );
+      expect(reusedMessage(events1)).toBeUndefined();
+
+      // Run 2: same project, repo untouched — the persisted hash matches, so this run must
+      // reuse the cache instead of walking the repo again.
+      const events2: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events2.push(e) },
+      );
+      expect(reusedMessage(events2)).toBeDefined();
+
+      // Real edit: add a second real endpoint to the repo — the fingerprint must change.
+      writeFileSync(
+        join(repoPath, 'src', 'app.js'),
+        "const express = require('express');\nconst app = express();\napp.get('/health', (req, res) => res.status(200).send('ok'));\napp.get('/status', (req, res) => res.status(200).send('ok'));\n",
+      );
+
+      // Run 3: repo changed since the last persist — must recompute (no "Reused" message).
+      const events3: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events3.push(e) },
+      );
+      expect(reusedMessage(events3)).toBeUndefined();
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
 });

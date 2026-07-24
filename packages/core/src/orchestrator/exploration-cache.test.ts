@@ -2,11 +2,7 @@ import fs, { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import path, { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
-import {
-  clearExplorationCache,
-  loadExplorationCache,
-  persistExplorationCache,
-} from './exploration-cache.js';
+import { clearExplorationCache, loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { projectsDir } from '../env/app-data.js';
 import type { ExplorationArtifact } from '../modes/types.js';
 
@@ -64,7 +60,7 @@ describe('persistExplorationCache / loadExplorationCache', () => {
     expect(loadExplorationCache('prj_test', 'https://new.example.test')).toBeNull();
   });
 
-  it('scopes the cache per project — a different projectId never sees another project\'s cache', () => {
+  it("scopes the cache per project — a different projectId never sees another project's cache", () => {
     persistExplorationCache('prj_a', 'https://app.example.test', sampleArtifact());
     expect(loadExplorationCache('prj_b', 'https://app.example.test')).toBeNull();
   });
@@ -95,7 +91,9 @@ describe('persistExplorationCache / loadExplorationCache', () => {
     vi.spyOn(fs, 'writeFileSync').mockImplementation(() => {
       throw new Error('disk full');
     });
-    expect(() => persistExplorationCache('prj_test', 'https://app.example.test', sampleArtifact())).not.toThrow();
+    expect(() =>
+      persistExplorationCache('prj_test', 'https://app.example.test', sampleArtifact()),
+    ).not.toThrow();
   });
 });
 

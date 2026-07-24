@@ -1,4 +1,8 @@
-import { describe, expect, it } from 'vitest';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 import {
   actionHighlighterFixtureContents,
   authSetupContents,
@@ -8,6 +12,26 @@ import {
   playwrightConfigContents,
   stepsReporterContents,
 } from './templates.js';
+
+/**
+ * Pulls computeWorkers()'s body out of the generated config source and
+ * re-evaluates it with fake cpus()/freemem() so its arithmetic is actually
+ * exercised, not just grepped for as a substring.
+ */
+function evalComputeWorkers(cpuCount: number, freeMemBytes: number): number {
+  const cfg = playwrightConfigContents();
+  const match = /function computeWorkers\(\) \{[\s\S]*?\n\}/.exec(cfg);
+  if (!match) throw new Error('computeWorkers() not found in generated config');
+  const fn = new Function(
+    'cpus',
+    'freemem',
+    `${match[0]}\nreturn computeWorkers();`,
+  ) as (cpus: () => unknown[], freemem: () => number) => number;
+  return fn(
+    () => Array.from({ length: cpuCount }),
+    () => freeMemBytes,
+  );
+}
 
 describe('playwrightConfigContents — artifact capture policy', () => {
   it('records a screenshot, video, AND trace for every test, pass or fail', () => {
@@ -48,6 +72,26 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     expect(cfg).toContain('freemem()');
     // Leaves one core free for the host OS/desktop app, never claims 0 workers.
     expect(cfg).toContain('Math.max(1, cpuCount - 1)');
+  });
+
+  describe('computeWorkers() — actual arithmetic, not just source text', () => {
+    const GB = 1024 ** 3;
+
+    it('is CPU-bound when RAM is plentiful: 8 cores, 8GB free -> 7 (cores - 1)', () => {
+      expect(evalComputeWorkers(8, 8 * GB)).toBe(7);
+    });
+
+    it('is memory-bound when RAM is scarce: 8 cores, 1GB free -> 1 (floored, never 0)', () => {
+      expect(evalComputeWorkers(8, 1 * GB)).toBe(1);
+    });
+
+    it('never claims 0 workers on a single-core machine, even with ample RAM', () => {
+      expect(evalComputeWorkers(1, 8 * GB)).toBe(1);
+    });
+
+    it('rounds down to whole workers off free RAM: 8 cores, 2GB free -> 2 (2 / 0.75 floored)', () => {
+      expect(evalComputeWorkers(8, 2 * GB)).toBe(2);
+    });
   });
 
   it('registers the write-through checkpoint reporter alongside steps-reporter', () => {
@@ -131,6 +175,147 @@ describe('checkpointReporterContents', () => {
   it('never throws the test run over a write failure', () => {
     const src = checkpointReporterContents();
     expect(src).toMatch(/catch\s*\{/);
+  });
+
+  describe('live execution — the generated reporter actually run, not just grepped', () => {
+    let dir: string;
+
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), 'healix-checkpoint-reporter-'));
+    });
+
+    afterEach(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    function loadReporter(): new () => { onTestEnd(test: unknown, result: unknown): void } {
+      const reporterPath = join(dir, 'checkpoint-reporter.cjs');
+      require('node:fs').writeFileSync(reporterPath, checkpointReporterContents(), 'utf-8');
+      const req = createRequire(import.meta.url);
+      delete req.cache[req.resolve(reporterPath)];
+      return req(reporterPath);
+    }
+
+    function fakeTest(retries: number, titlePath: string[], outcome = 'expected') {
+      return { retries, titlePath: () => ['', ...titlePath], outcome: () => outcome };
+    }
+
+    async function readCheckpointLines(): Promise<Array<Record<string, unknown>>> {
+      let raw: string;
+      try {
+        raw = await readFile(join(dir, EXEC_CHECKPOINT_FILENAME), 'utf-8');
+      } catch {
+        return [];
+      }
+      return raw
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+    }
+
+    it('does not append when a failing attempt still has retries left', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(1, ['tierA-public', 'a.spec.ts', 'does a thing']), {
+          status: 'failed',
+          retry: 0,
+          duration: 12,
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      expect(await readCheckpointLines()).toEqual([]);
+    });
+
+    it('appends once every configured retry is exhausted', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(1, ['tierA-public', 'a.spec.ts', 'does a thing'], 'unexpected'), {
+          status: 'unexpected',
+          retry: 1,
+          duration: 34,
+          error: { message: 'boom' },
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({
+        project: 'tierA-public',
+        specFile: 'a.spec.ts',
+        title: 'does a thing',
+        key: '[tierA-public] › a.spec.ts › does a thing',
+        durationMs: 34,
+        error: 'boom',
+      });
+    });
+
+    it('appends immediately on a first-attempt pass, even with retries configured', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(2, ['tierC-api', 'b.spec.ts', 'passes']), {
+          status: 'passed',
+          retry: 0,
+          duration: 5,
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0].status).toBe('expected');
+    });
+
+    it('strips ANSI escapes from the persisted error text', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(0, ['tierA-public', 'a.spec.ts', 'fails loudly'], 'unexpected'), {
+          status: 'unexpected',
+          retry: 0,
+          duration: 1,
+          error: { stack: '[31mExpected true, got false[0m' },
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines[0].error).toBe('Expected true, got false');
+    });
+
+    it('swallows a write failure instead of throwing (best-effort contract)', () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      // Make the checkpoint file's own path a directory, so appendFileSync
+      // throws EISDIR — without touching cwd itself (deleting cwd is
+      // unreliable across platforms, notably Windows).
+      require('node:fs').mkdirSync(join(dir, EXEC_CHECKPOINT_FILENAME));
+      process.chdir(dir);
+      try {
+        expect(() =>
+          reporter.onTestEnd(fakeTest(0, ['tierA-public', 'a.spec.ts', 'whatever']), {
+            status: 'passed',
+            retry: 0,
+            duration: 1,
+          }),
+        ).not.toThrow();
+      } finally {
+        process.chdir(cwd);
+      }
+    });
   });
 });
 

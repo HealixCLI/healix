@@ -8,7 +8,9 @@
  *     throwing.
  */
 import { describe, it, expect, vi, beforeEach, afterEach, afterAll } from 'vitest';
-import { mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
+import type { ChildProcess } from 'node:child_process';
+import { EventEmitter } from 'node:events';
+import { mkdirSync, mkdtempSync, writeFileSync, readFileSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
@@ -942,5 +944,202 @@ describe('mergeParsedReports', () => {
     expect(merged.results[0].status).toBe('passed');
     expect(merged.passed).toBe(1);
     expect(merged.failed).toBe(0);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// execute() end-to-end: the checkpoint helpers ARE wired together correctly
+// inside the real function, not just individually correct in isolation. Spawn
+// is still mocked (no real Playwright process), but results.json/checkpoint
+// files are real, on-disk, temp-dir state — exercising the same read/write
+// paths a real run would.
+// ---------------------------------------------------------------------------
+describe('execute() — write-through checkpoint wired end-to-end', () => {
+  let dir: string;
+
+  function fakeChildProcess(exitCode: number | null = 0): ChildProcess {
+    const proc = new EventEmitter() as unknown as ChildProcess & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    proc.stdout = new EventEmitter() as never;
+    proc.stderr = new EventEmitter() as never;
+    (proc as unknown as { pid: number }).pid = 4242;
+    (proc as unknown as { kill: () => boolean }).kill = () => true;
+    queueMicrotask(() => proc.emit('close', exitCode, null));
+    return proc;
+  }
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-execute-e2e-'));
+    // ensureSuiteDeps() only checks for this marker — skips a real `npm install`.
+    mkdirSync(join(dir, 'node_modules', '@playwright'), { recursive: true });
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  const SPECS: GeneratedSpec[] = [
+    { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    { path: 'tests/tierA-public/b.spec.ts', title: 'b', tier: 'tierA-public', contents: '' },
+  ];
+
+  function writeCheckpointEntries(entries: Array<Record<string, unknown>>): void {
+    writeFileSync(
+      join(dir, EXEC_CHECKPOINT_FILENAME),
+      entries.map((e) => JSON.stringify(e)).join('\n') + '\n',
+      'utf-8',
+    );
+  }
+
+  it('omits --test-list-invert on a fresh run with no checkpoint', async () => {
+    let seenArgs: string[] = [];
+    vi.mocked(spawn).mockImplementationOnce((_cmd, args) => {
+      seenArgs = args as string[];
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(
+          report([
+            { title: 'a', projectName: 'tierA-public', status: 'passed' },
+            { title: 'b', projectName: 'tierA-public', status: 'passed' },
+          ]),
+        ),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), SPECS);
+
+    expect(seenArgs.some((a) => a.startsWith('--test-list-invert'))).toBe(false);
+    expect(outcome.passed).toBe(2);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('resume: merges checkpoint-restored entries with a fresh partial report, passing --test-list-invert', async () => {
+    writeCheckpointEntries([
+      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+    ]);
+
+    let seenArgs: string[] = [];
+    vi.mocked(spawn).mockImplementationOnce((_cmd, args) => {
+      seenArgs = args as string[];
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(report([{ title: 'b', projectName: 'tierA-public', status: 'passed' }])),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), SPECS);
+
+    const invertArg = seenArgs.find((a) => a.startsWith('--test-list-invert='));
+    expect(invertArg).toBeDefined();
+    expect(outcome.passed).toBe(2); // 1 restored from checkpoint + 1 freshly run
+    expect(outcome.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
+  });
+
+  it('fully-resumed run with nothing left to execute does not emit a false "no results" error', async () => {
+    writeCheckpointEntries([
+      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+      { key: 'k-b', title: 'b', project: 'tierA-public', specFile: 'tests/tierA-public/b.spec.ts', status: 'expected' },
+    ]);
+
+    const events: Array<{ message: string; data?: unknown }> = [];
+    vi.mocked(spawn).mockImplementationOnce(() => fakeChildProcess(0)); // no stdout, no results.json written
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      SPECS,
+    );
+
+    expect(outcome.passed).toBe(2);
+    expect(outcome.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
+    expect(events.some((e) => /no results found|failed to parse/i.test(e.message))).toBe(false);
+  });
+
+  it('classifies a checkpoint-restored Tier B failure as blocked using a checkpoint-restored (not fresh) auth-setup signal', async () => {
+    writeCheckpointEntries([
+      {
+        key: 'k-setup',
+        title: 'authenticate',
+        project: 'auth-setup',
+        specFile: 'fixtures/auth.setup.ts',
+        status: 'unexpected',
+        error: 'no email field',
+      },
+    ]);
+
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(report([{ title: 'login works', projectName: 'tierB-auth', status: 'failed' }])),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierB-auth/login.spec.ts', title: 'login works', tier: 'tierB-auth', contents: '' },
+    ]);
+
+    expect(outcome.blocked).toBe(1);
+    // The failed auth-setup phantom itself also surfaces as a `failed` result
+    // (root cause visibility — see checkpointEntriesToOutcome's doc comment),
+    // alongside the Tier B test it blocked.
+    expect(outcome.failed).toBe(1);
+    const row = outcome.results.find((r) => r.title === 'login works');
+    expect(row?.error).toContain('Auth setup failed');
+  });
+
+  it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {
+    writeCheckpointEntries([
+      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+    ]);
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(report([{ title: 'b', projectName: 'tierA-public', status: 'passed' }])),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    await execute(makeCtx({ projectDir: dir }), SPECS);
+
+    expect(await readCheckpointEntries(dir)).toEqual([]);
+  });
+
+  it('preserves the checkpoint (does not clear it) when the run is aborted mid-flight', async () => {
+    writeCheckpointEntries([
+      { key: 'k-a', title: 'a', project: 'tierA-public', specFile: 'tests/tierA-public/a.spec.ts', status: 'expected' },
+    ]);
+    const controller = new AbortController();
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      // Unlike fakeChildProcess(), this one only closes once killed — so the
+      // abort (queued right after this mock returns, but processed by
+      // runPlaywright's signal listener, which is attached synchronously
+      // right after spawn() returns) reliably happens BEFORE any close event,
+      // instead of racing an auto-close microtask scheduled at construction.
+      const proc = new EventEmitter() as unknown as ChildProcess;
+      (proc as unknown as { stdout: EventEmitter }).stdout = new EventEmitter();
+      (proc as unknown as { stderr: EventEmitter }).stderr = new EventEmitter();
+      (proc as unknown as { pid: number }).pid = 4243;
+      (proc as unknown as { kill: () => boolean }).kill = () => {
+        queueMicrotask(() => proc.emit('close', null, 'SIGTERM'));
+        return true;
+      };
+      queueMicrotask(() => controller.abort());
+      return proc;
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir, signal: controller.signal }), SPECS);
+
+    expect((outcome.raw as { aborted?: boolean } | undefined)?.aborted).toBe(true);
+    const remaining = await readCheckpointEntries(dir);
+    expect(remaining).toHaveLength(1);
+    expect(remaining[0].title).toBe('a');
   });
 });

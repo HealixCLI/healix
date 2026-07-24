@@ -302,6 +302,86 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
     expect(await readCheckpoint(runDir)).toBeNull();
   });
 
+  it('pause AFTER execute completes (executeComplete: true): resume skips mode.execute() entirely and reuses partialOutcome', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Resume Demo Post-Execute',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const controller = new AbortController();
+    const probe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
+    const mode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        probe.generateCalls += 1;
+        const specs: GeneratedSpec[] = [];
+        for (const s of CANNED_SPECS) {
+          const abs = join(ctx.projectDir, s.path);
+          await mkdir(dirname(abs), { recursive: true });
+          await writeFile(abs, s.contents, 'utf-8');
+          specs.push({ ...s, path: abs });
+        }
+        return specs;
+      },
+      async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        probe.executeCalls += 1;
+        const results = specs.map((s) => ({ title: s.title, status: 'passed' as const, durationMs: 5 }));
+        return { passed: results.length, failed: 0, blocked: 0, flaky: 0, results };
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        // Simulate the user clicking Pause AFTER execute already finished
+        // (e.g. right before triage) — executeComplete must already be true
+        // in the checkpoint this pause writes.
+        controller.abort('pause');
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const paused = await orchestrator.run({
+      projectId: project.id,
+      autoApprove: true,
+      signal: controller.signal,
+    });
+    expect(paused.status).toBe('paused');
+    expect(probe.executeCalls).toBe(1);
+
+    const runDir = join(projectsDir(), project.id, 'runs', paused.runId);
+    const checkpoint = await readCheckpoint(runDir);
+    expect(checkpoint?.executeComplete).toBe(true);
+    expect(checkpoint?.partialOutcome?.passed).toBe(2);
+
+    // Fresh, healthy mode for the resume attempt — proves resume() skips
+    // mode.execute() entirely rather than merely succeeding when called again.
+    const resumeProbe: ExecuteProbe = { generateCalls: 0, executeCalls: 0 };
+    const resumeOrchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeInterruptibleMode(resumeProbe, false, ''),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const summary = await resumeOrchestrator.resume(paused.runId);
+
+    expect(summary.status).toBe('passed');
+    expect(summary.outcome?.passed).toBe(2);
+    expect(resumeProbe.generateCalls).toBe(0);
+    // The load-bearing assertion: executeComplete:true short-circuits EXECUTE
+    // entirely on resume — mode.execute() is never called again.
+    expect(resumeProbe.executeCalls).toBe(0);
+  });
+
   it('GENERATE network interruption: pauses before anything is generated; resume redoes GENERATE then executes once', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

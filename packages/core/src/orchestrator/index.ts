@@ -19,6 +19,7 @@ import type { UsageRecorder } from '../providers/usage.js';
 import { getTestMode } from '../modes/registry.js';
 import type {
   ExecOutcome,
+  ExplorationArtifact,
   ExplorationMode,
   GeneratedSpec,
   SuiteBundle,
@@ -37,6 +38,7 @@ import type { ExternalDependency, MockResponse, MockServerHandle } from '../targ
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
 import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
+import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageInput } from '../triage/types.js';
@@ -1183,20 +1185,38 @@ async function runPipeline(
         }
 
         try {
-          // EXPLORE only needs ONE representative session to find/confirm a login
-          // form — not every role. Prefer a roleless credential (the "default"
-          // session Tier B also falls back to) over a role-tagged one.
-          const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
-          const exploration = await runExplorePhase({
-            browser,
-            baseUrl: effectiveBaseUrl,
-            credentials: defaultCredential
-              ? { username: defaultCredential.username, password: defaultCredential.password }
-              : undefined,
-            staticRoutePaths,
-            emit,
-            onFrame: hooks?.onFrame,
-          });
+          // Exploration caching: rebuilding the whole crawl from scratch on every single run is
+          // pure waste when the target app hasn't changed since the last one. Keyed by baseUrl
+          // with an explicit staleness window (unlike the source-context cache, a live app drifts
+          // independently of anything Healix can fingerprint, so this is never trusted
+          // indefinitely) — see exploration-cache.ts. "Force a fresh crawl" is simply deleting
+          // the cache file; no dedicated option is needed here.
+          const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl);
+          let exploration: ExplorationArtifact;
+          if (cachedExploration) {
+            exploration = cachedExploration;
+            emit(
+              'explore',
+              'info',
+              'Reusing cached exploration artifact (within staleness window) — skipping live crawl.',
+            );
+          } else {
+            // EXPLORE only needs ONE representative session to find/confirm a login
+            // form — not every role. Prefer a roleless credential (the "default"
+            // session Tier B also falls back to) over a role-tagged one.
+            const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            exploration = await runExplorePhase({
+              browser,
+              baseUrl: effectiveBaseUrl,
+              credentials: defaultCredential
+                ? { username: defaultCredential.username, password: defaultCredential.password }
+                : undefined,
+              staticRoutePaths,
+              emit,
+              onFrame: hooks?.onFrame,
+            });
+            persistExplorationCache(project.id, effectiveBaseUrl, exploration);
+          }
           ctx.exploration = exploration;
 
           // Auth-pattern-aware breadcrumb: a recognized auth library was detected in source but

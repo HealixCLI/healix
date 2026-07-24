@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { indexSource } from './source-index.js';
+import { computeRepoSourceHash, indexSource } from './source-index.js';
 
 const tempDirs: string[] = [];
 
@@ -23,6 +23,35 @@ afterEach(() => {
     const dir = tempDirs.pop();
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+describe('computeRepoSourceHash', () => {
+  it('is stable across repeated calls when nothing changed', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    expect(computeRepoSourceHash(dir)).toBe(computeRepoSourceHash(dir));
+  });
+
+  it('changes when a file is added', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    const before = computeRepoSourceHash(dir);
+    write(dir, 'src/New.tsx', 'export const x = 1;');
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
+
+  it('changes when an existing file is modified (size and mtime change)', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    const before = computeRepoSourceHash(dir);
+
+    const abs = path.join(dir, 'src', 'App.tsx');
+    fs.writeFileSync(abs, 'export default function App() { return null; }', 'utf-8');
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(abs, future, future);
+
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
 });
 
 describe('indexSource', () => {

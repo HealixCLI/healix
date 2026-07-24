@@ -51,8 +51,8 @@ import {
   type PlanParseFailureReason,
 } from './plan.js';
 import { estimateUnitWeight, type FunctionalityUnit } from '../target/functionality-index.js';
-import { indexSource } from '../target/source-index.js';
-import { persistSourceContext } from '../target/context-store.js';
+import { computeRepoSourceHash, indexSource } from '../target/source-index.js';
+import { loadSourceContext, persistSourceContext } from '../target/context-store.js';
 import type { SourceContext } from '../target/source-context.js';
 import { diffAgainstBase } from './topup.js';
 import {
@@ -672,6 +672,21 @@ async function runPipeline(
           `Could not reload dependencies for resume (continuing without mocks): ${errMsg(err)}`,
         );
       }
+      // sourceContext (white-box grounding for TRIAGE/GENERATE) is otherwise never recomputed on
+      // resume — formatSourceGrounding would silently return '' for every item without this.
+      // Best-effort, no hash check: even a slightly stale cached context is strictly better than
+      // none, and PLAN (where a fresher one would be computed) is being skipped entirely here.
+      if (project.repoPath) {
+        const cached = loadSourceContext(project.repoPath);
+        if (cached) {
+          sourceContext = cached.context;
+          emit(
+            'plan',
+            'debug',
+            `Resumed cached source context: ${sourceContext.units.length} functionality unit(s).`,
+          );
+        }
+      }
       setStatus('awaiting-approval');
       if (checkCancelled()) return await pauseOrCancel('approve');
       planForGeneration = { ...plan, items: plan.items.filter(isPlanItemIncluded) };
@@ -717,7 +732,23 @@ async function runPipeline(
             emit('plan', 'debug', `Repo indexing failed (planning without repo context): ${errMsg(err)}`);
           }
           try {
-            sourceContext = await indexSource(project.repoPath);
+            // Skip indexSource()'s full-repo AST walk when the repo's file list/size/mtime
+            // fingerprint hasn't changed since the last time it was persisted — a full walk is
+            // one of the more expensive PLAN-phase steps on a large repo, and re-running it
+            // every single run when nothing changed on disk is pure waste.
+            const currentHash = computeRepoSourceHash(project.repoPath);
+            const cached = loadSourceContext(project.repoPath);
+            if (cached && cached.hash === currentHash) {
+              sourceContext = cached.context;
+              emit(
+                'plan',
+                'debug',
+                `Reused cached source context (unchanged repo fingerprint): ${sourceContext.units.length} functionality unit(s).`,
+              );
+            } else {
+              sourceContext = await indexSource(project.repoPath);
+              persistSourceContext(project.repoPath, currentHash, sourceContext);
+            }
             if (sourceContext.units.length > 0) {
               repoIndex = {
                 ...(repoIndex ?? { summary: '', files: [] }),
@@ -729,7 +760,6 @@ async function runPipeline(
                 `Detected ${sourceContext.units.length} functionality unit(s) for plan grounding.`,
               );
             }
-            persistSourceContext(project.repoPath, sourceContext);
           } catch (err) {
             emit(
               'plan',

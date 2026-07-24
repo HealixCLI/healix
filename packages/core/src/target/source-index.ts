@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import type { File } from '@babel/types';
 import { detect } from './detector.js';
@@ -30,6 +32,30 @@ import type { SourceContext } from './source-context.js';
 const DEFAULT_MAX_UNITS = 300;
 const MULTILANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.php']);
 const JS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+/** Same hard file-count cap indexSource() itself walks with (via walkSourceFiles below). */
+const WALK_HARD_CAP = 5000;
+
+/**
+ * Cheap fingerprint of a repo's source tree — the file list plus each file's size and mtime,
+ * NEVER content (hashing every file's bytes would cost close to what indexSource() itself
+ * costs, defeating the point of a cache check). Mirrors indexSource()'s own walkSourceFiles()
+ * call (same cap, same extra extensions) so the hash reflects exactly the file set indexSource()
+ * would process — a file added/removed/touched anywhere in that set changes the hash.
+ */
+export function computeRepoSourceHash(repoPath: string): string {
+  const root = path.resolve(repoPath);
+  const { files } = walkSourceFiles(root, WALK_HARD_CAP, { extraExtensions: MULTILANG_EXTENSIONS });
+  const parts = files.map((f) => {
+    try {
+      const st = fs.statSync(f.abs);
+      return `${f.rel}:${st.size}:${st.mtimeMs}`;
+    } catch {
+      return `${f.rel}:?:?`;
+    }
+  });
+  parts.sort();
+  return createHash('sha256').update(parts.join('\n')).digest('hex');
+}
 
 /**
  * Build the full white-box static-analysis context for a repo: routes/endpoints (AST-based, with
@@ -56,7 +82,7 @@ export async function indexSource(repoPath: string, opts?: { maxUnits?: number }
     framework = null;
   }
 
-  const { files, truncated: filesTruncated } = walkSourceFiles(root, 5000, {
+  const { files, truncated: filesTruncated } = walkSourceFiles(root, WALK_HARD_CAP, {
     extraExtensions: MULTILANG_EXTENSIONS,
   });
 

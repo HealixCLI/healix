@@ -32,6 +32,9 @@ export interface RunConfigSnapshot {
   coverageTarget?: number;
   /** Plan item ids this run targeted for regeneration (Retry-pass/Repair), when set — see RunOptions.retryItemIds. */
   retryItemIds?: string[];
+  /** Proactive spend ceiling(s) this run was configured with, when set — see RunOptions.maxCostUsd/maxTokens. */
+  maxCostUsd?: number;
+  maxTokens?: number;
 }
 
 function runConfigPath(runDir: string): string {

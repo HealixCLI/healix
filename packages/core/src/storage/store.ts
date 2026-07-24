@@ -323,15 +323,16 @@ export class HealixStore {
   }
 
   /**
-   * Runs currently 'paused' with a reason other than 'manual' — candidates
-   * for boot-time auto-resume (see checkpoint.ts / the desktop app's
-   * reconciliation step). A manually-paused run never appears here; the user
-   * must resume it themselves.
+   * Runs currently 'paused' with a transient reason ('network' or
+   * 'credits-exhausted') — candidates for boot-time auto-resume (see
+   * checkpoint.ts / the desktop app's reconciliation step). 'manual' and
+   * 'budget-exceeded' never appear here: both need a human decision (resume
+   * as-is, or — for a budget ceiling — raise it) rather than an automatic retry.
    */
   listAutoResumableRuns(): Run[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM runs WHERE status = 'paused' AND pause_reason != 'manual' ORDER BY created_at ASC`,
+        `SELECT * FROM runs WHERE status = 'paused' AND pause_reason NOT IN ('manual', 'budget-exceeded') ORDER BY created_at ASC`,
       )
       .all() as Array<Record<string, unknown>>;
     return rows.map(rowToRun);

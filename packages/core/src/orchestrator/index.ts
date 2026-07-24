@@ -227,6 +227,8 @@ async function resumePipeline(
     coverageLoopEnabled: checkpoint.runOptions.coverageLoopEnabled,
     coverageTarget: checkpoint.runOptions.coverageTarget,
     retryItemIds: checkpoint.runOptions.retryItemIds,
+    maxCostUsd: checkpoint.runOptions.maxCostUsd,
+    maxTokens: checkpoint.runOptions.maxTokens,
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
@@ -359,31 +361,6 @@ async function runPipeline(
     }
   };
 
-  // Captures token/cost usage for every provider.complete() call this run makes
-  // (plan, gap-fill plan, generate, triage — see UsageRecorder's call sites),
-  // feeding the Usage tab / Reports page. Best-effort like every other store
-  // write here: a bad extraction or a DB fault must never affect the run itself.
-  const recordUsage: UsageRecorder = (phase, task, providerId, raw) => {
-    try {
-      const usage = extractUsage(raw);
-      store.recordUsage({
-        runId,
-        phase,
-        task,
-        provider: providerId,
-        inputTokens: usage?.inputTokens ?? null,
-        outputTokens: usage?.outputTokens ?? null,
-        costUsd: usage?.costUsd ?? null,
-        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
-        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
-        model: usage?.model ?? null,
-      });
-      noteStoreOk();
-    } catch (err) {
-      noteStoreFailure('recordUsage', err);
-    }
-  };
-
   const setStatus = (
     status: RunStatus,
     patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
@@ -421,6 +398,91 @@ async function runPipeline(
   const ctxEmit = (phase: string, message: string, data?: unknown): void =>
     emit(phase, 'info', message, data);
 
+  // Proactive credit-budget ceiling (opts.maxCostUsd/opts.maxTokens): an
+  // internal AbortController combined with the caller's own signal via
+  // AbortSignal.any(), tripped once this run's running spend crosses either
+  // configured ceiling. opts.signal is reassigned to the combined signal
+  // (rather than threading a second signal parameter everywhere) so every
+  // existing signal-checked boundary below — PLAN's batch loop, TRIAGE's AI
+  // batch loop, GENERATE's dispatch queue, every phase-boundary
+  // checkCancelled() — treats a budget breach exactly like a pause request,
+  // stopping the run before its NEXT AI dispatch rather than letting cost
+  // run unbounded. No separate plumbing needed anywhere else.
+  const budgetController = new AbortController();
+  // Only wrap opts.signal when a ceiling is actually configured — otherwise
+  // opts.signal stays the EXACT reference the caller passed in, unchanged
+  // from before this feature existed (no combined-signal indirection for
+  // the common case where no ceiling is set).
+  if (opts.maxCostUsd !== undefined || opts.maxTokens !== undefined) {
+    opts = {
+      ...opts,
+      signal: AbortSignal.any(
+        opts.signal ? [opts.signal, budgetController.signal] : [budgetController.signal],
+      ),
+    };
+  }
+
+  // Running totals for THIS run, seeded from any usage already recorded
+  // before an earlier crash/pause — so a resume doesn't reset the ceiling
+  // back to zero and let a run blow straight past it a second time — then
+  // incremented as recordUsage persists each new row.
+  let totalCostUsd = 0;
+  let totalTokens = 0;
+  if (resumeFrom) {
+    try {
+      for (const u of store.listUsageForRun(runId)) {
+        totalCostUsd += u.costUsd ?? 0;
+        totalTokens += (u.inputTokens ?? 0) + (u.outputTokens ?? 0);
+      }
+    } catch {
+      /* best-effort seeding; worst case the ceiling under-counts prior spend by one resume */
+    }
+  }
+
+  /** Trips budgetController the first time a configured ceiling is crossed — a no-op every call after. */
+  const checkBudget = (phase: OrchestratorPhase | string): void => {
+    if (budgetController.signal.aborted) return;
+    const overCost = opts.maxCostUsd !== undefined && totalCostUsd >= opts.maxCostUsd;
+    const overTokens = opts.maxTokens !== undefined && totalTokens >= opts.maxTokens;
+    if (!overCost && !overTokens) return;
+    emit(
+      phase,
+      'warn',
+      `Spend ceiling reached (cost $${totalCostUsd.toFixed(4)}` +
+        `${opts.maxCostUsd !== undefined ? ` / limit $${opts.maxCostUsd}` : ''}, tokens ${totalTokens}` +
+        `${opts.maxTokens !== undefined ? ` / limit ${opts.maxTokens}` : ''}); pausing run for review.`,
+    );
+    budgetController.abort('budget');
+  };
+
+  // Captures token/cost usage for every provider.complete() call this run makes
+  // (plan, gap-fill plan, generate, triage — see UsageRecorder's call sites),
+  // feeding the Usage tab / Reports page. Best-effort like every other store
+  // write here: a bad extraction or a DB fault must never affect the run itself.
+  const recordUsage: UsageRecorder = (phase, task, providerId, raw) => {
+    try {
+      const usage = extractUsage(raw);
+      store.recordUsage({
+        runId,
+        phase,
+        task,
+        provider: providerId,
+        inputTokens: usage?.inputTokens ?? null,
+        outputTokens: usage?.outputTokens ?? null,
+        costUsd: usage?.costUsd ?? null,
+        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
+        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
+        model: usage?.model ?? null,
+      });
+      totalCostUsd += usage?.costUsd ?? 0;
+      totalTokens += (usage?.inputTokens ?? 0) + (usage?.outputTokens ?? 0);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('recordUsage', err);
+    }
+    checkBudget(phase);
+  };
+
   // Cooperative cancellation. checkCancelled() is polled at every phase
   // boundary; in-flight provider/suite work additionally receives the signal
   // directly (ctx.signal, CompleteOptions.signal) so long-running phases can
@@ -437,8 +499,10 @@ async function runPipeline(
   // A pause shares the same AbortController/signal as cancel — the caller
   // distinguishes them via controller.abort('pause') vs. plain abort() — so
   // every existing checkCancelled() boundary can also honor a pause request
-  // without a second signal to plumb through ctx/provider calls.
-  const isPauseRequested = (): boolean => checkCancelled() && signal?.reason === 'pause';
+  // without a second signal to plumb through ctx/provider calls. A budget
+  // breach (budgetController.abort('budget')) is recognized the same way.
+  const isPauseRequested = (): boolean =>
+    checkCancelled() && (signal?.reason === 'pause' || signal?.reason === 'budget');
 
   try {
     await mkdir(join(runDir, 'plan'), { recursive: true });
@@ -467,6 +531,8 @@ async function runPipeline(
     coverageLoopEnabled: opts.coverageLoopEnabled,
     coverageTarget: opts.coverageTarget,
     retryItemIds: opts.retryItemIds,
+    maxCostUsd: opts.maxCostUsd,
+    maxTokens: opts.maxTokens,
   });
 
   if (!resumeFrom) {
@@ -566,6 +632,8 @@ async function runPipeline(
         coverageLoopEnabled: opts.coverageLoopEnabled,
         coverageTarget: opts.coverageTarget,
         retryItemIds: opts.retryItemIds,
+        maxCostUsd: opts.maxCostUsd,
+        maxTokens: opts.maxTokens,
       },
       plan: effectivePlan,
       generatedItemIds: effectivePlan.items
@@ -604,14 +672,14 @@ async function runPipeline(
     return { runId, status: 'paused' };
   };
 
-  /** At a cancellation boundary: honor a live pause request as 'paused' (resumable); otherwise cancel as today. */
+  /** At a cancellation boundary: honor a live pause/budget request as 'paused' (resumable); otherwise cancel as today. */
   const pauseOrCancel = (
     phase: OrchestratorPhase | string,
     executeComplete = false,
     cancelMessage?: string,
   ): Promise<RunSummary> =>
     isPauseRequested()
-      ? pauseRun(phase, 'manual', executeComplete)
+      ? pauseRun(phase, signal?.reason === 'budget' ? 'budget-exceeded' : 'manual', executeComplete)
       : Promise.resolve(cancelMessage ? cancelRun(phase, cancelMessage) : cancelRun(phase));
 
   try {
@@ -917,6 +985,8 @@ async function runPipeline(
               coverageLoopEnabled: opts.coverageLoopEnabled,
               coverageTarget: opts.coverageTarget,
               retryItemIds: opts.retryItemIds,
+              maxCostUsd: opts.maxCostUsd,
+              maxTokens: opts.maxTokens,
             },
             plan: {
               summary: `Planning in progress: ${progress.items.length} item(s) so far.`,
@@ -1467,6 +1537,26 @@ async function runPipeline(
           trackGeneration(planForGeneration.items.length, newSpecs.length);
         }
 
+        // A live pause/budget-ceiling abort can stop mode.generate() from
+        // dispatching further batches WITHOUT throwing (see generate.ts's
+        // runWithConcurrency shouldStop) — unlike an abort that kills an
+        // in-flight call (caught below), this returns normally with a
+        // PARTIAL newSpecs list. Catch it here, before `specs` (outer) is
+        // ever assigned: buildCheckpoint's phase resolves to 'execute' the
+        // moment specs.length > 0, and resume treats phase:'execute' as
+        // "GENERATE fully done, never call mode.generate() again" — locking
+        // in a partial specs list forever would silently ship an incomplete
+        // suite. Pausing here instead leaves `specs` empty, so the
+        // checkpoint stays phase:'generate' and resume re-invokes
+        // mode.generate(), which skips already-done items via its own
+        // write-through checkpoint and finishes the remainder. A plain
+        // cancel (not a pause/budget request) still cancels, same as every
+        // other checkCancelled() boundary — pauseOrCancel already makes
+        // that distinction.
+        if (checkCancelled()) {
+          return await pauseOrCancel('generate', false);
+        }
+
         // Pre-execution validation gate: generate.ts's regex/string gates
         // never parse the TypeScript, so a spec with a genuine syntax defect
         // (unclosed string, dropped brace) can still sail through — catch
@@ -1556,7 +1646,11 @@ async function runPipeline(
         // signature. Check isPauseRequested() FIRST: it's the direct cause,
         // regardless of what the resulting error message happens to say.
         if (isPauseRequested()) {
-          return await pauseRun('generate', 'manual', false);
+          return await pauseRun(
+            'generate',
+            signal?.reason === 'budget' ? 'budget-exceeded' : 'manual',
+            false,
+          );
         }
         // Otherwise, a systemic provider outage (see ProviderUnavailableError/
         // generate.ts) is worth pausing+resuming rather than hard-failing —
@@ -1634,7 +1728,11 @@ async function runPipeline(
         // which is what actually kills an in-flight Playwright invocation — so
         // check isPauseRequested() before trying to pattern-match the error text.
         if (isPauseRequested()) {
-          return await pauseRun('execute', 'manual', executeComplete);
+          return await pauseRun(
+            'execute',
+            signal?.reason === 'budget' ? 'budget-exceeded' : 'manual',
+            executeComplete,
+          );
         }
         const classified = classifyTransientFailure(errMsg(err));
         if (classified) {
@@ -2071,6 +2169,11 @@ async function runPipeline(
           };
 
           for (let i = 0; i < aiCandidates.length; i += TRIAGE_AI_BATCH_SIZE) {
+            // Mirrors PLAN's own batch loop: a live pause/budget-ceiling abort
+            // stops further AI batches from dispatching, rather than only
+            // taking effect at the next phase boundary (before REPORT) — the
+            // remaining candidates simply keep their rule-baseline verdict.
+            if (checkCancelled()) break;
             const batch = aiCandidates.slice(i, i + TRIAGE_AI_BATCH_SIZE);
             await enrichBatch(batch, 0);
             // Persist this batch's candidates now, with whatever verdict

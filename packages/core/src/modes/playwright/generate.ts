@@ -1616,14 +1616,25 @@ const GEN_CONCURRENCY = 3;
 
 /**
  * Run up to `concurrency` promises at a time from `tasks`. Returns results in
- * the same order as `tasks` regardless of completion order.
+ * the same order as `tasks` regardless of completion order. `shouldStop`
+ * (checked before each task is popped, e.g. a live pause or a proactive
+ * credit-budget ceiling tripping mid-GENERATE — see orchestrator/index.ts's
+ * checkBudget) lets a worker stop pulling NEW batches without disturbing
+ * batches already in flight; a task never dispatched simply leaves its slot
+ * `undefined` — callers must filter those out before use (see generate()'s
+ * `.filter(Boolean)` below).
  */
-async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+  shouldStop?: () => boolean,
+): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   let nextIndex = 0;
 
   async function worker(): Promise<void> {
     while (nextIndex < tasks.length) {
+      if (shouldStop?.()) return;
       const i = nextIndex++;
       results[i] = await tasks[i]();
     }
@@ -1708,7 +1719,12 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
     return batchOutcomes;
   });
 
-  const outcomes = (await runWithConcurrency(tasks, GEN_CONCURRENCY)).flat();
+  // shouldStop lets a live pause/budget-ceiling abort stop new batches from
+  // being dispatched (batches already in flight still finish); a batch never
+  // dispatched leaves an undefined slot, filtered out before flattening.
+  const outcomes = (await runWithConcurrency(tasks, GEN_CONCURRENCY, () => ctx.signal?.aborted === true))
+    .filter((r): r is NonNullable<typeof r> => r !== undefined)
+    .flat();
 
   let lastProviderFailureDetail: string | undefined;
   for (const { item, spec, reason, violations, providerFailureDetail } of outcomes) {
@@ -1735,9 +1751,15 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // nothing usable," which stays today's normal zero-specs outcome. Scoped to
   // remainingItems: if everything was already finished in an earlier attempt,
   // there's nothing left to dispatch and therefore nothing to classify.
+  // outcomes.length > 0 guards against Array.prototype.every's vacuous-true
+  // on an empty array: a signal already aborted before any batch even
+  // dispatched (runWithConcurrency's shouldStop, e.g. a live pause/budget
+  // ceiling) leaves outcomes empty — that's "we were told to stop", not a
+  // provider outage, and must not be misclassified as one.
   if (
     remainingItems.length > 0 &&
     specs.length === 0 &&
+    outcomes.length > 0 &&
     outcomes.every((o) => o.providerFailureDetail !== undefined)
   ) {
     throw new ProviderUnavailableError(

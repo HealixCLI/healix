@@ -122,8 +122,24 @@ export function registerRun(program: Command): void {
     .addOption(new Option('--mode <mode>', 'exploration mode').choices(['codegen', 'computer-use']))
     .option('--yes', 'auto-approve the plan (skip the approval gate)', false)
     .option('--prd <text>', 'PRD / acceptance-criteria text to ground generation')
+    .option(
+      '--max-cost-usd <amount>',
+      'pause the run cleanly (resumable) once its total AI spend reaches this many dollars',
+    )
+    .option(
+      '--max-tokens <count>',
+      'pause the run cleanly (resumable) once its total input+output tokens reach this count',
+    )
     .action(
-      async (opts: { project: string; provider?: string; mode?: string; yes?: boolean; prd?: string }) => {
+      async (opts: {
+        project: string;
+        provider?: string;
+        mode?: string;
+        yes?: boolean;
+        prd?: string;
+        maxCostUsd?: string;
+        maxTokens?: string;
+      }) => {
         const runOpts: RunOptions = {
           projectId: opts.project,
           autoApprove: opts.yes === true,
@@ -131,6 +147,8 @@ export function registerRun(program: Command): void {
         if (opts.provider) runOpts.provider = opts.provider as ProviderId;
         if (opts.mode) runOpts.explorationMode = opts.mode as ExplorationMode;
         if (opts.prd) runOpts.prd = opts.prd;
+        if (opts.maxCostUsd !== undefined) runOpts.maxCostUsd = Number(opts.maxCostUsd);
+        if (opts.maxTokens !== undefined) runOpts.maxTokens = Number(opts.maxTokens);
 
         // Ctrl+C previously just killed the process with no checkpoint
         // written at all — treating it as a pause request instead means the

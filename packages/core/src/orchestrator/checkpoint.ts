@@ -37,6 +37,8 @@ export interface ResumeCheckpoint {
     coverageLoopEnabled?: boolean;
     coverageTarget?: number;
     retryItemIds?: string[];
+    maxCostUsd?: number;
+    maxTokens?: number;
   };
   /**
    * The finalized, human-approved plan once `phase` is past 'plan' — resume

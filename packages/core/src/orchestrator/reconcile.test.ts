@@ -69,6 +69,22 @@ describe('reconcileRuns', () => {
     expect(store.getRun(run.id)?.pauseReason).toBe('network');
   });
 
+  it('excludes a budget-exceeded pause from auto-resume, same as manual — both need a human decision', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({ name: 'P1b', mode: 'playwright', baseUrl: 'https://a.test' });
+    const manualRun = store.createRun(project.id, {});
+    store.updateRunStatus(manualRun.id, 'paused', { pauseReason: 'manual' });
+    const budgetRun = store.createRun(project.id, {});
+    store.updateRunStatus(budgetRun.id, 'paused', { pauseReason: 'budget-exceeded' });
+
+    const result = await reconcileRuns(store);
+    expect(result.toResume.map((r) => r.id)).not.toContain(manualRun.id);
+    expect(result.toResume.map((r) => r.id)).not.toContain(budgetRun.id);
+    // Untouched — reconcile must not silently reclassify either pause reason.
+    expect(store.getRun(manualRun.id)?.pauseReason).toBe('manual');
+    expect(store.getRun(budgetRun.id)?.pauseReason).toBe('budget-exceeded');
+  });
+
   it('reclassifies an in-flight run WITH a checkpoint as paused/crashed and returns it for resume', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({ name: 'P2', mode: 'playwright', baseUrl: 'https://a.test' });

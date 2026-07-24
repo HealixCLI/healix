@@ -936,4 +936,175 @@ describe('orchestrator pause/resume (offline DI seam)', () => {
       rmSync(repoPath, { recursive: true, force: true });
     }
   });
+
+  it('BUDGET CEILING: maxCostUsd pauses (budget-exceeded) once GENERATE spend crosses it, stopping before the next batch', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Budget Ceiling Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const rawWithCost = (costUSD: number) => ({
+      modelUsage: { 'fake-model': { inputTokens: 10, outputTokens: 10, costUSD } },
+    });
+
+    let generateBatchCalls = 0;
+    const mode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        const specs: GeneratedSpec[] = [];
+        for (const s of CANNED_SPECS) {
+          if (ctx.signal?.aborted) break;
+          generateBatchCalls += 1;
+          ctx.onUsage?.('generate', `batch ${generateBatchCalls}`, 'claude', rawWithCost(6));
+          const abs = join(ctx.projectDir, s.path);
+          await mkdir(dirname(abs), { recursive: true });
+          await writeFile(abs, s.contents, 'utf-8');
+          specs.push({ ...s, path: abs });
+        }
+        return specs;
+      },
+      async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = specs.map((s) => ({ title: s.title, status: 'passed' as const, durationMs: 5 }));
+        return { passed: results.length, failed: 0, blocked: 0, flaky: 0, results };
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => mode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({
+      projectId: project.id,
+      autoApprove: true,
+      maxCostUsd: 5, // below a single batch's $6 — trips after the first, before a second dispatches
+    });
+
+    expect(summary.status).toBe('paused');
+    expect(store.getRun(summary.runId)?.pauseReason).toBe('budget-exceeded');
+    // CANNED_SPECS has 2 items — only the first ran before the ceiling stopped the loop.
+    expect(generateBatchCalls).toBe(1);
+
+    // The partial spec never got baked into an 'execute'-phase checkpoint —
+    // resume must still call mode.generate() again, not skip straight to EXECUTE.
+    const runDir = join(projectsDir(), project.id, 'runs', summary.runId);
+    const checkpoint = await readCheckpoint(runDir);
+    expect(checkpoint?.phase).toBe('generate');
+  });
+
+  it('BUDGET CEILING resume: prior spend is seeded from stored usage, not reset to zero, on resume', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Budget Ceiling Resume Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const rawWithCost = (costUSD: number) => ({
+      modelUsage: { 'fake-model': { inputTokens: 10, outputTokens: 10, costUSD } },
+    });
+
+    // Phase 1: a real run that reports $8 of GENERATE spend (under the $10
+    // ceiling, so the budget ceiling itself never fires here) then pauses
+    // manually right after — purely to leave a genuine phase:'generate'
+    // checkpoint plus one real, persisted usage row behind.
+    const pauseController = new AbortController();
+    const firstMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        ctx.onUsage?.('generate', 'batch 1', 'claude', rawWithCost(8));
+        const s = CANNED_SPECS[0]!;
+        const abs = join(ctx.projectDir, s.path);
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, s.contents, 'utf-8');
+        pauseController.abort('pause');
+        return [{ ...s, path: abs }];
+      },
+      async execute(): Promise<ExecOutcome> {
+        throw new Error('must not reach EXECUTE in phase 1');
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const firstOrchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => firstMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const paused = await firstOrchestrator.run({
+      projectId: project.id,
+      autoApprove: true,
+      maxCostUsd: 10,
+      signal: pauseController.signal,
+    });
+    expect(paused.status).toBe('paused');
+    expect(store.getRun(paused.runId)?.pauseReason).toBe('manual');
+    // PLAN's own completion call also records a (cost-less, since CANNED_PLAN
+    // carries no modelUsage) usage row — only the GENERATE row contributes cost.
+    const seededUsage = store.listUsageForRun(paused.runId);
+    const seededCost = seededUsage.reduce((sum, u) => sum + (u.costUsd ?? 0), 0);
+    expect(seededCost).toBe(8);
+
+    // Phase 2: resume. The SAME $10 ceiling (round-tripped via the
+    // checkpoint) is still configured. This mode reports just $5 more —
+    // under $10 on its own, but $8 (seeded) + $5 = $13 crosses it. If the
+    // seed were dropped on resume, this would wrongly proceed to EXECUTE.
+    let resumeGenerateCalls = 0;
+    const resumeMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext): Promise<GeneratedSpec[]> {
+        resumeGenerateCalls += 1;
+        ctx.onUsage?.('generate', 'batch 2', 'claude', rawWithCost(5));
+        const s = CANNED_SPECS[1]!;
+        const abs = join(ctx.projectDir, s.path);
+        await mkdir(dirname(abs), { recursive: true });
+        await writeFile(abs, s.contents, 'utf-8');
+        return [{ ...s, path: abs }];
+      },
+      async execute(): Promise<ExecOutcome> {
+        throw new Error('must not reach EXECUTE: the seeded + new spend should have crossed the ceiling');
+      },
+      async collectArtifacts(): Promise<{ dir: string; files: string[] }> {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export(): Promise<SuiteBundle> {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const resumeOrchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => resumeMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await resumeOrchestrator.resume(paused.runId);
+
+    expect(resumeGenerateCalls).toBe(1);
+    expect(summary.status).toBe('paused');
+    expect(store.getRun(summary.runId)?.pauseReason).toBe('budget-exceeded');
+    const totalUsage = store.listUsageForRun(summary.runId).reduce((sum, u) => sum + (u.costUsd ?? 0), 0);
+    expect(totalUsage).toBe(13);
+  });
 });

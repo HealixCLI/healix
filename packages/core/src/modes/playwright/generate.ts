@@ -1229,6 +1229,18 @@ async function generateOne(
 const GEN_BATCH_SIZE = 4;
 /** Recursion guard for the halve-and-retry split on total batch parse failure — mirrors runPlanPhase's PLAN_MAX_SPLIT_DEPTH shape (orchestrator/index.ts) for a truncated plan batch. */
 const GEN_MAX_SPLIT_DEPTH = 3;
+/** Extra time budget per additional item beyond the first in one batched call — a 4-item batch's response is roughly proportional in length to a single item's, not identical, so reusing GEN_TIMEOUT_MS unscaled would make a real, correctly-sized batch response look indistinguishable from a hang. */
+const GEN_BATCH_TIMEOUT_INCREMENT_MS = 60_000;
+/** Hard ceiling on the scaled batch timeout regardless of batch size, so a pathological batch can't hang indefinitely. */
+const GEN_BATCH_TIMEOUT_CAP_MS = 480_000;
+
+/** Timeout budget for a batch of `n` items: GEN_TIMEOUT_MS covers the first item's worth of output (base overhead + one item), plus GEN_BATCH_TIMEOUT_INCREMENT_MS per additional item, capped at GEN_BATCH_TIMEOUT_CAP_MS. For n=1 this equals GEN_TIMEOUT_MS exactly, matching generateOne's own budget. */
+function genBatchTimeoutMs(n: number): number {
+  return Math.min(
+    GEN_TIMEOUT_MS + Math.max(0, n - 1) * GEN_BATCH_TIMEOUT_INCREMENT_MS,
+    GEN_BATCH_TIMEOUT_CAP_MS,
+  );
+}
 
 function batchMarkerStart(reqTag: string): string {
   return `===== BEGIN SPEC [REQ:${reqTag}] =====`;
@@ -1403,7 +1415,7 @@ async function generateBatch(
   try {
     const res = await ctx.provider.complete(buildBatchPrompt(batchItems, ctx, tier), {
       cwd: ctx.repoPath ?? undefined,
-      timeoutMs: GEN_TIMEOUT_MS,
+      timeoutMs: genBatchTimeoutMs(batchItems.length),
       readOnly: true,
       signal: ctx.signal,
       taskType: 'codegen',
@@ -1429,10 +1441,14 @@ async function generateBatch(
       `Batched generation for ${batchItems.length} item(s) came back unusable; splitting and retrying.`,
     );
     const mid = Math.ceil(batchItems.length / 2);
-    const [leftOut, rightOut] = await Promise.all([
-      generateBatch(ctx, batchItems.slice(0, mid), usedPaths, depth + 1),
-      generateBatch(ctx, batchItems.slice(mid), usedPaths, depth + 1),
-    ]);
+    // Sequential, not Promise.all — matches runPlanPhase's planBatch split precedent exactly
+    // (orchestrator/index.ts). Recursing concurrently here would let a burst of simultaneous
+    // batch failures (this is itself a failure path) fan out beyond GEN_CONCURRENCY, since this
+    // recursion runs INSIDE an already-running top-level batch task and isn't governed by the
+    // outer runWithConcurrency pool — a real concurrency-cap leak, not just a cosmetic mismatch
+    // with the pattern it's supposed to mirror.
+    const leftOut = await generateBatch(ctx, batchItems.slice(0, mid), usedPaths, depth + 1);
+    const rightOut = await generateBatch(ctx, batchItems.slice(mid), usedPaths, depth + 1);
     return [...leftOut, ...rightOut];
   }
 

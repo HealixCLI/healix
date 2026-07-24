@@ -1011,6 +1011,66 @@ describe('generate — batched generation (multiple items per provider call)', (
     expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
   });
 
+  it('scales the provider call timeout with batch size instead of reusing the flat single-item budget', async () => {
+    const twoItemPlan: TestPlan = {
+      summary: 'two items',
+      items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
+    };
+    const fiveItemPlan: TestPlan = {
+      summary: 'five items',
+      items: [
+        planItem('a', 'REQ-A'),
+        planItem('b', 'REQ-B'),
+        planItem('c', 'REQ-C'),
+        planItem('d', 'REQ-D'),
+        planItem('e', 'REQ-E'),
+      ],
+    };
+
+    const twoCalls: FakeCall[] = [];
+    await generate(
+      makeCtx(makeProvider([batchReply({ 'REQ-A': specFor('REQ-A'), 'REQ-B': specFor('REQ-B') })], twoCalls)),
+      twoItemPlan,
+    );
+
+    const fiveCalls: FakeCall[] = [];
+    await generate(
+      makeCtx(
+        makeProvider(
+          [
+            // 5 items split into batches of up to GEN_BATCH_SIZE (4): a 4-item batch (A-D) + a
+            // 1-item "batch" (E) that bottoms out straight to generateOne — a plain spec, not a
+            // BEGIN/END-marker batch reply.
+            batchReply({
+              'REQ-A': specFor('REQ-A'),
+              'REQ-B': specFor('REQ-B'),
+              'REQ-C': specFor('REQ-C'),
+              'REQ-D': specFor('REQ-D'),
+            }),
+            specFor('REQ-E'),
+          ],
+          fiveCalls,
+        ),
+      ),
+      fiveItemPlan,
+    );
+
+    // Compare the actual 4-item batch call's timeout against the 2-item batch call's — the
+    // solo-path call for REQ-E (a flat single-item budget, same as the 2-item comparison isn't
+    // about) is irrelevant here.
+    const twoItemBatchCall = twoCalls.find((c) => c.prompt.includes('REQ-A') && c.prompt.includes('REQ-B'));
+    const fourItemBatchCall = fiveCalls.find(
+      (c) =>
+        c.prompt.includes('REQ-A') &&
+        c.prompt.includes('REQ-B') &&
+        c.prompt.includes('REQ-C') &&
+        c.prompt.includes('REQ-D'),
+    );
+    expect(twoItemBatchCall?.opts?.timeoutMs).toBeDefined();
+    expect(fourItemBatchCall?.opts?.timeoutMs).toBeDefined();
+    expect(fourItemBatchCall!.opts!.timeoutMs!).toBeGreaterThan(twoItemBatchCall!.opts!.timeoutMs!);
+  });
+
   it('never batches items from different tiers into the same provider call', async () => {
     const plan: TestPlan = {
       summary: 'two tiers',
@@ -1047,10 +1107,10 @@ describe('generate — batched generation (multiple items per provider call)', (
       items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
     };
     // First reply (the batch attempt) is garbage with no BEGIN/END markers at all — a total
-    // parse failure. The batch (size 2) splits into two size-1 sub-batches, run concurrently via
-    // Promise.all, each hitting generateOne directly and succeeding on its own first attempt.
-    // A prompt-aware provider (rather than positional replies) avoids depending on which of the
-    // two concurrent solo calls happens to reach the fake provider first.
+    // parse failure. The batch (size 2) splits into two size-1 sub-batches, run SEQUENTIALLY
+    // (not concurrently — see the concurrency-cap test below for why), each hitting generateOne
+    // directly and succeeding on its own first attempt. A prompt-aware provider (rather than
+    // positional replies) avoids depending on call ordering between the two solo sub-calls.
     let callIndex = 0;
     const provider: ProviderAdapter = {
       id: 'claude',
@@ -1075,6 +1135,54 @@ describe('generate — batched generation (multiple items per provider call)', (
     expect(calls).toHaveLength(3); // 1 failed batch + 1 solo call per item
     expect(specs).toHaveLength(2);
     expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B']);
+  });
+
+  it('never exceeds GEN_CONCURRENCY in-flight provider calls, even when several top-level batches fail and split at the same time', async () => {
+    // 3 top-level batches of 4 (same tier, GEN_CONCURRENCY=3) all fail their batch call with no
+    // markers at all, forcing every one of them to split at the same time. Before the fix,
+    // generateBatch's split recursed via Promise.all — ungoverned by the outer runWithConcurrency
+    // pool — so 3 simultaneously-failing top-level batches could each fan out 2 more concurrent
+    // calls, briefly pushing active calls to 6. The sequential-split fix keeps each top-level
+    // task's OWN recursion to one call at a time, so the true ceiling stays at GEN_CONCURRENCY.
+    const items = ['A', 'B', 'C', 'D', 'E', 'F', 'G', 'H', 'I', 'J', 'K', 'L'].map((id) =>
+      planItem(id, `REQ-${id}`),
+    );
+    const plan: TestPlan = { summary: 'twelve items, three batches of four', items };
+
+    let active = 0;
+    let peak = 0;
+    const isBatchPrompt = (prompt: string): boolean => prompt.includes('DIFFERENT, INDEPENDENT features');
+
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'Fake Claude',
+      capabilities: ['codegen'],
+      detect: vi.fn(),
+      health: vi.fn(),
+      plan: vi.fn(),
+      complete: async (prompt: string, opts?: CompleteOptions): Promise<CompletionResult> => {
+        calls.push({ prompt, opts });
+        active += 1;
+        peak = Math.max(peak, active);
+        // A short artificial delay forces genuinely-concurrent calls to overlap in wall-clock
+        // time rather than resolving instantly one after another by microtask ordering alone.
+        await new Promise((resolve) => setTimeout(resolve, 15));
+        active -= 1;
+
+        if (isBatchPrompt(prompt)) {
+          // Every batch-shaped call (any size > 1) is unusable — forces a split every time,
+          // all the way down to single-item solo calls.
+          return { provider: 'claude', ok: true, text: 'no markers here at all', raw: null, detail: '' };
+        }
+        const reqTag = /\[REQ:([^\]]+)\]/.exec(prompt)?.[1] ?? '';
+        return { provider: 'claude', ok: true, text: specFor(reqTag), raw: null, detail: '' };
+      },
+    } as unknown as ProviderAdapter;
+
+    const specs = await generate(makeCtx(provider), plan);
+
+    expect(specs).toHaveLength(12);
+    expect(peak).toBeLessThanOrEqual(3); // GEN_CONCURRENCY
   });
 });
 

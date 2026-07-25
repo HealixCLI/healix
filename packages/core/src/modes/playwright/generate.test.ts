@@ -21,18 +21,23 @@ import type { TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import type { ProjectCredential, Tier } from '../../storage/types.js';
 import { indexSource } from '../../target/source-index.js';
 import {
+  binPackByScenarioWeight,
+  buildGenerationBatches,
   clearGenerateCheckpoint,
   collectGroundTruth,
   demoteEscapeHatchBlocks,
+  findDominantPrefixes,
   findForbiddenApis,
   findUngroundedReferences,
   filterRoutesForItem,
   formatMockContent,
   generate,
+  genBatchTimeoutMs,
   GEN_CHECKPOINT_FILENAME,
   type GenCheckpointEntry,
   ProviderUnavailableError,
   readGenerateCheckpointEntries,
+  routeClusterKey,
   type GroundTruth,
 } from './generate.js';
 
@@ -868,14 +873,24 @@ function batchReply(specsByReqTag: Record<string, string>): string {
     .join('\n\n');
 }
 
-function planItem(id: string, reqTag: string, tier: Tier = 'tierA-public'): TestPlanItem {
+function planItem(
+  id: string,
+  reqTag: string,
+  tier: Tier = 'tierA-public',
+  opts?: { unitKey?: string; scenarioCount?: number },
+): TestPlanItem {
+  const scenarioCount = opts?.scenarioCount ?? 1;
   return {
     id,
     title: `Feature ${reqTag}`,
     reqTag,
     tier,
     intent: `${reqTag} renders`,
-    scenarios: [{ kind: 'positive', description: `${reqTag} renders` }],
+    scenarios: Array.from({ length: scenarioCount }, (_, i) => ({
+      kind: 'positive' as const,
+      description: `${reqTag} renders (${i + 1})`,
+    })),
+    ...(opts?.unitKey ? { unitKey: opts.unitKey } : {}),
   };
 }
 
@@ -1015,19 +1030,18 @@ describe('generate — batched generation (multiple items per provider call)', (
     expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
   });
 
-  it('scales the provider call timeout with batch size instead of reusing the flat single-item budget', async () => {
+  it('scales the provider call timeout with expected test count instead of the flat single-item budget', async () => {
     const twoItemPlan: TestPlan = {
       summary: 'two items',
       items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
     };
-    const fiveItemPlan: TestPlan = {
-      summary: 'five items',
+    // Same item count (2) as the plan above, but with more scenarios per item — the timeout
+    // should scale with total expected tests (scenarios summed), not raw item count.
+    const heavierPlan: TestPlan = {
+      summary: 'two heavier items',
       items: [
-        planItem('a', 'REQ-A'),
-        planItem('b', 'REQ-B'),
-        planItem('c', 'REQ-C'),
-        planItem('d', 'REQ-D'),
-        planItem('e', 'REQ-E'),
+        planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 4 }),
+        planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 4 }),
       ],
     };
 
@@ -1037,42 +1051,19 @@ describe('generate — batched generation (multiple items per provider call)', (
       twoItemPlan,
     );
 
-    const fiveCalls: FakeCall[] = [];
+    const heavierCalls: FakeCall[] = [];
     await generate(
       makeCtx(
-        makeProvider(
-          [
-            // 5 items split into batches of up to GEN_BATCH_SIZE (4): a 4-item batch (A-D) + a
-            // 1-item "batch" (E) that bottoms out straight to generateOne — a plain spec, not a
-            // BEGIN/END-marker batch reply.
-            batchReply({
-              'REQ-A': specFor('REQ-A'),
-              'REQ-B': specFor('REQ-B'),
-              'REQ-C': specFor('REQ-C'),
-              'REQ-D': specFor('REQ-D'),
-            }),
-            specFor('REQ-E'),
-          ],
-          fiveCalls,
-        ),
+        makeProvider([batchReply({ 'REQ-A': specFor('REQ-A'), 'REQ-B': specFor('REQ-B') })], heavierCalls),
       ),
-      fiveItemPlan,
+      heavierPlan,
     );
 
-    // Compare the actual 4-item batch call's timeout against the 2-item batch call's — the
-    // solo-path call for REQ-E (a flat single-item budget, same as the 2-item comparison isn't
-    // about) is irrelevant here.
-    const twoItemBatchCall = twoCalls.find((c) => c.prompt.includes('REQ-A') && c.prompt.includes('REQ-B'));
-    const fourItemBatchCall = fiveCalls.find(
-      (c) =>
-        c.prompt.includes('REQ-A') &&
-        c.prompt.includes('REQ-B') &&
-        c.prompt.includes('REQ-C') &&
-        c.prompt.includes('REQ-D'),
-    );
-    expect(twoItemBatchCall?.opts?.timeoutMs).toBeDefined();
-    expect(fourItemBatchCall?.opts?.timeoutMs).toBeDefined();
-    expect(fourItemBatchCall!.opts!.timeoutMs!).toBeGreaterThan(twoItemBatchCall!.opts!.timeoutMs!);
+    const lightBatchCall = twoCalls.find((c) => c.prompt.includes('REQ-A') && c.prompt.includes('REQ-B'));
+    const heavyBatchCall = heavierCalls.find((c) => c.prompt.includes('REQ-A') && c.prompt.includes('REQ-B'));
+    expect(lightBatchCall?.opts?.timeoutMs).toBeDefined();
+    expect(heavyBatchCall?.opts?.timeoutMs).toBeDefined();
+    expect(heavyBatchCall!.opts!.timeoutMs!).toBeGreaterThan(lightBatchCall!.opts!.timeoutMs!);
   });
 
   it('never batches items from different tiers into the same provider call', async () => {
@@ -1523,6 +1514,348 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
   it('omits hash-routing guidance when there is no exploration artifact at all', async () => {
     await generate(ctxWith(undefined), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+  });
+});
+
+describe('generate — relevance-ranked DOM inventory (Phase 2 scoring)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-relevance-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWith(exploration: TestModeContext['exploration']): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration,
+    };
+  }
+
+  function planWithIntent(intent: string, title = 'Feature'): TestPlan {
+    return {
+      summary: 'relevance test',
+      items: [
+        {
+          id: 'REQ-1',
+          title,
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent,
+          scenarios: [{ kind: 'positive', description: intent }],
+        },
+      ],
+    };
+  }
+
+  function explorationWithElements(
+    elements: Array<{ role: string; name: string; selector: string; selectorTier?: 1 | 2 | 3 | 4 }>,
+  ): NonNullable<TestModeContext['exploration']> {
+    return {
+      crawl: {
+        routes: [
+          {
+            url: 'https://app.acme.test/dashboard',
+            title: 'Dashboard',
+            depth: 0,
+            hasPasswordField: false,
+            role: 'anonymous',
+            snapshot: {
+              url: 'https://app.acme.test/dashboard',
+              title: 'Dashboard',
+              interactiveElements: elements,
+            },
+            networkEvents: [],
+          },
+        ],
+        visitedCount: 1,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+  }
+
+  it('lets a relevant element past the old positional cutoff survive per-route truncation', async () => {
+    // 35 elements (over MAX_ELEMENTS_PER_ROUTE=30): filler at positions 0-33, one genuinely
+    // relevant element ("Submit invoice") at position 34 — well past the old first-30 cutoff.
+    const elements = Array.from({ length: 34 }, (_, i) => ({
+      role: 'button',
+      name: `Filler ${i}`,
+      selector: `[data-testid="filler-${i}"]`,
+    }));
+    elements.push({ role: 'button', name: 'Submit invoice', selector: '[data-testid="submit-invoice"]' });
+
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Submit the invoice'));
+    expect(calls[0].prompt).toContain('[data-testid="submit-invoice"]');
+  });
+
+  it('scores an action-verb match (submit -> button) above an unrelated filler even with no name overlap', async () => {
+    const elements = Array.from({ length: 32 }, (_, i) => ({
+      role: 'link',
+      name: `Unrelated link ${i}`,
+      selector: `[data-testid="link-${i}"]`,
+    }));
+    // No literal word overlap with "submit" the requirement text — only the action-verb ->
+    // role bonus (button) should surface this past the 30-cap.
+    elements.push({ role: 'button', name: 'Go', selector: '[data-testid="go-button"]' });
+
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('submit the form'));
+    expect(calls[0].prompt).toContain('[data-testid="go-button"]');
+  });
+
+  it('suppresses a non-semantic (generic-role) element in favor of a semantic one under the cap', async () => {
+    const elements = [
+      { role: 'generic', name: 'Save changes', selector: '[data-testid="generic-save"]' },
+      ...Array.from({ length: 30 }, (_, i) => ({
+        role: 'link',
+        name: `Nav link ${i}`,
+        selector: `[data-testid="nav-${i}"]`,
+      })),
+      { role: 'button', name: 'Save changes', selector: '[data-testid="button-save"]' },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Save changes to the profile'));
+    const prompt = calls[0].prompt;
+    // Both share the "save"/"changes" keyword overlap, but the semantic button (no penalty)
+    // must outrank the generic-role element (NON_SEMANTIC_ROLES penalty) for one of the 30 slots.
+    expect(prompt).toContain('[data-testid="button-save"]');
+  });
+
+  it('prefers a tier-1 (data-testid) selector over an equally-matching tier-4 positional one', async () => {
+    // Fillers each get a modest score (one keyword overlap + route-role match = 3) — enough to
+    // outrank the tier-4 duplicate (which nets 1.5 after its stability penalty and the
+    // duplicate-suppression penalty for being the SECOND "Archive item" in array order) but not
+    // the tier-1 one (7, first occurrence + stability bonus, no duplicate penalty). This forces
+    // the tier-4 duplicate specifically to be the one cut by the per-route cap, not a filler.
+    const elements = [
+      {
+        role: 'button',
+        name: 'Archive item',
+        selector: '[data-testid="archive-item"]',
+        selectorTier: 1 as const,
+      },
+      { role: 'button', name: 'Archive item', selector: 'button:nth-of-type(3)', selectorTier: 4 as const },
+      ...Array.from({ length: 29 }, (_, i) => ({
+        role: 'link',
+        name: `Filler item ${i}`,
+        selector: `[data-testid="filler-${i}"]`,
+      })),
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Archive the item'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('[data-testid="archive-item"]');
+    expect(prompt).not.toContain('button:nth-of-type(3)');
+  });
+
+  it('warns inline on a tier-4 (positional) selector, and suggests a text-anchor when repeatedRowText is present', async () => {
+    const elements = [
+      {
+        role: 'button',
+        name: 'Edit',
+        selector: 'tr:nth-of-type(2) > td > button',
+        selectorTier: 4 as const,
+        repeatedRowText: 'Bob User',
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Edit the row'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('POSITIONAL selector');
+    expect(prompt).toContain('.filter({ hasText: "Bob User" })');
+  });
+
+  it('warns on a tier-4 selector with no repeatedRowText using the plain positional warning (no filter suggestion)', async () => {
+    const elements = [
+      { role: 'button', name: 'Go', selector: 'div > button:nth-of-type(1)', selectorTier: 4 as const },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Go somewhere'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('POSITIONAL selector');
+    expect(prompt).not.toContain('.filter({ hasText:');
+  });
+
+  it('handles a global inventory of 120+ elements across many routes without exceeding MAX_SNAPSHOT_ELEMENTS', async () => {
+    const manyRoutesExploration: NonNullable<TestModeContext['exploration']> = {
+      crawl: {
+        routes: Array.from({ length: 5 }, (_, r) => ({
+          url: `https://app.acme.test/route-${r}`,
+          title: `Route ${r}`,
+          depth: 0,
+          hasPasswordField: false,
+          role: 'anonymous' as const,
+          snapshot: {
+            url: `https://app.acme.test/route-${r}`,
+            title: `Route ${r}`,
+            interactiveElements: Array.from({ length: 30 }, (_, i) => ({
+              role: 'button',
+              name: `R${r} Action ${i}`,
+              selector: `[data-testid="r${r}-act-${i}"]`,
+            })),
+          },
+          networkEvents: [],
+        })),
+        visitedCount: 5,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+    // 5 routes * 30 elements = 150 total, over MAX_SNAPSHOT_ELEMENTS (120).
+    await generate(ctxWith(manyRoutesExploration), planWithIntent('does something'));
+    const prompt = calls[0].prompt;
+    const shownCount = (prompt.match(/data-testid="r\d-act-\d+"/g) ?? []).length;
+    expect(shownCount).toBeLessThanOrEqual(120);
+    expect(prompt).toContain('PARTIAL inventory');
+  });
+});
+
+describe('generate — context-widening retry on a hallucinated-selector rejection (Phase 3)', () => {
+  let projectDir: string;
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-expand-'));
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  // 35 elements on one route: over the default per-route cap (30, so 5 are omitted and the
+  // inventory is truncated) but under the expanded cap (60, so all 35 fit once widened).
+  function explorationWith35Elements(): NonNullable<TestModeContext['exploration']> {
+    return {
+      crawl: {
+        routes: [
+          {
+            url: 'https://app.acme.test/dashboard',
+            title: 'Dashboard',
+            depth: 0,
+            hasPasswordField: false,
+            role: 'anonymous',
+            snapshot: {
+              url: 'https://app.acme.test/dashboard',
+              title: 'Dashboard',
+              interactiveElements: Array.from({ length: 35 }, (_, i) => ({
+                role: 'button',
+                name: `Action ${i}`,
+                selector: `[data-testid="act-${i}"]`,
+              })),
+            },
+            networkEvents: [],
+          },
+        ],
+        visitedCount: 1,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+  }
+
+  function ctxWith(replies: string[]): { ctx: TestModeContext; calls: FakeCall[] } {
+    const localCalls: FakeCall[] = [];
+    const ctx = {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider(replies, localCalls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration: explorationWith35Elements(),
+      mockExternalDependencies: true,
+      externalDependencies: [
+        {
+          id: 'dep1',
+          category: 'backend',
+          label: 'Known API',
+          source: 'code',
+          mockStrategy: 'route-intercept',
+          endpoints: [{ method: 'GET', pathPattern: '/api/known' }],
+        },
+      ],
+    } as unknown as TestModeContext;
+    return { ctx, calls: localCalls };
+  }
+
+  const HALLUCINATED_MOCK_SPEC = `import { test, expect } from '../../fixtures/mock.fixture';
+
+test('[REQ:REQ-1] positive: does the thing', async ({ page, mockOverride }) => {
+  await mockOverride('POST', '**/totally/fabricated/endpoint', { status: 500, body: {} });
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+
+  const GROUNDED_MOCK_SPEC = `import { test, expect } from '../../fixtures/mock.fixture';
+
+test('[REQ:REQ-1] positive: does the thing', async ({ page, mockOverride }) => {
+  await mockOverride('GET', '**/api/known', { status: 200, body: {} });
+  await page.locator('[data-testid="act-32"]').click();
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+
+  it('widens the DOM inventory on the retry after a hallucinated mockOverride is rejected', async () => {
+    const { ctx, calls: localCalls } = ctxWith([HALLUCINATED_MOCK_SPEC, GROUNDED_MOCK_SPEC]);
+    const specs = await generate(ctx, PLAN);
+
+    expect(localCalls).toHaveLength(2);
+    // Attempt 1 (default caps): act-32 sits past the per-route cap (30), so it isn't shown.
+    expect(localCalls[0].prompt).not.toContain('[data-testid="act-32"]');
+    expect(localCalls[0].prompt).toContain('PARTIAL inventory');
+    // Attempt 2 (widened after the hallucinated-mockOverride rejection): all 35 elements fit
+    // under the expanded cap (60), so act-32 is now shown and the retry succeeds using it.
+    expect(localCalls[1].prompt).toContain('[data-testid="act-32"]');
+    expect(localCalls[1].prompt).toContain('AUTHORITATIVE, COMPLETE inventory');
+    expect(specs).toHaveLength(1);
+  });
+
+  it('does not widen the inventory on a retry triggered by a non-grounding rejection reason', async () => {
+    const FORBIDDEN_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
+import { execSync } from 'node:child_process';
+
+test('[REQ:REQ-1] positive: does the thing', async ({ page }) => {
+  execSync('echo hi');
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const { ctx, calls: localCalls } = ctxWith([FORBIDDEN_SPEC, GROUNDED_MOCK_SPEC]);
+    await generate(ctx, PLAN);
+
+    expect(localCalls).toHaveLength(2);
+    // A forbidden-API rejection is not a grounding/hallucination rejection — the retry must NOT
+    // widen the inventory just because some other gate rejected the first attempt.
+    expect(localCalls[1].prompt).not.toContain('[data-testid="act-32"]');
+    expect(localCalls[1].prompt).toContain('PARTIAL inventory');
   });
 });
 
@@ -2162,4 +2495,177 @@ describe('generate — grounded against a real indexSource() result (isolated ch
       expect(specs[0].contents).toContain(`[SRC:${unit!.file}]`);
     },
   );
+});
+
+describe('genBatchTimeoutMs', () => {
+  it('scales with total expected tests (scenarios summed), not item count', () => {
+    const oneScenarioEach = [
+      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 1 }),
+      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 1 }),
+    ];
+    const fourScenariosEach = [
+      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 4 }),
+      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 4 }),
+    ];
+    expect(genBatchTimeoutMs(fourScenariosEach)).toBeGreaterThan(genBatchTimeoutMs(oneScenarioEach));
+  });
+
+  it('matches generateOne single-item budget for a lone item with one scenario', () => {
+    // GEN_TIMEOUT_MS (single-item budget) + (1 expected test + 1 buffer) * per-test increment,
+    // capped — for a single one-scenario item this must not silently drift from generateOne's
+    // own flat timeout used by generateBatch's n===1 bypass path.
+    const single = [planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 1 })];
+    const pair = [
+      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 1 }),
+      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 1 }),
+    ];
+    expect(genBatchTimeoutMs(pair)).toBeGreaterThan(genBatchTimeoutMs(single));
+  });
+
+  it('caps the timeout regardless of how many expected tests a batch has', () => {
+    const huge = Array.from({ length: 50 }, (_, i) =>
+      planItem(`id${i}`, `REQ-${i}`, 'tierA-public', { scenarioCount: 10 }),
+    );
+    // GEN_BATCH_TIMEOUT_CAP_MS = 480_000 — a batch this large must saturate the cap, not grow unbounded.
+    expect(genBatchTimeoutMs(huge)).toBe(480_000);
+  });
+
+  it('treats a missing/zero scenarios array as weight 1 per item, matching binPackByScenarioWeight', () => {
+    const zeroScenarioItem: TestPlanItem = { ...planItem('a', 'REQ-A'), scenarios: [] };
+    const oneScenarioItem = planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 1 });
+    expect(genBatchTimeoutMs([zeroScenarioItem])).toBe(genBatchTimeoutMs([oneScenarioItem]));
+  });
+});
+
+describe('routeClusterKey', () => {
+  it('returns null for a missing unitKey', () => {
+    expect(routeClusterKey(undefined, new Set())).toBeNull();
+  });
+
+  it('returns null for a non-route unit key (e.g. component:)', () => {
+    expect(routeClusterKey('component:Foo', new Set())).toBeNull();
+  });
+
+  it('clusters by segment 1 alone when segment 1 is not a dominant prefix', () => {
+    expect(routeClusterKey('/login/resetpassword', new Set())).toBe('login');
+    expect(routeClusterKey('route:/login', new Set())).toBe('login');
+  });
+
+  it('clusters by segment1/segment2 when segment 1 is a dominant (shared-namespace) prefix', () => {
+    const dominant = new Set(['api']);
+    expect(routeClusterKey('endpoint:GET /api/users/:id', dominant)).toBe('api/users');
+    expect(routeClusterKey('/api/roles/:id', dominant)).toBe('api/roles');
+  });
+
+  it('falls back to segment 1 alone when a dominant-prefix key has no segment 2', () => {
+    expect(routeClusterKey('/api', new Set(['api']))).toBe('api');
+  });
+
+  it('tolerates a bare unitKey with no route:/endpoint: prefix', () => {
+    // Real stored plans persist bare unitKeys like "/home" with no prefix at all.
+    expect(routeClusterKey('/home', new Set())).toBe('home');
+  });
+});
+
+describe('findDominantPrefixes', () => {
+  it('returns empty when no item has a parseable unitKey', () => {
+    const items = [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')];
+    expect(findDominantPrefixes(items).size).toBe(0);
+  });
+
+  it('flags a segment-1 value shared by more than the threshold share of items', () => {
+    const items = [
+      planItem('a', 'REQ-A', 'tierC-api', { unitKey: 'endpoint:GET /api/users/:id' }),
+      planItem('b', 'REQ-B', 'tierC-api', { unitKey: 'endpoint:GET /api/roles/:id' }),
+      planItem('c', 'REQ-C', 'tierC-api', { unitKey: 'endpoint:POST /api/orders' }),
+    ];
+    expect(findDominantPrefixes(items).has('api')).toBe(true);
+  });
+
+  it('does not flag a segment-1 value that is a genuine minority feature boundary', () => {
+    const items = [
+      planItem('a', 'REQ-A', 'tierA-public', { unitKey: '/coupons' }),
+      planItem('b', 'REQ-B', 'tierA-public', { unitKey: '/points' }),
+      planItem('c', 'REQ-C', 'tierA-public', { unitKey: '/badges' }),
+      planItem('d', 'REQ-D', 'tierA-public', { unitKey: '/milestones' }),
+    ];
+    const dominant = findDominantPrefixes(items);
+    expect(dominant.has('coupons')).toBe(false);
+    expect(dominant.size).toBe(0);
+  });
+});
+
+describe('binPackByScenarioWeight', () => {
+  it('packs items into one batch while under the weight budget and item cap', () => {
+    const items = [
+      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 2 }),
+      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 2 }),
+    ];
+    expect(binPackByScenarioWeight(items, 12, 8)).toEqual([items]);
+  });
+
+  it('cuts a new batch once the next item would exceed the weight budget', () => {
+    const items = [
+      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 8 }),
+      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 8 }),
+    ];
+    const batches = binPackByScenarioWeight(items, 12, 8);
+    expect(batches).toEqual([[items[0]], [items[1]]]);
+  });
+
+  it('cuts a new batch once the item-count cap is reached, even under the weight budget', () => {
+    const items = Array.from({ length: 5 }, (_, i) => planItem(`id${i}`, `REQ-${i}`));
+    const batches = binPackByScenarioWeight(items, 100, 3);
+    expect(batches.map((b) => b.length)).toEqual([3, 2]);
+  });
+
+  it('gives a single over-budget item its own batch rather than failing', () => {
+    const heavy = planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 20 });
+    expect(binPackByScenarioWeight([heavy], 12, 8)).toEqual([[heavy]]);
+  });
+});
+
+describe('buildGenerationBatches', () => {
+  it('groups related routes (shared feature boundary) into the same batch', () => {
+    // A realistic-sized plan (mirroring C&A's real shape): "login" is a genuine feature with
+    // several sub-pages, but stays well under the dominant-prefix threshold relative to the
+    // whole plan, so it clusters at segment 1 rather than being fragmented like a namespace.
+    const login = planItem('a', 'REQ-A', 'tierA-public', { unitKey: '/login' });
+    const reset = planItem('b', 'REQ-B', 'tierA-public', { unitKey: '/login/resetpassword' });
+    const update = planItem('c', 'REQ-C', 'tierA-public', { unitKey: '/login/passwordupdate' });
+    const others = ['dashboard', 'cart', 'checkout', 'profile', 'orders', 'search', 'settings'].map(
+      (seg, i) => planItem(`o${i}`, `REQ-O${i}`, 'tierA-public', { unitKey: `/${seg}` }),
+    );
+
+    const batches = buildGenerationBatches([login, reset, update, ...others]);
+    const loginBatch = batches.find((b) => b.includes(login));
+    expect(loginBatch).toContain(reset);
+    expect(loginBatch).toContain(update);
+    for (const other of others) expect(loginBatch).not.toContain(other);
+  });
+
+  it('does not dump unrelated features together under a dominant shared-namespace prefix', () => {
+    const users = planItem('a', 'REQ-A', 'tierC-api', { unitKey: 'endpoint:GET /api/users/:id' });
+    const roles = planItem('b', 'REQ-B', 'tierC-api', { unitKey: 'endpoint:GET /api/roles/:id' });
+    const orders = planItem('c', 'REQ-C', 'tierC-api', { unitKey: 'endpoint:POST /api/orders' });
+
+    const batches = buildGenerationBatches([users, roles, orders]);
+    const usersBatch = batches.find((b) => b.includes(users));
+    expect(usersBatch).not.toContain(roles);
+    expect(usersBatch).not.toContain(orders);
+  });
+
+  it('bin-packs items with no usable unitKey into a catch-all pool in plan order', () => {
+    const items = Array.from({ length: 3 }, (_, i) => planItem(`id${i}`, `REQ-${i}`));
+    const batches = buildGenerationBatches(items);
+    expect(batches.flat()).toEqual(items);
+  });
+
+  it('degrades to the old fixed-size-ish chunking behavior when nothing has a unitKey', () => {
+    const items = Array.from({ length: 9 }, (_, i) => planItem(`id${i}`, `REQ-${i}`));
+    const batches = buildGenerationBatches(items);
+    // 9 one-scenario items under GEN_BATCH_MAX_ITEMS=8 and weight budget 12 still split by the
+    // item-count cap into batches of 8 + 1.
+    expect(batches.map((b) => b.length)).toEqual([8, 1]);
+  });
 });

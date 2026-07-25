@@ -84,31 +84,69 @@ function inferButtonType(rawType: string, inForm: boolean): string {
 }
 
 /**
- * Framework-generated-id filter, copied verbatim from `selectorFor`'s
- * `UNSTABLE_ID_RE` in selectors.ts. These id shapes are reassigned per
- * render tree (React's useId(), MUI's mui-N) rather than persisted across
- * page loads, so a selector built from one resolves against a different
+ * Dynamic-id filter, copied verbatim from `selectorFor`'s `isLikelyDynamicId` in
+ * selectors.ts. These id shapes are reassigned per render tree (React's useId(), MUI's mui-N) or
+ * generated/enumerated per record (UUIDs, hash-based ids, alpha+long-digit ids) rather than
+ * persisted across page loads, so a selector built from one resolves against a different
  * element (or nothing) on the next load.
  */
-const UNSTABLE_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+const FRAMEWORK_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+const UUID_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+const LONG_HEX_RUN_RE = /^[0-9a-f]{10,}$/i;
+const SHORT_ALPHA_LONG_DIGIT_RE = /^[a-z]{1,8}[-_:]?\d{5,}$/i;
 
-describe('selectors.UNSTABLE_ID_RE (framework-generated id detection)', () => {
+function isLikelyDynamicId(id: string): boolean {
+  return (
+    FRAMEWORK_ID_RE.test(id) ||
+    UUID_ID_RE.test(id) ||
+    LONG_HEX_RUN_RE.test(id) ||
+    SHORT_ALPHA_LONG_DIGIT_RE.test(id)
+  );
+}
+
+describe('selectors.isLikelyDynamicId (dynamic id detection)', () => {
   it('flags React useId() shapes as unstable', () => {
-    expect(UNSTABLE_ID_RE.test('_r_4_')).toBe(true);
-    expect(UNSTABLE_ID_RE.test('_r_6_')).toBe(true);
-    expect(UNSTABLE_ID_RE.test(':r4:')).toBe(true);
-    expect(UNSTABLE_ID_RE.test(':r4h:')).toBe(true);
+    expect(isLikelyDynamicId('_r_4_')).toBe(true);
+    expect(isLikelyDynamicId('_r_6_')).toBe(true);
+    expect(isLikelyDynamicId(':r4:')).toBe(true);
+    expect(isLikelyDynamicId(':r4h:')).toBe(true);
   });
 
   it('flags MUI-style generated ids as unstable', () => {
-    expect(UNSTABLE_ID_RE.test('mui-3')).toBe(true);
-    expect(UNSTABLE_ID_RE.test('mui-42')).toBe(true);
+    expect(isLikelyDynamicId('mui-3')).toBe(true);
+    expect(isLikelyDynamicId('mui-42')).toBe(true);
+  });
+
+  it('flags a UUID-shaped id', () => {
+    expect(isLikelyDynamicId('550e8400-e29b-41d4-a716-446655440000')).toBe(true);
+  });
+
+  it('flags a long unbroken hex run (e.g. a Mongo ObjectId or hash-based id)', () => {
+    expect(isLikelyDynamicId('507f1f77bcf86cd799439011')).toBe(true);
+    expect(isLikelyDynamicId('0123456789abcdef')).toBe(true);
+  });
+
+  it('flags a short alpha prefix followed by a long digit run', () => {
+    expect(isLikelyDynamicId('item-48213')).toBe(true);
+    expect(isLikelyDynamicId('row_910284')).toBe(true);
+    expect(isLikelyDynamicId('r12345')).toBe(true);
   });
 
   it('does not flag stable, developer-authored ids', () => {
-    expect(UNSTABLE_ID_RE.test('login-email')).toBe(false);
-    expect(UNSTABLE_ID_RE.test('submit-btn_1')).toBe(false);
-    expect(UNSTABLE_ID_RE.test('password')).toBe(false);
+    expect(isLikelyDynamicId('login-email')).toBe(false);
+    expect(isLikelyDynamicId('submit-btn_1')).toBe(false);
+    expect(isLikelyDynamicId('password')).toBe(false);
+  });
+
+  it('does not flag a short alpha+digit id below the 5-digit threshold (avoids false positives)', () => {
+    expect(isLikelyDynamicId('section-1')).toBe(false);
+    expect(isLikelyDynamicId('step2')).toBe(false);
+    expect(isLikelyDynamicId('field-42')).toBe(false);
+  });
+
+  it('does not flag a bare numeric id (a small numeric id is plausibly a stable DB record id)', () => {
+    expect(isLikelyDynamicId('123')).toBe(false);
+    expect(isLikelyDynamicId('42')).toBe(false);
   });
 });
 
@@ -343,3 +381,217 @@ function assertParsesIfPossible(selector: string): void {
   // invalid one throws a SyntaxError. So "does not throw" == "is valid".
   expect(() => maybeDoc.querySelector?.(selector)).not.toThrow();
 }
+
+// --- Mirrored selectorFor() tier/repeatedRowText harness ---
+//
+// selectorFor() itself needs a real DOM (querySelectorAll uniqueness checks, parentElement
+// walks), so this mirrors its exact branch structure over a minimal fake element tree built from
+// plain objects, rather than a real `document`. Kept in sync with selectors.ts's `selectorFor`;
+// a drift in the real impl is a signal to revisit this mirror, same convention as the rest of
+// this file.
+
+interface FakeEl {
+  id: string;
+  tagName: string;
+  textContent: string | null;
+  nodeType: number;
+  parentElement: FakeEl | null;
+  children: FakeEl[];
+  attrs: Record<string, string>;
+}
+
+function fakeEl(tag: string, opts: Partial<Pick<FakeEl, 'id' | 'textContent' | 'attrs'>> = {}): FakeEl {
+  return {
+    id: opts.id ?? '',
+    tagName: tag,
+    textContent: opts.textContent ?? null,
+    nodeType: 1,
+    parentElement: null,
+    children: [],
+    attrs: opts.attrs ?? {},
+  };
+}
+
+function appendChild(parent: FakeEl, child: FakeEl): void {
+  child.parentElement = parent;
+  parent.children.push(child);
+}
+
+/** A tiny querySelectorAll sufficient for selectorFor's uniqueness checks: #id and tag[attr="val"]. */
+function fakeQuerySelectorAll(root: FakeEl[], selector: string): FakeEl[] {
+  const all: FakeEl[] = [];
+  const visit = (el: FakeEl) => {
+    all.push(el);
+    el.children.forEach(visit);
+  };
+  root.forEach(visit);
+
+  const idMatch = /^#(.+)$/.exec(selector);
+  if (idMatch) {
+    // Selector-escaped ids (e.g. "\31 23abc") never match a plain fake id in these tests, so a
+    // literal comparison against the unescaped id is sufficient here.
+    return all.filter((el) => el.id === idMatch[1]);
+  }
+  const attrMatch = /^([a-z0-9]+)\[([a-z-]+)="([^"]*)"\]$/i.exec(selector);
+  if (attrMatch) {
+    const [, tag, attr, val] = attrMatch;
+    return all.filter((el) => el.tagName === tag && el.attrs[attr!] === val);
+  }
+  return [];
+}
+
+function isLikelyDynamicIdMirror(id: string): boolean {
+  return isLikelyDynamicId(id);
+}
+
+interface SelectorResult {
+  selector: string;
+  tier: 1 | 2 | 3 | 4;
+  repeatedRowText?: string;
+}
+
+/** Verbatim port of selectors.ts's `selectorFor`, over the fake tree instead of a real DOM. */
+function selectorForMirror(root: FakeEl[], el: FakeEl): SelectorResult {
+  const qsa = (selector: string) => fakeQuerySelectorAll(root, selector);
+
+  if (el.id && !isLikelyDynamicIdMirror(el.id)) {
+    const idCandidate = `#${el.id}`;
+    if (qsa(idCandidate).length === 1) {
+      return { selector: idCandidate, tier: 3 };
+    }
+  }
+
+  const tag = el.tagName.toLowerCase();
+  const testIdAttrs = ['data-testid', 'data-test'];
+  const nameAttrs = ['name', 'aria-label'];
+  for (const attr of [...testIdAttrs, ...nameAttrs]) {
+    const val = el.attrs[attr];
+    if (val) {
+      const candidate = `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
+      if (qsa(candidate).length === 1) {
+        return { selector: candidate, tier: testIdAttrs.includes(attr) ? 1 : 2 };
+      }
+    }
+  }
+
+  const parts: string[] = [];
+  let repeatedRowText: string | undefined;
+  let node: FakeEl | null = el;
+  while (node && node.nodeType === 1 && parts.length < 6) {
+    const current: FakeEl = node;
+    let part = current.tagName.toLowerCase();
+    const parent = current.parentElement;
+    if (parent) {
+      const siblings = parent.children;
+      const sameTag = siblings.filter((c) => c.tagName === current.tagName);
+      if (sameTag.length > 1) {
+        const index = sameTag.indexOf(current) + 1;
+        part += `:nth-of-type(${index})`;
+        // Overwritten (not set-once) on every repeated-sibling level — the OUTERMOST collision
+        // found while climbing wins, since real markup often nests a shallow repeated wrapper
+        // (e.g. a button-column div shared verbatim by every row) inside the actual repeated
+        // row/card whose text is the row's real identifying content.
+        repeatedRowText = clamp(current.textContent ?? '');
+      }
+    }
+    parts.unshift(part);
+    if (current.id && !isLikelyDynamicIdMirror(current.id) && qsa(`#${current.id}`).length === 1) {
+      parts[0] = `#${current.id}`;
+      break;
+    }
+    node = parent;
+  }
+  return { selector: parts.join(' > '), tier: 4, ...(repeatedRowText ? { repeatedRowText } : {}) };
+}
+
+describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
+  it('returns tier 1 for a data-testid/data-test match', () => {
+    const btn = fakeEl('button', { attrs: { 'data-testid': 'submit-btn' } });
+    const result = selectorForMirror([btn], btn);
+    expect(result.tier).toBe(1);
+    expect(result.selector).toBe('button[data-testid="submit-btn"]');
+  });
+
+  it('returns tier 2 for a name/aria-label match', () => {
+    const input = fakeEl('input', { attrs: { name: 'email' } });
+    const result = selectorForMirror([input], input);
+    expect(result.tier).toBe(2);
+    expect(result.selector).toBe('input[name="email"]');
+  });
+
+  it('returns tier 3 for a unique, stable #id', () => {
+    const el = fakeEl('div', { id: 'login-email' });
+    const result = selectorForMirror([el], el);
+    expect(result.tier).toBe(3);
+    expect(result.selector).toBe('#login-email');
+  });
+
+  it('falls through a dynamic id to the positional fallback (tier 4)', () => {
+    const el = fakeEl('div', { id: 'mui-3' });
+    const result = selectorForMirror([el], el);
+    expect(result.tier).toBe(4);
+  });
+
+  it('returns tier 4 with repeatedRowText when the element sits among repeated siblings', () => {
+    const table = fakeEl('table');
+    const row1 = fakeEl('tr', { textContent: 'Alice  Admin' });
+    const row2 = fakeEl('tr', { textContent: 'Bob   User' });
+    appendChild(table, row1);
+    appendChild(table, row2);
+    const cell = fakeEl('td');
+    appendChild(row2, cell);
+
+    const result = selectorForMirror([table], cell);
+    expect(result.tier).toBe(4);
+    expect(result.selector).toContain('tr:nth-of-type(2)');
+    expect(result.repeatedRowText).toBe('Bob User');
+  });
+
+  it('prefers the OUTERMOST repeated-sibling text over a shallower inner one (real-world nested-row shape)', () => {
+    // Mirrors a real pattern (Flask CRUD app): each row is a card div holding an id/title/desc
+    // block plus a button-column div — and that button-column div is itself a `div` sibling of
+    // the OTHER divs in the row, so a naive "first collision found while climbing" would grab
+    // the button-column's own text ("Update") instead of the row's real identifying content.
+    const list = fakeEl('div');
+    const card1 = fakeEl('div', { textContent: 'id: 1 Title: Task Alpha Update Delete' });
+    const card2 = fakeEl('div', { textContent: 'id: 2 Title: Task Beta Update Delete' });
+    appendChild(list, card1);
+    appendChild(list, card2);
+
+    const infoCol = fakeEl('div');
+    const buttonCol1 = fakeEl('div', { textContent: 'Update' });
+    const buttonCol2 = fakeEl('div', { textContent: 'Delete' });
+    appendChild(card2, infoCol);
+    appendChild(card2, buttonCol1);
+    appendChild(card2, buttonCol2);
+    const updateLink = fakeEl('a', { textContent: 'Update' });
+    appendChild(buttonCol1, updateLink);
+
+    const result = selectorForMirror([list], updateLink);
+    expect(result.tier).toBe(4);
+    // The row's own text (card2), not the shallow button-column div's text ("Update" alone,
+    // which is identical across every row and therefore useless as a disambiguating anchor).
+    expect(result.repeatedRowText).toBe('id: 2 Title: Task Beta Update Delete');
+  });
+
+  it('does not set repeatedRowText when the element has no repeated siblings', () => {
+    const container = fakeEl('div');
+    const onlyChild = fakeEl('button', { textContent: 'Submit' });
+    appendChild(container, onlyChild);
+
+    const result = selectorForMirror([container], onlyChild);
+    expect(result.tier).toBe(4);
+    expect(result.repeatedRowText).toBeUndefined();
+  });
+
+  it('prefers tier 1 over tier 4 when both a stable testid and a repeated-sibling shape exist', () => {
+    const row = fakeEl('tr', { attrs: { 'data-testid': 'row-2' } });
+    const sibling = fakeEl('tr');
+    const parent = fakeEl('table');
+    appendChild(parent, sibling);
+    appendChild(parent, row);
+
+    const result = selectorForMirror([parent], row);
+    expect(result.tier).toBe(1);
+  });
+});

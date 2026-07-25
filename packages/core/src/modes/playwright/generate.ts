@@ -423,8 +423,13 @@ function extractTestidFromSelector(selector: string): string | null {
  * (endpoint-less) mocks don't produce a comparable (method, path) pair, so
  * `hasEndpointLevelMocks` tracks whether a real comparison is even possible for this run.
  */
-export function collectGroundTruth(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): GroundTruth {
-  const { selected, truncated } = selectInventoryElements(ctx, tier, item);
+export function collectGroundTruth(
+  ctx: TestModeContext,
+  tier: Tier,
+  item?: TestPlanItem,
+  opts?: InventoryOpts,
+): GroundTruth {
+  const { selected, truncated } = selectInventoryElements(ctx, tier, item, opts);
 
   const testids = new Set<string>();
   const selectors = new Set<string>();
@@ -640,15 +645,29 @@ function retryNoteUngrounded(hard: string[], gt: GroundTruth): string {
   ]
     .filter(Boolean)
     .join(' ');
-  return `Your previous output was rejected because it referenced selectors/endpoints that were never observed: ${hard.join('; ')}. Use ONLY the real selectors/endpoints provided in the prompt context, or the ESCAPE HATCH rule (a text-based locator, or a "${ESCAPE_HATCH_MARKER}" comment) for anything genuinely unobserved — never invent a plausible-sounding data-testid or endpoint path. ${available}`;
+  return `Your previous output was rejected because it referenced selectors/endpoints that were never observed: ${hard.join('; ')}. Use ONLY the real selectors/endpoints provided in the prompt context, or the ESCAPE HATCH rule (a text-based locator, or a "${ESCAPE_HATCH_MARKER}" comment) for anything genuinely unobserved — never invent a plausible-sounding data-testid or endpoint path. ${available} The inventory shown below has been expanded with more elements in case the one you needed was previously omitted for length.`;
 }
 
 /** Per-route cap — keeps one busy page (header+footer+nav+form) from starving every other route's budget. */
 const MAX_ELEMENTS_PER_ROUTE = 30;
 /** Overall ceiling across the whole crawl (keeps the prompt bounded even with many routes). */
 const MAX_SNAPSHOT_ELEMENTS = 120;
+/** Widened per-route cap used only on a hallucinated-selector retry (see InventoryOpts.expand) — the relevant element the model needed may have sat just past the default cutoff. */
+const MAX_ELEMENTS_PER_ROUTE_EXPANDED = 60;
+/** Widened overall ceiling used only on a hallucinated-selector retry (see InventoryOpts.expand). */
+const MAX_SNAPSHOT_ELEMENTS_EXPANDED = 240;
 /** Truncate an accessible name so one pathological element can't bloat the prompt. */
 const MAX_ELEMENT_NAME_LEN = 80;
+/**
+ * Threaded through selectInventoryElements -> formatSnapshotInventory -> buildPrompt and
+ * collectGroundTruth -> validateAndPersist so a hallucinated-selector retry (see generateOne) can
+ * widen the DOM inventory shown to the model. collectGroundTruth MUST receive the identical opts
+ * as the prompt builder for the same attempt — the grounding gate has to validate against exactly
+ * what the model was shown, never a narrower or wider inventory.
+ */
+interface InventoryOpts {
+  expand?: boolean;
+}
 /**
  * Roles the DOM doesn't natively expose as `link`/`button` even though the element is
  * clickable (e.g. a `<div>` with a click handler and no `role` attribute) — the single
@@ -657,9 +676,143 @@ const MAX_ELEMENT_NAME_LEN = 80;
 const NON_SEMANTIC_ROLES = new Set(['generic']);
 
 type CrawledRouteLike = NonNullable<TestModeContext['exploration']>['crawl']['routes'][number];
+type InventoryElementLike = CrawledRouteLike['snapshot']['interactiveElements'][number];
 interface SelectedElement {
   route: CrawledRouteLike;
-  el: CrawledRouteLike['snapshot']['interactiveElements'][number];
+  el: InventoryElementLike;
+}
+
+/** Words too common/generic to carry any relevance signal on their own. */
+const STOPWORD_TOKENS = new Set([
+  'the',
+  'a',
+  'an',
+  'and',
+  'or',
+  'to',
+  'of',
+  'in',
+  'on',
+  'for',
+  'is',
+  'are',
+  'with',
+  'that',
+  'this',
+  'it',
+  'be',
+  'as',
+  'by',
+  'at',
+  'from',
+  'renders',
+  'page',
+]);
+
+/** Lowercase, split on non-alphanumeric runs, drop stopwords and single characters. */
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 1 && !STOPWORD_TOKENS.has(t));
+}
+
+/**
+ * Tokenizes a plan item's requirement text (title, intent, every scenario description, unitKey)
+ * into a lowercased/stopword-stripped token set, computed once per selectInventoryElements() call
+ * and used by scoreElement() to rank DOM elements by relevance to THIS item rather than truncating
+ * by blind positional order.
+ */
+function buildRequirementTokens(item?: TestPlanItem): Set<string> {
+  const tokens = new Set<string>();
+  if (!item) return tokens;
+  const parts = [item.title, item.intent, item.unitKey ?? '', ...item.scenarios.map((s) => s.description)];
+  for (const part of parts) {
+    for (const t of tokenize(part)) tokens.add(t);
+  }
+  return tokens;
+}
+
+/**
+ * Action-verb requirement token -> element predicate. When the requirement text names an action
+ * (e.g. "submit", "upload") and an element's role/type matches what that action implies, the
+ * element is very likely the one the scenario means to target, even if its accessible name shares
+ * no literal words with the requirement text.
+ */
+const ACTION_VERB_BONUSES: Record<string, (el: InventoryElementLike) => boolean> = {
+  submit: (el) => el.role === 'button',
+  login: (el) => el.role === 'button',
+  signin: (el) => el.role === 'button',
+  register: (el) => el.role === 'button',
+  signup: (el) => el.role === 'button',
+  save: (el) => el.role === 'button',
+  delete: (el) => el.role === 'button',
+  select: (el) => el.role === 'combobox',
+  choose: (el) => el.role === 'combobox',
+  upload: (el) => el.inputType === 'file',
+  search: (el) => el.role === 'searchbox',
+};
+
+/**
+ * Weighted relevance score for one crawled element against a plan item's requirement tokens:
+ * keyword overlap with the accessible name, an action-verb -> role/type bonus, a penalty for
+ * non-semantic roles (NON_SEMANTIC_ROLES — the single biggest hallucination source), a route-role
+ * match bonus, and a stability bonus/penalty from the element's locator tier (selectors.ts's
+ * selectorFor tiering) so a fragile positional selector must clear a higher relevance bar than a
+ * stable testid to make the cut. Higher is more relevant.
+ */
+function scoreElement(
+  el: InventoryElementLike,
+  route: CrawledRouteLike,
+  reqTokens: Set<string>,
+  preferredRole: string,
+): number {
+  let score = 0;
+  for (const t of tokenize(el.name)) {
+    if (reqTokens.has(t)) score += 2;
+  }
+  for (const [verb, matches] of Object.entries(ACTION_VERB_BONUSES)) {
+    if (reqTokens.has(verb) && matches(el)) score += 3;
+  }
+  if (NON_SEMANTIC_ROLES.has(el.role)) score -= 2;
+  if (route.role === preferredRole) score += 1;
+  const tierBonus: Record<1 | 2 | 3 | 4, number> = { 1: 2, 2: 1, 3: 0, 4: -2 };
+  if (el.selectorTier !== undefined) score += tierBonus[el.selectorTier];
+  return score;
+}
+
+/**
+ * Ranks one route's interactive elements by relevance (see scoreElement), applying a small
+ * proximity bonus for an element sitting next to another keyword-matching element (form fields
+ * cluster near their submit button, table cells near a matching header) and a duplicate-suppression
+ * penalty for a (role, name) pair repeated later in the same route (the first occurrence keeps its
+ * full score; a later, redundant duplicate is de-prioritized in favor of something new). Ties break
+ * on the ORIGINAL DOM-order index, ascending — required so a uniform-score fixture (no keyword
+ * signal at all) degrades to exactly today's first-K-by-DOM-order behavior.
+ */
+function rankRouteElements(
+  route: CrawledRouteLike,
+  reqTokens: Set<string>,
+  preferredRole: string,
+): InventoryElementLike[] {
+  const elements = route.snapshot.interactiveElements;
+  const matchedKeyword = elements.map((el) => tokenize(el.name).some((t) => reqTokens.has(t)));
+  const seenRoleName = new Map<string, number>();
+  const scored = elements.map((el, index) => {
+    let score = scoreElement(el, route, reqTokens, preferredRole);
+    if (!matchedKeyword[index] && (matchedKeyword[index - 1] || matchedKeyword[index + 1])) {
+      score += 0.5;
+    }
+    if (el.name) {
+      const key = `${el.role} ${el.name}`;
+      const priorCount = seenRoleName.get(key) ?? 0;
+      seenRoleName.set(key, priorCount + 1);
+      if (priorCount > 0) score -= 1.5;
+    }
+    return { el, index, score };
+  });
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  return scored.map((s) => s.el);
 }
 interface InventorySelection {
   ordered: CrawledRouteLike[];
@@ -707,8 +860,20 @@ export function filterRoutesForItem<T extends { url: string }>(routes: T[], rout
  * filterRoutesForItem) BEFORE the tier-wide ordering/selection below runs — so an item's prompt
  * is grounded in what's actually relevant to it, not the same tier-wide dump every other item in
  * the same tier also receives.
+ *
+ * Within each route, elements are ranked by relevance (rankRouteElements: keyword overlap with
+ * `item`'s requirement text, action-verb bonuses, non-semantic-role penalty, locator-stability
+ * tier) BEFORE the per-route/global caps below are applied — so a relevant element sitting past
+ * the old positional cutoff can still survive truncation. Ties (including the no-`item`/no-signal
+ * case) break on original DOM order, so an inventory with no relevance signal degrades to exactly
+ * the previous first-K-by-DOM-order behavior.
  */
-function selectInventoryElements(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): InventorySelection {
+function selectInventoryElements(
+  ctx: TestModeContext,
+  tier: Tier,
+  item?: TestPlanItem,
+  opts?: InventoryOpts,
+): InventorySelection {
   if (tier === 'tierC-api') return { ordered: [], selected: [], totalCount: 0, truncated: false };
   const allRoutes = ctx.exploration?.crawl.routes ?? [];
   if (allRoutes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
@@ -719,13 +884,17 @@ function selectInventoryElements(ctx: TestModeContext, tier: Tier, item?: TestPl
     (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
   );
 
+  const perRouteCap = opts?.expand ? MAX_ELEMENTS_PER_ROUTE_EXPANDED : MAX_ELEMENTS_PER_ROUTE;
+  const globalCap = opts?.expand ? MAX_SNAPSHOT_ELEMENTS_EXPANDED : MAX_SNAPSHOT_ELEMENTS;
+  const reqTokens = buildRequirementTokens(item);
   const selected: SelectedElement[] = [];
   let totalCount = 0;
   for (const route of ordered) {
     let perRouteCount = 0;
-    for (const el of route.snapshot.interactiveElements) {
+    const ranked = rankRouteElements(route, reqTokens, preferredRole);
+    for (const el of ranked) {
       totalCount += 1;
-      if (perRouteCount >= MAX_ELEMENTS_PER_ROUTE || selected.length >= MAX_SNAPSHOT_ELEMENTS) continue;
+      if (perRouteCount >= perRouteCap || selected.length >= globalCap) continue;
       selected.push({ route, el });
       perRouteCount += 1;
     }
@@ -747,9 +916,19 @@ function selectInventoryElements(ctx: TestModeContext, tier: Tier, item?: TestPl
  * legitimately targets a state EXPLORE never visited (e.g. content behind a mocked error
  * response) has a sanctioned way out that isn't "invent a selector" — this same marker is
  * recognized by findUngroundedReferences() to avoid penalizing an acknowledged gap.
+ *
+ * A tier-4 (positional, e.g. nth-of-type) selector gets an inline warning since it's fragile
+ * against list/table reordering; when the element also captured a `repeatedRowText` (it sits
+ * among repeated siblings, e.g. a table row), the warning suggests a text-anchored
+ * `.filter({ hasText: "..." })` pattern instead of trusting the raw index path.
  */
-function formatSnapshotInventory(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): string {
-  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier, item);
+function formatSnapshotInventory(
+  ctx: TestModeContext,
+  tier: Tier,
+  item?: TestPlanItem,
+  opts?: InventoryOpts,
+): string {
+  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier, item, opts);
   if (selected.length === 0) return '';
 
   const lines = selected.map(({ route, el }) => {
@@ -761,7 +940,13 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier, item?: TestPl
     const ambiguousNote = el.ambiguousMatch
       ? ' (⚠ AMBIGUOUS: another element on this page shares this exact role+name — a plain getByRole/getByText by role+name WILL throw a strict-mode violation here; use the selector shown, narrow it further, or chain .first()/.nth())'
       : '';
-    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}`;
+    const tierNote =
+      el.selectorTier === 4
+        ? el.repeatedRowText
+          ? ` (⚠ POSITIONAL selector among repeated rows — prefer anchoring on this row's own text instead, e.g. .filter({ hasText: "${el.repeatedRowText.slice(0, 60)}" }), rather than trusting the index if the list can reorder)`
+          : " (⚠ POSITIONAL selector — fragile if this element's position among its siblings can change; prefer a more specific attribute/text anchor when one is available above)"
+        : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}${tierNote}`;
   });
 
   const omitted = totalCount - selected.length;
@@ -892,16 +1077,25 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem, tier: T
   return lines.join('\n');
 }
 
-function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
+function buildPrompt(
+  item: TestPlanItem,
+  ctx: TestModeContext,
+  tier: Tier,
+  retryNote: string | null,
+  opts?: InventoryOpts,
+): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
   // Appended at the very end of the returned prompt (not interpolated here)
   // so a retry's prompt stays an exact byte-for-byte extension of the
   // previous attempt's prompt — that lets Anthropic's prefix-based prompt
   // cache hit on retry instead of the note splicing mid-string and breaking
-  // the shared prefix between attempt 1 and attempt 2.
+  // the shared prefix between attempt 1 and attempt 2. This invariant only
+  // holds for the non-expanded retry path — an expand:true retry necessarily
+  // shows a different (wider) inventory, so its prompt is not a byte-for-byte
+  // extension of attempt 1's; that's an accepted, deliberate tradeoff, not a bug.
   const strictNote = retryNote ? `\n\nIMPORTANT: ${retryNote}` : '';
-  const inventory = formatSnapshotInventory(ctx, tier, item);
+  const inventory = formatSnapshotInventory(ctx, tier, item, opts);
   const routingGuidance = formatRoutingGuidance(ctx);
   const observedRoutes = formatObservedRoutes(ctx, item);
   const sourceGrounding = formatSourceGrounding(ctx, item, tier);
@@ -1155,6 +1349,14 @@ interface ValidationOutcome {
   retryNote?: string;
   /** Non-blocking grounding-gate findings (see findUngroundedReferences), regardless of pass/fail. */
   ungroundedWarn?: string[];
+  /**
+   * Set when rejection was specifically the grounding-validation gate (a hallucinated
+   * selector/endpoint), as opposed to any other rejection reason (missing citation, forbidden
+   * API, wrong scenario count, etc). generateOne keys off this typed flag — rather than
+   * string-matching `reason` — to decide whether the next attempt should widen the DOM inventory
+   * (see InventoryOpts.expand).
+   */
+  hallucinated?: boolean;
 }
 
 /**
@@ -1171,6 +1373,7 @@ async function validateAndPersist(
   item: TestPlanItem,
   text: string,
   usedPaths: Set<string>,
+  opts?: InventoryOpts,
 ): Promise<ValidationOutcome> {
   const tier = resolveTier(item.tier);
   const reqTag = item.reqTag ?? item.id;
@@ -1241,7 +1444,7 @@ async function validateAndPersist(
   // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
   // correspond to anything actually observed during EXPLORE (or statically detected for
   // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
-  const groundTruth = collectGroundTruth(ctx, tier, item);
+  const groundTruth = collectGroundTruth(ctx, tier, item, opts);
   const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
   if (ungroundedHard.length > 0) {
     return {
@@ -1249,6 +1452,7 @@ async function validateAndPersist(
       reason: `hallucinated selector/endpoint references: ${ungroundedHard.join('; ')}`,
       retryNote: retryNoteUngrounded(ungroundedHard, groundTruth),
       ungroundedWarn,
+      hallucinated: true,
     };
   }
 
@@ -1293,11 +1497,17 @@ async function generateOne(
   // does with it afterward. Stays set only when every attempt failed before
   // that point (thrown, or ok:false), which is the systemic-outage signal.
   let providerFailureDetail: string | undefined;
+  // Set once attempt 0 is rejected specifically for a hallucinated selector/endpoint (see
+  // ValidationOutcome.hallucinated) — the very next attempt then widens the DOM inventory shown
+  // (InventoryOpts.expand), since the element the model needed may have simply sat past the
+  // default per-route/global cutoff rather than being genuinely unobserved.
+  let expandInventory = false;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const inventoryOpts: InventoryOpts | undefined = expandInventory ? { expand: true } : undefined;
     let text = '';
     try {
-      const res = await ctx.provider.complete(buildPrompt(item, ctx, tier, retryNote), {
+      const res = await ctx.provider.complete(buildPrompt(item, ctx, tier, retryNote, inventoryOpts), {
         cwd: ctx.repoPath ?? undefined,
         timeoutMs: GEN_TIMEOUT_MS,
         // Codegen must NEVER let the provider agent mutate the user's repo:
@@ -1324,7 +1534,7 @@ async function generateOne(
       continue;
     }
 
-    const validated = await validateAndPersist(ctx, item, text, usedPaths);
+    const validated = await validateAndPersist(ctx, item, text, usedPaths, inventoryOpts);
     if (validated.ungroundedWarn && validated.ungroundedWarn.length > 0) {
       emit(
         ctx,
@@ -1341,26 +1551,172 @@ async function generateOne(
     retryNote = validated.retryNote ?? null;
     lastReason = validated.reason ? `${validated.reason} after retry` : lastReason;
     lastViolations = validated.violations ?? lastViolations;
+    if (validated.hallucinated) expandInventory = true;
   }
 
   return { spec: null, reason: lastReason, violations: lastViolations, providerFailureDetail };
 }
 
-/** Max items requested back in a single batched generation call. */
-const GEN_BATCH_SIZE = 4;
 /** Recursion guard for the halve-and-retry split on total batch parse failure — mirrors runPlanPhase's PLAN_MAX_SPLIT_DEPTH shape (orchestrator/index.ts) for a truncated plan batch. */
 const GEN_MAX_SPLIT_DEPTH = 3;
-/** Extra time budget per additional item beyond the first in one batched call — a 4-item batch's response is roughly proportional in length to a single item's, not identical, so reusing GEN_TIMEOUT_MS unscaled would make a real, correctly-sized batch response look indistinguishable from a hang. */
-const GEN_BATCH_TIMEOUT_INCREMENT_MS = 60_000;
+/** Extra time budget per expected generated test beyond the first — a batch's response length scales with the number of tests it must produce (item.scenarios.length summed across the batch), not with raw item count, so timeout scales the same way. Values are first-pass estimates, not final. */
+const GEN_BATCH_TIMEOUT_PER_TEST_MS = 20_000;
 /** Hard ceiling on the scaled batch timeout regardless of batch size, so a pathological batch can't hang indefinitely. */
 const GEN_BATCH_TIMEOUT_CAP_MS = 480_000;
+/** Target sum of scenario-weight (see binPackByScenarioWeight) per generation batch. Tunable, not final. */
+const GEN_BATCH_SCENARIO_WEIGHT_BUDGET = 12;
+/** Hard item-count cap per batch regardless of scenario weight, as a structural safety net. Tunable, not final. */
+const GEN_BATCH_MAX_ITEMS = 8;
+/** Share of a tier's parseable-unitKey items a route segment-1 value must cover to be treated as a shared namespace/role/API-mount prefix (e.g. "api", "maltora-seller") rather than a real feature boundary — see routeClusterKey. Tunable, not final. */
+const GEN_DOMINANT_PREFIX_THRESHOLD = 0.4;
 
-/** Timeout budget for a batch of `n` items: GEN_TIMEOUT_MS covers the first item's worth of output (base overhead + one item), plus GEN_BATCH_TIMEOUT_INCREMENT_MS per additional item, capped at GEN_BATCH_TIMEOUT_CAP_MS. For n=1 this equals GEN_TIMEOUT_MS exactly, matching generateOne's own budget. */
-function genBatchTimeoutMs(n: number): number {
+/**
+ * Timeout budget for a batch expected to produce `totalExpectedTests` tests total:
+ * GEN_TIMEOUT_MS covers the first test's worth of output (base overhead + one test), plus
+ * GEN_BATCH_TIMEOUT_PER_TEST_MS per additional expected test, capped at GEN_BATCH_TIMEOUT_CAP_MS.
+ * The `+1` in the caller's sum (see genBatchTimeoutMs's call site) is a flat buffer since the
+ * actual generated test count can legitimately exceed scenarios.length (validateAndPersist only
+ * rejects FEWER tests than planned, never more). For a single-item batch this is never reached —
+ * generateBatch's n===1 branch routes straight to generateOne, which uses its own fixed
+ * GEN_TIMEOUT_MS budget.
+ */
+export function genBatchTimeoutMs(batchItems: TestPlanItem[]): number {
+  const totalExpectedTests = batchItems.reduce((sum, it) => sum + (it.scenarios.length || 1), 0);
   return Math.min(
-    GEN_TIMEOUT_MS + Math.max(0, n - 1) * GEN_BATCH_TIMEOUT_INCREMENT_MS,
+    GEN_TIMEOUT_MS + (totalExpectedTests + 1) * GEN_BATCH_TIMEOUT_PER_TEST_MS,
     GEN_BATCH_TIMEOUT_CAP_MS,
   );
+}
+
+/**
+ * Parses a plan item's unitKey into path segments for clustering, tolerating both the
+ * "route:"/"endpoint:<METHOD> " prefixed convention and bare paths (real stored plans persist
+ * both — see buildGenerationBatches doc comment). Returns null for anything that isn't a
+ * route/endpoint unit (e.g. "component:..." keys) or has no unitKey at all.
+ */
+function unitKeySegments(unitKey: string | undefined): string[] | null {
+  if (!unitKey) return null;
+  let rest = unitKey;
+  if (rest.startsWith('route:')) {
+    rest = rest.slice('route:'.length);
+  } else if (rest.startsWith('endpoint:')) {
+    const spaceIdx = rest.indexOf(' ');
+    rest = spaceIdx >= 0 ? rest.slice(spaceIdx + 1) : rest.slice('endpoint:'.length);
+  } else if (!rest.startsWith('/')) {
+    // Not a bare path and not a recognized route/endpoint prefix (e.g. "component:Foo") —
+    // not clusterable by route.
+    return null;
+  }
+  const segments = rest.split('/').filter((s) => s.length > 0);
+  return segments.length > 0 ? segments : null;
+}
+
+/**
+ * Computes the set of segment-1 values that are so common across a tier's items that they can't
+ * be discriminating between features — a shared namespace/role/API-mount prefix (e.g. "api" on an
+ * RBAC backend, "maltora-seller" on a role-prefixed frontend), not a real feature boundary. Any
+ * segment-1 value covering more than `threshold` of the tier's parseable-unitKey items is treated
+ * this way, extending clustering to segment 2 for those items (see routeClusterKey).
+ */
+export function findDominantPrefixes(
+  items: TestPlanItem[],
+  threshold = GEN_DOMINANT_PREFIX_THRESHOLD,
+): Set<string> {
+  const counts = new Map<string, number>();
+  let parseable = 0;
+  for (const item of items) {
+    const segments = unitKeySegments(item.unitKey);
+    if (!segments) continue;
+    parseable += 1;
+    counts.set(segments[0]!, (counts.get(segments[0]!) ?? 0) + 1);
+  }
+  const dominant = new Set<string>();
+  if (parseable === 0) return dominant;
+  for (const [segment, count] of counts) {
+    if (count / parseable > threshold) dominant.add(segment);
+  }
+  return dominant;
+}
+
+/**
+ * Cluster key for one item's unitKey: segment 1 alone, or "segment1/segment2" when segment 1 is a
+ * dominant (shared-namespace) prefix per findDominantPrefixes — so a role-prefixed/API-mounted
+ * app's routes cluster by their real feature (segment 2), while a flat app's routes cluster by
+ * segment 1 directly. Returns null when the unitKey isn't a parseable route/endpoint key.
+ */
+export function routeClusterKey(unitKey: string | undefined, dominantPrefixes: Set<string>): string | null {
+  const segments = unitKeySegments(unitKey);
+  if (!segments) return null;
+  const [first, second] = segments;
+  if (dominantPrefixes.has(first!) && second) return `${first}/${second}`;
+  return first!;
+}
+
+/**
+ * Greedily group items into batches whose scenario-weight (scenarios.length || 1, summed) stays
+ * within `weightBudget`, also capping each batch at `maxItems` regardless of weight. Mirrors
+ * orchestrator/index.ts's buildWeightedBatches shape exactly (same greedy-cut structure), applied
+ * here to TestPlanItem's scenario count instead of estimateUnitWeight. A single item whose own
+ * weight already exceeds the budget still gets its own batch — an item can't be split further.
+ */
+export function binPackByScenarioWeight(
+  items: TestPlanItem[],
+  weightBudget: number,
+  maxItems: number,
+): TestPlanItem[][] {
+  const batches: TestPlanItem[][] = [];
+  let current: TestPlanItem[] = [];
+  let currentWeight = 0;
+  for (const item of items) {
+    const w = item.scenarios.length || 1;
+    if (current.length > 0 && (currentWeight + w > weightBudget || current.length >= maxItems)) {
+      batches.push(current);
+      current = [];
+      currentWeight = 0;
+    }
+    current.push(item);
+    currentWeight += w;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/**
+ * Groups same-tier items into generation batches by route relatedness before bin-packing by
+ * scenario weight, so items covering the same feature (e.g. /login, /login/resetpassword,
+ * /login/passwordupdate) share a batch — and its shared preamble/tier guidance cost — instead of
+ * landing in unrelated batches purely by plan order. Items with no usable unitKey (no functionality
+ * -index grounding) fall into one catch-all pool per tier, bin-packed in plan order — this
+ * naturally degrades to a pure weight-budget chunking for plans with no route grounding at all,
+ * which is a strict generalization of the old fixed-size GEN_BATCH_SIZE chunking.
+ *
+ * Batch composition is intentionally not stable across resumes — generate()'s checkpoint-resume
+ * filter may leave a previously-clustered group split across batches after a partial resume; this
+ * is harmless since all DOM/source grounding is built per-item, not per-batch (see buildBatchPrompt).
+ */
+export function buildGenerationBatches(items: TestPlanItem[]): TestPlanItem[][] {
+  const dominantPrefixes = findDominantPrefixes(items);
+  const clusters = new Map<string, TestPlanItem[]>();
+  const catchAll: TestPlanItem[] = [];
+  for (const item of items) {
+    const key = routeClusterKey(item.unitKey, dominantPrefixes);
+    if (key === null) {
+      catchAll.push(item);
+      continue;
+    }
+    const list = clusters.get(key) ?? [];
+    list.push(item);
+    clusters.set(key, list);
+  }
+
+  const batches: TestPlanItem[][] = [];
+  for (const clusterItems of clusters.values()) {
+    batches.push(
+      ...binPackByScenarioWeight(clusterItems, GEN_BATCH_SCENARIO_WEIGHT_BUDGET, GEN_BATCH_MAX_ITEMS),
+    );
+  }
+  batches.push(...binPackByScenarioWeight(catchAll, GEN_BATCH_SCENARIO_WEIGHT_BUDGET, GEN_BATCH_MAX_ITEMS));
+  return batches;
 }
 
 function batchMarkerStart(reqTag: string): string {
@@ -1538,7 +1894,7 @@ async function generateBatch(
   try {
     const res = await ctx.provider.complete(buildBatchPrompt(batchItems, ctx, tier), {
       cwd: ctx.repoPath ?? undefined,
-      timeoutMs: genBatchTimeoutMs(batchItems.length),
+      timeoutMs: genBatchTimeoutMs(batchItems),
       readOnly: true,
       signal: ctx.signal,
       taskType: 'codegen',
@@ -1611,7 +1967,7 @@ async function generateBatch(
   return results;
 }
 
-/** Number of generation BATCHES (see GEN_BATCH_SIZE) run concurrently. */
+/** Number of generation BATCHES (see buildGenerationBatches) run concurrently. */
 const GEN_CONCURRENCY = 3;
 
 /**
@@ -1646,7 +2002,7 @@ async function runWithConcurrency<T>(
 }
 
 /**
- * Group plan items into same-tier batches of up to GEN_BATCH_SIZE, then for each batch ask the
+ * Group plan items into same-tier batches (see buildGenerationBatches), then for each batch ask the
  * provider (read-only) for all of that batch's specs in ONE call (see generateBatch) — validating
  * each (must look like a spec, contain >=1 expect, pass the forbidden-API and grounding gates),
  * solo-retrying any individual failure via the existing single-item generateOne, and writing
@@ -1679,7 +2035,9 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // Batch same-tier items together so a shared tier-wide/app-wide context (rules, tier guidance,
   // mock note, routing guidance) is paid for ONCE per batch instead of once per item — items from
   // different tiers are never mixed into the same batch, since their tier guidance genuinely
-  // differs (see buildBatchPrompt).
+  // differs (see buildBatchPrompt). Within a tier, buildGenerationBatches further clusters items by
+  // route relatedness and bin-packs by scenario weight (see its doc comment) instead of chunking
+  // in fixed-size, order-only groups.
   const byTier = new Map<Tier, TestPlanItem[]>();
   for (const item of remainingItems) {
     const tier = resolveTier(item.tier);
@@ -1689,14 +2047,12 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   }
   const batches: TestPlanItem[][] = [];
   for (const list of byTier.values()) {
-    for (let i = 0; i < list.length; i += GEN_BATCH_SIZE) {
-      batches.push(list.slice(i, i + GEN_BATCH_SIZE));
-    }
+    batches.push(...buildGenerationBatches(list));
   }
 
   emit(
     ctx,
-    `Generating ${remainingItems.length} spec(s) across ${batches.length} batch(es) of up to ${GEN_BATCH_SIZE} (up to ${GEN_CONCURRENCY} batch(es) in parallel)`,
+    `Generating ${remainingItems.length} spec(s) across ${batches.length} batch(es) (up to ${GEN_CONCURRENCY} batch(es) in parallel)`,
     { count: remainingItems.length, batches: batches.length },
   );
 

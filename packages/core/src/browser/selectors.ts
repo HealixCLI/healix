@@ -78,41 +78,68 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       return result;
     }
 
-    // Framework-generated ids are reassigned per render tree, not persisted
-    // across page loads, so a selector built from one will resolve against a
-    // completely different element (or nothing) the next time the page
-    // loads — e.g. React's useId() (`_r_4_`, `:r4:`) or MUI's `mui-3`.
-    // Matches these known shapes so selectorFor() falls through to a stable
-    // attribute instead of trusting the id.
-    const UNSTABLE_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+    // Framework-generated ids are reassigned per render tree, not persisted across page loads, so
+    // a selector built from one will resolve against a completely different element (or nothing)
+    // the next time the page loads. Each named sub-check below covers one known-unstable id shape;
+    // isLikelyDynamicId() ORs them together so selectorFor() falls through to a stable attribute
+    // instead of trusting the id.
+    // React's useId() (`_r_4_`, `:r4:`) and MUI's `mui-3`.
+    const FRAMEWORK_ID_RE = /^_r_[0-9a-z]+_$|^:r[0-9a-z]+:$|^mui-\d+$|^:[a-z0-9]+:$/i;
+    // A UUID (v1-v5 shape, hyphenated hex groups) — always a generated/session identifier.
+    const UUID_ID_RE = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+    // A long unbroken hex run (>=10 chars) — e.g. a Mongo ObjectId or a hash-based id.
+    const LONG_HEX_RUN_RE = /^[0-9a-f]{10,}$/i;
+    // A short alpha prefix followed by a long digit run (e.g. "item-48213", "row_910284") — a
+    // generated/enumerated id. The digit run must be >=5 to avoid false positives on genuinely
+    // stable, human-authored ids like "section-1"/"step2"/"field-42". Deliberately NOT a bare
+    // numeric catch-all (a small numeric id is plausibly a stable DB record id) — a known judgment
+    // call, not an oversight.
+    const SHORT_ALPHA_LONG_DIGIT_RE = /^[a-z]{1,8}[-_:]?\d{5,}$/i;
 
-    function selectorFor(el: DomElement): string {
+    function isLikelyDynamicId(id: string): boolean {
+      return (
+        FRAMEWORK_ID_RE.test(id) ||
+        UUID_ID_RE.test(id) ||
+        LONG_HEX_RUN_RE.test(id) ||
+        SHORT_ALPHA_LONG_DIGIT_RE.test(id)
+      );
+    }
+
+    interface SelectorResult {
+      selector: string;
+      tier: 1 | 2 | 3 | 4;
+      repeatedRowText?: string;
+    }
+
+    function selectorFor(el: DomElement): SelectorResult {
       // Trust an id only when it's actually unique on the page — some real (if invalid) HTML
       // reuses the same id on more than one element, which would otherwise silently produce a
       // selector that resolves to >1 node (a strict-mode violation at test-execution time).
-      if (el.id && !UNSTABLE_ID_RE.test(el.id)) {
+      if (el.id && !isLikelyDynamicId(el.id)) {
         const idCandidate = `#${cssEscape(el.id)}`;
         if (doc.querySelectorAll(idCandidate).length === 1) {
-          return idCandidate;
+          return { selector: idCandidate, tier: 3 };
         }
       }
 
       const tag = el.tagName.toLowerCase();
-      const stableAttrs = ['data-testid', 'data-test', 'name', 'aria-label'];
-      for (const attr of stableAttrs) {
+      const testIdAttrs = ['data-testid', 'data-test'];
+      const nameAttrs = ['name', 'aria-label'];
+      for (const attr of [...testIdAttrs, ...nameAttrs]) {
         const val = el.getAttribute(attr);
         if (val) {
           const candidate = `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
           // Only emit the attribute shortcut when it uniquely identifies the
           // node; otherwise fall through to the nth-of-type path builder.
           if (doc.querySelectorAll(candidate).length === 1) {
-            return candidate;
+            return { selector: candidate, tier: testIdAttrs.includes(attr) ? 1 : 2 };
           }
         }
       }
 
       // Build an nth-of-type path that uniquely identifies the node.
       const parts: string[] = [];
+      let repeatedRowText: string | undefined;
       let node: DomElement | null = el;
       while (node && node.nodeType === 1 && parts.length < 6) {
         const current: DomElement = node;
@@ -124,12 +151,22 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           if (sameTag.length > 1) {
             const index = sameTag.indexOf(current) + 1;
             part += `:nth-of-type(${index})`;
+            // The nearest repeated ancestor's own text is the best anchor for a
+            // .filter({ hasText: ... }) alternative to this fragile index path — capture it in
+            // the same walk, no extra DOM pass. Deliberately OVERWRITTEN (not set-once) on
+            // every repeated-sibling level found while climbing: real markup often nests a
+            // shallow repeated wrapper (e.g. a button-column div shared verbatim by every row,
+            // whose own text is just "Update") INSIDE the actual repeated row/card (whose text
+            // is the row's real identifying content, e.g. an id/title/description). Keeping the
+            // OUTERMOST (last-found, closest to the walk's end) collision's text gives a far
+            // more useful .filter({ hasText }) anchor than the first, innermost one.
+            repeatedRowText = clamp(current.textContent ?? '');
           }
         }
         parts.unshift(part);
         if (
           current.id &&
-          !UNSTABLE_ID_RE.test(current.id) &&
+          !isLikelyDynamicId(current.id) &&
           doc.querySelectorAll(`#${cssEscape(current.id)}`).length === 1
         ) {
           parts[0] = `#${cssEscape(current.id)}`;
@@ -137,7 +174,11 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         }
         node = parent;
       }
-      return parts.join(' > ');
+      return {
+        selector: parts.join(' > '),
+        tier: 4,
+        ...(repeatedRowText ? { repeatedRowText } : {}),
+      };
     }
 
     function isInputLike(el: DomElement): boolean {
@@ -277,16 +318,19 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       const tag = el.tagName.toLowerCase();
       const inForm = isInForm(el);
       const rawButtonType = tag === 'button' ? (el.getAttribute('type') ?? '').toLowerCase() : undefined;
+      const { selector, tier, repeatedRowText } = selectorFor(el);
       out.push({
         role: roleFor(el),
         name: accessibleName(el),
-        selector: selectorFor(el),
+        selector,
         href: tag === 'a' ? (el.getAttribute('href') ?? undefined) : undefined,
         inputType: tag === 'input' ? (el.getAttribute('type') ?? 'text').toLowerCase() : undefined,
         // An untyped <button> inside a <form> implicitly submits per HTML spec.
         buttonType: tag === 'button' ? rawButtonType || (inForm ? 'submit' : '') : undefined,
         inForm,
         disabled: isDisabled(el),
+        selectorTier: tier,
+        ...(repeatedRowText ? { repeatedRowText } : {}),
       });
     }
 

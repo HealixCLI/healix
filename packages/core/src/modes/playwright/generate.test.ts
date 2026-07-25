@@ -153,6 +153,7 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
       endpoints: [{ method: 'POST', pathPattern: '/customer/passwordvalidate' }],
       hasEndpointLevelMocks: true,
       inventoryTruncated: false,
+      attributes: new Map([['type', new Set(['email'])]]),
       ...overrides,
     };
   }
@@ -243,6 +244,26 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
     const { hard, warn } = findUngroundedReferences(source, gt({ inventoryTruncated: true }));
     expect(hard).toEqual([]);
     expect(warn.some((w) => w.includes('completely unobserved text'))).toBe(true);
+  });
+
+  // GAP-047: generic CSS attribute selectors (not data-testid) weren't checked at all.
+  it('warns on a fabricated CSS attribute selector never observed in the inventory', () => {
+    const source = `await page.locator('input[name="firstName"]').fill('Jane');`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('name="firstName"'))).toBe(true);
+  });
+
+  it('does not flag a native input type attribute that was actually observed', () => {
+    const source = `await page.locator('input[type="email"]').fill('jane@example.com');`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  it('does not double-report a data-testid attribute selector already covered by the hard testid check', () => {
+    const source = `page.locator('[data-testid="reset-password-email"]').fill('x');`;
+    const { hard, warn } = findUngroundedReferences(source, gt());
+    expect(hard.filter((h) => h.includes('reset-password-email'))).toHaveLength(1);
+    expect(warn.filter((w) => w.includes('reset-password-email'))).toHaveLength(0);
   });
 });
 
@@ -336,6 +357,74 @@ describe('collectGroundTruth — mirrors selectInventoryElements so the gate nev
     expect(gt.testids.has('login-email')).toBe(true);
     expect(gt.roleByName.get('email')?.has('textbox')).toBe(true);
     expect(gt.inventoryTruncated).toBe(false);
+  });
+
+  // GAP-047: attribute ground truth must come from both the selector string itself (e.g. a
+  // `name`-based tier-2 selector) and the element's own inputType — independent of which selector
+  // tier was actually chosen for it.
+  it('populates attribute ground truth from selector fragments and native input type', () => {
+    const ctx = {
+      projectDir: '/tmp/unused',
+      baseUrl: 'http://localhost:3000',
+      provider: {} as TestModeContext['provider'],
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration: {
+        crawl: {
+          routes: [
+            {
+              url: 'https://app.acme.test/register',
+              title: 'Register',
+              depth: 0,
+              hasPasswordField: false,
+              role: 'anonymous' as const,
+              snapshot: {
+                url: 'https://app.acme.test/register',
+                title: 'Register',
+                interactiveElements: [
+                  {
+                    role: 'textbox',
+                    name: 'Surname',
+                    selector: 'input[name="surname"]',
+                    inputType: 'text',
+                  },
+                  {
+                    role: 'textbox',
+                    name: 'Email',
+                    selector: 'form > div:nth-of-type(2) > input',
+                    inputType: 'email',
+                  },
+                ],
+              },
+              networkEvents: [],
+            },
+          ],
+          visitedCount: 1,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [],
+      },
+    } as unknown as TestModeContext;
+
+    const gt = collectGroundTruth(ctx, 'tierA-public');
+    expect(gt.attributes.get('name')?.has('surname')).toBe(true);
+    // "email" input's selector fell through to an nth-of-type path with no `type` fragment in it —
+    // inputType must still populate the ground truth so a legitimate `[type="email"]` isn't flagged.
+    expect(gt.attributes.get('type')?.has('email')).toBe(true);
+
+    const fabricated = `await page.locator('input[name="firstName"]').fill('Jane');`;
+    expect(findUngroundedReferences(fabricated, gt).warn.some((w) => w.includes('firstName'))).toBe(true);
+
+    const real = `await page.locator('input[type="email"]').fill('jane@example.com');`;
+    expect(findUngroundedReferences(real, gt)).toEqual({ hard: [], warn: [] });
   });
 
   it('includes EXPLORE-observed endpoints as ground truth, provable even with no static dependency (GAP-046)', () => {
@@ -2573,13 +2662,44 @@ describe('findDominantPrefixes', () => {
     expect(findDominantPrefixes(items).size).toBe(0);
   });
 
-  it('flags a segment-1 value shared by more than the threshold share of items', () => {
+  it('flags a segment-1 value shared by more than the threshold share of items, given enough diverse other items', () => {
+    // A real "api" mount prefix dominates across a large, feature-diverse route population — the
+    // fixture needs enough non-"api" items to clear GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS too (see
+    // GAP-048), not just a high share on a handful of items.
     const items = [
       planItem('a', 'REQ-A', 'tierC-api', { unitKey: 'endpoint:GET /api/users/:id' }),
       planItem('b', 'REQ-B', 'tierC-api', { unitKey: 'endpoint:GET /api/roles/:id' }),
       planItem('c', 'REQ-C', 'tierC-api', { unitKey: 'endpoint:POST /api/orders' }),
+      planItem('d', 'REQ-D', 'tierC-api', { unitKey: 'endpoint:GET /api/invoices' }),
+      planItem('e', 'REQ-E', 'tierC-api', { unitKey: 'endpoint:GET /api/carts' }),
+      planItem('f', 'REQ-F', 'tierC-api', { unitKey: 'endpoint:GET /api/reviews' }),
+      planItem('g', 'REQ-G', 'tierC-api', { unitKey: '/health' }),
+      planItem('h', 'REQ-H', 'tierC-api', { unitKey: '/docs' }),
+      planItem('i', 'REQ-I', 'tierC-api', { unitKey: '/status' }),
+      planItem('j', 'REQ-J', 'tierC-api', { unitKey: '/metrics' }),
+      planItem('k', 'REQ-K', 'tierC-api', { unitKey: '/version' }),
     ];
     expect(findDominantPrefixes(items).has('api')).toBe(true);
+  });
+
+  // GAP-048: a small, incidentally single-feature-heavy tier crossed the flat share threshold
+  // even though there weren't enough "other" items for the classification to be meaningful.
+  it('does not flag a segment-1 value that merely dominates a small, feature-heavy sample', () => {
+    const items = [
+      planItem('a', 'REQ-A', 'tierA-public', { unitKey: '/login' }),
+      planItem('b', 'REQ-B', 'tierA-public', { unitKey: '/login' }),
+      planItem('c', 'REQ-C', 'tierA-public', { unitKey: '/login/errorpage' }),
+      planItem('d', 'REQ-D', 'tierA-public', { unitKey: '/login/resetpassword' }),
+      planItem('e', 'REQ-E', 'tierA-public', { unitKey: '/login/resetpassword' }),
+      planItem('f', 'REQ-F', 'tierA-public', { unitKey: '/login/passwordupdate' }),
+      planItem('g', 'REQ-G', 'tierA-public', { unitKey: '/register' }),
+      planItem('h', 'REQ-H', 'tierA-public', { unitKey: '/dashboard' }),
+      planItem('i', 'REQ-I', 'tierA-public', { unitKey: '/coupons' }),
+      planItem('j', 'REQ-J', 'tierA-public', { unitKey: '/points' }),
+    ];
+    // "login" is segment-1 for 6/10 items (60%, above the 40% threshold) but only 4 other items —
+    // below GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS — so it must not be classified as dominant.
+    expect(findDominantPrefixes(items).has('login')).toBe(false);
   });
 
   it('does not flag a segment-1 value that is a genuine minority feature boundary', () => {
@@ -2648,8 +2768,17 @@ describe('buildGenerationBatches', () => {
     const users = planItem('a', 'REQ-A', 'tierC-api', { unitKey: 'endpoint:GET /api/users/:id' });
     const roles = planItem('b', 'REQ-B', 'tierC-api', { unitKey: 'endpoint:GET /api/roles/:id' });
     const orders = planItem('c', 'REQ-C', 'tierC-api', { unitKey: 'endpoint:POST /api/orders' });
+    // GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS (see GAP-048) requires both enough non-"api" items AND
+    // a share still above the threshold, so "api" is validated as a genuine mount prefix across a
+    // large, diverse tier rather than the tier's only shape.
+    const moreApi = ['invoices', 'carts', 'reviews'].map((seg, i) =>
+      planItem(`m${i}`, `REQ-M${i}`, 'tierC-api', { unitKey: `endpoint:GET /api/${seg}` }),
+    );
+    const others = ['health', 'docs', 'status', 'metrics', 'version'].map((seg, i) =>
+      planItem(`o${i}`, `REQ-O${i}`, 'tierC-api', { unitKey: `/${seg}` }),
+    );
 
-    const batches = buildGenerationBatches([users, roles, orders]);
+    const batches = buildGenerationBatches([users, roles, orders, ...moreApi, ...others]);
     const usersBatch = batches.find((b) => b.includes(users));
     expect(usersBatch).not.toContain(roles);
     expect(usersBatch).not.toContain(orders);

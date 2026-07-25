@@ -407,12 +407,33 @@ export interface GroundTruth {
   hasEndpointLevelMocks: boolean;
   /** true when selectInventoryElements() had to omit elements for length — can't prove a selector's absence against an incomplete inventory */
   inventoryTruncated: boolean;
+  /**
+   * lowercased CSS attribute name -> observed value(s) for that attribute, seen anywhere in the
+   * selected inventory (see GAP-047). Populated from two sources: (1) attr="value" fragments
+   * embedded in a selectorFor()-style selector string (tier-1/2 selectors already look like
+   * `input[name="firstName"]`), and (2) each input element's own `type` attribute (via
+   * InteractiveElement.inputType), which is known regardless of which selector tier was chosen —
+   * a selector referencing a real native `type="email"` shouldn't warn just because the id-based
+   * selector path never surfaced `type` textually.
+   */
+  attributes: Map<string, Set<string>>;
 }
 
 /** Pull a `data-testid="..."` (or `data-test="..."`) value out of a selectorFor()-style CSS selector string, if present. */
 function extractTestidFromSelector(selector: string): string | null {
   const m = /data-test(?:id)?=["']([^"']+)["']/.exec(selector);
   return m ? m[1] : null;
+}
+
+/** attr="value" / attr='value' fragments embedded in a selectorFor()-style CSS selector string (e.g. `input[name="firstName"]`). */
+const SELECTOR_ATTR_FRAGMENT_RE = /([\w-]+)=["']([^"']+)["']/g;
+
+/** Record an observed (attr, value) pair into a GroundTruth.attributes-shaped map, lowercasing the attribute name for case-insensitive lookup. */
+function addObservedAttribute(attributes: Map<string, Set<string>>, attr: string, value: string): void {
+  const key = attr.toLowerCase();
+  const values = attributes.get(key) ?? new Set<string>();
+  values.add(value);
+  attributes.set(key, values);
 }
 
 /**
@@ -435,6 +456,7 @@ export function collectGroundTruth(
   const selectors = new Set<string>();
   const names: string[] = [];
   const roleByName = new Map<string, Set<string>>();
+  const attributes = new Map<string, Set<string>>();
   for (const { el } of selected) {
     selectors.add(el.selector);
     const testid = extractTestidFromSelector(el.selector);
@@ -446,6 +468,10 @@ export function collectGroundTruth(
       roles.add(el.role);
       roleByName.set(lname, roles);
     }
+    for (const m of el.selector.matchAll(SELECTOR_ATTR_FRAGMENT_RE)) {
+      addObservedAttribute(attributes, m[1]!, m[2]!);
+    }
+    if (el.inputType) addObservedAttribute(attributes, 'type', el.inputType);
   }
 
   const endpoints: Array<{ method: string; pathPattern: string }> = [];
@@ -472,11 +498,14 @@ export function collectGroundTruth(
     endpoints,
     hasEndpointLevelMocks,
     inventoryTruncated: truncated,
+    attributes,
   };
 }
 
 const TESTID_CALL_RE = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
 const TESTID_ATTR_RE = /data-test(?:id)?=["']([^"']+)["']/g;
+/** Matches a CSS attribute-selector fragment inside a `page.locator(...)`-style string, e.g. `input[name="firstName"]` or `[type='email']`. Excludes `data-testid`/`data-test`, which are already hard-checked via TESTID_ATTR_RE — see GAP-047. */
+const CSS_ATTR_SELECTOR_RE = /\[([\w-]+)=["']([^"']+)["']\]/g;
 const ROLE_CALL_RE =
   /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
 const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
@@ -576,6 +605,9 @@ function findObservedEndpoint(
  *     HARD/WARN split as data-testid. Only covers text that lives on an interactive element;
  *     free-standing copy (banners, profile fields) isn't in the inventory at all and so never
  *     produces a HARD finding here — it's unproven, not confirmed grounded.
+ *   - generic CSS attribute selectors (`input[name="firstName"]`, `[type="email"]`) not matching
+ *     any observed (attr, value) pair (see GAP-047): WARN always — attribute selectors are more
+ *     guessable/coincidentally-correct than a testid, so this never hard-fails.
  * A `// TODO: unobserved element` marker anywhere in the source (the sanctioned ESCAPE HATCH,
  * see formatSnapshotInventory) downgrades every hard finding in this spec to a warning — an
  * acknowledged, intentional gap isn't the same defect as a silent fabrication.
@@ -628,6 +660,21 @@ export function findUngroundedReferences(
     const label = `mockOverride('${method}', '${path}') doesn't match any statically-detected endpoint`;
     if (gt.hasEndpointLevelMocks && !hasEscapeHatch) hard.push(label);
     else warn.push(label);
+  }
+
+  // Generic CSS attribute selectors (`input[name="firstName"]`, `[type="email"]`) — see GAP-047.
+  // `data-testid`/`data-test` are skipped here since they're already hard-checked above; checking
+  // them again against `gt.attributes` would just double-report the same fabrication. Always
+  // WARN, never HARD: an attribute selector is inherently more guessable/coincidentally-correct
+  // than a testid (e.g. a legitimately-observed native `type="email"` that just wasn't spelled out
+  // in this exact attribute form anywhere else), so hard-failing here risks real false positives.
+  for (const m of source.matchAll(CSS_ATTR_SELECTOR_RE)) {
+    const attr = m[1]!.toLowerCase();
+    if (attr === 'data-testid' || attr === 'data-test') continue;
+    const value = m[2]!;
+    const observedValues = gt.attributes.get(attr);
+    if (observedValues && observedValues.has(value)) continue;
+    warn.push(`[${attr}="${value}"] not found in the observed element inventory`);
   }
 
   return { hard, warn };
@@ -1569,6 +1616,17 @@ const GEN_BATCH_SCENARIO_WEIGHT_BUDGET = 12;
 const GEN_BATCH_MAX_ITEMS = 8;
 /** Share of a tier's parseable-unitKey items a route segment-1 value must cover to be treated as a shared namespace/role/API-mount prefix (e.g. "api", "maltora-seller") rather than a real feature boundary — see routeClusterKey. Tunable, not final. */
 const GEN_DOMINANT_PREFIX_THRESHOLD = 0.4;
+/**
+ * Minimum number of same-tier parseable items that must NOT share a candidate's segment-1 value,
+ * required in addition to GEN_DOMINANT_PREFIX_THRESHOLD before that value is treated as a
+ * namespace/mount prefix (see GAP-048). A real mount prefix like "api"/"maltora-seller" dominates
+ * across a large, feature-diverse route population, so plenty of non-matching items are always
+ * around to validate the classification against. A small, incidentally single-feature-heavy tier
+ * (e.g. 10 items, 6 of them under "login") can cross the share threshold too, but with too few
+ * "other" items for that to mean anything — this floor exists specifically to reject that case
+ * without weakening the real namespace-prefix detection. Tunable, not final.
+ */
+const GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS = 5;
 
 /**
  * Timeout budget for a batch expected to produce `totalExpectedTests` tests total:
@@ -1614,13 +1672,17 @@ function unitKeySegments(unitKey: string | undefined): string[] | null {
 /**
  * Computes the set of segment-1 values that are so common across a tier's items that they can't
  * be discriminating between features — a shared namespace/role/API-mount prefix (e.g. "api" on an
- * RBAC backend, "maltora-seller" on a role-prefixed frontend), not a real feature boundary. Any
- * segment-1 value covering more than `threshold` of the tier's parseable-unitKey items is treated
- * this way, extending clustering to segment 2 for those items (see routeClusterKey).
+ * RBAC backend, "maltora-seller" on a role-prefixed frontend), not a real feature boundary. A
+ * segment-1 value must both cover more than `threshold` of the tier's parseable-unitKey items AND
+ * leave at least `minOtherItems` items that don't share it (see GAP-048 / GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS —
+ * a high share on too few "other" items is as likely to be a small tier's single dominant feature
+ * as a genuine shared namespace) before it's treated this way, extending clustering to segment 2
+ * for those items (see routeClusterKey).
  */
 export function findDominantPrefixes(
   items: TestPlanItem[],
   threshold = GEN_DOMINANT_PREFIX_THRESHOLD,
+  minOtherItems = GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS,
 ): Set<string> {
   const counts = new Map<string, number>();
   let parseable = 0;
@@ -1633,7 +1695,7 @@ export function findDominantPrefixes(
   const dominant = new Set<string>();
   if (parseable === 0) return dominant;
   for (const [segment, count] of counts) {
-    if (count / parseable > threshold) dominant.add(segment);
+    if (count / parseable > threshold && parseable - count >= minOtherItems) dominant.add(segment);
   }
   return dominant;
 }

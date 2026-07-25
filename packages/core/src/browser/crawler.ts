@@ -37,16 +37,16 @@ export interface CrawlResult {
 }
 
 export interface CrawlOptions {
-  /** Hard cap on distinct routes visited. Default 25. */
+  /** Hard cap on distinct routes visited. Default 60. */
   maxRoutes?: number;
-  /** Wall-clock budget for the whole crawl. Default 45s. */
+  /** Wall-clock budget for the whole crawl. Default 90s. */
   wallClockBudgetMs?: number;
   /** Extra URLs to seed the BFS queue alongside `baseUrl` (e.g. known routes from static analysis). */
   seedRoutes?: string[];
 }
 
-const DEFAULT_MAX_ROUTES = 25;
-const DEFAULT_BUDGET_MS = 45_000;
+const DEFAULT_MAX_ROUTES = 60;
+const DEFAULT_BUDGET_MS = 90_000;
 /** Once a DOM fingerprint has repeated this many times, stop following that page's links. */
 const SHELL_REPEAT_THRESHOLD = 3;
 /** Share of visited routes sharing the dominant fingerprint that counts as "collapsed". */
@@ -109,10 +109,15 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
  * crawler could discover the register route but never the login route behind
  * that toggle — every login attempt then wrongly filled in the registration
  * form. This is what makes it safe to click things on a real, possibly-
- * production app unattended.
+ * production app unattended. Deliberately does NOT include "register"/"sign
+ * up" — navigating TO a registration/signup page is a safe, non-mutating
+ * click on its own (the actual account-creation mutation is a `buttonType
+ * === 'submit'` click, already excluded above); blocking the nav click by
+ * name too would hide a real route on any SPA whose primary "Register" entry
+ * point happens to be a `<button onClick>` rather than a real `<a href>`.
  */
 const UNSAFE_CLICK_TEXT_RE =
-  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|register|sign up|add to cart|clear|cancel/i;
+  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|add to cart|clear|cancel/i;
 /** An accessible name that reads as a login/sign-in action — used both to score crawled login
  * candidates (see `scoreLoginCandidates`) and, during click-probing, to recognize a same-URL
  * toggle that reveals a login view (see `discoverClickRoutes`). */
@@ -564,6 +569,17 @@ export interface LoginCandidate {
   source: 'crawled' | 'common-path';
 }
 
+/**
+ * Join a hash/region prefix (e.g. "#/SK") and a static path into one URL-safe relative string,
+ * normalizing whichever side does/doesn't already have a separating slash — a naive
+ * `${prefix}${path}` concatenation silently produces a malformed "#/SKhome" the moment `path`
+ * lacks its own leading slash (as every top-level static-analysis route path does; see
+ * target/ast/routes.ts), rather than the real "#/SK/home".
+ */
+function joinHashPath(prefix: string, path: string): string {
+  return `${prefix.replace(/\/+$/, '')}/${path.replace(/^\/+/, '')}`;
+}
+
 /** Bounded last-resort fallback tried only when the crawl found no confident candidate. */
 const COMMON_LOGIN_PATHS = ['/login', '/signin', '/auth/login'];
 /** Minimum score treated as "confident" (crawled candidates only — see scoreLoginCandidates). */
@@ -593,7 +609,7 @@ export function scoreLoginCandidates(
 
   if (!candidates.some((c) => c.score >= CONFIDENT_SCORE)) {
     for (const path of COMMON_LOGIN_PATHS) {
-      const relative = routing.hashRouted ? `${routing.invariantPrefix ?? '#'}${path}` : path;
+      const relative = routing.hashRouted ? joinHashPath(routing.invariantPrefix ?? '#', path) : path;
       try {
         candidates.push({ url: new URL(relative, baseUrl).toString(), score: 1, source: 'common-path' });
       } catch {
@@ -624,7 +640,7 @@ export function reconcileStaticRoutePaths(
   const out: string[] = [];
   for (const path of paths) {
     if (DYNAMIC_SEGMENT_RE.test(path)) continue;
-    const relative = routing.hashRouted ? `${routing.invariantPrefix ?? '#'}${path}` : path;
+    const relative = routing.hashRouted ? joinHashPath(routing.invariantPrefix ?? '#', path) : path;
     try {
       out.push(new URL(relative, baseUrl).toString());
     } catch {

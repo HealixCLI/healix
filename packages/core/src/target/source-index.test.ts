@@ -145,6 +145,39 @@ describe('indexSource', () => {
     });
   });
 
+  // Regression test: detect() returns the specific string 'vite-react' (not the bare 'vite') for
+  // any Vite + React app — by far the most common modern React SPA setup — and
+  // RELEVANT_FRAMEWORKS_FOR_ROUTER previously didn't include it, silently skipping ALL React
+  // Router extraction for such a repo (confirmed live against a real vite-react app, where
+  // indexSource() returned zero `route` units despite a real, nested <Route> config in source).
+  it('extracts <Route> units for a real Vite + React app (detect() returns "vite-react", not "vite")', () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({ dependencies: { vite: '^5.0.0', react: '^18.0.0' } }));
+    write(
+      dir,
+      'src/routes/AppRoutes.tsx',
+      `
+        import { Route, Routes } from 'react-router-dom';
+        export function AppRoutes() {
+          return (
+            <Routes>
+              <Route path="login">
+                <Route index element={<LoginPage />} />
+                <Route path="resetpassword" element={<ResetPasswordPage />} />
+              </Route>
+            </Routes>
+          );
+        }
+      `,
+    );
+
+    return indexSource(dir).then((ctx) => {
+      const keys = ctx.units.filter((u) => u.kind === 'route').map((u) => u.key);
+      expect(keys).toContain('route:/login');
+      expect(keys).toContain('route:/login/resetpassword');
+    });
+  });
+
   it('lets a spec-derived unit override a code-derived one sharing the same key (spec is authoritative)', () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({ dependencies: { express: '^4.0.0' } }));

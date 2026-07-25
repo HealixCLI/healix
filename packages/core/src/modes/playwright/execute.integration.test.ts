@@ -18,7 +18,7 @@
  * added deliberately.
  */
 import { mkdtempSync, readFileSync, rmSync, writeFileSync } from 'node:fs';
-import { mkdir, readFile, writeFile } from 'node:fs/promises';
+import { mkdir, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
@@ -37,6 +37,7 @@ describe.skipIf(!!process.env.CI)('execute() — real Playwright process (local-
 
   afterEach(() => {
     rmSync(dir, { recursive: true, force: true });
+    delete process.env.HEALIX_WORKERS;
   });
 
   function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
@@ -115,19 +116,18 @@ test('dashboard renders', async ({ page }) => {
     // outcome. The fix shells out to `taskkill /F /T /PID` on Windows
     // (matching target/launcher.ts's / exec/run-cli.ts's own killTree()).
     const ctx1Signal = new AbortController();
+    // Force single-worker sequential execution so 'first' reliably finishes
+    // before 'second' starts — this test's timing (abort while 'second' is
+    // still mid-wait) depends on that order. HEALIX_WORKERS is read directly
+    // by the generated playwright.config.ts (see templates.ts) and passed
+    // through by suiteEnv()'s HEALIX_-prefix allowlist, so this reliably pins
+    // workers to 1 regardless of the config's own literal text — unlike a
+    // source-patch via string-replace, which silently no-ops (and previously
+    // did, letting 'first'/'second' run concurrently) if that literal ever
+    // changes shape.
+    process.env.HEALIX_WORKERS = '1';
     const ctx = makeCtx({ signal: ctx1Signal.signal });
     await scaffold(ctx);
-
-    // Force single-worker sequential execution so 'first' reliably
-    // finishes before 'second' starts — this test's timing (abort while
-    // 'second' is still mid-wait) depends on that order.
-    const configPath = join(dir, 'playwright.config.ts');
-    const config = await readFile(configPath, 'utf-8');
-    await writeFile(
-      configPath,
-      config.replace('workers: process.env.CI ? 1 : computeWorkers()', 'workers: 1'),
-      'utf-8',
-    );
 
     const runLog = join(dir, 'kill-test-run-log.txt');
     await writeSpec(

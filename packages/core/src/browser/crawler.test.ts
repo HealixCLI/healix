@@ -372,7 +372,7 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
   });
 
   it('never click-probes a control whose name reads as a destructive/mutating action', async () => {
-    const unsafeButton = button('Register now');
+    const unsafeButton = button('Delete account');
     const safeButton = button('View Menu');
     const recordClicks: string[] = [];
     const browser = makeFakeBrowser({
@@ -388,6 +388,28 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
 
     expect(recordClicks).not.toContain(unsafeButton.selector);
     expect(recordClicks).toContain(safeButton.selector);
+  });
+
+  it('DOES click-probe a "Register"/"Sign up" nav control — navigating there is safe, only the submit is excluded', async () => {
+    // A button-driven SPA nav often renders "Register"/"Create account" as a plain <button
+    // onClick> rather than a real <a href> — excluding it by name would hide that whole route on
+    // any app whose primary entry point uses that wording, when the actual mutation (account
+    // creation) is already independently blocked via buttonType==='submit'.
+    const registerButton = button('Register now');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [registerButton] },
+        'https://a.test/register': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/register' },
+      recordClicks,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(registerButton.selector);
+    expect(result.routes.map((r) => r.url)).toContain('https://a.test/register');
   });
 
   it('does click-probe a non-submit control inside a <form> (e.g. a login/register view toggle)', async () => {
@@ -821,6 +843,16 @@ describe('reconcileStaticRoutePaths()', () => {
   it('falls back to a bare "#" prefix when hash-routed but no invariant prefix was detected', () => {
     const out = reconcileStaticRoutePaths(['/checkout'], { hashRouted: true }, 'https://a.test/');
     expect(out).toEqual(['https://a.test/#/checkout']);
+  });
+
+  it('inserts the separating slash a naive string concat would drop when the static path has no leading slash', () => {
+    const out = reconcileStaticRoutePaths(
+      ['home'],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+    expect(out).toEqual(['https://a.test/#/SK/home']);
+    expect(out).not.toEqual(['https://a.test/#/SKhome']);
   });
 
   it('drops paths with a dynamic segment (:id, [id], or *) instead of guessing a value', () => {

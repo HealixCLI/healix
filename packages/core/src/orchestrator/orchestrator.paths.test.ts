@@ -7,6 +7,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import { createOrchestrator } from './index.js';
 import type { OrchestratorEvent, PlanApprovalResult } from './types.js';
 import type { RunReport } from './report.js';
+import { persistExplorationCache } from './exploration-cache.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import { projectsDir } from '../env/app-data.js';
 import { ProviderRouter } from '../providers/router.js';
@@ -20,6 +21,7 @@ import type {
 } from '../providers/types.js';
 import type {
   ExecOutcome,
+  ExplorationArtifact,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
@@ -1753,5 +1755,83 @@ describe('orchestrator paths (offline DI seam)', () => {
     } finally {
       rmSync(repoPath, { recursive: true, force: true });
     }
+  });
+
+  it('EXPLORATION CACHE: a thin/not-useful cached crawl is re-crawled, never silently reused', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Exploration Cache Quality Gate Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const reusedMessage = (events: OrchestratorEvent[]): OrchestratorEvent | undefined =>
+      events.find((e) => e.message.includes('Reusing cached exploration artifact'));
+    const recrawledMessage = (events: OrchestratorEvent[]): OrchestratorEvent | undefined =>
+      events.find((e) => e.message.includes('re-crawling instead of reusing it'));
+
+    // Run 1: fakeBrowser's snapshot() always returns the same near-empty page, so the resulting
+    // crawl is naturally `useful: false` (assessExplorationUsefulness's "single thin route" case)
+    // — exactly the low-quality artifact this gate must never trust on a later run.
+    const events1: OrchestratorEvent[] = [];
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, { onEvent: (e) => events1.push(e) });
+    expect(reusedMessage(events1)).toBeUndefined();
+
+    // Run 2: same project/baseUrl, cache from run 1 is within its staleness window — must NOT be
+    // silently reused (it was never useful), must re-crawl instead.
+    const events2: OrchestratorEvent[] = [];
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, { onEvent: (e) => events2.push(e) });
+    expect(reusedMessage(events2)).toBeUndefined();
+    expect(recrawledMessage(events2)).toBeDefined();
+
+    // Now simulate a genuinely GOOD cached crawl (useful, not budget-exhausted) for the same
+    // project/baseUrl — this one SHOULD be trusted and reused on the next run.
+    const goodArtifact: ExplorationArtifact = {
+      crawl: {
+        routes: [
+          {
+            url: 'https://app.example.test/',
+            title: 'Home',
+            snapshot: {
+              url: 'https://app.example.test/',
+              title: 'Home',
+              interactiveElements: Array.from({ length: 6 }, (_, i) => ({
+                role: 'button',
+                name: `Action ${i}`,
+                selector: `#action-${i}`,
+              })),
+            },
+            depth: 0,
+            hasPasswordField: false,
+            role: 'anonymous',
+            networkEvents: [],
+          },
+        ],
+        visitedCount: 1,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+    persistExplorationCache(project.id, 'https://app.example.test', goodArtifact);
+
+    const events3: OrchestratorEvent[] = [];
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, { onEvent: (e) => events3.push(e) });
+    expect(reusedMessage(events3)).toBeDefined();
+    expect(recrawledMessage(events3)).toBeUndefined();
   });
 });

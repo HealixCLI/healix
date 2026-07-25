@@ -130,6 +130,14 @@ export function registerRun(program: Command): void {
       '--max-tokens <count>',
       'pause the run cleanly (resumable) once its total input+output tokens reach this count',
     )
+    .option(
+      '--max-crawl-routes <count>',
+      "override EXPLORE's hard cap on distinct routes visited (default 60)",
+    )
+    .option(
+      '--crawl-budget-ms <ms>',
+      "override EXPLORE's wall-clock crawl budget in milliseconds (default 90000)",
+    )
     .action(
       async (opts: {
         project: string;
@@ -139,6 +147,8 @@ export function registerRun(program: Command): void {
         prd?: string;
         maxCostUsd?: string;
         maxTokens?: string;
+        maxCrawlRoutes?: string;
+        crawlBudgetMs?: string;
       }) => {
         const runOpts: RunOptions = {
           projectId: opts.project,
@@ -149,6 +159,12 @@ export function registerRun(program: Command): void {
         if (opts.prd) runOpts.prd = opts.prd;
         if (opts.maxCostUsd !== undefined) runOpts.maxCostUsd = Number(opts.maxCostUsd);
         if (opts.maxTokens !== undefined) runOpts.maxTokens = Number(opts.maxTokens);
+        if (opts.maxCrawlRoutes !== undefined || opts.crawlBudgetMs !== undefined) {
+          runOpts.crawlBudget = {
+            ...(opts.maxCrawlRoutes !== undefined ? { maxRoutes: Number(opts.maxCrawlRoutes) } : {}),
+            ...(opts.crawlBudgetMs !== undefined ? { wallClockBudgetMs: Number(opts.crawlBudgetMs) } : {}),
+          };
+        }
 
         // Ctrl+C previously just killed the process with no checkpoint
         // written at all — treating it as a pause request instead means the

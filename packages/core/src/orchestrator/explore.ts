@@ -252,6 +252,19 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       );
     }
 
+    const crashedRoutes = crawlResult.routes.filter((r) => r.crashed).map((r) => r.url);
+    if (crashedRoutes.length > 0) {
+      // A real app-side bug (unhandled crash rendering an error boundary),
+      // distinct from a route that's merely thin — never blocks the run,
+      // just a breadcrumb so it can be told apart from sparse-but-fine.
+      emit(
+        'explore',
+        'warn',
+        `${crashedRoutes.length} route(s) rendered an unhandled app-side crash instead of real content.`,
+        { crashedRoutes },
+      );
+    }
+
     if (!quality.useful) {
       // Breadcrumb only — thin/empty context must never abort the run, it
       // just means GENERATE will lean more on guessing than grounding.

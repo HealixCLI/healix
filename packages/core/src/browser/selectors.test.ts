@@ -398,9 +398,16 @@ interface FakeEl {
   parentElement: FakeEl | null;
   children: FakeEl[];
   attrs: Record<string, string>;
+  /** Simulated `getComputedStyle(el).cursor` — only relevant to the GAP-053 mirror below. */
+  cursor?: string;
+  /** Simulated visibility gate — only relevant to the GAP-053 mirror below. */
+  hidden?: boolean;
 }
 
-function fakeEl(tag: string, opts: Partial<Pick<FakeEl, 'id' | 'textContent' | 'attrs'>> = {}): FakeEl {
+function fakeEl(
+  tag: string,
+  opts: Partial<Pick<FakeEl, 'id' | 'textContent' | 'attrs' | 'cursor' | 'hidden'>> = {},
+): FakeEl {
   return {
     id: opts.id ?? '',
     tagName: tag,
@@ -409,6 +416,8 @@ function fakeEl(tag: string, opts: Partial<Pick<FakeEl, 'id' | 'textContent' | '
     parentElement: null,
     children: [],
     attrs: opts.attrs ?? {},
+    cursor: opts.cursor,
+    hidden: opts.hidden,
   };
 }
 
@@ -470,6 +479,16 @@ function selectorForMirror(root: FakeEl[], el: FakeEl): SelectorResult {
       const candidate = `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
       if (qsa(candidate).length === 1) {
         return { selector: candidate, tier: testIdAttrs.includes(attr) ? 1 : 2 };
+      }
+    }
+  }
+
+  if (tag === 'a') {
+    const href = el.attrs['href'];
+    if (href) {
+      const candidate = `a[href="${href.replace(/"/g, '\\"')}"]`;
+      if (qsa(candidate).length === 1) {
+        return { selector: candidate, tier: 2 };
       }
     }
   }
@@ -593,5 +612,182 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
 
     const result = selectorForMirror([parent], row);
     expect(result.tier).toBe(1);
+  });
+
+  it('GAP-055: gives a repeated <a> with a unique href its own tier-2 selector instead of a positional path', () => {
+    // Flask CRUD's per-row "Update" links: same accessible name (ambiguousMatch),
+    // but each has a genuinely unique, order-independent href.
+    const list = fakeEl('div');
+    const row1 = fakeEl('a', { attrs: { href: '/update/1' }, textContent: 'Update' });
+    const row2 = fakeEl('a', { attrs: { href: '/update/2' }, textContent: 'Update' });
+    appendChild(list, row1);
+    appendChild(list, row2);
+
+    const result1 = selectorForMirror([list], row1);
+    const result2 = selectorForMirror([list], row2);
+
+    expect(result1).toEqual({ selector: 'a[href="/update/1"]', tier: 2 });
+    expect(result2).toEqual({ selector: 'a[href="/update/2"]', tier: 2 });
+  });
+
+  it('GAP-055: falls through to the positional path when the href is not unique (or absent)', () => {
+    const list = fakeEl('div');
+    const row1 = fakeEl('a', { attrs: { href: '/same' }, textContent: 'Dup' });
+    const row2 = fakeEl('a', { attrs: { href: '/same' }, textContent: 'Dup' });
+    appendChild(list, row1);
+    appendChild(list, row2);
+
+    const result = selectorForMirror([list], row1);
+    expect(result.tier).toBe(4);
+  });
+});
+
+// --- Mirrored GAP-053 (non-semantic clickable element) detection ---
+
+/** Mirrors `isSemanticInteractive()`. */
+function isSemanticInteractiveMirror(el: FakeEl): boolean {
+  const tag = el.tagName.toLowerCase();
+  if (tag === 'button' || tag === 'input' || tag === 'select' || tag === 'textarea') return true;
+  if (tag === 'a' && !!el.attrs['href']) return true;
+  return el.attrs['role'] === 'button';
+}
+
+/** Mirrors `hasInteractiveAncestor()` — also true when an ancestor was already collected
+ * (semantic OR generic) in `seen`, so a nested cursor-pointer wrapper around an
+ * already-captured cursor-pointer wrapper doesn't get its own duplicate entry. */
+function hasInteractiveAncestorMirror(el: FakeEl, seen: Set<FakeEl>): boolean {
+  let node = el.parentElement;
+  while (node) {
+    if (isSemanticInteractiveMirror(node) || seen.has(node)) return true;
+    node = node.parentElement;
+  }
+  return false;
+}
+
+interface GenericClickResult {
+  role: 'generic';
+  name: string;
+  selector: string;
+}
+
+/**
+ * Mirrors `collectInteractiveElements()`'s second pass over
+ * GENERIC_CLICK_CANDIDATE_SELECTOR (div/span/li/td/tr/[onclick]): visible,
+ * non-empty text, no semantic-interactive OR already-collected ancestor, cursor:pointer.
+ * `seen` accumulates across `candidates` in order, mirroring document-order iteration.
+ */
+function collectGenericClickCandidatesMirror(root: FakeEl[], candidates: FakeEl[]): GenericClickResult[] {
+  const out: GenericClickResult[] = [];
+  const seen = new Set<FakeEl>();
+  for (const el of candidates) {
+    if (el.hidden) continue;
+    const text = clamp(el.textContent ?? '');
+    if (!text) continue;
+    if (hasInteractiveAncestorMirror(el, seen)) continue;
+    if (el.cursor !== 'pointer') continue;
+    seen.add(el);
+    out.push({ role: 'generic', name: text, selector: selectorForMirror(root, el).selector });
+  }
+  return out;
+}
+
+describe('selectors.GAP-053 non-semantic clickable elements (mirrored)', () => {
+  it('captures a cursor-pointer div with an onclick-shaped handler and visible text as role generic', () => {
+    const trigger = fakeEl('div', { textContent: 'Zmeniť', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror([trigger], [trigger]);
+    expect(result).toEqual([{ role: 'generic', name: 'Zmeniť', selector: expect.any(String) }]);
+  });
+
+  it('does not capture a cursor-pointer wrapper with no visible text', () => {
+    const wrapper = fakeEl('div', { cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror([wrapper], [wrapper]);
+    expect(result).toEqual([]);
+  });
+
+  it('does not capture a div with text but no cursor:pointer styling', () => {
+    const plain = fakeEl('div', { textContent: 'Just some text' });
+    const result = collectGenericClickCandidatesMirror([plain], [plain]);
+    expect(result).toEqual([]);
+  });
+
+  it('does not double-capture a cursor-pointer span nested inside a real <button>', () => {
+    const button = fakeEl('button', { textContent: 'Export' });
+    const innerSpan = fakeEl('span', { textContent: 'Export', cursor: 'pointer' });
+    appendChild(button, innerSpan);
+
+    const result = collectGenericClickCandidatesMirror([button], [innerSpan]);
+    expect(result).toEqual([]);
+  });
+
+  it('does not double-capture nested cursor-pointer wrapper layers around one logical click target', () => {
+    // A card with 3 nested cursor-pointer divs (common in real apps — Herfy's reward
+    // cards) is ONE click target, not 3 — only the outermost (first in document order,
+    // i.e. first in `candidates`) should survive.
+    const outer = fakeEl('div', { textContent: '100 Off reward', cursor: 'pointer' });
+    const middle = fakeEl('div', { textContent: '100 Off reward', cursor: 'pointer' });
+    const inner = fakeEl('div', { textContent: '100 Off reward', cursor: 'pointer' });
+    appendChild(outer, middle);
+    appendChild(middle, inner);
+
+    const result = collectGenericClickCandidatesMirror([outer], [outer, middle, inner]);
+    expect(result).toEqual([{ role: 'generic', name: '100 Off reward', selector: expect.any(String) }]);
+  });
+});
+
+// --- Mirrored duplicate-target (wrapper + nested control) dedup ---
+
+interface DedupEntry {
+  el: FakeEl;
+  name: string;
+}
+
+/**
+ * Mirrors the ancestor-dedup check added to `collectInteractiveElements()`'s
+ * main loop: when a later (descendant, since querySelectorAll returns
+ * document order) element shares its accessible name with an
+ * already-collected ancestor, the ancestor's entry is dropped in favor of the
+ * more specific descendant.
+ */
+function collectWithAncestorDedupMirror(elementsInDocumentOrder: FakeEl[]): DedupEntry[] {
+  const out: DedupEntry[] = [];
+  for (const el of elementsInDocumentOrder) {
+    const name = clamp(el.textContent ?? '');
+    if (name) {
+      let ancestor = el.parentElement;
+      while (ancestor) {
+        const idx = out.findIndex((entry) => entry.el === ancestor);
+        if (idx !== -1) {
+          if (out[idx]!.name === name) out.splice(idx, 1);
+          break;
+        }
+        ancestor = ancestor.parentElement;
+      }
+    }
+    out.push({ el, name });
+  }
+  return out;
+}
+
+describe('selectors.duplicate-target capture dedup (mirrored)', () => {
+  it('drops the wrapper <a href> entry when a nested <button> shares its accessible name', () => {
+    const wrapperLink = fakeEl('a', { attrs: { href: '/shop' }, textContent: 'Go to shop' });
+    const nestedButton = fakeEl('button', { textContent: 'Go to shop' });
+    appendChild(wrapperLink, nestedButton);
+
+    // document order: the wrapper is visited before its child.
+    const result = collectWithAncestorDedupMirror([wrapperLink, nestedButton]);
+
+    expect(result).toHaveLength(1);
+    expect(result[0]?.el).toBe(nestedButton);
+  });
+
+  it('keeps both entries when the wrapper and nested control have different accessible names', () => {
+    const wrapperLink = fakeEl('a', { attrs: { href: '/shop' }, textContent: 'Shop wrapper' });
+    const nestedButton = fakeEl('button', { textContent: 'Buy now' });
+    appendChild(wrapperLink, nestedButton);
+
+    const result = collectWithAncestorDedupMirror([wrapperLink, nestedButton]);
+
+    expect(result).toHaveLength(2);
   });
 });

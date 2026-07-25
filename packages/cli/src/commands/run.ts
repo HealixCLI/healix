@@ -136,7 +136,7 @@ export function registerRun(program: Command): void {
     )
     .option(
       '--crawl-budget-ms <ms>',
-      "override EXPLORE's wall-clock crawl budget in milliseconds (default 90000)",
+      "override EXPLORE's wall-clock crawl budget in milliseconds (default 120000)",
     )
     .action(
       async (opts: {

@@ -21,6 +21,13 @@ export interface CrawledRoute {
    * next route's drain window — but sufficient as endpoint/status/body ground
    * truth (see GAP-046, `browser/network-capture.ts`). */
   networkEvents: CapturedNetworkEvent[];
+  /** True when this route's own snapshot (title/axTree) reads as an unhandled
+   * app-side crash (e.g. React Router's default ErrorBoundary) rather than a
+   * genuinely sparse page — see `looksCrashed()`. A real, non-Healix app bug;
+   * never a triage verdict, just a signal so a crashed route can be
+   * distinguished from one that's just thin. Optional so existing hand-built
+   * fixtures (tests) default to "not crashed" rather than requiring the field. */
+  crashed?: boolean;
 }
 
 export interface CrawlResult {
@@ -39,14 +46,19 @@ export interface CrawlResult {
 export interface CrawlOptions {
   /** Hard cap on distinct routes visited. Default 60. */
   maxRoutes?: number;
-  /** Wall-clock budget for the whole crawl. Default 90s. */
+  /** Wall-clock budget for the whole crawl. Default 120s. */
   wallClockBudgetMs?: number;
   /** Extra URLs to seed the BFS queue alongside `baseUrl` (e.g. known routes from static analysis). */
   seedRoutes?: string[];
 }
 
 const DEFAULT_MAX_ROUTES = 60;
-const DEFAULT_BUDGET_MS = 90_000;
+// Click-probing now also tries GAP-053's non-semantic `generic` candidates (see
+// extractClickCandidates below), so a click-probe-heavy page costs noticeably more
+// real navigations than before this budget was last tuned — raised alongside
+// MAX_CLICKS_PER_PAGE/MAX_CLICK_PROBES_PER_CRAWL so the larger candidate pool has
+// room to actually run instead of hitting budgetExhausted mid-page.
+const DEFAULT_BUDGET_MS = 120_000;
 /** Once a DOM fingerprint has repeated this many times, stop following that page's links. */
 const SHELL_REPEAT_THRESHOLD = 3;
 /** Share of visited routes sharing the dominant fingerprint that counts as "collapsed". */
@@ -84,6 +96,13 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
   for (const el of snapshot.interactiveElements) {
     if (el.role !== 'link' || !el.href) continue;
     if (/^(mailto:|tel:|javascript:)/i.test(el.href)) continue;
+    // A bare "#" (a common no-op brand-link/dropdown-toggle pattern) never
+    // navigates anywhere — resolving it against the current page URL produces
+    // a distinct-looking string (e.g. "http://x/#") that isn't a real route,
+    // duplicating the current page under a phantom URL (see GAP-054). Checked
+    // against the RAW attribute, not the resolved URL, so a genuine hash-route
+    // like "#/login" (content after the "#") is untouched.
+    if (/^#\s*$/.test(el.href)) continue;
     let resolved: string;
     try {
       resolved = new URL(el.href, snapshot.url).toString();
@@ -124,20 +143,43 @@ const UNSAFE_CLICK_TEXT_RE =
 const LOGIN_TEXT_RE = /log[- ]?in|sign[- ]?in|prihl[aá]si/i;
 /** Cap on click candidates considered per page, before the per-visit MAX_CLICKS_PER_PAGE slice. */
 const CLICK_CANDIDATES_PER_PAGE = 8;
-/** Click-probe candidates actually clicked on a single page in one visit. */
-const MAX_CLICKS_PER_PAGE = 4;
-/** Total click-probe budget across a whole crawl() call — a fallback for link-following, not the primary discovery mechanism, so it's bounded tightly. */
-const MAX_CLICK_PROBES_PER_CRAWL = 20;
-/** Only click-probe a page once the link-following queue is running low — following a real link is cheaper and safer than guessing at a click target. */
-const LINK_QUEUE_THIN_THRESHOLD = 3;
+/**
+ * Click-probe candidates actually clicked on a single page in one visit — equal to
+ * CLICK_CANDIDATES_PER_PAGE so nothing that survived extractClickCandidates()'s filtering is
+ * silently dropped here. Previously 4: on a page with several real buttons ahead of it in
+ * document order, that cap could exhaust before reaching the one non-semantic (GAP-053)
+ * candidate actually worth discovering (confirmed live — C&A's "Môj účet" nav item was
+ * candidate #5 on its page and never got clicked at the old cap of 4).
+ */
+const MAX_CLICKS_PER_PAGE = 8;
+/**
+ * Total click-probe budget across a whole crawl() call — a fallback for link-following, not
+ * the primary discovery mechanism, so still bounded, just no longer tightly enough to starve
+ * every page after the first two or three now that MAX_CLICKS_PER_PAGE is 8 (was 20, which
+ * exhausted after ~2-3 pages regardless of how many more remained in the crawl).
+ */
+const MAX_CLICK_PROBES_PER_CRAWL = 60;
+/**
+ * Only click-probe a page once the link-following queue is running low — following a real
+ * link is cheaper and safer than guessing at a click target. Loosened from 3: a page with a
+ * modest handful of real links (e.g. footer FAQ/terms/privacy links) could keep the queue
+ * non-thin and skip click-probing entirely, even though the page's non-semantic (GAP-053) nav
+ * elements are exactly the ones link-following can never find on its own.
+ */
+const LINK_QUEUE_THIN_THRESHOLD = 5;
 
 function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
-  return snapshot.interactiveElements
-    .filter((el) => el.role === 'button' || (el.role === 'link' && !el.href))
-    .filter((el) => !el.disabled)
-    .filter((el) => el.buttonType !== 'submit')
-    .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
-    .slice(0, CLICK_CANDIDATES_PER_PAGE);
+  return (
+    snapshot.interactiveElements
+      // 'generic' includes GAP-053's non-semantic cursor-pointer div/span click
+      // targets — eligible for the same click-probing under the same safety
+      // filters below (disabled, non-submit, UNSAFE_CLICK_TEXT_RE).
+      .filter((el) => el.role === 'button' || el.role === 'generic' || (el.role === 'link' && !el.href))
+      .filter((el) => !el.disabled)
+      .filter((el) => el.buttonType !== 'submit')
+      .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
+      .slice(0, CLICK_CANDIDATES_PER_PAGE)
+  );
 }
 
 export interface ClickDiscoveryResult {
@@ -216,6 +258,20 @@ function fingerprintOf(snapshot: DomSnapshot): string {
 
 function hasPasswordField(snapshot: DomSnapshot): boolean {
   return snapshot.interactiveElements.some((el) => el.inputType === 'password');
+}
+
+/** Recognizable "this route rendered a crash" shapes: a framework error-boundary fallback
+ * (React Router's default included), a browser-reported uncaught error, or a raw stack-trace
+ * line (`at fn (file:line:col)`) leaking into the accessible tree/title instead of real content. */
+const CRASH_MARKER_RE =
+  /unexpected application error|error boundary|uncaught (?:runtime )?error|at\s+\S+\s+\([^)]+:\d+:\d+\)/i;
+
+/** `snapshot.axTree` (Playwright's `ariaSnapshot()`) is a YAML string when present — see
+ * `browser/index.ts`'s `snapshot()`. Checked alongside the title since a crash fallback page
+ * commonly carries a generic/blank title but a distinctive accessible tree (or vice versa). */
+function looksCrashed(snapshot: DomSnapshot): boolean {
+  const axText = typeof snapshot.axTree === 'string' ? snapshot.axTree : '';
+  return CRASH_MARKER_RE.test(axText) || CRASH_MARKER_RE.test(snapshot.title);
 }
 
 const DEGENERATE_URL_MAX_LENGTH = 2000;
@@ -303,7 +359,12 @@ export async function crawl(
 
     let snapshot: DomSnapshot;
     try {
-      await browser.goto(requestedUrl);
+      // Navigate with the URL as queued, NOT its normalized form — normalizeUrl()'s
+      // trailing-slash strip is only meant as a dedup key. Navigating to the
+      // stripped variant breaks any app hosted under a subpath that requires
+      // the exact trailing-slash directory URL (e.g. Vite's `base` config) —
+      // see GAP-052.
+      await browser.goto(item.url);
       snapshot = await browser.snapshot();
     } catch {
       // Dead link or navigation failure — discard whatever traffic that attempt
@@ -349,6 +410,7 @@ export async function crawl(
       hasPasswordField: hasPasswordField(snapshot),
       role: 'anonymous',
       networkEvents,
+      crashed: looksCrashed(snapshot),
     });
 
     // A fingerprint that keeps repeating is a shell page rendering nothing
@@ -359,7 +421,10 @@ export async function crawl(
       const norm = normalizeUrl(link);
       if (!requested.has(norm) && !queued.has(norm)) {
         queued.add(norm);
-        queue.push({ url: norm, depth: item.depth + 1 });
+        // Queue the link as discovered, not its normalized form — see the
+        // goto() comment above (GAP-052) for why navigating to a
+        // trailing-slash-stripped URL can be wrong.
+        queue.push({ url: link, depth: item.depth + 1 });
       }
     }
 

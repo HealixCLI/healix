@@ -1394,8 +1394,18 @@ async function runPipeline(
           // indefinitely) — see exploration-cache.ts. "Force a fresh crawl" is simply deleting
           // the cache file; no dedicated option is needed here.
           const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl);
+          // A cache hit is only trusted when the crawl it came from was actually good — a
+          // budget-exhausted or thin/collapsed crawl (assessExplorationUsefulness's `useful:
+          // false`) gets replayed to every run for the whole staleness window otherwise, and
+          // crucially skips this run's static-route-seeding follow-up entirely (that only runs
+          // inside runExplorePhase, below), even though the approved plan's unitKeys — and
+          // whatever seeding paths they resolve to — differ run to run.
+          const cachedExplorationIsTrustworthy =
+            cachedExploration !== null &&
+            cachedExploration.useful &&
+            !cachedExploration.crawl.budgetExhausted;
           let exploration: ExplorationArtifact;
-          if (cachedExploration) {
+          if (cachedExploration && cachedExplorationIsTrustworthy) {
             exploration = cachedExploration;
             emit(
               'explore',
@@ -1403,6 +1413,17 @@ async function runPipeline(
               'Reusing cached exploration artifact (within staleness window) — skipping live crawl.',
             );
           } else {
+            if (cachedExploration && !cachedExplorationIsTrustworthy) {
+              emit(
+                'explore',
+                'debug',
+                'Cached exploration artifact was thin/budget-exhausted — re-crawling instead of reusing it.',
+                {
+                  uselessReason: cachedExploration.uselessReason,
+                  budgetExhausted: cachedExploration.crawl.budgetExhausted,
+                },
+              );
+            }
             // EXPLORE only needs ONE representative session to find/confirm a login
             // form — not every role. Prefer a roleless credential (the "default"
             // session Tier B also falls back to) over a role-tagged one.
@@ -1413,6 +1434,7 @@ async function runPipeline(
               credentials: defaultCredential
                 ? { username: defaultCredential.username, password: defaultCredential.password }
                 : undefined,
+              crawlOptions: opts.crawlBudget,
               staticRoutePaths,
               emit,
               onFrame: hooks?.onFrame,

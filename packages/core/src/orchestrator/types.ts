@@ -110,6 +110,13 @@ export interface RunOptions {
   /** Combined input+output token ceiling — see maxCostUsd. */
   maxTokens?: number;
   /**
+   * Overrides EXPLORE's crawl budget (see browser/crawler.ts's CrawlOptions) for this run —
+   * `maxRoutes` (default 60) and/or `wallClockBudgetMs` (default 120_000). Either can be set
+   * independently; omit both to use the crawler's own defaults. Useful for a larger app whose
+   * real route-cluster count exceeds the default cap.
+   */
+  crawlBudget?: { maxRoutes?: number; wallClockBudgetMs?: number };
+  /**
    * Cooperative cancellation. When aborted, the run stops at the next phase
    * boundary (and in-flight provider/suite work is killed), the run row is
    * marked 'cancelled', and run() resolves with that summary — it never rejects.

@@ -30,6 +30,20 @@ export interface InteractiveElement {
    * (`.first()`/`.nth()`/a more specific attribute) rather than assuming role+name is unique.
    */
   ambiguousMatch?: boolean;
+  /**
+   * Confidence ranking of `selector`'s stability, from which selectorFor() branch produced it:
+   * 1 = data-testid/data-test, 2 = name/aria-label, 3 = unique #id, 4 = positional nth-of-type
+   * fallback. Optional so existing hand-built fixtures default to a neutral (no bonus/penalty)
+   * score rather than being misread as tier 4.
+   */
+  selectorTier?: 1 | 2 | 3 | 4;
+  /**
+   * When `selector` is a positional (tier-4) nth-of-type path sitting among repeated siblings,
+   * the nearest repeated ancestor's own clamped text content — e.g. a table row's text. Lets
+   * generation prefer a text-anchored Playwright pattern (`.filter({ hasText: ... })`) over the
+   * raw index path, which breaks when the list/table reorders.
+   */
+  repeatedRowText?: string;
 }
 
 export interface DomSnapshot {

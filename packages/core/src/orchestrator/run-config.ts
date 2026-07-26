@@ -20,6 +20,21 @@ export interface RunConfigSnapshot {
   provider?: ProviderId;
   prd?: string;
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
+  /** Whether the coverage feedback loop's iterative retry was enabled for this run — see RunOptions.coverageLoopEnabled. */
+  coverageLoopEnabled?: boolean;
+  /** The coverage target this run used, when coverageLoopEnabled — see RunOptions.coverageTarget. */
+  coverageTarget?: number;
+  /** Plan item ids this run targeted for regeneration (Retry-pass/Repair), when set — see RunOptions.retryItemIds. */
+  retryItemIds?: string[];
+  /** Proactive spend ceiling(s) this run was configured with, when set — see RunOptions.maxCostUsd/maxTokens. */
+  maxCostUsd?: number;
+  maxTokens?: number;
 }
 
 function runConfigPath(runDir: string): string {

@@ -1,8 +1,9 @@
 import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
 import type { ReactNode } from 'react';
-import type { AgentEvent, TestCase, TestResult, TestStatus } from '@healix/core';
+import type { AgentEvent, TestCase, TestResult, TestStatus, UsageRow } from '@healix/core';
 import {
   Camera,
+  Check,
   ChevronDown,
   ChevronRight,
   FileText,
@@ -10,6 +11,8 @@ import {
   History,
   Image as ImageIcon,
   PackageOpen,
+  RotateCcw,
+  Wrench,
   X,
 } from 'lucide-react';
 import { Badge } from './ui/badge';
@@ -18,8 +21,9 @@ import { StatTile, StatTileRow } from './StatTiles';
 import { TestCaseHistoryDrawer } from './TestCaseHistoryDrawer';
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from './ui/table';
 import { Tabs } from './ui/tabs';
-import type { RunDetail, ReportTriageEntryShape } from '../lib/ipc-types';
+import type { RunDetail, ReportTriageEntryShape, StartRunArgs } from '../lib/ipc-types';
 import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
+import { SHOW_TOKEN_USAGE } from '../lib/feature-flags';
 import { cn } from '../lib/utils';
 import {
   artifactKind,
@@ -28,17 +32,20 @@ import {
   computeStageDurations,
   computeTotalDurationMs,
   eventLevelColor,
+  formatCost,
   formatDuration,
   formatStageBreakdown,
   formatTime,
+  formatTokens,
   groupArtifacts,
   runStatusTone,
   slugMatches,
+  sumNullable,
   testStatusTone,
 } from '../lib/run-format';
 import type { StageDuration } from '../lib/run-format';
 
-type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts';
+type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts' | 'usage';
 
 const VERDICT_TONE: Record<string, 'ok' | 'warn' | 'err' | 'muted' | 'default'> = {
   app_is_wrong: 'err',
@@ -53,14 +60,22 @@ export function RunDetailPanel({
   detail,
   loading,
   onSelectRun,
+  onRetryPass,
 }: {
   detail: RunDetail | null;
   loading: boolean;
   /** Jump to a different run (e.g. from the Test Case History drawer). Omit to disable those jumps. */
   onSelectRun?: (runId: string) => void;
+  /**
+   * Start a targeted regeneration run (Retry-pass/Repair): given a ready
+   * StartRunArgs (suiteMode 'topup', baseRunId this run, retryItemIds set),
+   * the caller runs it through the same start-or-queue path as any other
+   * run. Omit to hide the Retry-pass/Repair buttons entirely.
+   */
+  onRetryPass?: (args: StartRunArgs) => void;
 }) {
   const [tab, setTab] = useState<DetailTab>('timeline');
-  const [busy, setBusy] = useState<'reveal' | 'export' | null>(null);
+  const [busy, setBusy] = useState<'reveal' | 'export' | 'retry' | 'repair' | null>(null);
   const [note, setNote] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
   const [historyCaseKey, setHistoryCaseKey] = useState<{ reqTag: string | null; title: string } | null>(null);
@@ -156,6 +171,74 @@ export function RunDetailPanel({
     }
   };
 
+  /**
+   * Regenerate ONLY the plan items from this run that never got a test
+   * generated, OR got generated but never actually executed (a spec was
+   * registered, then the run errored out before EXECUTE produced a result
+   * for it — see main/index.ts's runs:generationGaps / matchGenerationGaps's
+   * doc comment) — a targeted top-up instead of a full re-plan. No-op (with
+   * an explanatory note) when this run's plan had no gaps to fill.
+   */
+  const startRetryPass = async (): Promise<void> => {
+    if (!onRetryPass || !detail?.run) return;
+    setBusy('retry');
+    setNote(null);
+    try {
+      const gaps = await window.healix.generationGaps(detail.run.id);
+      if (gaps.length === 0) {
+        setNote('Nothing to retry — every planned item already has a generated, executed test.');
+        return;
+      }
+      onRetryPass({
+        projectId: detail.run.projectId,
+        testingScope: detail.runConfig?.testingScope,
+        provider: detail.runConfig?.provider,
+        suiteMode: 'topup',
+        baseRunId: detail.run.id,
+        autoApprove: true,
+        retryItemIds: gaps.map((g) => g.id),
+      });
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
+  /**
+   * Regenerate ONLY the tests this run's triage verdicted 'test_is_wrong' —
+   * the test itself is the problem (not the app), so a fresh generation
+   * attempt is the fix, not a re-run. Reuses Retry-pass's exact
+   * retryItemIds mechanism (see main/index.ts's runs:repairCandidates,
+   * built on the same base-plan-id matching as runs:generationGaps), just
+   * with triage verdicts as the candidate source instead of generation gaps.
+   */
+  const startRepair = async (): Promise<void> => {
+    if (!onRetryPass || !detail?.run) return;
+    setBusy('repair');
+    setNote(null);
+    try {
+      const candidates = await window.healix.repairCandidates(detail.run.id);
+      if (candidates.length === 0) {
+        setNote('Nothing to repair — no tests were triaged "test is wrong" for this run.');
+        return;
+      }
+      onRetryPass({
+        projectId: detail.run.projectId,
+        testingScope: detail.runConfig?.testingScope,
+        provider: detail.runConfig?.provider,
+        suiteMode: 'topup',
+        baseRunId: detail.run.id,
+        autoApprove: true,
+        retryItemIds: candidates.map((c) => c.id),
+      });
+    } catch (err) {
+      setNote(err instanceof Error ? err.message : String(err));
+    } finally {
+      setBusy(null);
+    }
+  };
+
   if (!detail && loading) {
     return <div className="flex h-full items-center justify-center text-sm text-muted">Loading run…</div>;
   }
@@ -169,11 +252,15 @@ export function RunDetailPanel({
 
   const { run } = detail;
 
+  const usage = detail.usage ?? [];
+
+  // Usage tab is gated behind SHOW_TOKEN_USAGE — see feature-flags.ts.
   const TABS: ReadonlyArray<{ value: DetailTab; label: string }> = [
     { value: 'timeline', label: `Timeline · ${detail.events.length}` },
     { value: 'results', label: `Results · ${rows.length}` },
     { value: 'triage', label: `Triage · ${triage.length}` },
     { value: 'artifacts', label: `Media · ${mediaCount}` },
+    ...(SHOW_TOKEN_USAGE ? [{ value: 'usage' as const, label: `Usage · ${usage.length}` }] : []),
   ];
 
   return (
@@ -214,6 +301,30 @@ export function RunDetailPanel({
             <PackageOpen className="h-4 w-4" />
             {busy === 'export' ? 'Exporting…' : 'Export suite'}
           </Button>
+          {onRetryPass && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void startRetryPass()}
+              disabled={busy !== null}
+              title="Regenerate only the plan items from this run that never got a test, or never got executed"
+            >
+              <RotateCcw className="h-4 w-4" />
+              {busy === 'retry' ? 'Checking…' : 'Retry-pass'}
+            </Button>
+          )}
+          {onRetryPass && (
+            <Button
+              size="sm"
+              variant="outline"
+              onClick={() => void startRepair()}
+              disabled={busy !== null}
+              title="Regenerate only the tests this run's triage marked 'test is wrong'"
+            >
+              <Wrench className="h-4 w-4" />
+              {busy === 'repair' ? 'Checking…' : 'Repair'}
+            </Button>
+          )}
         </div>
       </div>
 
@@ -270,6 +381,11 @@ export function RunDetailPanel({
         )}
         {tab === 'triage' && (
           <div className="min-h-0 flex-1 overflow-auto">
+            {report?.groupingSummary && (
+              <p className="mb-3 rounded-lg border border-border bg-panel/40 px-3 py-2 text-sm italic text-fg">
+                {report.groupingSummary}
+              </p>
+            )}
             <TriageList entries={triage} />
           </div>
         )}
@@ -282,6 +398,11 @@ export function RunDetailPanel({
               focusFolder={focusFolder}
               setPreview={setPreview}
             />
+          </div>
+        )}
+        {tab === 'usage' && SHOW_TOKEN_USAGE && (
+          <div className="min-h-0 flex-1 overflow-auto">
+            <UsagePanel usage={usage} />
           </div>
         )}
       </div>
@@ -322,6 +443,16 @@ interface JoinedRow {
   details: string | null;
   /** This test's own artifact paths (relative to the suite's test-results dir), from TestResult.artifactsJson. */
   artifacts: string[];
+  /** Step-by-step breakdown (click, fill, navigate, assert...) from TestResult.stepsJson — present for both passed and failed tests. */
+  steps: StepItem[];
+}
+
+interface StepItem {
+  title: string;
+  durationMs: number;
+  error?: string;
+  /** The raw actions performed inside a human-authored test.step(...) task, when present. */
+  steps?: StepItem[];
 }
 
 /** TestResult.artifactsJson is a JSON array of relative paths; malformed/missing rows just have no evidence. */
@@ -330,6 +461,20 @@ function parseArtifacts(json: string | null | undefined): string[] {
   try {
     const parsed: unknown = JSON.parse(json);
     return Array.isArray(parsed) ? parsed.filter((p): p is string => typeof p === 'string') : [];
+  } catch {
+    return [];
+  }
+}
+
+/** TestResult.stepsJson is a JSON array of {title, durationMs, error?}; malformed/missing rows just show no steps. */
+function parseSteps(json: string | null | undefined): StepItem[] {
+  if (!json) return [];
+  try {
+    const parsed: unknown = JSON.parse(json);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter(
+      (s): s is StepItem => !!s && typeof s === 'object' && typeof (s as StepItem).title === 'string',
+    );
   } catch {
     return [];
   }
@@ -352,6 +497,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
         description: t.description,
         details: t.details,
         artifacts: parseArtifacts(r?.artifactsJson),
+        steps: parseSteps(r?.stepsJson),
       };
     });
   }
@@ -367,6 +513,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
     description: null,
     details: null,
     artifacts: parseArtifacts(r.artifactsJson),
+    steps: parseSteps(r.stepsJson),
   }));
 }
 
@@ -591,6 +738,7 @@ function ResultsTable({
                           {r.error}
                         </pre>
                       )}
+                      <TestCaseSteps steps={r.steps} />
                       <TestCaseEvidence artifacts={r.artifacts} setPreview={setPreview} />
                     </div>
                   </TableCell>
@@ -601,6 +749,76 @@ function ResultsTable({
         })}
       </TableBody>
     </Table>
+  );
+}
+
+/**
+ * Step-by-step breakdown (click, fill, navigate, assert...) for a single test
+ * row's own expanded detail — present for both passed and failed tests, not
+ * just failures, since seeing what a test actually DID is useful regardless
+ * of outcome. Sourced from TestResult.stepsJson (see execute.ts's custom
+ * Playwright reporter); absent for older suites scaffolded before it existed.
+ */
+function TestCaseSteps({ steps }: { steps: StepItem[] }) {
+  if (steps.length === 0) {
+    // Genuinely nothing ran (e.g. a config/credential check that throws
+    // before any page action — auth-setup's "no test credentials configured"
+    // case) as well as older suites scaffolded before the steps reporter
+    // existed both land here. Say so explicitly rather than rendering
+    // nothing, which reads as a bug ("why are there no steps?") rather than
+    // an accurate "there were none to record".
+    return <p className="text-xs text-muted/70">No steps recorded for this test.</p>;
+  }
+  return (
+    <details className="group">
+      <summary className="cursor-pointer text-xs text-muted hover:text-fg">
+        {steps.length} step{steps.length === 1 ? '' : 's'}
+      </summary>
+      <ol className="mt-1.5 flex flex-col gap-1 border-l border-border/60 pl-3 text-xs">
+        {steps.map((s, i) => (
+          <StepListItem key={i} step={s} />
+        ))}
+      </ol>
+    </details>
+  );
+}
+
+/**
+ * One step — a human-authored test.step(...) task gets its own nested
+ * dropdown revealing the raw actions (click/fill/expect/etc.) performed
+ * inside it, so the high-level task name is what you see by default, with
+ * the technical blow-by-blow one click away rather than always-on noise.
+ */
+function StepListItem({ step }: { step: StepItem }) {
+  return (
+    <li className={cn('flex items-start gap-1', step.error ? 'text-err' : 'text-muted')}>
+      {step.error ? (
+        <X className="mt-0.5 h-3 w-3 shrink-0 text-err" aria-label="Failed" />
+      ) : (
+        <Check className="mt-0.5 h-3 w-3 shrink-0 text-ok" aria-label="Passed" />
+      )}
+      <span className="min-w-0 flex-1">
+        <span className={step.error ? '' : 'text-fg'}>{step.title}</span>{' '}
+        <span className="text-[11px] text-muted/70">{formatDuration(step.durationMs)}</span>
+        {step.error && (
+          <div className="mt-0.5 truncate font-mono text-[11px] text-err/80" title={step.error}>
+            {step.error.split('\n')[0]}
+          </div>
+        )}
+        {step.steps && step.steps.length > 0 && (
+          <details className="mt-0.5">
+            <summary className="cursor-pointer text-[11px] text-muted/70 hover:text-fg">
+              {step.steps.length} action{step.steps.length === 1 ? '' : 's'}
+            </summary>
+            <ol className="mt-1 flex flex-col gap-1 border-l border-border/40 pl-2.5 text-[11px]">
+              {step.steps.map((s, i) => (
+                <StepListItem key={i} step={s} />
+              ))}
+            </ol>
+          </details>
+        )}
+      </span>
+    </li>
   );
 }
 
@@ -718,6 +936,118 @@ function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
         </li>
       ))}
     </ul>
+  );
+}
+
+// ---- Usage --------------------------------------------------------------
+
+interface PhaseUsage {
+  phase: string;
+  rows: UsageRow[];
+  inputTokens: number | null;
+  outputTokens: number | null;
+  costUsd: number | null;
+  cacheReadInputTokens: number | null;
+  cacheCreationInputTokens: number | null;
+}
+
+function groupUsageByPhase(usage: UsageRow[]): PhaseUsage[] {
+  const byPhase = new Map<string, UsageRow[]>();
+  for (const u of usage) {
+    const list = byPhase.get(u.phase) ?? [];
+    list.push(u);
+    byPhase.set(u.phase, list);
+  }
+  return [...byPhase.entries()].map(([phase, rows]) => ({
+    phase,
+    rows,
+    inputTokens: sumNullable(rows.map((r) => r.inputTokens)),
+    outputTokens: sumNullable(rows.map((r) => r.outputTokens)),
+    costUsd: sumNullable(rows.map((r) => r.costUsd)),
+    cacheReadInputTokens: sumNullable(rows.map((r) => r.cacheReadInputTokens)),
+    cacheCreationInputTokens: sumNullable(rows.map((r) => r.cacheCreationInputTokens)),
+  }));
+}
+
+/** Compact total + per-phase/task token/cost breakdown for a single run. */
+function UsagePanel({ usage }: { usage: UsageRow[] }) {
+  const phases = useMemo(() => groupUsageByPhase(usage), [usage]);
+  const totalInput = useMemo(() => sumNullable(phases.map((p) => p.inputTokens)), [phases]);
+  const totalOutput = useMemo(() => sumNullable(phases.map((p) => p.outputTokens)), [phases]);
+  const totalCost = useMemo(() => sumNullable(phases.map((p) => p.costUsd)), [phases]);
+  const totalTokens =
+    totalInput === null && totalOutput === null ? null : (totalInput ?? 0) + (totalOutput ?? 0);
+
+  if (usage.length === 0) {
+    return (
+      <EmptyHint>
+        No usage recorded for this run — this run may predate usage tracking, or its provider didn't report
+        token/cost data.
+      </EmptyHint>
+    );
+  }
+
+  return (
+    <div className="flex flex-col gap-3">
+      <StatTileRow className="sm:grid-cols-4">
+        <StatTile label="Total tokens" value={formatTokens(totalTokens)} />
+        <StatTile label="Input" value={formatTokens(totalInput)} />
+        <StatTile label="Output" value={formatTokens(totalOutput)} />
+        <StatTile label="Cost" value={formatCost(totalCost)} />
+      </StatTileRow>
+
+      <div className="flex flex-col gap-4">
+        {phases.map((p) => (
+          <section key={p.phase} className="rounded-lg border border-border bg-panel/40 p-3">
+            <header className="mb-2 flex items-center justify-between gap-2">
+              <span className="font-mono text-xs uppercase tracking-wide text-fg">{p.phase}</span>
+              <span className="text-[11px] text-muted">
+                {formatTokens(p.inputTokens)} in · {formatTokens(p.outputTokens)} out ·{' '}
+                {formatCost(p.costUsd)} · {formatTokens(p.cacheReadInputTokens)} cache read
+              </span>
+            </header>
+            <Table>
+              <TableHeader>
+                <TableRow>
+                  <TableHead>Task</TableHead>
+                  <TableHead>Provider</TableHead>
+                  <TableHead>Model</TableHead>
+                  <TableHead className="text-right">Input</TableHead>
+                  <TableHead className="text-right">Output</TableHead>
+                  <TableHead className="text-right">Cost</TableHead>
+                  <TableHead className="text-right">Cache read</TableHead>
+                  <TableHead className="text-right">Cache create</TableHead>
+                </TableRow>
+              </TableHeader>
+              <TableBody>
+                {p.rows.map((r) => (
+                  <TableRow key={r.id}>
+                    <TableCell className="max-w-[16rem] truncate" title={r.task ?? undefined}>
+                      {r.task ?? '—'}
+                    </TableCell>
+                    <TableCell className="font-mono text-[11px] text-muted">{r.provider}</TableCell>
+                    <TableCell className="font-mono text-[11px] text-muted">{r.model ?? '—'}</TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.inputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.outputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">{formatCost(r.costUsd)}</TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.cacheReadInputTokens)}
+                    </TableCell>
+                    <TableCell className="text-right text-xs text-muted">
+                      {formatTokens(r.cacheCreationInputTokens)}
+                    </TableCell>
+                  </TableRow>
+                ))}
+              </TableBody>
+            </Table>
+          </section>
+        ))}
+      </div>
+    </div>
   );
 }
 

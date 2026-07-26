@@ -123,6 +123,29 @@ function migrate(db: DatabaseSync): void {
     ensureColumn(db, 'tests', 'details', 'TEXT');
     ensureColumn(db, 'results', 'description', 'TEXT');
     ensureColumn(db, 'results', 'details', 'TEXT');
+    // v10: steps_json — per-test action/assertion breakdown (click, fill,
+    // navigate, assert...) captured by the custom Playwright reporter (see
+    // templates.ts's stepsReporterContents()), present for both passed and
+    // failed tests, not just failures.
+    ensureColumn(db, 'results', 'steps_json', 'TEXT');
+    // v11: usage table (per-call token/cost tracking) — no ensureColumn needed
+    // here; it's a brand-new table, so the CREATE TABLE IF NOT EXISTS already
+    // inside SCHEMA_SQL (executed unconditionally above, within this same
+    // version-gated block) is sufficient to retrofit it onto an existing DB.
+    // v12: cache-read/cache-creation token counts on the usage table, added to
+    // an existing usage table via ensureColumn (the CREATE above only helps
+    // fresh installs).
+    ensureColumn(db, 'usage', 'cache_creation_input_tokens', 'INTEGER');
+    ensureColumn(db, 'usage', 'cache_read_input_tokens', 'INTEGER');
+    // v13: model — the dominant modelUsage entry that served each call, added
+    // to an existing usage table via ensureColumn (the CREATE above only
+    // helps fresh installs).
+    ensureColumn(db, 'usage', 'model', 'TEXT');
+    // v14: spec_code on tests (the generated spec's full source, added via
+    // ensureColumn for existing DBs) + the new triage_results table — no
+    // ensureColumn needed for the table itself, same reasoning as v11's usage
+    // table: CREATE TABLE IF NOT EXISTS already retrofits it.
+    ensureColumn(db, 'tests', 'spec_code', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

@@ -4,6 +4,16 @@ import type { MockResponse } from '../../target/types.js';
 /** The three tiers a scaffolded suite always provisions, in execution order. */
 export const TIERS: Tier[] = ['tierA-public', 'tierB-auth', 'tierC-api'];
 
+/**
+ * Write-through per-test checkpoint file (see checkpointReporterContents()),
+ * read back by execute.ts to resume mid-suite after an interruption. Lives at
+ * the suite's project root, alongside results.json — not under fixtures/.
+ */
+export const EXEC_CHECKPOINT_FILENAME = 'healix-exec-checkpoint.ndjson';
+
+/** `--test-list-invert` file execute.ts builds from EXEC_CHECKPOINT_FILENAME's entries before a resumed run. */
+export const EXEC_CHECKPOINT_INVERT_FILENAME = 'healix-completed-tests.txt';
+
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -68,11 +78,32 @@ export function playwrightConfigContents(opts: ConfigOptions = {}): string {
     : "process.env.HEALIX_BASE_URL || 'http://localhost:3000'";
 
   return `import { defineConfig, devices } from '@playwright/test';
+import { cpus, freemem } from 'node:os';
 
 /**
  * Healix-generated Playwright config.
  * Projects mirror the Healix tiers; edit baseURL via HEALIX_BASE_URL or below.
  */
+
+// Workers are sized to the machine's own headroom instead of a fixed number:
+// this suite runs on the user's own desktop (often alongside their IDE/
+// browser/other apps, not a dedicated CI runner), so saturating every core or
+// every free byte of RAM would make the whole machine sluggish mid-run rather
+// than just finishing tests faster. Leaves one core free for the OS/host app,
+// and bounds by free RAM since each worker launches its own Chromium instance
+// (memory-hungry, especially with video/trace recording always on — see the
+// \`use\` block below). CI keeps a fixed worker count instead of trusting
+// os.cpus()/os.freemem() — containerized CI runners often report the HOST's
+// full capacity while only being allotted a cgroup-limited slice of it.
+function computeWorkers() {
+  const cpuCount = cpus().length;
+  const freeMemGB = freemem() / 1024 ** 3;
+  const GB_PER_WORKER = 0.75; // headed Chromium + video/trace recording, empirically ample
+  const cpuBound = Math.max(1, cpuCount - 1);
+  const memBound = Math.max(1, Math.floor(freeMemGB / GB_PER_WORKER));
+  return Math.max(1, Math.min(cpuBound, memBound));
+}
+
 export default defineConfig({
   testDir: './tests',
   fullyParallel: true,
@@ -81,13 +112,37 @@ export default defineConfig({
   // to register as flaky). Default to 1 locally too — gating on CI meant flaky
   // was never detectable on a local \`healix run\`. Override with HEALIX_RETRIES.
   retries: process.env.HEALIX_RETRIES ? Number(process.env.HEALIX_RETRIES) : process.env.CI ? 2 : 1,
-  workers: process.env.CI ? 1 : undefined,
+  // CI defaults to fully serial (1 worker) since that's the safest default for
+  // a shared runner, but it also means CI test execution time scales linearly
+  // with suite size. Override with HEALIX_WORKERS when the CI environment can
+  // actually support more parallelism; outside CI, fall back to the headroom-
+  // aware computeWorkers() above rather than a fixed number.
+  workers: process.env.HEALIX_WORKERS
+    ? Number(process.env.HEALIX_WORKERS)
+    : process.env.CI
+      ? 1
+      : computeWorkers(),
   timeout: 60_000,
   expect: { timeout: 10_000 },
   reporter: [
     ['json', { outputFile: 'results.json' }],
     ['html', { open: 'never' }],
     ['list'],
+    // Playwright's own json reporter doesn't serialize step-level detail at
+    // all (only overall status/duration/error/attachments) — this custom
+    // reporter reads it straight off the live TestResult the Reporter API
+    // exposes and writes it to steps.json, so the run detail can show what a
+    // test actually did (clicked, filled, navigated, asserted...) step by
+    // step, for passed tests too, not just failures.
+    ['./fixtures/steps-reporter.cjs'],
+    // Write-through per-test checkpoint (see fixtures/checkpoint-reporter.cjs's
+    // own doc comment) — lets an interrupted run resume by skipping only the
+    // tests that already finished, instead of redoing the whole suite. This is
+    // also what makes it safe for all three tiers to run in a single combined
+    // invocation below (instead of one Playwright process per tier): a crash
+    // mid-run no longer loses per-tier progress, since progress is now tracked
+    // per test regardless of which tier(s) were still in flight together.
+    ['./fixtures/checkpoint-reporter.cjs'],
   ],
   use: {
     baseURL: ${baseUrlLiteral},
@@ -128,6 +183,165 @@ export default defineConfig({
 }
 
 /**
+ * Custom Playwright reporter that captures step-level detail (clicks, fills,
+ * navigations, assertions...) for every test — pass or fail — and writes it
+ * to steps.json. Written as CommonJS (.cjs) regardless of the scaffolded
+ * suite's "type": "module" so Playwright can always require() it directly,
+ * with no transpilation step of its own.
+ *
+ * WHY a custom reporter instead of reading the built-in json reporter's
+ * output: that reporter's TestResult serialization only includes overall
+ * status/duration/error/attachments — no steps array at all. The Reporter
+ * API's LIVE onTestEnd(test, result) callback, however, does expose
+ * `result.steps` — this just persists that to disk before the process exits.
+ *
+ * Kept categories: 'test.step' (a generated spec's own human-authored
+ * test.step('Enter email address', ...) wrapper — see generate.ts's prompt —
+ * takes priority when present, since Playwright nests the raw pw:api/expect
+ * calls INSIDE it as children, not as top-level entries, so only the
+ * descriptive wrapper title surfaces here), plus 'pw:api' (real page actions)
+ * and 'expect' (assertions) as a fallback for any action a spec didn't wrap.
+ * 'hook'/'fixture' steps are Healix's own plumbing (auth setup, mock
+ * routing) and not something a viewer needs to see per-test.
+ */
+export function stepsReporterContents(): string {
+  return `const fs = require('node:fs');
+const path = require('node:path');
+
+const KEPT_CATEGORIES = new Set(['test.step', 'pw:api', 'expect']);
+// Playwright's step error messages carry terminal color escape codes by
+// default (e.g. \\u001b[2m) — verified live against a real failing step; left
+// unstripped they render as garbled control characters in the report/UI.
+const ANSI_RE = /[\\u001b\\u009b][[\\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+function stripAnsi(text) {
+  return (text || '').replace(ANSI_RE, '');
+}
+
+function toStepItem(s) {
+  // Only a test.step(...) wrapper gets its raw actions nested underneath —
+  // a bare pw:api/expect step (no test.step wrapping) has no useful children
+  // of its own, just the same kind of entry, so nesting there would just be
+  // a step wrapping an identical copy of itself.
+  const children =
+    s.category === 'test.step'
+      ? (s.steps || []).filter((c) => c.category === 'pw:api' || c.category === 'expect').map(toStepItem)
+      : undefined;
+  return {
+    title: s.title,
+    durationMs: Math.round(s.duration || 0),
+    error: s.error ? stripAnsi(s.error.message || String(s.error)) : undefined,
+    steps: children && children.length > 0 ? children : undefined,
+  };
+}
+
+class HealixStepsReporter {
+  constructor() {
+    this.results = [];
+  }
+
+  onTestEnd(test, result) {
+    const steps = (result.steps || []).filter((s) => KEPT_CATEGORIES.has(s.category)).map(toStepItem);
+    if (steps.length === 0) return;
+    this.results.push({ title: test.title, retry: result.retry, steps });
+  }
+
+  onEnd() {
+    try {
+      fs.writeFileSync(path.join(process.cwd(), 'steps.json'), JSON.stringify(this.results), 'utf-8');
+    } catch {
+      // best-effort — never fail the actual test run over this
+    }
+  }
+}
+
+module.exports = HealixStepsReporter;
+`;
+}
+
+/**
+ * Custom Playwright reporter that persists every FINISHED test's identity to
+ * disk THE MOMENT it finishes, instead of buffering until onEnd() like
+ * HealixStepsReporter above (which exists purely for cosmetic step detail and
+ * can afford to lose everything on a crash). This file is what makes resuming
+ * a killed/paused execution safe: execute.ts reads it back and passes
+ * `--test-list-invert` on the next attempt so already-finished tests are never
+ * re-run. Without a write-through reporter, a mid-run crash loses every result
+ * Playwright already produced, forcing a resume to redo the entire suite from
+ * scratch — the same problem that used to require one Playwright invocation
+ * PER TIER just to get a coarse, tier-boundary checkpoint.
+ *
+ * Only appends once a test's fate is TRULY final — `result.status ===
+ * 'passed'` (no more retries needed) OR `result.retry >= test.retries` (every
+ * configured retry has been used) — never on an earlier failing attempt that
+ * still has retries left. `test.outcome()` looks tempting for this, but it
+ * reflects only the attempts seen SO FAR: verified empirically that a test
+ * failing on attempt 1 of a 2-retry config already reports outcome() ===
+ * 'unexpected', even though Playwright hasn't given up on it yet. Treating
+ * that as final would wrongly skip a test on resume that deserved another
+ * retry attempt.
+ *
+ * The key format ("[project] › file › describe › test") matches EXACTLY what
+ * `npx playwright test --list` / `--test-list-invert` expect — verified
+ * against a real Playwright run — built straight from test.titlePath() rather
+ * than hand-reconstructed from file paths, so it stays correct across
+ * Playwright versions rather than depending on this code guessing right.
+ */
+export function checkpointReporterContents(): string {
+  return `const fs = require('node:fs');
+const path = require('node:path');
+
+const CHECKPOINT_FILE = ${JSON.stringify(EXEC_CHECKPOINT_FILENAME)};
+// Same pattern as steps-reporter.cjs: Playwright's error messages carry
+// terminal color escape codes by default — left unstripped they render as
+// garbled control characters wherever this checkpoint's error text surfaces
+// (e.g. a Tier B row restored from an interrupted attempt, in execute.ts's
+// checkpointEntriesToOutcome).
+const ANSI_RE = /[\\u001b\\u009b][[\\]()#;?]*(?:[0-9]{1,4}(?:;[0-9]{0,4})*)?[0-9A-ORZcf-nqry=><]/g;
+function stripAnsi(text) {
+  return (text || '').replace(ANSI_RE, '');
+}
+
+function titleInfo(test) {
+  const parts = test.titlePath().slice(1); // drop the leading '' root entry
+  return {
+    project: parts[0],
+    specFile: parts[1],
+    title: parts[parts.length - 1],
+    key: '[' + parts[0] + '] \\u203a ' + parts.slice(1).join(' \\u203a '),
+  };
+}
+
+class HealixCheckpointReporter {
+  onTestEnd(test, result) {
+    const isFinal = result.status === 'passed' || result.retry >= test.retries;
+    if (!isFinal) return;
+    try {
+      const info = titleInfo(test);
+      const errorText = result.error
+        ? stripAnsi(result.error.stack || result.error.message || String(result.error))
+        : undefined;
+      const line =
+        JSON.stringify({
+          key: info.key,
+          title: info.title,
+          project: info.project,
+          specFile: info.specFile,
+          status: test.outcome(),
+          durationMs: Math.round(result.duration || 0),
+          error: errorText,
+        }) + '\\n';
+      fs.appendFileSync(path.join(process.cwd(), CHECKPOINT_FILE), line, 'utf-8');
+    } catch {
+      // best-effort — never fail the actual test run over this
+    }
+  }
+}
+
+module.exports = HealixCheckpointReporter;
+`;
+}
+
+/**
  * Auth setup fixture. Requires Healix to have injected test credentials for
  * this project (single or multiple, via HEALIX_TIERB_* env vars); when none
  * are configured, or the DEFAULT credential's login attempt fails, this
@@ -143,7 +357,7 @@ export default defineConfig({
  * are affected.
  */
 export function authSetupContents(): string {
-  return `import { test as setup } from '@playwright/test';
+  return `import { test as setup } from './action-highlighter.js';
 import { mkdir, writeFile } from 'node:fs/promises';
 import { dirname } from 'node:path';
 
@@ -250,11 +464,20 @@ async function loginForm(page, email, password, loginUrl, path) {
   // Locale-aware matchers (English + common Slovak forms observed in the
   // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
   // i18n engine, just enough to not be English-only.
-  const emailField = fieldLocator(
+  //
+  // The login identifier field isn't always an email — plenty of real apps
+  // (this one included) label it plain "Username", with no "email" anywhere
+  // in the label, placeholder, or the input's name/id attributes either. An
+  // /e-?mail/i-only matcher then finds nothing at all and hangs for the full
+  // 60s test timeout with no selector-wait context, easily mistaken for an
+  // environment/target problem rather than a selector gap. Matching
+  // "username" (label/placeholder text) and the standards-based
+  // autocomplete="username" attribute alongside email covers both shapes.
+  const identifierField = fieldLocator(
     page,
-    /e-?mail/i,
-    /e-?mail/i,
-    'input[type="email"], input[name*="email" i], input[name*="user" i], input[id*="email" i]',
+    /e-?mail|user\\s*name/i,
+    /e-?mail|user\\s*name/i,
+    'input[type="email"], input[autocomplete="username"], input[name*="email" i], input[name*="user" i], input[id*="email" i], input[id*="user" i]',
   );
   const passwordField = fieldLocator(
     page,
@@ -265,18 +488,18 @@ async function loginForm(page, email, password, loginUrl, path) {
   const loginRevealRe = /prihl|sign in|log ?in/i;
 
   // Some apps gate the login form behind a reveal button/link (e.g. a
-  // "Prihlásiť sa" click before the email/password fields even render) —
+  // "Prihlásiť sa" click before the identifier/password fields even render) —
   // click through it before searching for the form.
-  const hasEmailField = await emailField
+  const hasIdentifierField = await identifierField
     .first()
     .isVisible()
     .catch(() => false);
-  if (!hasEmailField) {
+  if (!hasIdentifierField) {
     const reveal = await submitButtonLocator(page, loginRevealRe);
     await reveal.click({ timeout: 5000 }).catch(() => {});
   }
 
-  await emailField.first().fill(email);
+  await identifierField.first().fill(email);
   await passwordField.first().fill(password);
   const beforeUrl = page.url();
   const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue/i);
@@ -402,6 +625,183 @@ setup('authenticate', async ({ page, browser }) => {
 `;
 }
 
+/**
+ * Fixture wrapping @playwright/test's `test`/`page` with an auto-injected
+ * browser-side script that makes a recorded video actually show what a test
+ * is doing: a fake cursor, a highlight ring around whatever was just
+ * interacted with, and a floating banner naming the action. Generated specs
+ * import { test, expect } from here instead of '@playwright/test' directly —
+ * see generate.ts's ACTION_HIGHLIGHTER_IMPORT_PATH — so no changes are ever
+ * needed to how a spec calls page/locator methods.
+ *
+ * Deliberately NOT a wrapper around Playwright's click()/fill()/etc. — there's
+ * no supported way to intercept those (Locator isn't an exported class from
+ * '@playwright/test'). Instead it passively watches real DOM events
+ * (mousemove/pointerdown/focusin/scroll) that Playwright's own actions already
+ * dispatch in the page, so it reacts to whatever a spec does without needing
+ * to know how it did it.
+ *
+ * Adds NO artificial wait to the actual test run: the cursor/highlight/banner
+ * animate via CSS transitions the browser plays out in real wall-clock time
+ * while Playwright's script has already moved on to the next line — the
+ * video, which is a continuous capture independent of what the test script is
+ * doing, records them regardless.
+ */
+export function actionHighlighterFixtureContents(): string {
+  return `import { test as base, expect } from '@playwright/test';
+
+/**
+ * Healix-generated visual action highlighter. Injected into every page via
+ * addInitScript so it runs before any page script, on every navigation.
+ */
+function healixActionHighlighter() {
+  if (window.__healixHighlighterInstalled) return;
+  window.__healixHighlighterInstalled = true;
+
+  var STYLE_ID = '__healix_highlighter_style';
+  if (!document.getElementById(STYLE_ID)) {
+    var style = document.createElement('style');
+    style.id = STYLE_ID;
+    style.textContent =
+      '#__healix_cursor { position: fixed; width: 18px; height: 18px; border-radius: 50%;' +
+      ' background: rgba(255,90,90,0.85); border: 2px solid #fff; box-shadow: 0 0 6px rgba(0,0,0,0.5);' +
+      ' pointer-events: none; z-index: 2147483647; transition: left 100ms linear, top 100ms linear, opacity 150ms;' +
+      ' transform: translate(-50%, -50%); opacity: 0; }' +
+      '#__healix_banner { position: fixed; left: 50%; bottom: 24px; transform: translateX(-50%);' +
+      ' background: rgba(20,20,24,0.88); color: #fff; font: 13px/1.4 -apple-system,Segoe UI,Roboto,sans-serif;' +
+      ' padding: 6px 14px; border-radius: 999px; pointer-events: none; z-index: 2147483647;' +
+      ' opacity: 0; transition: opacity 200ms; white-space: nowrap; }' +
+      '#__healix_banner.show { opacity: 1; }' +
+      '.__healix_highlight { position: fixed; border: 2px solid #ff5a5a; border-radius: 4px;' +
+      ' box-shadow: 0 0 0 3px rgba(255,90,90,0.35); pointer-events: none; z-index: 2147483646;' +
+      ' opacity: 0; transition: opacity 200ms; }' +
+      '.__healix_highlight.show { opacity: 1; }';
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function ensureEl(id) {
+    var el = document.getElementById(id);
+    if (!el) {
+      el = document.createElement('div');
+      el.id = id;
+      (document.body || document.documentElement).appendChild(el);
+    }
+    return el;
+  }
+
+  function describe(el) {
+    if (!el || el.nodeType !== 1) return 'the page';
+    var tag = el.tagName.toLowerCase();
+    var label =
+      el.getAttribute('aria-label') ||
+      el.getAttribute('placeholder') ||
+      el.getAttribute('name') ||
+      (el.textContent || '').trim().slice(0, 40) ||
+      el.id ||
+      tag;
+    if (tag === 'input' || tag === 'textarea') return 'field "' + label + '"';
+    if (tag === 'select') return 'dropdown "' + label + '"';
+    if (tag === 'button' || el.getAttribute('role') === 'button') return 'button "' + label + '"';
+    if (tag === 'a') return 'link "' + label + '"';
+    return '"' + label + '"';
+  }
+
+  var bannerTimer = null;
+  function showBanner(text) {
+    var banner = ensureEl('__healix_banner');
+    banner.textContent = text;
+    banner.classList.add('show');
+    if (bannerTimer) clearTimeout(bannerTimer);
+    bannerTimer = setTimeout(function () {
+      banner.classList.remove('show');
+    }, 900);
+  }
+
+  var highlightPool = [];
+  function highlightElement(el) {
+    if (!el || el.nodeType !== 1 || typeof el.getBoundingClientRect !== 'function') return;
+    var rect = el.getBoundingClientRect();
+    var box = highlightPool.pop();
+    if (!box) {
+      box = document.createElement('div');
+      box.className = '__healix_highlight';
+      (document.body || document.documentElement).appendChild(box);
+    }
+    box.style.left = rect.left - 3 + 'px';
+    box.style.top = rect.top - 3 + 'px';
+    box.style.width = rect.width + 6 + 'px';
+    box.style.height = rect.height + 6 + 'px';
+    box.classList.add('show');
+    setTimeout(function () {
+      box.classList.remove('show');
+      setTimeout(function () {
+        highlightPool.push(box);
+      }, 250);
+    }, 500);
+  }
+
+  document.addEventListener(
+    'mousemove',
+    function (e) {
+      var cursor = ensureEl('__healix_cursor');
+      cursor.style.left = e.clientX + 'px';
+      cursor.style.top = e.clientY + 'px';
+      cursor.style.opacity = '1';
+    },
+    true,
+  );
+
+  document.addEventListener(
+    'pointerdown',
+    function (e) {
+      highlightElement(e.target);
+      var tag = ((e.target && e.target.tagName) || '').toLowerCase();
+      var verb = tag === 'a' ? 'Clicking' : tag === 'input' || tag === 'select' ? 'Interacting with' : 'Clicking';
+      showBanner(verb + ' ' + describe(e.target));
+    },
+    true,
+  );
+
+  document.addEventListener(
+    'focusin',
+    function (e) {
+      var tag = ((e.target && e.target.tagName) || '').toLowerCase();
+      if (tag !== 'input' && tag !== 'textarea' && tag !== 'select') return;
+      highlightElement(e.target);
+      showBanner('Typing into ' + describe(e.target));
+    },
+    true,
+  );
+
+  var scrollTimer = null;
+  document.addEventListener(
+    'scroll',
+    function () {
+      if (scrollTimer) return;
+      showBanner('Scrolling');
+      scrollTimer = setTimeout(function () {
+        scrollTimer = null;
+      }, 400);
+    },
+    true,
+  );
+
+  window.addEventListener('beforeunload', function () {
+    showBanner('Navigating…');
+  });
+}
+
+export const test = base.extend({
+  page: async ({ page }, use) => {
+    await page.addInitScript(healixActionHighlighter);
+    await use(page);
+  },
+});
+
+export { expect };
+`;
+}
+
 export interface MockRouteEntry {
   id: string;
   hostnames: string[];
@@ -424,7 +824,7 @@ export interface MockRouteEntry {
  */
 export function mockFixtureContents(routes: MockRouteEntry[]): string {
   const serialized = JSON.stringify(routes, null, 2);
-  return `import { test as base, expect } from '@playwright/test';
+  return `import { test as base, expect } from './action-highlighter.js';
 
 /**
  * Healix-generated mock fixture — intercepts network requests to detected

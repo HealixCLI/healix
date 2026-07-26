@@ -43,6 +43,12 @@ export interface RunOptions {
   autoApprove?: boolean;
   /** Optional PRD / acceptance-criteria text to ground generation. */
   prd?: string;
+  /** How the `prd` text was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
   /**
    * Freeform additional instructions from the user, steering HOW the plan is
    * built rather than describing WHAT the app does (that's the PRD's job) —
@@ -64,6 +70,52 @@ export interface RunOptions {
    * project's most recent 'passed' run.
    */
   baseRunId?: string;
+  /**
+   * Opt-in for the coverage feedback loop's ITERATIVE re-plan/generate/execute
+   * retry (see index.ts's "COVERAGE FEEDBACK LOOP" section) — off by default,
+   * since each iteration can add a full extra plan+generate+execute cycle (up
+   * to COVERAGE_MAX_ITERATIONS). Coverage is still MEASURED once regardless of
+   * this flag (the report always needs a real number to show); this only gates
+   * whether the loop retries to chase the target higher. No effect in 'reuse'
+   * mode, which never plans/generates at all.
+   */
+  coverageLoopEnabled?: boolean;
+  /**
+   * Overrides the coverage loop's target ratio (0-1) when coverageLoopEnabled
+   * is true. Defaults to FRESH_COVERAGE_TARGET/TOPUP_COVERAGE_TARGET (coverage.ts)
+   * per suiteMode when omitted.
+   */
+  coverageTarget?: number;
+  /**
+   * Targeted regeneration for results-page "Retry-pass"/"Repair" actions:
+   * when set (requires suiteMode 'topup' and a resolvable base run), planning
+   * skips AI entirely and reuses ONLY the base run's plan items whose id is
+   * in this list, instead of the full re-plan. Generation's existing
+   * base-run diff (topup.ts's diffAgainstBase) then naturally regenerates
+   * just those items and carries everything else forward untouched. Ids that
+   * don't match anything in the base plan are silently ignored; if none
+   * match at all, falls back to a full re-plan.
+   */
+  retryItemIds?: string[];
+  /**
+   * Proactive spend ceiling(s) for this run's AI usage. Checked after every
+   * recorded usage row (plan/gap-fill plan, generate, triage); once running
+   * cost/tokens for the run reaches either configured limit, the run pauses
+   * cleanly (pauseReason: 'budget-exceeded') before its next PLAN/GENERATE/
+   * TRIAGE dispatch — the same clean checkpoint-and-stop path a manual pause
+   * uses — rather than continuing to spend unbounded. Either knob alone is
+   * enough to trip the ceiling; omit both to run with no ceiling (default).
+   */
+  maxCostUsd?: number;
+  /** Combined input+output token ceiling — see maxCostUsd. */
+  maxTokens?: number;
+  /**
+   * Overrides EXPLORE's crawl budget (see browser/crawler.ts's CrawlOptions) for this run —
+   * `maxRoutes` (default 60) and/or `wallClockBudgetMs` (default 120_000). Either can be set
+   * independently; omit both to use the crawler's own defaults. Useful for a larger app whose
+   * real route-cluster count exceeds the default cap.
+   */
+  crawlBudget?: { maxRoutes?: number; wallClockBudgetMs?: number };
   /**
    * Cooperative cancellation. When aborted, the run stops at the next phase
    * boundary (and in-flight provider/suite work is killed), the run row is

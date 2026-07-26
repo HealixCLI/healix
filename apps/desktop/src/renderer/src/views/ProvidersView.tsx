@@ -1,13 +1,38 @@
 import * as React from 'react';
 import { useCallback, useEffect, useState } from 'react';
-import type { DoctorReport, HealthResult, ProviderId } from '@healix/core';
+import type {
+  ClaudeEffort,
+  ClaudeModel,
+  DoctorReport,
+  HealthResult,
+  ModelEffortConfig,
+  ModelEffortOverrides,
+  ProviderId,
+} from '@healix/core';
 import { Activity, Cpu, Database, FolderOpen, LogIn, RefreshCw } from 'lucide-react';
 import { Button } from '../components/ui/button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/card';
 import { Badge, type BadgeTone } from '../components/ui/badge';
+import { Select } from '../components/ui/select';
 import { cn, formatRelativeTime } from '../lib/utils';
 
 type Provider = HealthResult;
+
+const CLAUDE_MODELS: ClaudeModel[] = ['fable', 'opus', 'sonnet', 'haiku'];
+const CLAUDE_EFFORTS: ClaudeEffort[] = ['low', 'medium', 'high', 'xhigh', 'max'];
+
+const TASK_LABELS: Record<keyof ModelEffortConfig, string> = {
+  'plan-generate': 'Test plan generation',
+  'plan-gapfill': 'Coverage gap-fill planning',
+  'plan-revise-item': 'Single test-item revision',
+  codegen: 'Spec code generation',
+  'mock-response': 'Mock response generation',
+  triage: 'Failure triage/analysis',
+  'triage-summary': 'End-of-run failure grouping summary',
+  'health-probe': 'Health probe (auth check)',
+};
+
+const TASK_ORDER = Object.keys(TASK_LABELS) as (keyof ModelEffortConfig)[];
 
 interface Override {
   health: HealthResult;
@@ -69,6 +94,39 @@ export function ProvidersView() {
   const [connect, setConnect] = useState<Partial<Record<ProviderId, ConnectState>>>({});
   const [busy, setBusy] = useState<Partial<Record<ProviderId, 'login' | 'recheck'>>>({});
   const [error, setError] = useState<string | null>(null);
+
+  // Per-task-type Claude model/effort selections (Settings page) — "last
+  // used": every change is saved immediately via setModelConfig and read back
+  // verbatim on restart. `modelOverrides` only ever holds the tasks the user
+  // has actually touched; anything absent falls back to `modelDefaults` (the
+  // recommended seed) — see model-config.ts's resolveModelAndEffort.
+  const [modelDefaults, setModelDefaults] = useState<ModelEffortConfig | null>(null);
+  const [modelOverrides, setModelOverrides] = useState<ModelEffortOverrides>({});
+  // Task whose change most recently finished saving — drives a brief "Saved" flash.
+  const [savedTask, setSavedTask] = useState<keyof ModelEffortConfig | null>(null);
+
+  useEffect(() => {
+    void window.healix.getModelConfig().then(({ defaults, overrides }) => {
+      setModelDefaults(defaults);
+      setModelOverrides(overrides);
+    });
+  }, []);
+
+  const setTaskOverride = useCallback(
+    (task: keyof ModelEffortConfig, field: 'model' | 'effort', value: string) => {
+      const current = { ...modelOverrides[task], [field]: value as ClaudeModel & ClaudeEffort };
+      const next = { ...modelOverrides, [task]: current };
+      setModelOverrides(next);
+      void window.healix
+        .setModelConfig(next)
+        .then(() => {
+          setSavedTask(task);
+          setTimeout(() => setSavedTask((t) => (t === task ? null : t)), 1500);
+        })
+        .catch((err) => setError(err instanceof Error ? err.message : String(err)));
+    },
+    [modelOverrides],
+  );
 
   const updateOverrides = useCallback(
     (updater: (prev: Partial<Record<ProviderId, Override>>) => Partial<Record<ProviderId, Override>>) => {
@@ -291,6 +349,56 @@ export function ProvidersView() {
                         ? 'Complete login in the opened terminal, then Re-check.'
                         : (conn.detail ?? 'Could not launch the login flow.')}
                     </p>
+                  )}
+
+                  {p.provider === 'claude' && modelDefaults && (
+                    <div className="mt-4 border-t border-border pt-4">
+                      <h3 className="text-xs font-semibold text-muted">Model / effort per task</h3>
+                      <p className="mt-1 text-[11px] leading-relaxed text-muted">
+                        Changes save immediately and persist across restarts.
+                      </p>
+                      <div className="mt-3 flex flex-col gap-2">
+                        {TASK_ORDER.map((task) => {
+                          const def = modelDefaults[task];
+                          const override = modelOverrides[task];
+                          const currentModel = override?.model ?? def.model;
+                          const currentEffort = override?.effort ?? def.effort;
+                          return (
+                            <div
+                              key={task}
+                              className="grid grid-cols-[1fr_auto_auto_auto] items-center gap-2"
+                            >
+                              <span className="text-xs text-fg">{TASK_LABELS[task]}</span>
+                              <Select
+                                className="h-8 w-28 text-xs"
+                                value={currentModel}
+                                onChange={(e) => setTaskOverride(task, 'model', e.target.value)}
+                              >
+                                {CLAUDE_MODELS.map((m) => (
+                                  <option key={m} value={m}>
+                                    {m[0]!.toUpperCase() + m.slice(1)}
+                                  </option>
+                                ))}
+                              </Select>
+                              <Select
+                                className="h-8 w-28 text-xs"
+                                value={currentEffort}
+                                onChange={(e) => setTaskOverride(task, 'effort', e.target.value)}
+                              >
+                                {CLAUDE_EFFORTS.map((ef) => (
+                                  <option key={ef} value={ef}>
+                                    {ef[0]!.toUpperCase() + ef.slice(1)}
+                                  </option>
+                                ))}
+                              </Select>
+                              <span className="w-10 text-[10px] text-ok">
+                                {savedTask === task ? 'Saved' : ''}
+                              </span>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </div>
                   )}
                 </CardContent>
               </Card>

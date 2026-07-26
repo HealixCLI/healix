@@ -2,6 +2,8 @@
 import type {
   DoctorReport,
   HealthResult,
+  ModelEffortConfig,
+  ModelEffortOverrides,
   PlanApprovalResult,
   Project,
   NewProject,
@@ -10,11 +12,14 @@ import type {
   RunSummary,
   SuiteBundle,
   TestPlanItem,
+  UsageAggregate,
 } from '@healix/core';
 import type {
   ActiveRunSnapshot,
+  ExtractPrdSheetsResult,
   PickPrdFileResult,
   PickRepoPathResult,
+  PreviewPrdSheetsResult,
   ProviderLoginResult,
   ProviderSummary,
   QueuedRunSummary,
@@ -24,6 +29,7 @@ import type {
   StartRunResult,
   RunChannelMessage,
   SuiteDiffSummary,
+  GenerationGapItem,
   TestCaseHistory,
   ProjectMetrics,
 } from './lib/ipc-types';
@@ -70,6 +76,8 @@ export interface HealixBridge {
 
   // ---- PRD file upload ----
   pickPrdFile: () => Promise<PickPrdFileResult>;
+  previewPrdSheets: (filePath: string) => Promise<PreviewPrdSheetsResult>;
+  extractPrdSheets: (filePath: string, selectedSheetNames: string[]) => Promise<ExtractPrdSheetsResult>;
 
   // ---- repo path folder picker ----
   pickRepoPath: () => Promise<PickRepoPathResult>;
@@ -78,14 +86,21 @@ export interface HealixBridge {
   providerLogin: (id: ProviderId) => Promise<ProviderLoginResult>;
   providerHealth: (id: ProviderId, probe?: boolean) => Promise<HealthResult>;
 
+  // ---- Claude per-task-type model/effort config (Settings page) ----
+  getModelConfig: () => Promise<{ defaults: ModelEffortConfig; overrides: ModelEffortOverrides }>;
+  setModelConfig: (overrides: ModelEffortOverrides) => Promise<{ ok: true }>;
+
   // ---- run history ----
   listRuns: (projectId?: string) => Promise<Run[]>;
   runDetail: (runId: string) => Promise<RunDetail>;
   deleteRun: (runId: string) => Promise<{ ok: true; assetsRemoved: boolean }>;
   lastSuccessfulRun: (projectId: string) => Promise<Run | null>;
   suiteDiff: (runId: string) => Promise<SuiteDiffSummary | null>;
+  generationGaps: (runId: string) => Promise<GenerationGapItem[]>;
+  repairCandidates: (runId: string) => Promise<GenerationGapItem[]>;
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) => Promise<TestCaseHistory>;
   projectMetrics: (projectId: string) => Promise<ProjectMetrics | null>;
+  usageCrossRun: (projectId?: string) => Promise<UsageAggregate>;
 
   onRunEvent: (cb: (msg: RunChannelMessage) => void) => () => void;
 }

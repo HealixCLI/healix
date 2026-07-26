@@ -15,12 +15,17 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
-vi.mock('node:child_process', async (importOriginal) => {
-  const actual = await importOriginal<typeof import('node:child_process')>();
-  return { ...actual, spawn: vi.fn(actual.spawn) };
+// execute.ts (which validate.ts's runCommand delegates to) spawns via
+// cross-spawn, not node:child_process directly — see execute.test.ts.
+vi.mock('cross-spawn', async (importOriginal) => {
+  // cross-spawn's .d.ts uses `export =`, so the static type has no `.default`
+  // even though the real module — accessed here via Vite/Node ESM interop —
+  // does; cast narrowly to the shape actually needed instead of `as any`.
+  const actual = (await importOriginal()) as { default: (...args: never[]) => unknown };
+  return { ...actual, default: vi.fn(actual.default) };
 });
 
-import { spawn } from 'node:child_process';
+import spawn from 'cross-spawn';
 import type { GeneratedSpec, TestModeContext } from '../types.js';
 import { attemptBracketRepair, validateSuite } from './validate.js';
 

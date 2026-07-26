@@ -16,6 +16,8 @@ import {
 } from 'electron';
 import mammoth from 'mammoth';
 import pdfParse from 'pdf-parse';
+import { extractSheets, previewSheets, type SheetPreview } from './spreadsheet.js';
+import { matchGenerationGaps, matchRepairCandidates, type GenerationGapItem } from './repair-candidates.js';
 import {
   doctor,
   ProviderRouter,
@@ -40,8 +42,7 @@ import {
   type PlanApprovalResult,
   type RunSummary,
   type Run,
-  type PauseReason,
-  readCheckpoint,
+  reconcileRuns,
   readRunConfigSnapshot,
   type RunConfigSnapshot,
   type SuiteMode,
@@ -49,6 +50,13 @@ import {
   type TestResult,
   type AgentEvent,
   type HealthResult,
+  DEFAULT_MODEL_CONFIG,
+  readModelConfigOverrides,
+  writeModelConfigOverrides,
+  type ModelEffortConfig,
+  type ModelEffortOverrides,
+  type UsageRow,
+  type UsageAggregate,
 } from '@healix/core';
 
 // Last-resort net: every ipcMain handler already catches its own errors and
@@ -87,7 +95,14 @@ function artifactRequestPath(rawUrl: string): string | null {
   // Windows: "/C:\foo" → "C:\foo".
   const abs = resolve(decoded.replace(/^\/([A-Za-z]:)/, '$1'));
   const root = resolve(projectsDir());
-  if (abs !== root && !abs.startsWith(root + sep)) return null;
+  // Windows filesystems are case-insensitive, but this is a plain string
+  // comparison — without normalizing case here, a containment check can
+  // fail (and silently 403 an otherwise-legitimate artifact) whenever the
+  // drive letter or a path segment's case differs from projectsDir()'s own
+  // resolved casing, which shows up as one artifact rendering fine and an
+  // otherwise-identical one appearing broken for no visible reason.
+  const cmp = process.platform === 'win32' ? (s: string) => s.toLowerCase() : (s: string) => s;
+  if (cmp(abs) !== cmp(root) && !cmp(abs).startsWith(cmp(root) + sep)) return null;
   return abs;
 }
 
@@ -96,7 +111,19 @@ function registerArtifactProtocol(): void {
     const abs = artifactRequestPath(request.url);
     if (!abs) return new Response('Not allowed', { status: 403 });
     try {
-      return await net.fetch(pathToFileURL(abs).toString());
+      // Forward the incoming Range header (sent by <video> for seeking, and
+      // by Chromium's own metadata-preload probe even before playback starts)
+      // through to the file:// fetch. Without it, every request — ranged or
+      // not — got the FULL file back with a 200, which a <video> element
+      // that asked for a byte range doesn't accept as valid: seeking breaks,
+      // and some files fail to decode at all and render as "corrupted"/black.
+      // Chromium's own file:// loader (which net.fetch uses under the hood)
+      // already knows how to answer a Range request correctly — it just
+      // needs the header passed through.
+      const range = request.headers.get('range');
+      return await net.fetch(pathToFileURL(abs).toString(), {
+        headers: range ? { Range: range } : undefined,
+      });
     } catch {
       return new Response('Not found', { status: 404 });
     }
@@ -354,10 +381,22 @@ export interface StartRunArgs {
    * distinct from the PRD, which describes WHAT the app does.
    */
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
   /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
   baseRunId?: string;
+  /** Opt-in for the coverage feedback loop's iterative re-plan/generate/execute retry — off by default. */
+  coverageLoopEnabled?: boolean;
+  /** Overrides the coverage loop's target ratio (0-1) when coverageLoopEnabled is true. */
+  coverageTarget?: number;
+  /** Targeted regeneration for the results-page Retry-pass/Repair actions — see RunOptions.retryItemIds. */
+  retryItemIds?: string[];
 }
 
 /**
@@ -384,8 +423,14 @@ async function executeRun(args: StartRunArgs, sender: WebContents): Promise<RunS
         autoApprove: args.autoApprove ?? false,
         prd: args.prd,
         instructions: args.instructions,
+        prdSourceKind: args.prdSourceKind,
+        prdFileName: args.prdFileName,
+        prdSelectedSheets: args.prdSelectedSheets,
         suiteMode: args.suiteMode,
         baseRunId: args.baseRunId,
+        coverageLoopEnabled: args.coverageLoopEnabled,
+        coverageTarget: args.coverageTarget,
+        retryItemIds: args.retryItemIds,
         signal: controller.signal,
       },
       {
@@ -769,16 +814,44 @@ ipcMain.handle('shell:showItem', (_e, target: string): { ok: boolean } => {
 
 // ---- PRD file upload (native file picker + text extraction) ----
 
-const PRD_FILE_FILTERS = [{ name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] }];
+const PRD_FILE_FILTERS = [
+  { name: 'All PRD files', extensions: ['pdf', 'doc', 'docx', 'md', 'txt', 'xlsx', 'xls', 'csv'] },
+  { name: 'PRD documents', extensions: ['pdf', 'doc', 'docx', 'md', 'txt'] },
+  { name: 'Spreadsheets', extensions: ['xlsx', 'xls', 'csv'] },
+];
+
+const SPREADSHEET_EXTENSIONS = new Set(['.xlsx', '.xls', '.csv']);
 
 export interface PickPrdFileResult {
   canceled: boolean;
   fileName?: string;
   text?: string;
   error?: string;
+  /** True only when the workbook has more than one non-empty sheet and the renderer must show a picker. */
+  needsSheetPicker?: boolean;
+  /** Present alongside needsSheetPicker so the renderer's follow-up extractPrdSheets call knows which file to reread. */
+  filePath?: string;
+  /** Preview of every non-empty sheet, present alongside needsSheetPicker. */
+  sheets?: SheetPreview[];
+  /** Present when text came from a spreadsheet (single-sheet fast path or after picker selection). */
+  sourceKind?: 'file' | 'spreadsheet';
+  selectedSheets?: string[];
+  /** Non-fatal notes (e.g. row-cap truncation) — distinct from `error`, which means the upload failed outright. */
+  warnings?: string[];
 }
 
-/** Extract plain text from an uploaded PRD file, used verbatim as acceptance criteria. */
+export interface PreviewPrdSheetsResult {
+  sheets?: SheetPreview[];
+  error?: string;
+}
+
+export interface ExtractPrdSheetsResult {
+  sheets?: { name: string; content: string }[];
+  warnings?: string[];
+  error?: string;
+}
+
+/** Extract plain text from an uploaded prose PRD file, used verbatim as acceptance criteria. */
 async function extractPrdText(filePath: string): Promise<string> {
   const ext = extname(filePath).toLowerCase();
   switch (ext) {
@@ -798,6 +871,11 @@ async function extractPrdText(filePath: string): Promise<string> {
   }
 }
 
+/** Joins extracted sheets into one PRD-ready string, labeling each under its own heading. */
+function joinSheetsAsPrd(sheets: { name: string; content: string }[]): string {
+  return sheets.map((s) => `--- Sheet: ${s.name} ---\n${s.content}`).join('\n\n');
+}
+
 ipcMain.handle('dialog:pickPrdFile', async (event: IpcMainInvokeEvent): Promise<PickPrdFileResult> => {
   const win = BrowserWindow.fromWebContents(event.sender);
   const picked = win
@@ -807,13 +885,68 @@ ipcMain.handle('dialog:pickPrdFile', async (event: IpcMainInvokeEvent): Promise<
 
   const filePath = picked.filePaths[0];
   const fileName = filePath.split(/[\\/]/).pop() ?? filePath;
+  const ext = extname(filePath).toLowerCase();
+
+  if (SPREADSHEET_EXTENSIONS.has(ext)) {
+    try {
+      const sheets = await previewSheets(filePath);
+      if (sheets.length === 0) {
+        return { canceled: false, fileName, error: 'This file has no data to import.' };
+      }
+      if (sheets.length === 1) {
+        // A CSV can never have more than one sheet, and a single-sheet workbook
+        // doesn't need a picker either — go straight through, same shape as the
+        // existing prose-file path.
+        const { sheets: extracted, warnings } = await extractSheets(filePath, [sheets[0].name]);
+        return {
+          canceled: false,
+          fileName,
+          text: joinSheetsAsPrd(extracted),
+          sourceKind: 'spreadsheet',
+          selectedSheets: [sheets[0].name],
+          warnings: warnings.length > 0 ? warnings : undefined,
+        };
+      }
+      return { canceled: false, fileName, filePath, needsSheetPicker: true, sheets };
+    } catch (err) {
+      return { canceled: false, fileName, error: errMsg(err) };
+    }
+  }
+
   try {
     const text = (await extractPrdText(filePath)).trim();
-    return { canceled: false, fileName, text };
+    return { canceled: false, fileName, text, sourceKind: 'file' };
   } catch (err) {
     return { canceled: false, fileName, error: errMsg(err) };
   }
 });
+
+ipcMain.handle(
+  'dialog:previewPrdSheets',
+  async (_event: IpcMainInvokeEvent, filePath: string): Promise<PreviewPrdSheetsResult> => {
+    try {
+      return { sheets: await previewSheets(filePath) };
+    } catch (err) {
+      return { error: errMsg(err) };
+    }
+  },
+);
+
+ipcMain.handle(
+  'dialog:extractPrdSheets',
+  async (
+    _event: IpcMainInvokeEvent,
+    filePath: string,
+    selectedSheetNames: string[],
+  ): Promise<ExtractPrdSheetsResult> => {
+    try {
+      const { sheets, warnings } = await extractSheets(filePath, selectedSheetNames);
+      return { sheets, warnings };
+    } catch (err) {
+      return { error: errMsg(err) };
+    }
+  },
+);
 
 // ---- Repo path folder picker (Project create/edit form) ----
 
@@ -916,6 +1049,24 @@ ipcMain.handle(
   },
 );
 
+// ---- Claude per-task-type model/effort config (Settings page) ----
+
+ipcMain.handle(
+  'settings:getModelConfig',
+  async (): Promise<{ defaults: ModelEffortConfig; overrides: ModelEffortOverrides }> => {
+    const overrides = (await readModelConfigOverrides()) ?? {};
+    return { defaults: DEFAULT_MODEL_CONFIG, overrides };
+  },
+);
+
+ipcMain.handle(
+  'settings:setModelConfig',
+  async (_e, overrides: ModelEffortOverrides): Promise<{ ok: true }> => {
+    await writeModelConfigOverrides(overrides ?? {});
+    return { ok: true };
+  },
+);
+
 // ---- Runs: list + detail (read from store + on-disk run artifacts) ----
 
 /**
@@ -953,6 +1104,8 @@ export interface RunDetail {
    * (a run from before this feature existed, or the write failed).
    */
   runConfig: RunConfigSnapshot | null;
+  /** Per-call token/cost usage captured during this run (plan/generate/triage) — feeds the Usage tab. */
+  usage: UsageRow[];
 }
 
 ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<RunDetail> => {
@@ -967,6 +1120,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     reportHtmlPath: null,
     plan: null,
     runConfig: null,
+    usage: [],
   };
   const runId = payload?.runId;
   if (!runId) return empty;
@@ -979,6 +1133,7 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
   let tests: TestCase[] = [];
   let results: TestResult[] = [];
   let events: AgentEvent[] = [];
+  let usage: UsageRow[] = [];
   try {
     run = store.getRun(runId);
   } catch {
@@ -998,6 +1153,11 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     events = store.listEvents(runId);
   } catch {
     events = [];
+  }
+  try {
+    usage = store.listUsageForRun(runId);
+  } catch {
+    usage = [];
   }
 
   // On-disk artifacts live under <projectsDir>/<projectId>/runs/<runId>/...
@@ -1021,8 +1181,23 @@ ipcMain.handle('runs:detail', async (_e, payload: { runId: string }): Promise<Ru
     runConfig = await readRunConfigSnapshot(runDir);
   }
 
-  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan, runConfig };
+  return { run, tests, results, events, report, suiteDir, artifacts, reportHtmlPath, plan, runConfig, usage };
 });
+
+/** Cross-run usage aggregation for the Reports/Usage page — omit projectId for every project. */
+ipcMain.handle(
+  'usage:crossRun',
+  async (_e, payload: { projectId?: string } | undefined): Promise<UsageAggregate> => {
+    const empty: UsageAggregate = { perRun: [], perPhase: [], perModel: [] };
+    const store = await getStore();
+    if (!store) return empty;
+    try {
+      return store.getUsageAggregate({ projectId: payload?.projectId });
+    } catch {
+      return empty;
+    }
+  },
+);
 
 /** Most recent fully-passed run for a project — drives the Suite Mode toggle's enable/disable state. */
 ipcMain.handle('runs:lastSuccessful', async (_e, payload: { projectId: string }): Promise<Run | null> => {
@@ -1081,6 +1256,60 @@ ipcMain.handle('runs:suiteDiff', async (_e, payload: { runId: string }): Promise
 
   return { runId: run.id, baseRunId: run.baseRunId, addedCount, carriedCount, removedCount, totalCount };
 });
+
+/**
+ * Plan items from this run's OWN plan.json that either never got a matching
+ * test row (generation silently dropped) or never got EXECUTED (a spec was
+ * generated but the run errored out before its result was recorded — see
+ * matchGenerationGaps's doc comment for the full 'pending'-status
+ * reasoning). Feeds the results-page Retry-pass button. See
+ * matchGenerationGaps (repair-candidates.js) for why this matches by
+ * id/reqTag directly rather than via topup.ts's diffAgainstBase.
+ */
+ipcMain.handle(
+  'runs:generationGaps',
+  async (_e, payload: { runId: string }): Promise<GenerationGapItem[]> => {
+    const store = await getStore();
+    if (!store || !payload?.runId) return [];
+    const run = store.getRun(payload.runId);
+    if (!run) return [];
+
+    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
+    const plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
+    if (!plan || plan.items.length === 0) return [];
+
+    return matchGenerationGaps(plan, store.listTests(run.id));
+  },
+);
+
+/**
+ * Plan items from this run whose test was triaged 'test_is_wrong' — feeds
+ * the results-page Repair button, which reuses Retry-pass's exact
+ * retryItemIds mechanism with this as its candidate source.
+ */
+ipcMain.handle(
+  'runs:repairCandidates',
+  async (_e, payload: { runId: string }): Promise<GenerationGapItem[]> => {
+    const store = await getStore();
+    if (!store || !payload?.runId) return [];
+    const run = store.getRun(payload.runId);
+    if (!run) return [];
+
+    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
+    const plan = (await readJsonIfExists(join(runDir, 'plan', 'plan.json'))) as TestPlan | null;
+    if (!plan || plan.items.length === 0) return [];
+
+    const wrongTestIds = new Set(
+      store
+        .listTriageResults(run.id)
+        .filter((t) => t.verdict === 'test_is_wrong')
+        .map((t) => t.testId),
+    );
+    if (wrongTestIds.size === 0) return [];
+
+    return matchRepairCandidates(plan, store.listTests(run.id), wrongTestIds);
+  },
+);
 
 /**
  * Delete a single historical run: its DB rows (tests/results/agent_events,
@@ -1380,33 +1609,15 @@ async function reconcileRunsOnBoot(): Promise<void> {
   const store = await getStore();
   if (!store) return;
 
-  const toResume: Run[] = [...store.listAutoResumableRuns()];
-  let failedNow = 0;
-  for (const run of store.listInFlightRuns()) {
-    const runDir = join(projectsDir(), run.projectId, 'runs', run.id);
-    const checkpoint = await readCheckpoint(runDir);
-    if (!checkpoint) {
-      store.updateRunStatus(run.id, 'error', { finishedAt: new Date().toISOString() });
-      try {
-        store.appendEvent(
-          run.id,
-          'done',
-          'Run interrupted (app closed or crashed) before any checkpoint existed — nothing to resume from.',
-          { level: 'error' },
-        );
-      } catch {
-        /* best-effort */
-      }
-      failedNow += 1;
-      continue;
-    }
-    const pauseReason: PauseReason = 'crashed';
-    store.updateRunStatus(run.id, 'paused', { pauseReason, finishedAt: new Date().toISOString() });
-    toResume.push({ ...run, status: 'paused', pauseReason });
-  }
-  if (failedNow > 0) {
+  // The "figure out what needs attention" half now lives in @healix/core (see
+  // reconcileRuns's doc comment) so the CLI can run the exact same
+  // reconciliation — this function keeps only the desktop-specific half:
+  // actually driving each returned run through resume(), broadcast over IPC,
+  // and respecting the single-active-run queue.
+  const { toResume, markedError, orphansReaped } = await reconcileRuns(store);
+  if (markedError > 0) {
     console.log(
-      `[healix] boot: marked ${failedNow} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
+      `[healix] boot: marked ${markedError} uncheckpointed in-flight run(s) as error (nothing to resume from).`,
     );
   }
 
@@ -1430,15 +1641,7 @@ async function reconcileRunsOnBoot(): Promise<void> {
   // with the NEXT boot-time resume, reintroducing the same bug in a new spot.
   if (toResume.length > 0) void startNextQueued();
 
-  // Fallback janitor for anything the pass above didn't touch (e.g. storage
-  // was briefly unavailable) — still age-buffered (default 6h) so it never
-  // reaps a run genuinely still in flight in another process (e.g. the CLI).
-  try {
-    const reaped = store.failOrphanedRuns();
-    if (reaped > 0) console.log(`[healix] janitor: marked ${reaped} orphaned run(s) as error`);
-  } catch {
-    /* best-effort */
-  }
+  if (orphansReaped > 0) console.log(`[healix] janitor: marked ${orphansReaped} orphaned run(s) as error`);
 }
 
 app.whenReady().then(() => {

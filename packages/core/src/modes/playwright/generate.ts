@@ -1,4 +1,4 @@
-import { mkdir, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
@@ -281,9 +281,20 @@ export function findForbiddenApis(source: string, extraAllowedImport?: string): 
  * Relative import path (constant across all specs, which always land two
  * directories deep at tests/<tier>/<slug>.spec.ts) to the Healix-authored mock
  * fixture — see scaffold.ts's mockFixtureContents(). Used in place of
- * '@playwright/test' when mocking is enabled for the run.
+ * ACTION_HIGHLIGHTER_IMPORT_PATH when mocking is enabled for the run (the mock
+ * fixture itself chains on top of the highlighter, so both are always active).
  */
 export const MOCK_FIXTURE_IMPORT_PATH = '../../fixtures/mock.fixture';
+
+/**
+ * Relative import path to the Healix-authored action-highlighter fixture —
+ * see templates.ts's actionHighlighterFixtureContents(). This is the DEFAULT
+ * import source for every generated spec (mocking-enabled runs use
+ * MOCK_FIXTURE_IMPORT_PATH instead, which itself imports from here) — no spec
+ * ever imports '@playwright/test' directly anymore, so every recorded video
+ * gets the visual action highlighter regardless of mocking.
+ */
+export const ACTION_HIGHLIGHTER_IMPORT_PATH = '../../fixtures/action-highlighter';
 
 export function looksLikePlaywrightSpec(source: string, extraAllowedImport?: string): boolean {
   const importsTest =
@@ -396,6 +407,16 @@ export interface GroundTruth {
   hasEndpointLevelMocks: boolean;
   /** true when selectInventoryElements() had to omit elements for length — can't prove a selector's absence against an incomplete inventory */
   inventoryTruncated: boolean;
+  /**
+   * lowercased CSS attribute name -> observed value(s) for that attribute, seen anywhere in the
+   * selected inventory (see GAP-047). Populated from two sources: (1) attr="value" fragments
+   * embedded in a selectorFor()-style selector string (tier-1/2 selectors already look like
+   * `input[name="firstName"]`), and (2) each input element's own `type` attribute (via
+   * InteractiveElement.inputType), which is known regardless of which selector tier was chosen —
+   * a selector referencing a real native `type="email"` shouldn't warn just because the id-based
+   * selector path never surfaced `type` textually.
+   */
+  attributes: Map<string, Set<string>>;
 }
 
 /** Pull a `data-testid="..."` (or `data-test="..."`) value out of a selectorFor()-style CSS selector string, if present. */
@@ -404,21 +425,38 @@ function extractTestidFromSelector(selector: string): string | null {
   return m ? m[1] : null;
 }
 
+/** attr="value" / attr='value' fragments embedded in a selectorFor()-style CSS selector string (e.g. `input[name="firstName"]`). */
+const SELECTOR_ATTR_FRAGMENT_RE = /([\w-]+)=["']([^"']+)["']/g;
+
+/** Record an observed (attr, value) pair into a GroundTruth.attributes-shaped map, lowercasing the attribute name for case-insensitive lookup. */
+function addObservedAttribute(attributes: Map<string, Set<string>>, attr: string, value: string): void {
+  const key = attr.toLowerCase();
+  const values = attributes.get(key) ?? new Set<string>();
+  values.add(value);
+  attributes.set(key, values);
+}
+
 /**
  * Build the ground-truth the grounding-validation gate checks a generated spec against.
- * MUST read from the same selectInventoryElements() the model was actually shown (see that
- * function's doc comment) — otherwise this gate could reject a selector the model never had
- * the option to use. Endpoint ground truth is separate: dependency-level (endpoint-less)
- * mocks don't produce a comparable (method, path) pair, so `hasEndpointLevelMocks` tracks
- * whether a real comparison is even possible for this run.
+ * MUST read from the same selectInventoryElements() the model was actually shown, WITH the same
+ * `item` (see that function's doc comment) — otherwise this gate could reject a selector the
+ * model never had the option to use. Endpoint ground truth is separate: dependency-level
+ * (endpoint-less) mocks don't produce a comparable (method, path) pair, so
+ * `hasEndpointLevelMocks` tracks whether a real comparison is even possible for this run.
  */
-export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTruth {
-  const { selected, truncated } = selectInventoryElements(ctx, tier);
+export function collectGroundTruth(
+  ctx: TestModeContext,
+  tier: Tier,
+  item?: TestPlanItem,
+  opts?: InventoryOpts,
+): GroundTruth {
+  const { selected, truncated } = selectInventoryElements(ctx, tier, item, opts);
 
   const testids = new Set<string>();
   const selectors = new Set<string>();
   const names: string[] = [];
   const roleByName = new Map<string, Set<string>>();
+  const attributes = new Map<string, Set<string>>();
   for (const { el } of selected) {
     selectors.add(el.selector);
     const testid = extractTestidFromSelector(el.selector);
@@ -430,6 +468,10 @@ export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTrut
       roles.add(el.role);
       roleByName.set(lname, roles);
     }
+    for (const m of el.selector.matchAll(SELECTOR_ATTR_FRAGMENT_RE)) {
+      addObservedAttribute(attributes, m[1]!, m[2]!);
+    }
+    if (el.inputType) addObservedAttribute(attributes, 'type', el.inputType);
   }
 
   const endpoints: Array<{ method: string; pathPattern: string }> = [];
@@ -456,11 +498,14 @@ export function collectGroundTruth(ctx: TestModeContext, tier: Tier): GroundTrut
     endpoints,
     hasEndpointLevelMocks,
     inventoryTruncated: truncated,
+    attributes,
   };
 }
 
 const TESTID_CALL_RE = /getByTestId\(\s*['"]([^'"]+)['"]\s*\)/g;
 const TESTID_ATTR_RE = /data-test(?:id)?=["']([^"']+)["']/g;
+/** Matches a CSS attribute-selector fragment inside a `page.locator(...)`-style string, e.g. `input[name="firstName"]` or `[type='email']`. Excludes `data-testid`/`data-test`, which are already hard-checked via TESTID_ATTR_RE — see GAP-047. */
+const CSS_ATTR_SELECTOR_RE = /\[([\w-]+)=["']([^"']+)["']\]/g;
 const ROLE_CALL_RE =
   /getByRole\(\s*['"](\w+)['"]\s*(?:,\s*\{[^}]*name:\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]+)['"]))?/g;
 const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
@@ -560,6 +605,9 @@ function findObservedEndpoint(
  *     HARD/WARN split as data-testid. Only covers text that lives on an interactive element;
  *     free-standing copy (banners, profile fields) isn't in the inventory at all and so never
  *     produces a HARD finding here — it's unproven, not confirmed grounded.
+ *   - generic CSS attribute selectors (`input[name="firstName"]`, `[type="email"]`) not matching
+ *     any observed (attr, value) pair (see GAP-047): WARN always — attribute selectors are more
+ *     guessable/coincidentally-correct than a testid, so this never hard-fails.
  * A `// TODO: unobserved element` marker anywhere in the source (the sanctioned ESCAPE HATCH,
  * see formatSnapshotInventory) downgrades every hard finding in this spec to a warning — an
  * acknowledged, intentional gap isn't the same defect as a silent fabrication.
@@ -614,6 +662,21 @@ export function findUngroundedReferences(
     else warn.push(label);
   }
 
+  // Generic CSS attribute selectors (`input[name="firstName"]`, `[type="email"]`) — see GAP-047.
+  // `data-testid`/`data-test` are skipped here since they're already hard-checked above; checking
+  // them again against `gt.attributes` would just double-report the same fabrication. Always
+  // WARN, never HARD: an attribute selector is inherently more guessable/coincidentally-correct
+  // than a testid (e.g. a legitimately-observed native `type="email"` that just wasn't spelled out
+  // in this exact attribute form anywhere else), so hard-failing here risks real false positives.
+  for (const m of source.matchAll(CSS_ATTR_SELECTOR_RE)) {
+    const attr = m[1]!.toLowerCase();
+    if (attr === 'data-testid' || attr === 'data-test') continue;
+    const value = m[2]!;
+    const observedValues = gt.attributes.get(attr);
+    if (observedValues && observedValues.has(value)) continue;
+    warn.push(`[${attr}="${value}"] not found in the observed element inventory`);
+  }
+
   return { hard, warn };
 }
 
@@ -629,15 +692,29 @@ function retryNoteUngrounded(hard: string[], gt: GroundTruth): string {
   ]
     .filter(Boolean)
     .join(' ');
-  return `Your previous output was rejected because it referenced selectors/endpoints that were never observed: ${hard.join('; ')}. Use ONLY the real selectors/endpoints provided in the prompt context, or the ESCAPE HATCH rule (a text-based locator, or a "${ESCAPE_HATCH_MARKER}" comment) for anything genuinely unobserved — never invent a plausible-sounding data-testid or endpoint path. ${available}`;
+  return `Your previous output was rejected because it referenced selectors/endpoints that were never observed: ${hard.join('; ')}. Use ONLY the real selectors/endpoints provided in the prompt context, or the ESCAPE HATCH rule (a text-based locator, or a "${ESCAPE_HATCH_MARKER}" comment) for anything genuinely unobserved — never invent a plausible-sounding data-testid or endpoint path. ${available} The inventory shown below has been expanded with more elements in case the one you needed was previously omitted for length.`;
 }
 
 /** Per-route cap — keeps one busy page (header+footer+nav+form) from starving every other route's budget. */
 const MAX_ELEMENTS_PER_ROUTE = 30;
 /** Overall ceiling across the whole crawl (keeps the prompt bounded even with many routes). */
 const MAX_SNAPSHOT_ELEMENTS = 120;
+/** Widened per-route cap used only on a hallucinated-selector retry (see InventoryOpts.expand) — the relevant element the model needed may have sat just past the default cutoff. */
+const MAX_ELEMENTS_PER_ROUTE_EXPANDED = 60;
+/** Widened overall ceiling used only on a hallucinated-selector retry (see InventoryOpts.expand). */
+const MAX_SNAPSHOT_ELEMENTS_EXPANDED = 240;
 /** Truncate an accessible name so one pathological element can't bloat the prompt. */
 const MAX_ELEMENT_NAME_LEN = 80;
+/**
+ * Threaded through selectInventoryElements -> formatSnapshotInventory -> buildPrompt and
+ * collectGroundTruth -> validateAndPersist so a hallucinated-selector retry (see generateOne) can
+ * widen the DOM inventory shown to the model. collectGroundTruth MUST receive the identical opts
+ * as the prompt builder for the same attempt — the grounding gate has to validate against exactly
+ * what the model was shown, never a narrower or wider inventory.
+ */
+interface InventoryOpts {
+  expand?: boolean;
+}
 /**
  * Roles the DOM doesn't natively expose as `link`/`button` even though the element is
  * clickable (e.g. a `<div>` with a click handler and no `role` attribute) — the single
@@ -646,9 +723,143 @@ const MAX_ELEMENT_NAME_LEN = 80;
 const NON_SEMANTIC_ROLES = new Set(['generic']);
 
 type CrawledRouteLike = NonNullable<TestModeContext['exploration']>['crawl']['routes'][number];
+type InventoryElementLike = CrawledRouteLike['snapshot']['interactiveElements'][number];
 interface SelectedElement {
   route: CrawledRouteLike;
-  el: CrawledRouteLike['snapshot']['interactiveElements'][number];
+  el: InventoryElementLike;
+}
+
+/** Words too common/generic to carry any relevance signal on their own. */
+const STOPWORD_TOKENS = new Set([
+  'the',
+  'a',
+  'an',
+  'and',
+  'or',
+  'to',
+  'of',
+  'in',
+  'on',
+  'for',
+  'is',
+  'are',
+  'with',
+  'that',
+  'this',
+  'it',
+  'be',
+  'as',
+  'by',
+  'at',
+  'from',
+  'renders',
+  'page',
+]);
+
+/** Lowercase, split on non-alphanumeric runs, drop stopwords and single characters. */
+function tokenize(text: string): string[] {
+  return text
+    .toLowerCase()
+    .split(/[^a-z0-9]+/)
+    .filter((t) => t.length > 1 && !STOPWORD_TOKENS.has(t));
+}
+
+/**
+ * Tokenizes a plan item's requirement text (title, intent, every scenario description, unitKey)
+ * into a lowercased/stopword-stripped token set, computed once per selectInventoryElements() call
+ * and used by scoreElement() to rank DOM elements by relevance to THIS item rather than truncating
+ * by blind positional order.
+ */
+function buildRequirementTokens(item?: TestPlanItem): Set<string> {
+  const tokens = new Set<string>();
+  if (!item) return tokens;
+  const parts = [item.title, item.intent, item.unitKey ?? '', ...item.scenarios.map((s) => s.description)];
+  for (const part of parts) {
+    for (const t of tokenize(part)) tokens.add(t);
+  }
+  return tokens;
+}
+
+/**
+ * Action-verb requirement token -> element predicate. When the requirement text names an action
+ * (e.g. "submit", "upload") and an element's role/type matches what that action implies, the
+ * element is very likely the one the scenario means to target, even if its accessible name shares
+ * no literal words with the requirement text.
+ */
+const ACTION_VERB_BONUSES: Record<string, (el: InventoryElementLike) => boolean> = {
+  submit: (el) => el.role === 'button',
+  login: (el) => el.role === 'button',
+  signin: (el) => el.role === 'button',
+  register: (el) => el.role === 'button',
+  signup: (el) => el.role === 'button',
+  save: (el) => el.role === 'button',
+  delete: (el) => el.role === 'button',
+  select: (el) => el.role === 'combobox',
+  choose: (el) => el.role === 'combobox',
+  upload: (el) => el.inputType === 'file',
+  search: (el) => el.role === 'searchbox',
+};
+
+/**
+ * Weighted relevance score for one crawled element against a plan item's requirement tokens:
+ * keyword overlap with the accessible name, an action-verb -> role/type bonus, a penalty for
+ * non-semantic roles (NON_SEMANTIC_ROLES — the single biggest hallucination source), a route-role
+ * match bonus, and a stability bonus/penalty from the element's locator tier (selectors.ts's
+ * selectorFor tiering) so a fragile positional selector must clear a higher relevance bar than a
+ * stable testid to make the cut. Higher is more relevant.
+ */
+function scoreElement(
+  el: InventoryElementLike,
+  route: CrawledRouteLike,
+  reqTokens: Set<string>,
+  preferredRole: string,
+): number {
+  let score = 0;
+  for (const t of tokenize(el.name)) {
+    if (reqTokens.has(t)) score += 2;
+  }
+  for (const [verb, matches] of Object.entries(ACTION_VERB_BONUSES)) {
+    if (reqTokens.has(verb) && matches(el)) score += 3;
+  }
+  if (NON_SEMANTIC_ROLES.has(el.role)) score -= 2;
+  if (route.role === preferredRole) score += 1;
+  const tierBonus: Record<1 | 2 | 3 | 4, number> = { 1: 2, 2: 1, 3: 0, 4: -2 };
+  if (el.selectorTier !== undefined) score += tierBonus[el.selectorTier];
+  return score;
+}
+
+/**
+ * Ranks one route's interactive elements by relevance (see scoreElement), applying a small
+ * proximity bonus for an element sitting next to another keyword-matching element (form fields
+ * cluster near their submit button, table cells near a matching header) and a duplicate-suppression
+ * penalty for a (role, name) pair repeated later in the same route (the first occurrence keeps its
+ * full score; a later, redundant duplicate is de-prioritized in favor of something new). Ties break
+ * on the ORIGINAL DOM-order index, ascending — required so a uniform-score fixture (no keyword
+ * signal at all) degrades to exactly today's first-K-by-DOM-order behavior.
+ */
+function rankRouteElements(
+  route: CrawledRouteLike,
+  reqTokens: Set<string>,
+  preferredRole: string,
+): InventoryElementLike[] {
+  const elements = route.snapshot.interactiveElements;
+  const matchedKeyword = elements.map((el) => tokenize(el.name).some((t) => reqTokens.has(t)));
+  const seenRoleName = new Map<string, number>();
+  const scored = elements.map((el, index) => {
+    let score = scoreElement(el, route, reqTokens, preferredRole);
+    if (!matchedKeyword[index] && (matchedKeyword[index - 1] || matchedKeyword[index + 1])) {
+      score += 0.5;
+    }
+    if (el.name) {
+      const key = `${el.role} ${el.name}`;
+      const priorCount = seenRoleName.get(key) ?? 0;
+      seenRoleName.set(key, priorCount + 1);
+      if (priorCount > 0) score -= 1.5;
+    }
+    return { el, index, score };
+  });
+  scored.sort((a, b) => b.score - a.score || a.index - b.index);
+  return scored.map((s) => s.el);
 }
 interface InventorySelection {
   ordered: CrawledRouteLike[];
@@ -658,32 +869,79 @@ interface InventorySelection {
 }
 
 /**
+ * The route path a plan item's matched unit encodes, when it's a `route`-kind unit (e.g.
+ * "route:/checkout" -> "/checkout") — the criterion prompt-trimming filters crawled routes/URLs
+ * down to. Returns null for an item with no unitKey, no matching unit, or a non-route unit
+ * (endpoint/component units don't correspond to a crawled DOM route by path).
+ */
+function routePathForItem(ctx: TestModeContext, item: TestPlanItem | undefined): string | null {
+  const unit = item?.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+  if (!unit || unit.kind !== 'route') return null;
+  return unit.key.replace(/^route:/, '');
+}
+
+/**
+ * Narrow `routes` down to the ones actually relevant to a plan item, so its prompt isn't padded
+ * with the same tier-wide dump every other item in the same tier also gets. Falls back to the
+ * FULL list whenever nothing matches (no route path to filter by, or the filter would leave
+ * nothing) — grounding must never go from "too much" to "none" just because the match missed.
+ */
+export function filterRoutesForItem<T extends { url: string }>(routes: T[], routePath: string | null): T[] {
+  if (!routePath) return routes;
+  const matched = routes.filter((r) => r.url.includes(routePath));
+  return matched.length > 0 ? matched : routes;
+}
+
+/**
  * Select the interactive-element inventory shown to the model AND checked by the
  * grounding-validation gate (findUngroundedReferences) — the two MUST read from this same
- * function, or the gate could reject a selector the model was never even shown. Applies a
- * per-route cap (MAX_ELEMENTS_PER_ROUTE) so one busy page can't starve every other route's
- * budget, plus an overall ceiling (MAX_SNAPSHOT_ELEMENTS) so a huge crawl can't blow up the
- * prompt. Tier-aware ordering surfaces the most relevant role first: authenticated routes
- * for tierB-auth items, anonymous routes otherwise. Returns an empty selection for the
- * tierC-api tier (must not drive a browser page at all) or when there's no exploration data.
+ * function (with the same `item`, when one is passed), or the gate could reject a selector the
+ * model was never even shown. Applies a per-route cap (MAX_ELEMENTS_PER_ROUTE) so one busy page
+ * can't starve every other route's budget, plus an overall ceiling (MAX_SNAPSHOT_ELEMENTS) so a
+ * huge crawl can't blow up the prompt. Tier-aware ordering surfaces the most relevant role first:
+ * authenticated routes for tierB-auth items, anonymous routes otherwise. Returns an empty
+ * selection for the tierC-api tier (must not drive a browser page at all) or when there's no
+ * exploration data.
+ *
+ * `item`, when passed, narrows the crawled routes to the one(s) its unitKey resolves to (see
+ * filterRoutesForItem) BEFORE the tier-wide ordering/selection below runs — so an item's prompt
+ * is grounded in what's actually relevant to it, not the same tier-wide dump every other item in
+ * the same tier also receives.
+ *
+ * Within each route, elements are ranked by relevance (rankRouteElements: keyword overlap with
+ * `item`'s requirement text, action-verb bonuses, non-semantic-role penalty, locator-stability
+ * tier) BEFORE the per-route/global caps below are applied — so a relevant element sitting past
+ * the old positional cutoff can still survive truncation. Ties (including the no-`item`/no-signal
+ * case) break on original DOM order, so an inventory with no relevance signal degrades to exactly
+ * the previous first-K-by-DOM-order behavior.
  */
-function selectInventoryElements(ctx: TestModeContext, tier: Tier): InventorySelection {
+function selectInventoryElements(
+  ctx: TestModeContext,
+  tier: Tier,
+  item?: TestPlanItem,
+  opts?: InventoryOpts,
+): InventorySelection {
   if (tier === 'tierC-api') return { ordered: [], selected: [], totalCount: 0, truncated: false };
-  const routes = ctx.exploration?.crawl.routes ?? [];
-  if (routes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return { ordered: [], selected: [], totalCount: 0, truncated: false };
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
 
   const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
   const ordered = [...routes].sort(
     (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
   );
 
+  const perRouteCap = opts?.expand ? MAX_ELEMENTS_PER_ROUTE_EXPANDED : MAX_ELEMENTS_PER_ROUTE;
+  const globalCap = opts?.expand ? MAX_SNAPSHOT_ELEMENTS_EXPANDED : MAX_SNAPSHOT_ELEMENTS;
+  const reqTokens = buildRequirementTokens(item);
   const selected: SelectedElement[] = [];
   let totalCount = 0;
   for (const route of ordered) {
     let perRouteCount = 0;
-    for (const el of route.snapshot.interactiveElements) {
+    const ranked = rankRouteElements(route, reqTokens, preferredRole);
+    for (const el of ranked) {
       totalCount += 1;
-      if (perRouteCount >= MAX_ELEMENTS_PER_ROUTE || selected.length >= MAX_SNAPSHOT_ELEMENTS) continue;
+      if (perRouteCount >= perRouteCap || selected.length >= globalCap) continue;
       selected.push({ route, el });
       perRouteCount += 1;
     }
@@ -705,9 +963,19 @@ function selectInventoryElements(ctx: TestModeContext, tier: Tier): InventorySel
  * legitimately targets a state EXPLORE never visited (e.g. content behind a mocked error
  * response) has a sanctioned way out that isn't "invent a selector" — this same marker is
  * recognized by findUngroundedReferences() to avoid penalizing an acknowledged gap.
+ *
+ * A tier-4 (positional, e.g. nth-of-type) selector gets an inline warning since it's fragile
+ * against list/table reordering; when the element also captured a `repeatedRowText` (it sits
+ * among repeated siblings, e.g. a table row), the warning suggests a text-anchored
+ * `.filter({ hasText: "..." })` pattern instead of trusting the raw index path.
  */
-function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
-  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier);
+function formatSnapshotInventory(
+  ctx: TestModeContext,
+  tier: Tier,
+  item?: TestPlanItem,
+  opts?: InventoryOpts,
+): string {
+  const { ordered, selected, totalCount, truncated } = selectInventoryElements(ctx, tier, item, opts);
   if (selected.length === 0) return '';
 
   const lines = selected.map(({ route, el }) => {
@@ -716,7 +984,16 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
     const genericNote = NON_SEMANTIC_ROLES.has(el.role)
       ? " (NOT a semantic link/button — use text or the selector shown, never getByRole('link'/'button'))"
       : '';
-    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}`;
+    const ambiguousNote = el.ambiguousMatch
+      ? ' (⚠ AMBIGUOUS: another element on this page shares this exact role+name — a plain getByRole/getByText by role+name WILL throw a strict-mode violation here; use the selector shown, narrow it further, or chain .first()/.nth())'
+      : '';
+    const tierNote =
+      el.selectorTier === 4
+        ? el.repeatedRowText
+          ? ` (⚠ POSITIONAL selector among repeated rows — prefer anchoring on this row's own text instead, e.g. .filter({ hasText: "${el.repeatedRowText.slice(0, 60)}" }), rather than trusting the index if the list can reorder)`
+          : " (⚠ POSITIONAL selector — fragile if this element's position among its siblings can change; prefer a more specific attribute/text anchor when one is available above)"
+        : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}${tierNote}`;
   });
 
   const omitted = totalCount - selected.length;
@@ -730,7 +1007,7 @@ function formatSnapshotInventory(ctx: TestModeContext, tier: Tier): string {
 
   return `
 
-Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
+Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. This also means using the selector shown EXACTLY as given — do NOT modify it, combine it with your own guessed parent/child CSS combinator (e.g. turning a real "#checkbox" into an invented "#checkbox > input"), or otherwise assume a DOM nesting relationship you were not shown; the string after "->" is already the complete, correct selector for that exact element. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
 ${lines.join('\n')}${more}`;
 }
 
@@ -751,6 +1028,30 @@ function formatRoutingGuidance(ctx: TestModeContext): string {
   return `
 
 This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
+}
+
+/** Cap on distinct route URLs listed, so a large crawl can't blow up the prompt. */
+const MAX_ROUTES_LISTED = 30;
+
+/**
+ * Real URLs actually visited during EXPLORE — grounds toHaveURL()/navigation assertions in
+ * what the app really does, not a guessed conventional path. A recurring real-data failure
+ * pattern this closes: a generated test asserting `toHaveURL(/register/)` or a redirect to
+ * "/" when the real app actually uses "/signup" or "/signin" for the same concept — the model
+ * guessed a common convention instead of using the route this list already contains. Returns
+ * '' when no exploration data exists (e.g. tierC-api, or a black-box run with nothing crawled).
+ */
+function formatObservedRoutes(ctx: TestModeContext, item?: TestPlanItem): string {
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return '';
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
+  const urls = Array.from(new Set(routes.map((r) => r.url)));
+  const shown = urls.slice(0, MAX_ROUTES_LISTED);
+  const omitted = urls.length - shown.length;
+  const more = omitted > 0 ? ` (+${omitted} more not shown)` : '';
+  return `
+
+Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), use one of these real observed URLs/paths, or a regex scoped only to what you're sure of (e.g. that the path changed away from the current one) — do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
 }
 
 /** Render a plan item's scenarios as a numbered list for the generation prompt. */
@@ -779,7 +1080,7 @@ function truncateJson(value: unknown, maxChars: number): string {
  * for spec-derived (provenance: 'spec') units, and any real form fields observed in that file.
  * Returns '' when the item has no unitKey or nothing in sourceContext matches it.
  */
-function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string {
+function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem, tier: Tier): string {
   const unit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
   if (!unit) return '';
 
@@ -789,6 +1090,17 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string
     `Source grounding — this feature maps to real source at ${unit.file}${unit.method ? ` (${unit.method})` : ''}.`,
     `You MUST include a comment "// [SRC:${unit.file}]" somewhere in the generated spec, naming this exact file, so its grounding is traceable.`,
   ];
+
+  // Real-data-traced bug: a tierC-api item can get matched to a frontend `route`/`component`
+  // unit (e.g. a React Router path from AppRouter.tsx) rather than a real backend `endpoint` —
+  // the unit is legitimately grounded (the file IS real), but it serves HTML/JS navigation, not
+  // a JSON API. Without this warning the model happily calls `request.get(unit.file's path)`
+  // expecting the feature's described JSON payload and gets an empty/unrelated response instead.
+  if (tier === 'tierC-api' && unit.kind !== 'endpoint') {
+    lines.push(
+      `WARNING: this source unit is a ${unit.kind === 'route' ? 'frontend client-side route (React Router/page navigation)' : 'frontend component'}, NOT a confirmed backend REST endpoint — it may only serve the app's HTML/JS shell, not JSON data. Do NOT assume a raw HTTP request (the \`request\` fixture) to this exact path returns the JSON payload described in this feature's intent unless a real backend endpoint/controller/spec confirms it elsewhere in this prompt — if nothing confirms it, treat the request/response shape as unknown and assert only what you can verify (e.g. that the request doesn't 500), rather than specific fields you're guessing at.`,
+    );
+  }
 
   if (unit.provenance === 'spec') {
     lines.push(
@@ -812,27 +1124,44 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem): string
   return lines.join('\n');
 }
 
-function buildPrompt(item: TestPlanItem, ctx: TestModeContext, tier: Tier, retryNote: string | null): string {
+function buildPrompt(
+  item: TestPlanItem,
+  ctx: TestModeContext,
+  tier: Tier,
+  retryNote: string | null,
+  opts?: InventoryOpts,
+): string {
   const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
   const reqTag = item.reqTag ?? item.id;
-  const strictNote = retryNote ? `\nIMPORTANT: ${retryNote}` : '';
-  const inventory = formatSnapshotInventory(ctx, tier);
+  // Appended at the very end of the returned prompt (not interpolated here)
+  // so a retry's prompt stays an exact byte-for-byte extension of the
+  // previous attempt's prompt — that lets Anthropic's prefix-based prompt
+  // cache hit on retry instead of the note splicing mid-string and breaking
+  // the shared prefix between attempt 1 and attempt 2. This invariant only
+  // holds for the non-expanded retry path — an expand:true retry necessarily
+  // shows a different (wider) inventory, so its prompt is not a byte-for-byte
+  // extension of attempt 1's; that's an accepted, deliberate tradeoff, not a bug.
+  const strictNote = retryNote ? `\n\nIMPORTANT: ${retryNote}` : '';
+  const inventory = formatSnapshotInventory(ctx, tier, item, opts);
   const routingGuidance = formatRoutingGuidance(ctx);
-  const sourceGrounding = formatSourceGrounding(ctx, item);
+  const observedRoutes = formatObservedRoutes(ctx, item);
+  const sourceGrounding = formatSourceGrounding(ctx, item, tier);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
   const scenarioList = formatScenarios(scenarios);
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page.'
+      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. `expect(response.status()).not.toBe(200)`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the `multipart` option on the request call (e.g. `await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.'
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
 
-  const importSource = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : '@playwright/test';
+  const importSource = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
   const mockNote = ctx.mockExternalDependencies
-    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario.${formatMockContent(ctx)}`
+    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario. CRITICAL: the mock matches ONLY by method + path — it never inspects headers, tokens, or the request body, so it CANNOT organically reject a missing/invalid Authorization header, an unauthorized role, or cross-tenant/ownership access with a 401/403/404. If a scenario asserts that kind of rejection, you MUST call \`mockOverride(...)\` with that exact status first, or the mock will silently return its default success response and the assertion will fail every time — this is true even for a request you never customized before.${formatMockContent(ctx)}`
     : '';
 
   return `You are generating ONE Playwright test spec file in TypeScript covering ONE feature with
@@ -848,21 +1177,58 @@ Requirements:
   followed by its scenario kind, e.g. test('[REQ:${reqTag}] positive: succeeds with valid input', ...).
   This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
 - Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
+- After EVERY page.goto(...) (or a click that navigates), before interacting with any page-specific
+  element, verify the navigation actually landed on a real, expected page — not a 404/error/blank
+  page — using a SHORT, bounded check (e.g. \`await expect(page.locator('body')).not.toContainText('Not Found', { timeout: 3000 })\`,
+  or asserting an element from the inventory that should always be present on that page). Skipping
+  this is the single biggest cause of a mysterious full-timeout hang: if navigation silently lands on
+  the wrong page (a transient server error, a redirect you didn't expect, a typo'd path), every
+  subsequent locator for that page's real elements will never resolve, and the test burns the ENTIRE
+  default test timeout (tens of seconds) waiting on something that will never appear, instead of
+  failing fast with a clear, diagnosable reason.
 - Every test(...) MUST include at least one concrete expect(...) assertion.
+- Wrap each meaningful action or assertion group in test.step('<clear, plain-English description>', async () => { ... }),
+  e.g. test.step('Enter a valid email and password', async () => { ... }) or
+  test.step('Verify the error message is shown', async () => { ... }) — write the description the way a
+  human tester would narrate what they're doing, NOT a restatement of the code (not "Fill input" or
+  "Click button"). This becomes the step-by-step breakdown shown in the run report; a test with no
+  test.step(...) wrapping still passes, but only Playwright's own generic action log appears instead.
 - For a negative/invalid-input scenario, do NOT fill invalid data and then click a submit-like
   control assuming the click succeeds and a validation message appears afterward — many real apps
   correctly disable that control on invalid input, and clicking a disabled control hangs until
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
+- Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
+  \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
+  (CI machines, headless vs. headed, network conditions) vary widely in speed, making this
+  assertion flaky/brittle regardless of whether the app works correctly. Verify the OUTCOME of an
+  action (e.g. the swap/update actually happened) using Playwright's own built-in waiting/retry
+  behavior instead of a manual millisecond comparison.
+- Before calling a single-target action (click/fill/check/dblclick/selectOption/hover) on a locator,
+  make sure it can only match ONE element on the real page — Playwright throws a strict-mode
+  violation (and the test fails) if the locator resolves to more than one match. A bare
+  \`getByRole('link'/'button'/etc.)\`, a short \`getByText(...)\`, or a class/tag CSS selector are the
+  ones most likely to collide with another real element. Narrow it with a distinguishing
+  \`{ name: ... }\`/\`{ exact: true }\` filter, a more specific visible text/data-testid/id, or chain
+  \`.first()\`/\`.nth()\` when you intend a specific match — only rely on an unscoped locator when the
+  inventory above shows it is the sole element of that role/name on the page.
 - Be self-contained and runnable; do not import any other local helpers beyond the one import above.
-- ${tierGuidance}${mockNote}${strictNote}${inventory}${routingGuidance}${sourceGrounding}
+- When a scenario CREATES a new resource that the app enforces as unique (e.g. registering a user
+  by email, creating an account/username), do NOT hardcode a fixed literal value for that unique
+  field — embed \`Date.now()\` (or a similarly varying value) in it, e.g.
+  \`\`email-\${Date.now()}@example.com\`\`. A fixed value passes once against a real, persistent
+  backend and then fails every later re-run with a duplicate/conflict error, since the app correctly
+  remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
+  path itself should still register their own fresh unique value first, then reuse THAT same value for
+  the collision attempt within the same test.
+- ${tierGuidance}${mockNote}${inventory}${routingGuidance}${observedRoutes}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
 
 Feature: ${item.title}
 Feature intent: ${item.intent}
-Tier: ${tierLabel(tier)}`;
+Tier: ${tierLabel(tier)}${strictNote}`;
 }
 
 interface GenOneOutcome {
@@ -879,6 +1245,127 @@ interface GenOneOutcome {
    * treats very differently from an ordinary content-validation skip).
    */
   providerFailureDetail?: string;
+}
+
+// ---- Write-through per-item checkpoint (mirrors execute.ts's write-through
+// per-test checkpoint — see templates.ts's checkpointReporterContents() for
+// the rationale). GENERATE has no separate subprocess/reporter the way
+// EXECUTE does (every call here happens in-process), so the read/append/clear
+// helpers live directly alongside the code that produces each item's outcome. ----
+
+/** File name for GENERATE's own write-through checkpoint, at the suite project root (alongside EXEC_CHECKPOINT_FILENAME). */
+export const GEN_CHECKPOINT_FILENAME = 'healix-generate-checkpoint.ndjson';
+
+/**
+ * One plan item's FINAL generation outcome, persisted the moment it's decided
+ * (see recordGenOutcome) instead of only after the whole GENERATE phase
+ * returns. Without this, a crash mid-phase loses every item's progress even
+ * though their spec FILES already survived on disk — resume would have to
+ * re-ask the AI for all of them again, batches it had already paid for
+ * included. 'skipped' is recorded only for an item that exhausted its retries
+ * under NORMAL operation (content genuinely rejected); an item still in
+ * flight when a pause/abort hits is deliberately left unrecorded (see
+ * recordGenOutcome) so it's retried fresh next time, not written off.
+ */
+export interface GenCheckpointEntry {
+  itemId: string;
+  title: string;
+  reqTag: string;
+  tier: Tier;
+  status: 'generated' | 'skipped';
+  /** Absolute path to the written spec file — only present when status === 'generated'. */
+  specPath?: string;
+  /** The reqTag-prefixed report title (matches GeneratedSpec.title) — only present when status === 'generated'. */
+  specTitle?: string;
+  /** Why the item was skipped — only present when status === 'skipped'. */
+  reason?: string;
+}
+
+function genCheckpointFilePath(projectDir: string): string {
+  return join(projectDir, GEN_CHECKPOINT_FILENAME);
+}
+
+/** Best-effort read; a missing/corrupt file just means "nothing finished yet" — same tolerance as execute.ts's readCheckpointEntries. */
+export async function readGenerateCheckpointEntries(projectDir: string): Promise<GenCheckpointEntry[]> {
+  let raw: string;
+  try {
+    raw = await readFile(genCheckpointFilePath(projectDir), 'utf-8');
+  } catch {
+    return [];
+  }
+  const byId = new Map<string, GenCheckpointEntry>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as GenCheckpointEntry;
+      if (entry && typeof entry.itemId === 'string') byId.set(entry.itemId, entry);
+    } catch {
+      // One malformed line (e.g. a write truncated by the same crash this file exists to survive)
+      // must not lose every other entry in it.
+    }
+  }
+  return [...byId.values()];
+}
+
+// Serializes appends per projectDir: GEN_CONCURRENCY runs multiple batch tasks
+// concurrently IN THIS SAME PROCESS (unlike execute.ts's reporter, which is
+// naturally serialized by Playwright's single main-process reporter model), so
+// without this queue two concurrent appendFile calls could interleave partial
+// writes to the same file.
+const appendQueues = new Map<string, Promise<void>>();
+
+async function appendGenerateCheckpointEntry(projectDir: string, entry: GenCheckpointEntry): Promise<void> {
+  const line = `${JSON.stringify(entry)}\n`;
+  const prior = appendQueues.get(projectDir) ?? Promise.resolve();
+  const next = prior
+    .then(() => appendFile(genCheckpointFilePath(projectDir), line, 'utf-8'))
+    .catch(() => {
+      // best-effort — never fail generation over a checkpoint write
+    });
+  appendQueues.set(projectDir, next);
+  await next;
+}
+
+/** Best-effort cleanup once generate() completes without being interrupted — nothing left to resume. */
+export async function clearGenerateCheckpoint(projectDir: string): Promise<void> {
+  await unlink(genCheckpointFilePath(projectDir)).catch(() => {});
+}
+
+/**
+ * Records an item's outcome as FINAL, unless a pause/abort is the reason
+ * we're looking at it right now — in which case nothing is written, so the
+ * item is retried fresh (not written off as permanently skipped) the next
+ * time generate() runs. This is the per-item analogue of execute.ts's
+ * `cmd.aborted || ctx.signal?.aborted` check gating its own checkpoint logic.
+ */
+async function recordGenOutcome(
+  ctx: TestModeContext,
+  item: TestPlanItem,
+  outcome: GenOneOutcome,
+): Promise<void> {
+  if (ctx.signal?.aborted) return;
+  const entry: GenCheckpointEntry = {
+    itemId: item.id,
+    title: item.title,
+    reqTag: item.reqTag ?? item.id,
+    tier: resolveTier(item.tier),
+    status: outcome.spec ? 'generated' : 'skipped',
+    ...(outcome.spec ? { specPath: outcome.spec.path, specTitle: outcome.spec.title } : {}),
+    ...(!outcome.spec && outcome.reason ? { reason: outcome.reason } : {}),
+  };
+  await appendGenerateCheckpointEntry(ctx.projectDir, entry);
+}
+
+/** Reconstructs a GeneratedSpec for an already-finished item from an earlier, interrupted generate() call — by re-reading its spec file rather than re-asking the AI. Returns null (best-effort) if the file is gone or the entry wasn't a 'generated' one. */
+async function restoreGeneratedSpec(entry: GenCheckpointEntry): Promise<GeneratedSpec | null> {
+  if (entry.status !== 'generated' || !entry.specPath || !entry.specTitle) return null;
+  try {
+    const contents = await readFile(entry.specPath, 'utf-8');
+    return { path: entry.specPath, title: entry.specTitle, reqTag: entry.reqTag, tier: entry.tier, contents };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -898,15 +1385,153 @@ function uniqueRelPath(tier: Tier, slug: string, usedPaths: Set<string>): string
   return rel;
 }
 
+/** Result of validateAndPersist: either an accepted, on-disk spec, or enough detail (reason,
+ * violations, a ready-to-use retryNote, and any non-blocking grounding warnings) for a caller to
+ * decide whether/how to retry. */
+interface ValidationOutcome {
+  spec: GeneratedSpec | null;
+  reason?: string;
+  violations?: string[];
+  /** Present whenever a re-attempt could plausibly do better with this fed back into the prompt. */
+  retryNote?: string;
+  /** Non-blocking grounding-gate findings (see findUngroundedReferences), regardless of pass/fail. */
+  ungroundedWarn?: string[];
+  /**
+   * Set when rejection was specifically the grounding-validation gate (a hallucinated
+   * selector/endpoint), as opposed to any other rejection reason (missing citation, forbidden
+   * API, wrong scenario count, etc). generateOne keys off this typed flag — rather than
+   * string-matching `reason` — to decide whether the next attempt should widen the DOM inventory
+   * (see InventoryOpts.expand).
+   */
+  hallucinated?: boolean;
+}
+
+/**
+ * The full validation-gate chain (spec-shape, expect count, scenario count, [REQ:...] tagging,
+ * [SRC:...] citation, forbidden-API deny-list, grounding-validation) plus the on-success
+ * transforms (ensureReqTag, demoteEscapeHatchBlocks, tierB-auth storageState insertion) and
+ * disk-write — given raw model OUTPUT TEXT for exactly one item, decides whether it's acceptable
+ * and, if so, persists it. Deliberately takes no knowledge of "attempt number" or retry looping —
+ * that's the caller's concern (generateOne's single-item loop, or the batch path's per-item
+ * solo-retry) — so this same gate serves both without duplicating any of these checks.
+ */
+async function validateAndPersist(
+  ctx: TestModeContext,
+  item: TestPlanItem,
+  text: string,
+  usedPaths: Set<string>,
+  opts?: InventoryOpts,
+): Promise<ValidationOutcome> {
+  const tier = resolveTier(item.tier);
+  const reqTag = item.reqTag ?? item.id;
+  const slug = slugify(item.title || item.id);
+  const extraAllowedImport = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
+
+  let source = stripCodeFences(text);
+  if (!source) {
+    return { spec: null, reason: 'empty output' };
+  }
+  if (!looksLikePlaywrightSpec(source, extraAllowedImport)) {
+    return { spec: null, reason: 'did not look like a Playwright spec' };
+  }
+  if (!hasExpect(source)) {
+    return {
+      spec: null,
+      reason: 'no valid spec with an expect(...)',
+      retryNote: RETRY_NOTE_NO_EXPECT,
+    };
+  }
+
+  const expectedScenarios = item.scenarios.length || 1;
+  const actualTestCases = countTestCases(source);
+  if (actualTestCases < expectedScenarios) {
+    return {
+      spec: null,
+      reason: `only ${actualTestCases}/${expectedScenarios} scenario(s) covered`,
+      retryNote: retryNoteMissingScenarios(expectedScenarios, actualTestCases),
+    };
+  }
+
+  const reqTagOccurrences = countReqTagOccurrences(source, reqTag);
+  if (reqTagOccurrences < expectedScenarios) {
+    // The tag must be on every individual test(...) title, not just the describe block, so
+    // results/coverage-tracking can match each scenario result back to this item.
+    return {
+      spec: null,
+      reason: `[REQ:${reqTag}] missing from individual test titles`,
+      retryNote: retryNoteMissingPerTestTag(reqTag),
+    };
+  }
+
+  // Source-citation gate: only enforced when this item actually matched a real
+  // source-context unit (formatSourceGrounding only demands the citation in that case) — an
+  // item with no unitKey/match has no file to cite, so nothing to gate here.
+  const matchedUnit = item.unitKey ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey) : undefined;
+  if (matchedUnit && !hasSrcCitation(source, matchedUnit.file)) {
+    return {
+      spec: null,
+      reason: `missing [SRC:${matchedUnit.file}] citation`,
+      retryNote: retryNoteMissingSrcCitation(matchedUnit.file),
+    };
+  }
+
+  // Deny-list gate.
+  const violations = findForbiddenApis(source, extraAllowedImport);
+  if (violations.length > 0) {
+    return {
+      spec: null,
+      reason: `forbidden APIs in generated spec: ${violations.join('; ')}`,
+      violations,
+      retryNote: retryNoteForbidden(violations, extraAllowedImport ?? '@playwright/test'),
+    };
+  }
+
+  // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
+  // correspond to anything actually observed during EXPLORE (or statically detected for
+  // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
+  const groundTruth = collectGroundTruth(ctx, tier, item, opts);
+  const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
+  if (ungroundedHard.length > 0) {
+    return {
+      spec: null,
+      reason: `hallucinated selector/endpoint references: ${ungroundedHard.join('; ')}`,
+      retryNote: retryNoteUngrounded(ungroundedHard, groundTruth),
+      ungroundedWarn,
+      hallucinated: true,
+    };
+  }
+
+  source = ensureReqTag(source, reqTag);
+  source = demoteEscapeHatchBlocks(source);
+  if (tier === 'tierB-auth') {
+    const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
+    const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;
+    if (matchedRole) source = insertRoleStorageState(source, matchedRole);
+  }
+  if (!source.endsWith('\n')) source += '\n';
+
+  // Resolve a unique path BEFORE writing so same-tier slug collisions don't
+  // overwrite each other on disk.
+  const relPath = uniqueRelPath(tier, slug, usedPaths);
+  const absPath = join(ctx.projectDir, relPath);
+  await mkdir(join(ctx.projectDir, 'tests', tier), { recursive: true });
+  await writeFile(absPath, source, 'utf-8');
+
+  const title = `[REQ:${reqTag}] ${item.title}`;
+  return {
+    spec: { path: absPath, title, reqTag, tier, contents: source },
+    ungroundedWarn: ungroundedWarn.length > 0 ? ungroundedWarn : undefined,
+  };
+}
+
 async function generateOne(
   ctx: TestModeContext,
   item: TestPlanItem,
   usedPaths: Set<string>,
 ): Promise<GenOneOutcome> {
   const tier = resolveTier(item.tier);
-  const reqTag = item.reqTag ?? item.id;
-  const slug = slugify(item.title || item.id);
-  const extraAllowedImport = ctx.mockExternalDependencies ? MOCK_FIXTURE_IMPORT_PATH : undefined;
 
   // Carried across attempts: the note explaining WHY the last output was
   // rejected (fed back into the retry prompt) and the last violation list
@@ -919,11 +1544,17 @@ async function generateOne(
   // does with it afterward. Stays set only when every attempt failed before
   // that point (thrown, or ok:false), which is the systemic-outage signal.
   let providerFailureDetail: string | undefined;
+  // Set once attempt 0 is rejected specifically for a hallucinated selector/endpoint (see
+  // ValidationOutcome.hallucinated) — the very next attempt then widens the DOM inventory shown
+  // (InventoryOpts.expand), since the element the model needed may have simply sat past the
+  // default per-route/global cutoff rather than being genuinely unobserved.
+  let expandInventory = false;
 
   for (let attempt = 0; attempt < 2; attempt += 1) {
+    const inventoryOpts: InventoryOpts | undefined = expandInventory ? { expand: true } : undefined;
     let text = '';
     try {
-      const res = await ctx.provider.complete(buildPrompt(item, ctx, tier, retryNote), {
+      const res = await ctx.provider.complete(buildPrompt(item, ctx, tier, retryNote, inventoryOpts), {
         cwd: ctx.repoPath ?? undefined,
         timeoutMs: GEN_TIMEOUT_MS,
         // Codegen must NEVER let the provider agent mutate the user's repo:
@@ -934,7 +1565,9 @@ async function generateOne(
         // US below — the provider only ever needs to return text.
         readOnly: true,
         signal: ctx.signal,
+        taskType: 'codegen',
       });
+      ctx.onUsage?.('generate', item.title, ctx.provider.id, res.raw);
       if (!res.ok) {
         emit(ctx, `Codegen provider error for "${item.title}" (attempt ${attempt + 1}): ${res.detail}`);
         providerFailureDetail = res.detail;
@@ -948,146 +1581,478 @@ async function generateOne(
       continue;
     }
 
-    let source = stripCodeFences(text);
-    if (!source) {
-      continue;
-    }
-    if (!looksLikePlaywrightSpec(source, extraAllowedImport)) {
+    const validated = await validateAndPersist(ctx, item, text, usedPaths, inventoryOpts);
+    if (validated.ungroundedWarn && validated.ungroundedWarn.length > 0) {
       emit(
         ctx,
-        `Output for "${item.title}" did not look like a Playwright spec (attempt ${attempt + 1}); retrying`,
-      );
-      continue;
-    }
-    if (!hasExpect(source)) {
-      // Reject zero-expect specs; the loop retries once with a stricter prompt.
-      retryNote = RETRY_NOTE_NO_EXPECT;
-      lastReason = 'no valid spec with an expect(...) after retry';
-      continue;
-    }
-
-    const expectedScenarios = item.scenarios.length || 1;
-    const actualTestCases = countTestCases(source);
-    if (actualTestCases < expectedScenarios) {
-      // Same retry-once-then-skip treatment: a spec covering fewer cases than
-      // requested isn't the positive/negative/edge bundle the plan asked for.
-      emit(
-        ctx,
-        `Output for "${item.title}" had ${actualTestCases}/${expectedScenarios} scenario(s) (attempt ${attempt + 1}); retrying`,
-      );
-      retryNote = retryNoteMissingScenarios(expectedScenarios, actualTestCases);
-      lastReason = `only ${actualTestCases}/${expectedScenarios} scenario(s) covered after retry`;
-      continue;
-    }
-
-    const reqTagOccurrences = countReqTagOccurrences(source, reqTag);
-    if (reqTagOccurrences < expectedScenarios) {
-      // The tag must be on every individual test(...) title, not just the
-      // describe block, so results/coverage-tracking can match each scenario
-      // result back to this item (see orchestrator/index.ts persistResults).
-      emit(
-        ctx,
-        `Output for "${item.title}" only tagged ${reqTagOccurrences}/${expectedScenarios} test(s) with [REQ:${reqTag}] (attempt ${attempt + 1}); retrying`,
-      );
-      retryNote = retryNoteMissingPerTestTag(reqTag);
-      lastReason = `[REQ:${reqTag}] missing from individual test titles after retry`;
-      continue;
-    }
-
-    // Source-citation gate: only enforced when this item actually matched a real
-    // source-context unit (formatSourceGrounding only demands the citation in that case) — an
-    // item with no unitKey/match has no file to cite, so nothing to gate here.
-    const matchedUnit = item.unitKey
-      ? ctx.sourceContext?.units.find((u) => u.key === item.unitKey)
-      : undefined;
-    if (matchedUnit && !hasSrcCitation(source, matchedUnit.file)) {
-      emit(
-        ctx,
-        `Output for "${item.title}" is missing its [SRC:${matchedUnit.file}] citation (attempt ${attempt + 1}); retrying`,
-      );
-      retryNote = retryNoteMissingSrcCitation(matchedUnit.file);
-      lastReason = `missing [SRC:${matchedUnit.file}] citation after retry`;
-      continue;
-    }
-
-    // Deny-list gate: same retry-once-then-skip treatment as the zero-expect
-    // case, but the stricter note lists the concrete violations so the retry
-    // can actually fix them.
-    const violations = findForbiddenApis(source, extraAllowedImport);
-    if (violations.length > 0) {
-      emit(
-        ctx,
-        `Output for "${item.title}" used forbidden APIs (attempt ${attempt + 1}): ${violations.join('; ')}`,
-        {
-          violations,
-        },
-      );
-      retryNote = retryNoteForbidden(violations, extraAllowedImport ?? '@playwright/test');
-      lastReason = `forbidden APIs in generated spec: ${violations.join('; ')}`;
-      lastViolations = violations;
-      continue;
-    }
-
-    // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
-    // correspond to anything actually observed during EXPLORE (or statically detected for
-    // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
-    const groundTruth = collectGroundTruth(ctx, tier);
-    const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
-    if (ungroundedWarn.length > 0) {
-      emit(
-        ctx,
-        `Output for "${item.title}" has unverifiable selector/endpoint references (attempt ${attempt + 1}, not blocking): ${ungroundedWarn.join('; ')}`,
+        `Output for "${item.title}" has unverifiable selector/endpoint references (attempt ${attempt + 1}, not blocking): ${validated.ungroundedWarn.join('; ')}`,
       );
     }
-    if (ungroundedHard.length > 0) {
-      emit(
-        ctx,
-        `Output for "${item.title}" referenced hallucinated selectors/endpoints (attempt ${attempt + 1}): ${ungroundedHard.join('; ')}`,
-        { ungrounded: ungroundedHard },
-      );
-      retryNote = retryNoteUngrounded(ungroundedHard, groundTruth);
-      lastReason = `hallucinated selector/endpoint references: ${ungroundedHard.join('; ')}`;
-      continue;
+    if (validated.spec) {
+      return { spec: validated.spec };
     }
 
-    source = ensureReqTag(source, reqTag);
-    source = demoteEscapeHatchBlocks(source);
-    if (tier === 'tierB-auth') {
-      const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
-      const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;
-      if (matchedRole) source = insertRoleStorageState(source, matchedRole);
-    }
-    if (!source.endsWith('\n')) source += '\n';
-
-    // Resolve a unique path BEFORE writing so same-tier slug collisions don't
-    // overwrite each other on disk.
-    const relPath = uniqueRelPath(tier, slug, usedPaths);
-    const absPath = join(ctx.projectDir, relPath);
-    await mkdir(join(ctx.projectDir, 'tests', tier), { recursive: true });
-    await writeFile(absPath, source, 'utf-8');
-
-    const title = `[REQ:${reqTag}] ${item.title}`;
-    return {
-      spec: { path: absPath, title, reqTag, tier, contents: source },
-    };
+    emit(ctx, `Output for "${item.title}" rejected (attempt ${attempt + 1}): ${validated.reason}; retrying`, {
+      ...(validated.violations ? { violations: validated.violations } : {}),
+    });
+    retryNote = validated.retryNote ?? null;
+    lastReason = validated.reason ? `${validated.reason} after retry` : lastReason;
+    lastViolations = validated.violations ?? lastViolations;
+    if (validated.hallucinated) expandInventory = true;
   }
 
   return { spec: null, reason: lastReason, violations: lastViolations, providerFailureDetail };
 }
 
-/** Number of plan items generated concurrently. */
+/** Recursion guard for the halve-and-retry split on total batch parse failure — mirrors runPlanPhase's PLAN_MAX_SPLIT_DEPTH shape (orchestrator/index.ts) for a truncated plan batch. */
+const GEN_MAX_SPLIT_DEPTH = 3;
+/** Extra time budget per expected generated test beyond the first — a batch's response length scales with the number of tests it must produce (item.scenarios.length summed across the batch), not with raw item count, so timeout scales the same way. Values are first-pass estimates, not final. */
+const GEN_BATCH_TIMEOUT_PER_TEST_MS = 20_000;
+/** Hard ceiling on the scaled batch timeout regardless of batch size, so a pathological batch can't hang indefinitely. */
+const GEN_BATCH_TIMEOUT_CAP_MS = 480_000;
+/** Target sum of scenario-weight (see binPackByScenarioWeight) per generation batch. Tunable, not final. */
+const GEN_BATCH_SCENARIO_WEIGHT_BUDGET = 12;
+/** Hard item-count cap per batch regardless of scenario weight, as a structural safety net. Tunable, not final. */
+const GEN_BATCH_MAX_ITEMS = 8;
+/** Share of a tier's parseable-unitKey items a route segment-1 value must cover to be treated as a shared namespace/role/API-mount prefix (e.g. "api", "maltora-seller") rather than a real feature boundary — see routeClusterKey. Tunable, not final. */
+const GEN_DOMINANT_PREFIX_THRESHOLD = 0.4;
+/**
+ * Minimum number of same-tier parseable items that must NOT share a candidate's segment-1 value,
+ * required in addition to GEN_DOMINANT_PREFIX_THRESHOLD before that value is treated as a
+ * namespace/mount prefix (see GAP-048). A real mount prefix like "api"/"maltora-seller" dominates
+ * across a large, feature-diverse route population, so plenty of non-matching items are always
+ * around to validate the classification against. A small, incidentally single-feature-heavy tier
+ * (e.g. 10 items, 6 of them under "login") can cross the share threshold too, but with too few
+ * "other" items for that to mean anything — this floor exists specifically to reject that case
+ * without weakening the real namespace-prefix detection. Tunable, not final.
+ */
+const GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS = 5;
+
+/**
+ * Timeout budget for a batch expected to produce `totalExpectedTests` tests total:
+ * GEN_TIMEOUT_MS covers the first test's worth of output (base overhead + one test), plus
+ * GEN_BATCH_TIMEOUT_PER_TEST_MS per additional expected test, capped at GEN_BATCH_TIMEOUT_CAP_MS.
+ * The `+1` in the caller's sum (see genBatchTimeoutMs's call site) is a flat buffer since the
+ * actual generated test count can legitimately exceed scenarios.length (validateAndPersist only
+ * rejects FEWER tests than planned, never more). For a single-item batch this is never reached —
+ * generateBatch's n===1 branch routes straight to generateOne, which uses its own fixed
+ * GEN_TIMEOUT_MS budget.
+ */
+export function genBatchTimeoutMs(batchItems: TestPlanItem[]): number {
+  const totalExpectedTests = batchItems.reduce((sum, it) => sum + (it.scenarios.length || 1), 0);
+  return Math.min(
+    GEN_TIMEOUT_MS + (totalExpectedTests + 1) * GEN_BATCH_TIMEOUT_PER_TEST_MS,
+    GEN_BATCH_TIMEOUT_CAP_MS,
+  );
+}
+
+/**
+ * Parses a plan item's unitKey into path segments for clustering, tolerating both the
+ * "route:"/"endpoint:<METHOD> " prefixed convention and bare paths (real stored plans persist
+ * both — see buildGenerationBatches doc comment). Returns null for anything that isn't a
+ * route/endpoint unit (e.g. "component:..." keys) or has no unitKey at all.
+ */
+function unitKeySegments(unitKey: string | undefined): string[] | null {
+  if (!unitKey) return null;
+  let rest = unitKey;
+  if (rest.startsWith('route:')) {
+    rest = rest.slice('route:'.length);
+  } else if (rest.startsWith('endpoint:')) {
+    const spaceIdx = rest.indexOf(' ');
+    rest = spaceIdx >= 0 ? rest.slice(spaceIdx + 1) : rest.slice('endpoint:'.length);
+  } else if (!rest.startsWith('/')) {
+    // Not a bare path and not a recognized route/endpoint prefix (e.g. "component:Foo") —
+    // not clusterable by route.
+    return null;
+  }
+  const segments = rest.split('/').filter((s) => s.length > 0);
+  return segments.length > 0 ? segments : null;
+}
+
+/**
+ * Computes the set of segment-1 values that are so common across a tier's items that they can't
+ * be discriminating between features — a shared namespace/role/API-mount prefix (e.g. "api" on an
+ * RBAC backend, "maltora-seller" on a role-prefixed frontend), not a real feature boundary. A
+ * segment-1 value must both cover more than `threshold` of the tier's parseable-unitKey items AND
+ * leave at least `minOtherItems` items that don't share it (see GAP-048 / GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS —
+ * a high share on too few "other" items is as likely to be a small tier's single dominant feature
+ * as a genuine shared namespace) before it's treated this way, extending clustering to segment 2
+ * for those items (see routeClusterKey).
+ */
+export function findDominantPrefixes(
+  items: TestPlanItem[],
+  threshold = GEN_DOMINANT_PREFIX_THRESHOLD,
+  minOtherItems = GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS,
+): Set<string> {
+  const counts = new Map<string, number>();
+  let parseable = 0;
+  for (const item of items) {
+    const segments = unitKeySegments(item.unitKey);
+    if (!segments) continue;
+    parseable += 1;
+    counts.set(segments[0]!, (counts.get(segments[0]!) ?? 0) + 1);
+  }
+  const dominant = new Set<string>();
+  if (parseable === 0) return dominant;
+  for (const [segment, count] of counts) {
+    if (count / parseable > threshold && parseable - count >= minOtherItems) dominant.add(segment);
+  }
+  return dominant;
+}
+
+/**
+ * Cluster key for one item's unitKey: segment 1 alone, or "segment1/segment2" when segment 1 is a
+ * dominant (shared-namespace) prefix per findDominantPrefixes — so a role-prefixed/API-mounted
+ * app's routes cluster by their real feature (segment 2), while a flat app's routes cluster by
+ * segment 1 directly. Returns null when the unitKey isn't a parseable route/endpoint key.
+ */
+export function routeClusterKey(unitKey: string | undefined, dominantPrefixes: Set<string>): string | null {
+  const segments = unitKeySegments(unitKey);
+  if (!segments) return null;
+  const [first, second] = segments;
+  if (dominantPrefixes.has(first!) && second) return `${first}/${second}`;
+  return first!;
+}
+
+/**
+ * Greedily group items into batches whose scenario-weight (scenarios.length || 1, summed) stays
+ * within `weightBudget`, also capping each batch at `maxItems` regardless of weight. Mirrors
+ * orchestrator/index.ts's buildWeightedBatches shape exactly (same greedy-cut structure), applied
+ * here to TestPlanItem's scenario count instead of estimateUnitWeight. A single item whose own
+ * weight already exceeds the budget still gets its own batch — an item can't be split further.
+ */
+export function binPackByScenarioWeight(
+  items: TestPlanItem[],
+  weightBudget: number,
+  maxItems: number,
+): TestPlanItem[][] {
+  const batches: TestPlanItem[][] = [];
+  let current: TestPlanItem[] = [];
+  let currentWeight = 0;
+  for (const item of items) {
+    const w = item.scenarios.length || 1;
+    if (current.length > 0 && (currentWeight + w > weightBudget || current.length >= maxItems)) {
+      batches.push(current);
+      current = [];
+      currentWeight = 0;
+    }
+    current.push(item);
+    currentWeight += w;
+  }
+  if (current.length > 0) batches.push(current);
+  return batches;
+}
+
+/**
+ * Groups same-tier items into generation batches by route relatedness before bin-packing by
+ * scenario weight, so items covering the same feature (e.g. /login, /login/resetpassword,
+ * /login/passwordupdate) share a batch — and its shared preamble/tier guidance cost — instead of
+ * landing in unrelated batches purely by plan order. Items with no usable unitKey (no functionality
+ * -index grounding) fall into one catch-all pool per tier, bin-packed in plan order — this
+ * naturally degrades to a pure weight-budget chunking for plans with no route grounding at all,
+ * which is a strict generalization of the old fixed-size GEN_BATCH_SIZE chunking.
+ *
+ * Batch composition is intentionally not stable across resumes — generate()'s checkpoint-resume
+ * filter may leave a previously-clustered group split across batches after a partial resume; this
+ * is harmless since all DOM/source grounding is built per-item, not per-batch (see buildBatchPrompt).
+ */
+export function buildGenerationBatches(items: TestPlanItem[]): TestPlanItem[][] {
+  const dominantPrefixes = findDominantPrefixes(items);
+  const clusters = new Map<string, TestPlanItem[]>();
+  const catchAll: TestPlanItem[] = [];
+  for (const item of items) {
+    const key = routeClusterKey(item.unitKey, dominantPrefixes);
+    if (key === null) {
+      catchAll.push(item);
+      continue;
+    }
+    const list = clusters.get(key) ?? [];
+    list.push(item);
+    clusters.set(key, list);
+  }
+
+  const batches: TestPlanItem[][] = [];
+  for (const clusterItems of clusters.values()) {
+    batches.push(
+      ...binPackByScenarioWeight(clusterItems, GEN_BATCH_SCENARIO_WEIGHT_BUDGET, GEN_BATCH_MAX_ITEMS),
+    );
+  }
+  batches.push(...binPackByScenarioWeight(catchAll, GEN_BATCH_SCENARIO_WEIGHT_BUDGET, GEN_BATCH_MAX_ITEMS));
+  return batches;
+}
+
+function batchMarkerStart(reqTag: string): string {
+  return `===== BEGIN SPEC [REQ:${reqTag}] =====`;
+}
+function batchMarkerEnd(reqTag: string): string {
+  return `===== END SPEC [REQ:${reqTag}] =====`;
+}
+
+/**
+ * Build ONE prompt requesting specs for MULTIPLE same-tier plan items instead of paying for a
+ * separate provider call — and a separate copy of every tier-wide/app-wide rule — per item.
+ * generate() only ever batches items sharing a tier, so the tier guidance/mock note below are
+ * genuinely shared, not approximated. Every substantive rule here is the same one buildPrompt
+ * states for a single item; wording is generalized to refer to "that feature's own reqTag/title"
+ * since a batch covers several distinct reqTags in one response.
+ */
+function buildBatchPrompt(items: TestPlanItem[], ctx: TestModeContext, tier: Tier): string {
+  const baseUrl = (ctx.baseUrl ?? '').trim() || 'the application under test';
+  const importSource = ctx.mockExternalDependencies
+    ? MOCK_FIXTURE_IMPORT_PATH
+    : ACTION_HIGHLIGHTER_IMPORT_PATH;
+  const routingGuidance = formatRoutingGuidance(ctx);
+
+  const tierGuidance =
+    tier === 'tierC-api'
+      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. `expect(response.status()).not.toBe(200)`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the `multipart` option on the request call (e.g. `await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.'
+      : tier === 'tierB-auth'
+        ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
+        : 'This is a public flow requiring no authentication.';
+
+  const mockNote = ctx.mockExternalDependencies
+    ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario. CRITICAL: the mock matches ONLY by method + path — it never inspects headers, tokens, or the request body, so it CANNOT organically reject a missing/invalid Authorization header, an unauthorized role, or cross-tenant/ownership access with a 401/403/404. If a scenario asserts that kind of rejection, you MUST call \`mockOverride(...)\` with that exact status first, or the mock will silently return its default success response and the assertion will fail every time — this is true even for a request you never customized before.${formatMockContent(ctx)}`
+    : '';
+
+  const header = `You are generating Playwright test spec files in TypeScript for ${items.length} DIFFERENT, INDEPENDENT features in ONE response — ${items.length} SEPARATE self-contained spec files, not one spec covering all of them.
+
+For EACH feature listed below, output ONE complete spec file wrapped EXACTLY like this, with no markdown/code fences around or inside the markers:
+===== BEGIN SPEC [REQ:<that feature's reqTag, exactly as shown for it below>] =====
+<the full TypeScript source for that ONE feature's spec>
+===== END SPEC [REQ:<the same reqTag>] =====
+
+Output all ${items.length} specs this way, each within its own BEGIN/END pair using the EXACT reqTag shown for that feature, in the same order the features are listed below. Nothing else outside the markers.
+
+Requirements that apply to EVERY feature's spec below:
+- Begin with: import { test, expect } from '${importSource}';
+- Wrap that feature's cases in: test.describe('[REQ:<its reqTag>] <its title>', () => { ... }) — using EXACTLY that feature's own reqTag and title, given in its own section below.
+- Output exactly one test(...) per scenario listed for that feature, IN THE SAME ORDER.
+- EVERY test(...) title MUST itself start with "[REQ:<its reqTag>]" too (not just the describe title),
+  followed by its scenario kind, e.g. test('[REQ:REQ-1] positive: succeeds with valid input', ...).
+  This tag on every individual test is REQUIRED for coverage tracking — do not omit it.
+- Use relative paths against the configured baseURL (${baseUrl}); call page.goto('/') for the root.
+- After EVERY page.goto(...) (or a click that navigates), before interacting with any page-specific
+  element, verify the navigation actually landed on a real, expected page — not a 404/error/blank
+  page — using a SHORT, bounded check (e.g. \`await expect(page.locator('body')).not.toContainText('Not Found', { timeout: 3000 })\`,
+  or asserting an element from that feature's own inventory that should always be present on that page). Skipping
+  this is the single biggest cause of a mysterious full-timeout hang: if navigation silently lands on
+  the wrong page (a transient server error, a redirect you didn't expect, a typo'd path), every
+  subsequent locator for that page's real elements will never resolve, and the test burns the ENTIRE
+  default test timeout (tens of seconds) waiting on something that will never appear, instead of
+  failing fast with a clear, diagnosable reason.
+- Every test(...) MUST include at least one concrete expect(...) assertion.
+- Wrap each meaningful action or assertion group in test.step('<clear, plain-English description>', async () => { ... }),
+  e.g. test.step('Enter a valid email and password', async () => { ... }) or
+  test.step('Verify the error message is shown', async () => { ... }) — write the description the way a
+  human tester would narrate what they're doing, NOT a restatement of the code (not "Fill input" or
+  "Click button"). This becomes the step-by-step breakdown shown in the run report; a test with no
+  test.step(...) wrapping still passes, but only Playwright's own generic action log appears instead.
+- For a negative/invalid-input scenario, do NOT fill invalid data and then click a submit-like
+  control assuming the click succeeds and a validation message appears afterward — many real apps
+  correctly disable that control on invalid input, and clicking a disabled control hangs until
+  timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
+  assert the inline validation message directly without depending on a successful click.
+- Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
+  \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
+  (CI machines, headless vs. headed, network conditions) vary widely in speed, making this
+  assertion flaky/brittle regardless of whether the app works correctly. Verify the OUTCOME of an
+  action (e.g. the swap/update actually happened) using Playwright's own built-in waiting/retry
+  behavior instead of a manual millisecond comparison.
+- Before calling a single-target action (click/fill/check/dblclick/selectOption/hover) on a locator,
+  make sure it can only match ONE element on the real page — Playwright throws a strict-mode
+  violation (and the test fails) if the locator resolves to more than one match. A bare
+  \`getByRole('link'/'button'/etc.)\`, a short \`getByText(...)\`, or a class/tag CSS selector are the
+  ones most likely to collide with another real element. Narrow it with a distinguishing
+  \`{ name: ... }\`/\`{ exact: true }\` filter, a more specific visible text/data-testid/id, or chain
+  \`.first()\`/\`.nth()\` when you intend a specific match — only rely on an unscoped locator when that
+  feature's own inventory below shows it is the sole element of that role/name on the page.
+- Be self-contained and runnable; do not import any other local helpers beyond the one import above.
+- When a scenario CREATES a new resource that the app enforces as unique (e.g. registering a user
+  by email, creating an account/username), do NOT hardcode a fixed literal value for that unique
+  field — embed \`Date.now()\` (or a similarly varying value) in it, e.g.
+  \`\`email-\${Date.now()}@example.com\`\`. A fixed value passes once against a real, persistent
+  backend and then fails every later re-run with a duplicate/conflict error, since the app correctly
+  remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
+  path itself should still register their own fresh unique value first, then reuse THAT same value for
+  the collision attempt within the same test.
+- ${tierGuidance}${mockNote}${routingGuidance}`;
+
+  const sections = items.map((item) => {
+    const reqTag = item.reqTag ?? item.id;
+    const scenarios =
+      item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
+    const scenarioList = formatScenarios(scenarios);
+    const inventory = formatSnapshotInventory(ctx, tier, item);
+    const observedRoutes = formatObservedRoutes(ctx, item);
+    const sourceGrounding = formatSourceGrounding(ctx, item, tier);
+    return `
+
+----- FEATURE (reqTag: "${reqTag}") -----
+Feature: ${item.title}
+Feature intent: ${item.intent}
+Scenarios to cover, one test(...) each, in this order:
+${scenarioList}${inventory}${observedRoutes}${sourceGrounding}
+Output this feature's spec between:
+${batchMarkerStart(reqTag)}
+...
+${batchMarkerEnd(reqTag)}`;
+  });
+
+  return `${header}
+${sections.join('\n')}`;
+}
+
+/**
+ * Pull each item's own spec text out of a batch response by its BEGIN/END markers. An item whose
+ * markers are missing or whose captured body is empty is simply absent from the returned map —
+ * generateBatch solo-retries those individually via generateOne rather than failing the whole
+ * batch over one item.
+ */
+function extractBatchSpecs(text: string, items: TestPlanItem[]): Map<string, string> {
+  const result = new Map<string, string>();
+  for (const item of items) {
+    const reqTag = item.reqTag ?? item.id;
+    const escaped = reqTag.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+    const re = new RegExp(
+      `=====\\s*BEGIN SPEC \\[REQ:${escaped}\\]\\s*=====([\\s\\S]*?)=====\\s*END SPEC \\[REQ:${escaped}\\]\\s*=====`,
+    );
+    const body = re.exec(text)?.[1]?.trim();
+    if (body) result.set(reqTag, body);
+  }
+  return result;
+}
+
+/**
+ * Generate specs for a batch of same-tier items with ONE provider call. Bottoms out at the
+ * existing single-item generateOne (its own 2-attempt retry loop, untouched) in two situations:
+ * a batch of exactly one item (the base case), and any item that individually fails validation
+ * within an otherwise-usable batch response — no new per-item retry logic is invented here, only
+ * routing to the one that already exists.
+ *
+ * On a TOTAL parse failure (nothing at all extracted from an ok response, or the call itself
+ * failed at the provider level — both leave `extracted` empty) the batch is split in half and
+ * each half retried recursively, mirroring runPlanPhase's truncated-batch split
+ * (splitUnitsByWeight/PLAN_MAX_SPLIT_DEPTH in orchestrator/index.ts) rather than assuming every
+ * item needs its own solo call — a batch merely too big for one response often succeeds once
+ * halved. Once the split depth is exhausted, the remaining items simply solo-retry individually
+ * (the same per-item fallback used for a single missing/invalid item), a graceful bottom-out
+ * rather than a special case.
+ */
+async function generateBatch(
+  ctx: TestModeContext,
+  batchItems: TestPlanItem[],
+  usedPaths: Set<string>,
+  depth: number,
+): Promise<Array<{ item: TestPlanItem } & GenOneOutcome>> {
+  if (batchItems.length === 1) {
+    const item = batchItems[0]!;
+    const outcome = await generateOne(ctx, item, usedPaths);
+    await recordGenOutcome(ctx, item, outcome);
+    return [{ item, ...outcome }];
+  }
+
+  const tier = resolveTier(batchItems[0]!.tier);
+  let text = '';
+  try {
+    const res = await ctx.provider.complete(buildBatchPrompt(batchItems, ctx, tier), {
+      cwd: ctx.repoPath ?? undefined,
+      timeoutMs: genBatchTimeoutMs(batchItems),
+      readOnly: true,
+      signal: ctx.signal,
+      taskType: 'codegen',
+    });
+    ctx.onUsage?.('generate', `batch of ${batchItems.length}`, ctx.provider.id, res.raw);
+    if (!res.ok) {
+      emit(ctx, `Batched codegen provider error for ${batchItems.length} item(s): ${res.detail}`);
+    } else {
+      text = res.text;
+    }
+  } catch (err) {
+    emit(
+      ctx,
+      `Batched codegen threw for ${batchItems.length} item(s): ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  const extracted = text ? extractBatchSpecs(text, batchItems) : new Map<string, string>();
+
+  if (extracted.size === 0 && depth < GEN_MAX_SPLIT_DEPTH) {
+    emit(
+      ctx,
+      `Batched generation for ${batchItems.length} item(s) came back unusable; splitting and retrying.`,
+    );
+    const mid = Math.ceil(batchItems.length / 2);
+    // Sequential, not Promise.all — matches runPlanPhase's planBatch split precedent exactly
+    // (orchestrator/index.ts). Recursing concurrently here would let a burst of simultaneous
+    // batch failures (this is itself a failure path) fan out beyond GEN_CONCURRENCY, since this
+    // recursion runs INSIDE an already-running top-level batch task and isn't governed by the
+    // outer runWithConcurrency pool — a real concurrency-cap leak, not just a cosmetic mismatch
+    // with the pattern it's supposed to mirror.
+    const leftOut = await generateBatch(ctx, batchItems.slice(0, mid), usedPaths, depth + 1);
+    const rightOut = await generateBatch(ctx, batchItems.slice(mid), usedPaths, depth + 1);
+    return [...leftOut, ...rightOut];
+  }
+
+  const results: Array<{ item: TestPlanItem } & GenOneOutcome> = [];
+  for (const item of batchItems) {
+    const reqTag = item.reqTag ?? item.id;
+    const itemText = extracted.get(reqTag);
+    if (!itemText) {
+      emit(ctx, `Batched response was missing a spec for "${item.title}"; solo-retrying.`);
+      const soloOutcome = await generateOne(ctx, item, usedPaths);
+      await recordGenOutcome(ctx, item, soloOutcome);
+      results.push({ item, ...soloOutcome });
+      continue;
+    }
+    const validated = await validateAndPersist(ctx, item, itemText, usedPaths);
+    if (validated.ungroundedWarn && validated.ungroundedWarn.length > 0) {
+      emit(
+        ctx,
+        `Batched output for "${item.title}" has unverifiable selector/endpoint references (not blocking): ${validated.ungroundedWarn.join('; ')}`,
+      );
+    }
+    if (validated.spec) {
+      const outcome: GenOneOutcome = { spec: validated.spec };
+      await recordGenOutcome(ctx, item, outcome);
+      results.push({ item, spec: validated.spec });
+      continue;
+    }
+    emit(
+      ctx,
+      `Batched output for "${item.title}" failed validation (${validated.reason}); solo-retrying via the single-item path.`,
+      { ...(validated.violations ? { violations: validated.violations } : {}) },
+    );
+    const soloOutcome = await generateOne(ctx, item, usedPaths);
+    await recordGenOutcome(ctx, item, soloOutcome);
+    results.push({ item, ...soloOutcome });
+  }
+  return results;
+}
+
+/** Number of generation BATCHES (see buildGenerationBatches) run concurrently. */
 const GEN_CONCURRENCY = 3;
 
 /**
  * Run up to `concurrency` promises at a time from `tasks`. Returns results in
- * the same order as `tasks` regardless of completion order.
+ * the same order as `tasks` regardless of completion order. `shouldStop`
+ * (checked before each task is popped, e.g. a live pause or a proactive
+ * credit-budget ceiling tripping mid-GENERATE — see orchestrator/index.ts's
+ * checkBudget) lets a worker stop pulling NEW batches without disturbing
+ * batches already in flight; a task never dispatched simply leaves its slot
+ * `undefined` — callers must filter those out before use (see generate()'s
+ * `.filter(Boolean)` below).
  */
-async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency: number): Promise<T[]> {
+async function runWithConcurrency<T>(
+  tasks: Array<() => Promise<T>>,
+  concurrency: number,
+  shouldStop?: () => boolean,
+): Promise<T[]> {
   const results: T[] = new Array(tasks.length);
   let nextIndex = 0;
 
   async function worker(): Promise<void> {
     while (nextIndex < tasks.length) {
+      if (shouldStop?.()) return;
       const i = nextIndex++;
       results[i] = await tasks[i]();
     }
@@ -1099,40 +2064,85 @@ async function runWithConcurrency<T>(tasks: Array<() => Promise<T>>, concurrency
 }
 
 /**
- * For each plan item, ask the provider (read-only) for a single Playwright
- * spec, validate it (must look like a spec, contain >=1 expect, and pass the
- * forbidden-API gate), retry once stricter on failure, write it to
- * tests/<tier>/<slug>.spec.ts, and return the accepted specs.
+ * Group plan items into same-tier batches (see buildGenerationBatches), then for each batch ask the
+ * provider (read-only) for all of that batch's specs in ONE call (see generateBatch) — validating
+ * each (must look like a spec, contain >=1 expect, pass the forbidden-API and grounding gates),
+ * solo-retrying any individual failure via the existing single-item generateOne, and writing
+ * accepted specs to tests/<tier>/<slug>.spec.ts.
  *
- * Runs up to GEN_CONCURRENCY items in parallel to increase throughput on
- * plans with many items; per-item order doesn't matter since each spec is
- * independent, but path de-dup (usedPaths) still guarantees unique files.
+ * Runs up to GEN_CONCURRENCY batches in parallel to increase throughput on plans with many items
+ * (same wall-clock-parallelism benefit the old one-item-per-task scheme had, now applied across
+ * batches); per-batch/per-item order doesn't matter since each spec is independent, but path
+ * de-dup (usedPaths) still guarantees unique files.
  */
 export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
   const items = plan.items ?? [];
-  emit(ctx, `Generating ${items.length} spec(s) (up to ${GEN_CONCURRENCY} in parallel)`, {
-    count: items.length,
-  });
+
+  // Restore whatever finished in an earlier, interrupted generate() call (see
+  // recordGenOutcome/readGenerateCheckpointEntries above) — only entries for
+  // items still present in THIS plan count, so a later, unrelated generate()
+  // call reusing the same projectDir never inherits stale entries (same
+  // precedent as execute.ts's clearExecCheckpoint doc comment).
+  const priorEntriesAll = await readGenerateCheckpointEntries(ctx.projectDir);
+  const currentItemIds = new Set(items.map((it) => it.id));
+  const priorEntries = priorEntriesAll.filter((e) => currentItemIds.has(e.itemId));
+  const doneIds = new Set(priorEntries.map((e) => e.itemId));
+  const remainingItems = items.filter((it) => !doneIds.has(it.id));
+  if (priorEntries.length > 0) {
+    emit(ctx, `Resuming: ${priorEntries.length} item(s) already finished; skipping them this run.`, {
+      alreadyFinished: priorEntries.length,
+    });
+  }
+
+  // Batch same-tier items together so a shared tier-wide/app-wide context (rules, tier guidance,
+  // mock note, routing guidance) is paid for ONCE per batch instead of once per item — items from
+  // different tiers are never mixed into the same batch, since their tier guidance genuinely
+  // differs (see buildBatchPrompt). Within a tier, buildGenerationBatches further clusters items by
+  // route relatedness and bin-packs by scenario weight (see its doc comment) instead of chunking
+  // in fixed-size, order-only groups.
+  const byTier = new Map<Tier, TestPlanItem[]>();
+  for (const item of remainingItems) {
+    const tier = resolveTier(item.tier);
+    const list = byTier.get(tier) ?? [];
+    list.push(item);
+    byTier.set(tier, list);
+  }
+  const batches: TestPlanItem[][] = [];
+  for (const list of byTier.values()) {
+    batches.push(...buildGenerationBatches(list));
+  }
+
+  emit(
+    ctx,
+    `Generating ${remainingItems.length} spec(s) across ${batches.length} batch(es) (up to ${GEN_CONCURRENCY} batch(es) in parallel)`,
+    { count: remainingItems.length, batches: batches.length },
+  );
 
   const specs: GeneratedSpec[] = [];
   const usedPaths = new Set<string>();
   let completed = 0;
+  const total = remainingItems.length;
 
-  // Path de-dup happens inside generateOne (before writeFile) via the shared
-  // usedPaths set, so each accepted spec persists to a unique file on disk
-  // even when several items are generated at once.
-  const tasks = items.map((item, i) => async () => {
-    emit(ctx, `Dispatched ${i + 1}/${items.length}: Generating "${item.title}"`, {
-      id: item.id,
-      tier: item.tier,
+  // Path de-dup happens inside validateAndPersist/generateOne (before writeFile) via the shared
+  // usedPaths set, so each accepted spec persists to a unique file on disk even when several
+  // batches are generated at once.
+  const tasks = batches.map((batchItems, i) => async () => {
+    emit(ctx, `Dispatched batch ${i + 1}/${batches.length}: ${batchItems.length} item(s)`, {
+      ids: batchItems.map((it) => it.id),
+      tier: batchItems[0]?.tier,
     });
-    const outcome = await generateOne(ctx, item, usedPaths);
-    completed += 1;
-    emit(ctx, `Progress: ${completed}/${items.length} done`, { completed, total: items.length });
-    return { item, ...outcome };
+    const batchOutcomes = await generateBatch(ctx, batchItems, usedPaths, 0);
+    completed += batchOutcomes.length;
+    emit(ctx, `Progress: ${completed}/${total} done`, { completed, total });
+    return batchOutcomes;
   });
 
-  const outcomes = await runWithConcurrency(tasks, GEN_CONCURRENCY);
+  // shouldStop lets a live pause/budget-ceiling abort stop new batches from
+  // being dispatched (batches already in flight still finish); a batch never
+  // dispatched leaves an undefined slot, filtered out before flattening.
+  const outcomes = (await runWithConcurrency(tasks, GEN_CONCURRENCY, () => ctx.signal?.aborted === true))
+    .filter((r): r is NonNullable<typeof r> => r !== undefined)
+    .flat();
 
   let lastProviderFailureDetail: string | undefined;
   for (const { item, spec, reason, violations, providerFailureDetail } of outcomes) {
@@ -1156,10 +2166,18 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
   // providerFailureDetail — a partial mix of provider- and content-failures
   // is ordinary generation, not this). Only then is this a network/credits
   // interruption worth checkpointing, rather than "the model produced
-  // nothing usable," which stays today's normal zero-specs outcome.
+  // nothing usable," which stays today's normal zero-specs outcome. Scoped to
+  // remainingItems: if everything was already finished in an earlier attempt,
+  // there's nothing left to dispatch and therefore nothing to classify.
+  // outcomes.length > 0 guards against Array.prototype.every's vacuous-true
+  // on an empty array: a signal already aborted before any batch even
+  // dispatched (runWithConcurrency's shouldStop, e.g. a live pause/budget
+  // ceiling) leaves outcomes empty — that's "we were told to stop", not a
+  // provider outage, and must not be misclassified as one.
   if (
-    items.length > 0 &&
+    remainingItems.length > 0 &&
     specs.length === 0 &&
+    outcomes.length > 0 &&
     outcomes.every((o) => o.providerFailureDetail !== undefined)
   ) {
     throw new ProviderUnavailableError(
@@ -1167,9 +2185,27 @@ export async function generate(ctx: TestModeContext, plan: TestPlan): Promise<Ge
     );
   }
 
+  // Fold in whatever finished during an earlier, interrupted attempt (and was
+  // therefore skipped this run) so the returned list covers the WHOLE
+  // GENERATE phase, not just what this particular invocation produced —
+  // mirrors execute.ts's equivalent merge of checkpoint-restored entries.
+  if (priorEntries.length > 0) {
+    const restored = await Promise.all(priorEntries.map((e) => restoreGeneratedSpec(e)));
+    for (const spec of restored) if (spec) specs.push(spec);
+  }
+
   emit(ctx, `Generation complete: ${specs.length}/${items.length} spec(s) accepted`, {
     accepted: specs.length,
     requested: items.length,
   });
+
+  // Completed without interruption — nothing left to resume. A pause/abort
+  // leaves the write-through checkpoint IN PLACE (not cleared) so the NEXT
+  // generate() call resumes from it instead of redoing already-finished work;
+  // only a clean, uninterrupted completion clears it — same condition
+  // execute.ts's clearExecCheckpoint call site uses.
+  if (!ctx.signal?.aborted) {
+    await clearGenerateCheckpoint(ctx.projectDir);
+  }
   return specs;
 }

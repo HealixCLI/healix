@@ -191,6 +191,24 @@ export function artifactLeaf(rel: string): string {
   return parts[parts.length - 1] ?? rel;
 }
 
+// ---- Usage formatting (token/cost display for RunDetailPanel + ReportsUsageView) --
+
+/** Formats a token count for display; '—' when null (the provider/call reported no usage). */
+export function formatTokens(n: number | null): string {
+  return n === null ? '—' : Math.round(n).toLocaleString();
+}
+
+/** Formats a USD cost for display; '—' when null (not every provider reports cost). */
+export function formatCost(n: number | null): string {
+  return n === null ? '—' : `$${n < 0.01 && n > 0 ? n.toFixed(4) : n.toFixed(2)}`;
+}
+
+/** Sums nullable numbers, staying null only when EVERY value is null (vs. 0 when some are 0/absent-but-known). */
+export function sumNullable(values: Array<number | null>): number | null {
+  const known = values.filter((v): v is number => v !== null);
+  return known.length > 0 ? known.reduce((a, b) => a + b, 0) : null;
+}
+
 // ---- Artifact media handling (screenshots / videos / traces) ----------------
 
 export type ArtifactKind = 'image' | 'video' | 'trace' | 'other';

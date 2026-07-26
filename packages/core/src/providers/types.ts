@@ -4,6 +4,21 @@ export type ProviderStatus = 'ready' | 'cli-missing' | 'not-authenticated' | 'er
 
 export type Capability = 'computer-use' | 'codegen' | 'plan' | 'triage';
 
+/**
+ * Identifies which of Healix's fixed set of AI call sites a request is for,
+ * so an adapter can resolve a per-task-type model/effort (see
+ * providers/model-config.ts) instead of always using one CLI default.
+ */
+export type TaskType =
+  | 'plan-generate'
+  | 'plan-gapfill'
+  | 'plan-revise-item'
+  | 'codegen'
+  | 'mock-response'
+  | 'triage'
+  | 'triage-summary'
+  | 'health-probe';
+
 export interface DetectResult {
   installed: boolean;
   binPath: string | null;
@@ -28,6 +43,9 @@ export interface PlanResult {
   plan: string;
   raw: unknown;
   detail: string;
+  /** Resolved model/effort actually used, when the adapter supports task-type routing (Claude only, for now). */
+  model?: string;
+  effort?: string;
 }
 
 export interface CompletionResult {
@@ -36,6 +54,9 @@ export interface CompletionResult {
   text: string;
   raw: unknown;
   detail: string;
+  /** Resolved model/effort actually used, when the adapter supports task-type routing (Claude only, for now). */
+  model?: string;
+  effort?: string;
 }
 
 export interface CompleteOptions {
@@ -58,6 +79,15 @@ export interface CompleteOptions {
    * abort-flavoured detail, matching the resolve-only runCli contract.
    */
   signal?: AbortSignal;
+  /** Which fixed AI call site this is, for per-task-type model/effort resolution. */
+  taskType?: TaskType;
+}
+
+export interface PlanOptions {
+  timeoutMs?: number;
+  signal?: AbortSignal;
+  /** Which fixed AI call site this is, for per-task-type model/effort resolution. */
+  taskType?: TaskType;
 }
 
 export interface HealthOptions {
@@ -74,7 +104,7 @@ export interface ProviderAdapter {
   readonly capabilities: Capability[];
   detect(): Promise<DetectResult>;
   health(opts?: HealthOptions): Promise<HealthResult>;
-  plan(task: string, opts?: { timeoutMs?: number; signal?: AbortSignal }): Promise<PlanResult>;
+  plan(task: string, opts?: PlanOptions): Promise<PlanResult>;
   /** General-purpose prompt → text completion (used by test modes, orchestrator, triage). */
   complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult>;
 }

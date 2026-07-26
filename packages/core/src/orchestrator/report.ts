@@ -1,6 +1,6 @@
 import { relative, sep } from 'node:path';
 import type { Project, Run, TestCase } from '../storage/types.js';
-import type { ExecOutcome, TestPlan } from '../modes/types.js';
+import type { ExecOutcome, ExecStepItem, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
 import type { ExternalDependency } from '../target/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
@@ -50,6 +50,13 @@ export interface RunReport {
   generation?: GenerationStats;
   /** Functionality-unit coverage reached by the coverage-feedback loop; null when it didn't run (e.g. reuse mode, or no functionality inventory). */
   coverage: ReportCoverageSummary | null;
+  /**
+   * End-of-run AI synthesis across every triaged failure (see
+   * triage/grouping.ts's summarizeTriageGroups) — cross-failure patterns a
+   * single failure's own triage never sees. Null when there were fewer than 2
+   * failures to compare, or the summary call failed/was skipped.
+   */
+  groupingSummary?: string | null;
   generatedAt: string;
 }
 
@@ -65,6 +72,7 @@ export function buildReport(input: {
   mockedRequestCounts?: Record<string, number>;
   generation?: GenerationStats;
   coverage?: ReportCoverageSummary | null;
+  groupingSummary?: string | null;
 }): RunReport {
   return {
     run: input.run,
@@ -78,6 +86,7 @@ export function buildReport(input: {
     mockedRequestCounts: input.mockedRequestCounts ?? {},
     generation: input.generation,
     coverage: input.coverage ?? null,
+    groupingSummary: input.groupingSummary ?? null,
     generatedAt: new Date().toISOString(),
   };
 }
@@ -220,6 +229,48 @@ function renderArtifacts(artifacts: string[] | undefined, reportDir: string | un
   return `<div class="evidence">${imgHtml}${videoHtml}${otherHtml}</div>`;
 }
 
+/**
+ * Step-by-step breakdown (click, fill, navigate, assert...) for one result —
+ * present for both passed and failed tests, not just failures, since seeing
+ * what a test actually DID is useful regardless of outcome. Collapsed by
+ * default so it doesn't dominate the row; absent entirely for older suites
+ * scaffolded before the steps reporter existed.
+ */
+/**
+ * One step's <li> — a human-authored test.step(...) task gets its own nested
+ * <details> revealing the raw actions (click/fill/expect/etc.) performed
+ * inside it, so a reader gets the high-level task name by default and can
+ * drop into the technical blow-by-blow only when they want to.
+ */
+function renderStepItem(s: ExecStepItem): string {
+  const errBlock = s.error ? `<div class="step-err">${esc(s.error.split('\n')[0] ?? s.error)}</div>` : '';
+  const children =
+    s.steps && s.steps.length > 0
+      ? `<details class="substeps"><summary>${s.steps.length} action${s.steps.length === 1 ? '' : 's'}</summary><ol>${s.steps
+          .map(renderStepItem)
+          .join('')}</ol></details>`
+      : '';
+  const mark = s.error
+    ? '<span class="step-mark step-mark-fail" aria-label="Failed">✕</span>'
+    : '<span class="step-mark step-mark-ok" aria-label="Passed">✓</span>';
+  return `<li${s.error ? ' class="step-failed"' : ''}>${mark}${esc(s.title)} <span class="hist">${esc(
+    formatDuration(s.durationMs),
+  )}</span>${errBlock}${children}</li>`;
+}
+
+function renderSteps(steps: ExecStepItem[] | undefined): string {
+  if (!steps || steps.length === 0) {
+    // Genuinely nothing ran (e.g. auth-setup's "no credentials configured"
+    // check throwing before any page action) as well as older suites from
+    // before the steps reporter existed both land here — say so explicitly,
+    // matching the desktop UI's equivalent, rather than leaving the cell
+    // blank (reads as a bug, not an accurate "there were none to record").
+    return '<span class="hist">No steps recorded.</span>';
+  }
+  const items = steps.map(renderStepItem).join('');
+  return `<details class="steps"><summary>${steps.length} step${steps.length === 1 ? '' : 's'}</summary><ol>${items}</ol></details>`;
+}
+
 function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
   if (!error) return '';
   const { summary, rest } = splitErrorText(error);
@@ -248,7 +299,18 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
  */
 export function renderReportHtml(report: RunReport, opts: { reportDir?: string } = {}): string {
   const { reportDir } = opts;
-  const { run, project, plan, outcome, triage, tests, dependencies, mockedRequestCounts, coverage } = report;
+  const {
+    run,
+    project,
+    plan,
+    outcome,
+    triage,
+    tests,
+    dependencies,
+    mockedRequestCounts,
+    coverage,
+    groupingSummary,
+  } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
@@ -299,7 +361,17 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   // Persisted TestCase rows are also keyed by title (the same title a result
   // row carries once updateTestTitle has run) so the Results table can show
   // the scenario's description/intent without needing testId on ExecResultItem.
-  const testByTitle = new Map<string, TestCase>(tests.map((t) => [t.title, t]));
+  // Two rows can end up sharing a title (a persistResults matching miss forks
+  // a duplicate, metadata-less row alongside the real one — see orchestrator/
+  // index.ts's persistResults) — when that happens, prefer whichever row
+  // actually carries its GENERATE-time metadata over a later, emptier one.
+  const testByTitle = new Map<string, TestCase>();
+  for (const t of tests) {
+    const existing = testByTitle.get(t.title);
+    if (!existing || (existing.specPath == null && t.specPath != null)) {
+      testByTitle.set(t.title, t);
+    }
+  }
 
   const resultRows = (outcome?.results ?? [])
     .map((r) => {
@@ -312,10 +384,9 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
           : '';
       return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
         formatDuration(r.durationMs),
-      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}</td><td>${renderArtifacts(
-        r.artifacts,
-        reportDir,
-      )}</td></tr>`;
+      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}</td><td>${renderSteps(
+        r.steps,
+      )}</td><td>${renderArtifacts(r.artifacts, reportDir)}</td></tr>`;
     })
     .join('');
 
@@ -380,6 +451,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   section.degraded { border: 1px solid #9a670066; background: #9a67000f; border-radius: 8px; padding: .25rem 1rem 1rem; }
   section.degraded h2 { color: #9a6700; }
   section.degraded ul { margin: 0; padding-left: 1.25rem; }
+  .grouping-summary { background: #8884; border-radius: 8px; padding: .6rem .8rem; font-style: italic; }
   .err-summary { font-weight: 600; }
   .diagnosis { margin-top: .35rem; font-size: .8rem; }
   .diagnosis .hist { display: inline; }
@@ -395,6 +467,16 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   .ev-file { font-size: .75rem; color: #888; align-self: center; border: 1px solid #8884; border-radius: 4px;
     padding: .1rem .4rem; text-decoration: none; }
   .ev-file:hover { color: inherit; }
+  .steps ol { margin: .35rem 0 0; padding-left: 1.1rem; font-size: .78rem; }
+  .steps li { margin-bottom: .2rem; }
+  .steps li.step-failed { color: #cf222e; }
+  .steps .step-err { font-size: .7rem; color: #cf222e; opacity: .85; }
+  .substeps { margin-top: .2rem; }
+  .substeps summary { color: #888; font-size: .7rem; }
+  .substeps ol { margin: .25rem 0 0; padding-left: 1rem; }
+  .step-mark { display: inline-block; width: 1.1em; font-weight: 700; }
+  .step-mark-ok { color: #1a7f37; }
+  .step-mark-fail { color: #cf222e; }
 </style>
 </head>
 <body>
@@ -432,8 +514,8 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   <section>
     <h2>Results</h2>
     <table>
-      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Description</th><th>Error</th><th>Evidence</th></tr></thead>
-      <tbody>${resultRows || '<tr><td colspan="6"><em>No results.</em></td></tr>'}</tbody>
+      <thead><tr><th>Title</th><th>Status</th><th>Duration</th><th>Description</th><th>Error</th><th>Steps</th><th>Evidence</th></tr></thead>
+      <tbody>${resultRows || '<tr><td colspan="7"><em>No results.</em></td></tr>'}</tbody>
     </table>
   </section>
 
@@ -441,6 +523,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
     triage.length > 0
       ? `<section>
     <h2>Triage</h2>
+    ${groupingSummary ? `<p class="grouping-summary">${esc(groupingSummary)}</p>` : ''}
     <table>
       <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>

@@ -1,5 +1,6 @@
-import { spawn } from 'node:child_process';
+import { spawn as nodeSpawn } from 'node:child_process';
 import { statSync } from 'node:fs';
+import spawn from 'cross-spawn';
 
 export interface RunResult {
   code: number | null;
@@ -73,27 +74,13 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     }
 
     const isWindows = process.platform === 'win32';
-    // Windows: npm-global CLIs (claude, codex) are .cmd/.bat shims that can
-    // only be spawned through a shell (Node refuses to exec .cmd directly).
-    // But real executables (node.exe, where, …) must NOT go through cmd.exe —
-    // it mangles quoted/paren args, so e.g. `node -e 'foo("hi")'` becomes a
-    // syntax error and the child exits 1. So only shell out on Windows when
-    // the target isn't already a directly-spawnable .exe/.com.
-    const useShell = isWindows && !/\.(exe|com)$/i.test(cmd);
-    // When shell:true, cmd+args are handed to cmd.exe as ONE concatenated
-    // string with NO escaping (Node's hardened shell:true behavior — see the
-    // DEP0190 deprecation notice — it used to quote args implicitly). A `cmd`
-    // containing a space or quote (e.g. a .cmd shim path under "Program
-    // Files") gets split/mis-parsed by cmd.exe, so quote it in that case. This
-    // does not attempt to fully escape `args` (out of scope — callers must
-    // avoid passing user-controlled multi-word/multi-line content via argv at
-    // all, e.g. by using `opts.input` instead, which is exactly what CLI
-    // prompts do).
-    const quotedCmd = useShell && /[\s"]/.test(cmd) ? `"${cmd}"` : cmd;
-    const child = spawn(quotedCmd, args, {
+    // cross-spawn resolves Windows .cmd/.bat shims (claude, codex, npx, …) and
+    // quotes argv itself, without cmd.exe string-concatenation (the plain
+    // shell:true + args combo Node's DEP0190 warns about, and which let a
+    // hostile argv element — e.g. a pasted git URL — inject shell metachars).
+    const child = spawn(cmd, args, {
       cwd: opts.cwd,
       env: { ...process.env, ...opts.env },
-      shell: useShell,
       // POSIX: make the child its own process-group leader so timeout/abort can
       // kill the CLI *and* everything it spawned (helpers, node children) with
       // one group signal — killing only the direct child leaves grandchildren
@@ -116,7 +103,7 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       try {
         if (process.platform === 'win32') {
           if (!child.pid) throw new Error('no pid');
-          spawn('taskkill', ['/F', '/T', '/PID', String(child.pid)]);
+          nodeSpawn('taskkill', ['/F', '/T', '/PID', String(child.pid)]);
         } else {
           if (!child.pid) throw new Error('no pid');
           process.kill(-child.pid, 'SIGKILL');
@@ -151,13 +138,16 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       resolve(res);
     };
 
+    // cross-spawn's type declarations return the nullable-stream ChildProcess
+    // shape, but we never override `stdio`, so these are always piped in
+    // practice — non-null assertions match runtime reality.
     // setEncoding decodes multi-byte UTF-8 safely across chunk boundaries.
-    child.stdout.setEncoding('utf8');
-    child.stderr.setEncoding('utf8');
-    child.stdout.on('data', (d: string) => {
+    child.stdout!.setEncoding('utf8');
+    child.stderr!.setEncoding('utf8');
+    child.stdout!.on('data', (d: string) => {
       stdout += d;
     });
-    child.stderr.on('data', (d: string) => {
+    child.stderr!.on('data', (d: string) => {
       stderr += d;
     });
     child.on('error', (err) => {
@@ -187,13 +177,13 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     // Swallow stdin errors BEFORE writing: if the CLI exits without reading
     // stdin (e.g. `--version` fast paths), the write/end below raises EPIPE,
     // and an unhandled 'error' event on the stream would crash the process.
-    child.stdin.on('error', () => {});
+    child.stdin!.on('error', () => {});
 
     // Always close stdin. Some CLIs (e.g. `codex exec`) block reading stdin to
     // EOF when none is provided; writing the optional input first preserves the
     // stdin-piping path for tools that consume it.
-    if (opts.input !== undefined) child.stdin.write(opts.input);
-    child.stdin.end();
+    if (opts.input !== undefined) child.stdin!.write(opts.input);
+    child.stdin!.end();
   });
 }
 

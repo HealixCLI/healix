@@ -1,5 +1,11 @@
-import { describe, expect, it } from 'vitest';
-import { runPlanPhase, attemptPlanCompletion, buildWeightedBatches, splitUnitsByWeight } from './index.js';
+import { afterEach, describe, expect, it, vi } from 'vitest';
+import {
+  runPlanPhase,
+  attemptPlanCompletion,
+  buildWeightedBatches,
+  splitUnitsByWeight,
+  type PlanBatchProgress,
+} from './index.js';
 import type { OrchestratorEvent } from './types.js';
 import type { PlanRepoContext } from './plan.js';
 import type { Project } from '../storage/types.js';
@@ -66,7 +72,11 @@ function fencedJson(value: unknown): string {
 }
 
 /** A provider whose plan completion fails `failTimes` times, then succeeds. */
-function makeFlakyProvider(failTimes: number, plan: unknown): ProviderAdapter & { calls: number } {
+function makeFlakyProvider(
+  failTimes: number,
+  plan: unknown,
+  failureDetail = 'transient failure',
+): ProviderAdapter & { calls: number } {
   const adapter = {
     id: 'claude' as const,
     label: 'Flaky Fake',
@@ -94,7 +104,7 @@ function makeFlakyProvider(failTimes: number, plan: unknown): ProviderAdapter & 
     async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
       adapter.calls += 1;
       if (opts?.mode === 'plan' && adapter.calls <= failTimes) {
-        return { provider: 'claude', ok: false, text: '', raw: null, detail: 'transient failure' };
+        return { provider: 'claude', ok: false, text: '', raw: null, detail: failureDetail };
       }
       return { provider: 'claude', ok: true, text: fencedJson(plan), raw: plan, detail: 'OK' };
     },
@@ -134,6 +144,73 @@ describe('runPlanPhase resilience', () => {
     // The literal synthesizePlan() smoke items — this IS the "few smoke tests" symptom.
     expect(plan.items.length).toBeGreaterThan(0);
     expect(provider.calls).toBe(2);
+  }, 10_000);
+
+  it('does NOT pause before a same-provider retry for an ordinary transient failure (only credits-exhausted warrants the delay)', async () => {
+    const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'transient failure');
+    const start = Date.now();
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
+    // The gated delay is 2000ms — an ungated retry completes in a small fraction of that.
+    expect(Date.now() - start).toBeLessThan(500);
+  }, 10_000);
+
+  it('pauses before a same-provider retry when the failure is classified credits-exhausted', async () => {
+    const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'Error: insufficient credits — quota exceeded');
+    const start = Date.now();
+    await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), { provider });
+    expect(Date.now() - start).toBeGreaterThanOrEqual(1900);
+  }, 10_000);
+
+  describe('(fake timers) delay gating — deterministic, no real wall-clock wait', () => {
+    afterEach(() => {
+      vi.useRealTimers();
+    });
+
+    it('does NOT need any timer advance for an ordinary transient failure — the retry is not waiting on anything', async () => {
+      vi.useFakeTimers();
+      const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'transient failure');
+      const plan = await runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
+        provider,
+      });
+      // No vi.advanceTimersByTimeAsync(...) call anywhere above — if the retry were still
+      // gated behind the 2s delay, this promise would never have resolved and the test would
+      // time out, since fake timers never advance on their own.
+      expect(plan.planSource).toBe('ai');
+      expect(provider.calls).toBe(2);
+    });
+
+    it('needs the fake clock advanced by the full delay before a credits-exhausted retry resolves', async () => {
+      vi.useFakeTimers();
+      const provider = makeFlakyProvider(1, SIMPLE_PLAN, 'Error: insufficient credits — quota exceeded');
+      const resultPromise = runPlanPhase(provider, makeProject(), { projectId: 'prj_test' }, noopEmit(), {
+        provider,
+      });
+      await vi.advanceTimersByTimeAsync(2_000);
+      const plan = await resultPromise;
+      expect(plan.planSource).toBe('ai');
+      expect(provider.calls).toBe(2);
+    });
+  });
+
+  it('attemptPlanCompletion requests taskType "plan-generate" (per-task-type model/effort routing)', async () => {
+    let seenTaskType: string | undefined;
+    const provider = makeFlakyProvider(0, SIMPLE_PLAN);
+    const originalComplete = provider.complete.bind(provider);
+    provider.complete = async (prompt, opts) => {
+      seenTaskType = opts?.taskType;
+      return originalComplete(prompt, opts);
+    };
+    await attemptPlanCompletion(
+      provider,
+      'irrelevant prompt text',
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      {
+        provider,
+      },
+    );
+    expect(seenTaskType).toBe('plan-generate');
   }, 10_000);
 
   it('attemptPlanCompletion never calls synthesizePlan — it returns null with a reason instead', async () => {
@@ -273,6 +350,163 @@ describe('runPlanPhase batching', () => {
     expect(plan.fallbackReason).toContain('batch 2');
     expect(plan.items.length).toBeGreaterThan(0);
     expect(plan.items.length).toBeLessThan(70);
+  }, 10_000);
+});
+
+describe('runPlanPhase resumeState/onBatchProgress (checkpointing a mid-batch-loop interruption)', () => {
+  function unitAwareProvider(): ProviderAdapter & { calls: number } {
+    const adapter = {
+      id: 'claude' as const,
+      label: 'Unit-aware Fake',
+      capabilities: ['plan' as const],
+      calls: 0,
+      async detect(): Promise<DetectResult> {
+        return { installed: true, binPath: '/fake/claude', version: '1.0.0' };
+      },
+      async health(): Promise<HealthResult> {
+        return {
+          provider: 'claude',
+          status: 'ready',
+          installed: true,
+          binPath: '/fake/claude',
+          version: '1.0.0',
+          authenticated: true,
+          model: 'fake',
+          latencyMs: 1,
+          detail: 'OK',
+        };
+      },
+      async plan(): Promise<PlanResult> {
+        return {
+          provider: 'claude',
+          ok: true,
+          plan: fencedJson(SIMPLE_PLAN),
+          raw: SIMPLE_PLAN,
+          detail: 'OK',
+        };
+      },
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        adapter.calls += 1;
+        if (opts?.mode !== 'plan') {
+          return { provider: 'claude', ok: true, text: 'n/a', raw: null, detail: 'OK' };
+        }
+        const keys = [...prompt.matchAll(/unitKey: "([^"]+)"/g)].map((m) => m[1]);
+        const body = {
+          summary: `Batch covering ${keys.length} unit(s).`,
+          items: keys.map((key) => ({
+            title: `Covers ${key}`,
+            tier: 'tierA-public',
+            intent: `Exercises ${key}.`,
+            unitKey: key,
+          })),
+        };
+        return { provider: 'claude', ok: true, text: fencedJson(body), raw: body, detail: 'OK' };
+      },
+    };
+    return adapter;
+  }
+
+  function makeUnits(count: number): FunctionalityUnit[] {
+    return Array.from({ length: count }, (_, i) => ({
+      key: `route:/page-${i}`,
+      kind: 'route' as const,
+      label: `page: /page-${i}`,
+      file: `app/page-${i}/page.tsx`,
+    }));
+  }
+
+  it('onBatchProgress fires once per top-level batch, with cumulative items and growing completedBatchIndices', async () => {
+    const units = makeUnits(70);
+    const provider = unitAwareProvider();
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+    const snapshots: PlanBatchProgress[] = [];
+
+    const plan = await runPlanPhase(
+      provider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider },
+      repoIndex,
+      undefined,
+      undefined,
+      async (progress) => {
+        snapshots.push(progress);
+      },
+    );
+
+    expect(snapshots.length).toBeGreaterThan(1);
+    // completedBatchIndices only ever grows, one more per snapshot.
+    for (let i = 1; i < snapshots.length; i++) {
+      expect(snapshots[i]!.completedBatchIndices.length).toBe(
+        snapshots[i - 1]!.completedBatchIndices.length + 1,
+      );
+    }
+    // The final snapshot already has every item the returned plan does.
+    expect(snapshots[snapshots.length - 1]!.items.length).toBe(plan.items.length);
+  }, 10_000);
+
+  it('resumeState skips already-completed batches — no provider call is made for them', async () => {
+    const units = makeUnits(70);
+    const repoIndex: PlanRepoContext = { summary: '', files: [], functionality: units };
+
+    // First pass: capture progress after exactly the FIRST top-level batch resolves.
+    const firstProvider = unitAwareProvider();
+    let firstBatchProgress: PlanBatchProgress | undefined;
+    await runPlanPhase(
+      firstProvider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider: firstProvider },
+      repoIndex,
+      undefined,
+      undefined,
+      async (progress) => {
+        firstBatchProgress ??= progress; // only keep the FIRST snapshot
+      },
+    );
+    expect(firstBatchProgress).toBeDefined();
+    expect(firstBatchProgress!.completedBatchIndices).toEqual([0]);
+    const itemsAfterFirstBatch = firstBatchProgress!.items.length;
+    expect(itemsAfterFirstBatch).toBeGreaterThan(0);
+    expect(itemsAfterFirstBatch).toBeLessThan(70);
+
+    // Second pass ("resume"): a provider that throws if asked to plan batch 1
+    // again — if resumeState didn't actually skip it, this test would fail
+    // with that thrown error instead of a normal result.
+    const resumeProvider = unitAwareProvider();
+    const guardedProvider: ProviderAdapter = {
+      ...resumeProvider,
+      async complete(prompt, opts) {
+        if (opts?.mode === 'plan' && prompt.includes('batch 1 of')) {
+          throw new Error('batch 1 should have been skipped via resumeState — it already completed');
+        }
+        return resumeProvider.complete(prompt, opts);
+      },
+    };
+
+    const resumedPlan = await runPlanPhase(
+      guardedProvider,
+      makeProject(),
+      { projectId: 'prj_test' },
+      noopEmit(),
+      { provider: guardedProvider },
+      repoIndex,
+      undefined,
+      {
+        completedBatchIndices: new Set(firstBatchProgress!.completedBatchIndices),
+        items: firstBatchProgress!.items,
+        failedBatches: firstBatchProgress!.failedBatches,
+      },
+    );
+
+    expect(resumedPlan.planSource).toBe('ai');
+    // Every unit still ends up covered exactly once — the resumed batches
+    // plus the carried-forward first batch together cover all 70.
+    expect(resumedPlan.items).toHaveLength(70);
+    const coveredKeys = new Set(resumedPlan.items.map((it) => it.unitKey));
+    expect(coveredKeys.size).toBe(70);
   }, 10_000);
 });
 

@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from '../providers/types.js';
+import type { UsageRecorder } from '../providers/usage.js';
 import type { ExternalDependency, MockResponse, TargetAdapter } from '../target/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import type { CrawlWithAuthResult, LoginCandidate, RoutePrefixInfo } from '../browser/crawler.js';
@@ -175,7 +176,9 @@ export type QualityFindingCode =
   | 'hardcoded-credential-literal'
   | 'absolute-url-assertion'
   | 'disabled-button-race-risk'
-  | 'disabled-button-click-race';
+  | 'disabled-button-click-race'
+  | 'ambiguous-locator-risk'
+  | 'unvalidated-status-code-assumption';
 
 export interface QualityFinding {
   code: QualityFindingCode;
@@ -202,12 +205,38 @@ export interface ValidationResult {
   warnings: QualityWarning[];
 }
 
+/** One action/assertion step Playwright performed during a test — e.g. "click", "fill", "expect.toBeVisible". */
+export interface ExecStepItem {
+  title: string;
+  durationMs: number;
+  error?: string;
+  /**
+   * The raw actions (click/fill/expect/etc.) performed inside this step,
+   * present only when this entry is a human-authored test.step(...) wrapper —
+   * gives a high-level task name with the granular technical detail nested
+   * underneath, instead of forcing a choice between the two.
+   */
+  steps?: ExecStepItem[];
+}
+
 export interface ExecResultItem {
   title: string;
   status: TestStatus;
   durationMs?: number;
   error?: string;
   artifacts?: string[];
+  /** Step-by-step breakdown for this outcome, present for both passed and failed tests. Absent for older suites without the steps reporter. */
+  steps?: ExecStepItem[];
+  /**
+   * The spec file this result came from (relative path, as reported by the
+   * test runner) — when present, gives mergeExecOutcomes (coverage.ts) a
+   * stable identity independent of title text, so two distinct generated
+   * scenarios that coincidentally share wording (e.g. across gap-fill
+   * iterations) aren't mistaken for the same re-executed test. Optional:
+   * absent for synthetic/fallback result items that were never tied to a
+   * real spec file.
+   */
+  specFile?: string;
 }
 
 export interface ExecOutcome {
@@ -243,6 +272,8 @@ export interface TestModeContext {
   /** White-box static-analysis result (routes/endpoints/forms/auth patterns), set during PLAN; grounds generation and triage with real source-file citations. */
   sourceContext?: SourceContext;
   emit?: (phase: string, message: string, data?: unknown) => void;
+  /** Reports a provider.complete() call's token/cost usage back to the run's store — see UsageRecorder. */
+  onUsage?: UsageRecorder;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
   /**
@@ -267,7 +298,7 @@ export interface TestMode {
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
   /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
   validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
-  execute(ctx: TestModeContext, specs: GeneratedSpec[], opts?: { onlyTier?: Tier }): Promise<ExecOutcome>;
+  execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;
 }

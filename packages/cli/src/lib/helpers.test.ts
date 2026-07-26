@@ -136,6 +136,7 @@ describe('shapeRunShow', () => {
         tier: null,
         status: 'passed',
         specPath: null,
+        specCode: null,
         description: null,
         details: null,
       },
@@ -150,6 +151,7 @@ describe('shapeRunShow', () => {
         artifactsJson: null,
         description: null,
         details: null,
+        stepsJson: null,
       },
     ];
 

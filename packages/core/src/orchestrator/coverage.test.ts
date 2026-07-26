@@ -133,4 +133,35 @@ describe('mergeExecOutcomes', () => {
     expect(merged.failed).toBe(0);
     expect(merged.results.find((r) => r.title.includes('REQ-1'))?.status).toBe('passed');
   });
+
+  it('DISTINCT-SPEC-FILE GUARD: two different specs with coincidentally identical titles both count', () => {
+    // Two separate gap-fill iterations can each generate a scenario with the
+    // exact same wording for the same requirement — genuinely distinct tests
+    // (different spec files, both persisted as separate DB rows), not a
+    // re-execution of one test. Without specFile, title-only matching
+    // collapsed these into one, undercounting the report relative to the
+    // Results tab (which has no such collision, since it keys DB rows by
+    // reqTag+position rather than title).
+    const a = outcome([
+      { title: '[REQ:REQ-1] positive: succeeds with valid input', status: 'passed', specFile: 'spec-a.ts' },
+    ]);
+    const b = outcome([
+      { title: '[REQ:REQ-1] positive: succeeds with valid input', status: 'passed', specFile: 'spec-b.ts' },
+    ]);
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.results).toHaveLength(2);
+    expect(merged.passed).toBe(2);
+  });
+
+  it('re-execution of the SAME spec file still dedupes (resume-replay case)', () => {
+    const a = outcome([{ title: '[REQ:REQ-1] positive: loads', status: 'failed', specFile: 'spec-a.ts' }]);
+    const b = outcome([{ title: '[REQ:REQ-1] positive: loads', status: 'passed', specFile: 'spec-a.ts' }]);
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.results).toHaveLength(1);
+    expect(merged.results[0]?.status).toBe('passed');
+  });
 });

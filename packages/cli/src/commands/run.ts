@@ -12,6 +12,7 @@ import {
   type TestPlan,
 } from '@healix/core';
 import { runExitCode } from '../lib/helpers.js';
+import { installInterruptHandler } from '../lib/interrupt.js';
 
 const PHASE_COLOR: Record<string, (s: string) => string> = {
   plan: pc.magenta,
@@ -121,8 +122,34 @@ export function registerRun(program: Command): void {
     .addOption(new Option('--mode <mode>', 'exploration mode').choices(['codegen', 'computer-use']))
     .option('--yes', 'auto-approve the plan (skip the approval gate)', false)
     .option('--prd <text>', 'PRD / acceptance-criteria text to ground generation')
+    .option(
+      '--max-cost-usd <amount>',
+      'pause the run cleanly (resumable) once its total AI spend reaches this many dollars',
+    )
+    .option(
+      '--max-tokens <count>',
+      'pause the run cleanly (resumable) once its total input+output tokens reach this count',
+    )
+    .option(
+      '--max-crawl-routes <count>',
+      "override EXPLORE's hard cap on distinct routes visited (default 60)",
+    )
+    .option(
+      '--crawl-budget-ms <ms>',
+      "override EXPLORE's wall-clock crawl budget in milliseconds (default 120000)",
+    )
     .action(
-      async (opts: { project: string; provider?: string; mode?: string; yes?: boolean; prd?: string }) => {
+      async (opts: {
+        project: string;
+        provider?: string;
+        mode?: string;
+        yes?: boolean;
+        prd?: string;
+        maxCostUsd?: string;
+        maxTokens?: string;
+        maxCrawlRoutes?: string;
+        crawlBudgetMs?: string;
+      }) => {
         const runOpts: RunOptions = {
           projectId: opts.project,
           autoApprove: opts.yes === true,
@@ -130,6 +157,24 @@ export function registerRun(program: Command): void {
         if (opts.provider) runOpts.provider = opts.provider as ProviderId;
         if (opts.mode) runOpts.explorationMode = opts.mode as ExplorationMode;
         if (opts.prd) runOpts.prd = opts.prd;
+        if (opts.maxCostUsd !== undefined) runOpts.maxCostUsd = Number(opts.maxCostUsd);
+        if (opts.maxTokens !== undefined) runOpts.maxTokens = Number(opts.maxTokens);
+        if (opts.maxCrawlRoutes !== undefined || opts.crawlBudgetMs !== undefined) {
+          runOpts.crawlBudget = {
+            ...(opts.maxCrawlRoutes !== undefined ? { maxRoutes: Number(opts.maxCrawlRoutes) } : {}),
+            ...(opts.crawlBudgetMs !== undefined ? { wallClockBudgetMs: Number(opts.crawlBudgetMs) } : {}),
+          };
+        }
+
+        // Ctrl+C previously just killed the process with no checkpoint
+        // written at all — treating it as a pause request instead means the
+        // orchestrator gets a chance to persist progress before exiting, and
+        // `healix runs resume <runId>` can pick it back up.
+        const interrupt = installInterruptHandler(() => {
+          console.log('');
+          console.log(pc.yellow('  ⚠ Interrupt received — pausing run (checkpoint will be saved)…'));
+        });
+        runOpts.signal = interrupt.signal;
 
         const orchestrator = createOrchestrator();
         console.log('');
@@ -150,6 +195,8 @@ export function registerRun(program: Command): void {
           console.log(pc.red(`  ✖ Run failed: ${err instanceof Error ? err.message : String(err)}`));
           console.log('');
           process.exitCode = 1;
+        } finally {
+          interrupt.dispose();
         }
       },
     );

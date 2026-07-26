@@ -438,6 +438,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         specPath: null,
         description: 'user submits valid credentials',
         details: 'Verify the login flow authenticates a user and redirects to the dashboard.',
+        specCode: null,
       },
     ];
     const report = buildReport({ run, project, plan, outcome, triage: [], tests });
@@ -445,6 +446,52 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('<th>Description</th>');
     expect(html).toContain('user submits valid credentials');
     expect(html).toContain('Verify the login flow authenticates a user and redirects to the dashboard.');
+  });
+
+  it('prefers the well-formed TestCase row over a metadata-less duplicate sharing the same title', () => {
+    // Reproduces a persistResults matching miss: the real, GENERATE-time row
+    // (specPath/tier/description set) and an orphan fallback-insert row (all
+    // of that null) end up with the exact same title. The report must not
+    // silently surface the emptier one just because it comes later in `tests`.
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        { title: '[REQ:pli_1] positive: succeeds with valid input', status: 'failed', durationMs: 10 },
+      ],
+    };
+    const tests: TestCase[] = [
+      {
+        id: 'tst_real',
+        runId: run.id,
+        title: '[REQ:pli_1] positive: succeeds with valid input',
+        reqTag: 'pli_1',
+        tier: 'tierA-public',
+        status: 'flaky',
+        specPath: 'tests/tierA-public/example.spec.ts',
+        description: 'Navigate and assert the heading is visible',
+        details: 'Verify the page renders correctly.',
+        specCode: null,
+      },
+      {
+        id: 'tst_orphan',
+        runId: run.id,
+        title: '[REQ:pli_1] positive: succeeds with valid input',
+        reqTag: 'pli_1',
+        tier: null,
+        status: 'failed',
+        specPath: null,
+        description: null,
+        details: null,
+        specCode: null,
+      },
+    ];
+    const report = buildReport({ run, project, plan, outcome, triage: [], tests });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Navigate and assert the heading is visible');
+    expect(html).toContain('Verify the page renders correctly.');
   });
 
   it('renders an empty description cell (no crash) when no TestCase row matches the result title', () => {
@@ -457,7 +504,10 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     };
     const report = buildReport({ run, project, plan, outcome, triage: [] });
     const html = renderReportHtml(report);
-    expect(html).toContain('<td></td><td></td></tr>');
+    // Description and Error cells are empty (no match, no error) — Steps and
+    // Evidence still render their own "nothing recorded" content, so the row
+    // doesn't end in two bare `<td></td>`s anymore.
+    expect(html).toContain('<td>Untracked scenario</td><td>passed</td><td>5ms</td><td></td><td></td>');
   });
 
   it('surfaces the coverage ratio and lists uncovered functionality units when present', () => {
@@ -482,5 +532,208 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('1/2 functionality unit(s) covered (50%)');
     expect(html).toContain('GET /checkout');
     expect(html).toContain('src/pages/checkout.tsx');
+  });
+});
+
+describe('report — step-by-step breakdown, for passed tests too', () => {
+  it("shows a passed test's steps, not just failed ones", () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: signs in successfully',
+          status: 'passed',
+          durationMs: 1200,
+          steps: [
+            { title: 'Navigate to /signin', durationMs: 300 },
+            { title: 'Fill "email"', durationMs: 50 },
+            { title: 'Fill "password"', durationMs: 40 },
+            { title: 'Click "Sign in"', durationMs: 400 },
+            { title: 'expect.toHaveURL', durationMs: 10 },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('class="steps"');
+    expect(html).toContain('5 steps');
+    expect(html).toContain('Navigate to /signin');
+    expect(html).toContain('Click &quot;Sign in&quot;');
+    // Only the CSS rule for step-failed should exist, no element actually uses it.
+    expect(html).not.toContain('class="step-failed"');
+  });
+
+  it('marks the specific failed step, not the whole list', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-2] negative: rejects bad password',
+          status: 'failed',
+          durationMs: 800,
+          error: 'expect(received).toHaveURL(expected)',
+          steps: [
+            { title: 'Navigate to /signin', durationMs: 300 },
+            { title: 'Fill "email"', durationMs: 50 },
+            { title: 'Click "Sign in"', durationMs: 400 },
+            { title: 'expect.toHaveURL', durationMs: 5, error: 'expect(received).toHaveURL(expected)' },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('class="step-failed"');
+    expect(html).toContain('4 steps');
+  });
+
+  it('says "no steps recorded" explicitly instead of an empty cell when a result has none (older suite, no reporter, or a test that failed before any action ran)', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: '[REQ:REQ-3] positive: legacy result', status: 'passed', durationMs: 100 }],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('class="steps"');
+    expect(html).toContain('No steps recorded.');
+  });
+
+  it('nests the raw actions under their test.step(...) task name instead of flattening them', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-4] positive: signs in',
+          status: 'passed',
+          durationMs: 500,
+          steps: [
+            {
+              title: 'Enter a valid email and password',
+              durationMs: 300,
+              steps: [
+                { title: 'Fill "seller@shop.test" locator(\'#email\')', durationMs: 100 },
+                { title: 'Fill "hunter22" locator(\'#password\')', durationMs: 40 },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('Enter a valid email and password');
+    expect(html).toContain('class="substeps"');
+    expect(html).toContain('2 actions');
+    expect(html).toContain('Fill &quot;seller@shop.test&quot; locator(&#39;#email&#39;)');
+  });
+
+  it('marks each individual step as passed or failed, not just the test overall', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 1,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-5] negative: rejects a wrong password',
+          status: 'failed',
+          durationMs: 500,
+          error: 'expect(locator).toBeVisible() failed',
+          steps: [
+            { title: 'Open the sign-in page', durationMs: 100 },
+            { title: 'Enter credentials', durationMs: 80 },
+            {
+              title: 'Verify an error message is shown',
+              durationMs: 300,
+              error: 'expect(locator).toBeVisible() failed',
+            },
+          ],
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    // Two ok marks (the passed steps) and one fail mark (the failed step) —
+    // matching the actual rendered usage, not the CSS rule declarations.
+    expect(html.match(/class="step-mark step-mark-ok"/g)?.length).toBe(2);
+    expect(html.match(/class="step-mark step-mark-fail"/g)?.length).toBe(1);
+  });
+});
+
+describe('groupingSummary — round-trips through buildReport/renderReportHtml', () => {
+  const run = makeRun();
+  const project = makeProject();
+  const plan = REAL_PLAN;
+  const outcome: ExecOutcome = {
+    passed: 0,
+    failed: 2,
+    blocked: 0,
+    flaky: 0,
+    results: [
+      { title: 'A', status: 'failed', durationMs: 1, error: 'boom' },
+      { title: 'B', status: 'failed', durationMs: 1, error: 'boom' },
+    ],
+  };
+  const triage = [
+    {
+      title: 'A',
+      error: 'boom',
+      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+    },
+    {
+      title: 'B',
+      error: 'boom',
+      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+    },
+  ];
+
+  it('defaults to null when omitted', () => {
+    const report = buildReport({ run, project, plan, outcome, triage });
+    expect(report.groupingSummary).toBeNull();
+  });
+
+  it('carries a provided summary through to the report object', () => {
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage,
+      groupingSummary: 'Both failures share the same broken /api/x endpoint.',
+    });
+    expect(report.groupingSummary).toBe('Both failures share the same broken /api/x endpoint.');
+  });
+
+  it('renders the summary as prose inside the Triage section of the HTML', () => {
+    const report = buildReport({
+      run,
+      project,
+      plan,
+      outcome,
+      triage,
+      groupingSummary: 'Both failures share the same broken /api/x endpoint.',
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<p class="grouping-summary">');
+    expect(html).toContain('Both failures share the same broken /api/x endpoint.');
+  });
+
+  it('omits the grouping-summary paragraph element when null (the CSS rule itself is always present)', () => {
+    const report = buildReport({ run, project, plan, outcome, triage });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('<p class="grouping-summary">');
   });
 });

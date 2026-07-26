@@ -49,6 +49,11 @@ const api = {
   providerHealth: (id: 'claude' | 'openai', probe?: boolean) =>
     ipcRenderer.invoke('provider:health', { id, probe }),
 
+  // Claude per-task-type model/effort config (Settings page)
+  getModelConfig: () => ipcRenderer.invoke('settings:getModelConfig'),
+  setModelConfig: (overrides: Record<string, { model?: string; effort?: string }>) =>
+    ipcRenderer.invoke('settings:setModelConfig', overrides),
+
   // projects
   listProjects: () => ipcRenderer.invoke('projects:list'),
   createProject: (input: {
@@ -79,8 +84,14 @@ const api = {
     autoApprove?: boolean;
     prd?: string;
     instructions?: string;
+    prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+    prdFileName?: string;
+    prdSelectedSheets?: string[];
     suiteMode?: string;
     baseRunId?: string;
+    coverageLoopEnabled?: boolean;
+    coverageTarget?: number;
+    retryItemIds?: string[];
   }) => ipcRenderer.invoke('run:start', args),
   approveRun: (runId: string, decision: { decision: 'cancel' } | { decision: 'proceed'; plan: unknown }) =>
     ipcRenderer.invoke('run:approve', { runId, ...decision }),
@@ -98,9 +109,12 @@ const api = {
   deleteRun: (runId: string) => ipcRenderer.invoke('runs:delete', { runId }),
   lastSuccessfulRun: (projectId: string) => ipcRenderer.invoke('runs:lastSuccessful', { projectId }),
   suiteDiff: (runId: string) => ipcRenderer.invoke('runs:suiteDiff', { runId }),
+  generationGaps: (runId: string) => ipcRenderer.invoke('runs:generationGaps', { runId }),
+  repairCandidates: (runId: string) => ipcRenderer.invoke('runs:repairCandidates', { runId }),
   caseHistory: (projectId: string, key: { reqTag?: string; title?: string }) =>
     ipcRenderer.invoke('runs:caseHistory', { projectId, ...key }),
   projectMetrics: (projectId: string) => ipcRenderer.invoke('runs:projectMetrics', { projectId }),
+  usageCrossRun: (projectId?: string) => ipcRenderer.invoke('usage:crossRun', { projectId }),
 
   // per-item plan revision (AI-regenerates one item from human feedback)
   reviseItem: (args: { projectId: string; item: unknown; suggestion: string }) =>
@@ -119,6 +133,9 @@ const api = {
 
   // PRD file upload (native picker + text extraction, main-process side)
   pickPrdFile: () => ipcRenderer.invoke('dialog:pickPrdFile'),
+  previewPrdSheets: (filePath: string) => ipcRenderer.invoke('dialog:previewPrdSheets', filePath),
+  extractPrdSheets: (filePath: string, selectedSheetNames: string[]) =>
+    ipcRenderer.invoke('dialog:extractPrdSheets', filePath, selectedSheetNames),
 
   // Repo path folder picker (Project create/edit form)
   pickRepoPath: () => ipcRenderer.invoke('dialog:pickRepoPath'),

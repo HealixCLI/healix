@@ -1,5 +1,37 @@
-import { describe, expect, it } from 'vitest';
-import { authSetupContents, mockFixtureContents, playwrightConfigContents } from './templates.js';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { mkdtemp, readFile, rm } from 'node:fs/promises';
+import { createRequire } from 'node:module';
+import { tmpdir } from 'node:os';
+import { join } from 'node:path';
+import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import {
+  actionHighlighterFixtureContents,
+  authSetupContents,
+  checkpointReporterContents,
+  EXEC_CHECKPOINT_FILENAME,
+  mockFixtureContents,
+  playwrightConfigContents,
+  stepsReporterContents,
+} from './templates.js';
+
+/**
+ * Pulls computeWorkers()'s body out of the generated config source and
+ * re-evaluates it with fake cpus()/freemem() so its arithmetic is actually
+ * exercised, not just grepped for as a substring.
+ */
+function evalComputeWorkers(cpuCount: number, freeMemBytes: number): number {
+  const cfg = playwrightConfigContents();
+  const match = /function computeWorkers\(\) \{[\s\S]*?\n\}/.exec(cfg);
+  if (!match) throw new Error('computeWorkers() not found in generated config');
+  const fn = new Function('cpus', 'freemem', `${match[0]}\nreturn computeWorkers();`) as (
+    cpus: () => unknown[],
+    freemem: () => number,
+  ) => number;
+  return fn(
+    () => Array.from({ length: cpuCount }),
+    () => freeMemBytes,
+  );
+}
 
 describe('playwrightConfigContents — artifact capture policy', () => {
   it('records a screenshot, video, AND trace for every test, pass or fail', () => {
@@ -32,14 +64,271 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     expect(cfg).toContain('process.env.HEALIX_RETRIES');
     expect(cfg).toContain('process.env.CI ? 2 : 1');
   });
+
+  it('sizes workers dynamically off CPU/RAM locally, but keeps a fixed count on CI, unless HEALIX_WORKERS overrides both', () => {
+    const cfg = playwrightConfigContents();
+    expect(cfg).toContain('process.env.HEALIX_WORKERS');
+    expect(cfg).toContain('process.env.CI');
+    expect(cfg).toContain('computeWorkers()');
+    expect(cfg).toContain('cpus().length');
+    expect(cfg).toContain('freemem()');
+    // Leaves one core free for the host OS/desktop app, never claims 0 workers.
+    expect(cfg).toContain('Math.max(1, cpuCount - 1)');
+  });
+
+  describe('computeWorkers() — actual arithmetic, not just source text', () => {
+    const GB = 1024 ** 3;
+
+    it('is CPU-bound when RAM is plentiful: 8 cores, 8GB free -> 7 (cores - 1)', () => {
+      expect(evalComputeWorkers(8, 8 * GB)).toBe(7);
+    });
+
+    it('is memory-bound when RAM is scarce: 8 cores, 1GB free -> 1 (floored, never 0)', () => {
+      expect(evalComputeWorkers(8, 1 * GB)).toBe(1);
+    });
+
+    it('never claims 0 workers on a single-core machine, even with ample RAM', () => {
+      expect(evalComputeWorkers(1, 8 * GB)).toBe(1);
+    });
+
+    it('rounds down to whole workers off free RAM: 8 cores, 2GB free -> 2 (2 / 0.75 floored)', () => {
+      expect(evalComputeWorkers(8, 2 * GB)).toBe(2);
+    });
+  });
+
+  it('registers the write-through checkpoint reporter alongside steps-reporter', () => {
+    const cfg = playwrightConfigContents();
+    expect(cfg).toContain("['./fixtures/steps-reporter.cjs']");
+    expect(cfg).toContain("['./fixtures/checkpoint-reporter.cjs']");
+  });
+});
+
+describe('actionHighlighterFixtureContents', () => {
+  it('injects a passive, event-driven highlighter via addInitScript — no wrapping of Locator methods', () => {
+    const src = actionHighlighterFixtureContents();
+    expect(src).toContain("from '@playwright/test'");
+    expect(src).toContain('page.addInitScript(healixActionHighlighter)');
+    expect(src).toContain('export { expect };');
+    // Reacts to real DOM events Playwright's own actions already dispatch —
+    // never wraps click()/fill()/etc., since Locator isn't an exported class.
+    for (const evt of ['mousemove', 'pointerdown', 'focusin', 'scroll']) {
+      expect(src).toContain(`'${evt}'`);
+    }
+    expect(src.match(/addEventListener/g)?.length ?? 0).toBeGreaterThanOrEqual(5);
+  });
+
+  it('never calls waitForTimeout or sleeps — highlighting must add no artificial delay to the actual run', () => {
+    const src = actionHighlighterFixtureContents();
+    expect(src).not.toContain('waitForTimeout');
+    expect(src).not.toContain('slowMo');
+  });
+});
+
+describe('stepsReporterContents', () => {
+  it('keeps test.step (human-authored step names) alongside pw:api/expect as a fallback', () => {
+    const src = stepsReporterContents();
+    expect(src).toContain("'test.step'");
+    expect(src).toContain("'pw:api'");
+    expect(src).toContain("'expect'");
+  });
+
+  it("strips ANSI color codes from a step error — verified live against a real failing step's raw message", () => {
+    const src = stepsReporterContents();
+    expect(src).toContain('stripAnsi(s.error.message');
+    expect(src).toContain('ANSI_RE');
+  });
+
+  it("nests a test.step task's raw pw:api/expect actions underneath it, not flattened alongside it", () => {
+    const src = stepsReporterContents();
+    // A test.step wrapper's own .steps children are captured as nested
+    // entries; a bare pw:api/expect step (no wrapper) gets no children of
+    // its own — see toStepItem's category check.
+    expect(src).toContain("s.category === 'test.step'");
+    expect(src).toContain('.map(toStepItem)');
+  });
+});
+
+describe('checkpointReporterContents', () => {
+  it('only appends once a test is truly final (passed, or every configured retry used)', () => {
+    const src = checkpointReporterContents();
+    // Verified empirically against a real Playwright run: test.outcome() is
+    // NOT reliable mid-retry (it reports 'unexpected' even on attempt 1 of a
+    // 2-retry config) — result.retry >= test.retries is what's actually safe.
+    expect(src).toContain("result.status === 'passed' || result.retry >= test.retries");
+  });
+
+  it('builds the key from test.titlePath(), matching --list/--test-list-invert format exactly', () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain('test.titlePath()');
+    expect(src).toContain("'[' + parts[0] + '] \\u203a '");
+  });
+
+  it('writes to the shared EXEC_CHECKPOINT_FILENAME constant, not a hardcoded string', () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain(JSON.stringify(EXEC_CHECKPOINT_FILENAME));
+  });
+
+  it('strips ANSI color codes from a persisted error, same as steps-reporter.cjs', () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain('stripAnsi(result.error.stack || result.error.message');
+    expect(src).toContain('ANSI_RE');
+  });
+
+  it('never throws the test run over a write failure', () => {
+    const src = checkpointReporterContents();
+    expect(src).toMatch(/catch\s*\{/);
+  });
+
+  describe('live execution — the generated reporter actually run, not just grepped', () => {
+    let dir: string;
+
+    beforeEach(async () => {
+      dir = await mkdtemp(join(tmpdir(), 'healix-checkpoint-reporter-'));
+    });
+
+    afterEach(async () => {
+      await rm(dir, { recursive: true, force: true });
+    });
+
+    function loadReporter(): new () => { onTestEnd(test: unknown, result: unknown): void } {
+      const reporterPath = join(dir, 'checkpoint-reporter.cjs');
+      writeFileSync(reporterPath, checkpointReporterContents(), 'utf-8');
+      const req = createRequire(import.meta.url);
+      delete req.cache[req.resolve(reporterPath)];
+      return req(reporterPath);
+    }
+
+    function fakeTest(retries: number, titlePath: string[], outcome = 'expected') {
+      return { retries, titlePath: () => ['', ...titlePath], outcome: () => outcome };
+    }
+
+    async function readCheckpointLines(): Promise<Array<Record<string, unknown>>> {
+      let raw: string;
+      try {
+        raw = await readFile(join(dir, EXEC_CHECKPOINT_FILENAME), 'utf-8');
+      } catch {
+        return [];
+      }
+      return raw
+        .split('\n')
+        .filter(Boolean)
+        .map((line) => JSON.parse(line));
+    }
+
+    it('does not append when a failing attempt still has retries left', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(1, ['tierA-public', 'a.spec.ts', 'does a thing']), {
+          status: 'failed',
+          retry: 0,
+          duration: 12,
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      expect(await readCheckpointLines()).toEqual([]);
+    });
+
+    it('appends once every configured retry is exhausted', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(1, ['tierA-public', 'a.spec.ts', 'does a thing'], 'unexpected'), {
+          status: 'unexpected',
+          retry: 1,
+          duration: 34,
+          error: { message: 'boom' },
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0]).toMatchObject({
+        project: 'tierA-public',
+        specFile: 'a.spec.ts',
+        title: 'does a thing',
+        key: '[tierA-public] › a.spec.ts › does a thing',
+        durationMs: 34,
+        error: 'boom',
+      });
+    });
+
+    it('appends immediately on a first-attempt pass, even with retries configured', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(2, ['tierC-api', 'b.spec.ts', 'passes']), {
+          status: 'passed',
+          retry: 0,
+          duration: 5,
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines).toHaveLength(1);
+      expect(lines[0].status).toBe('expected');
+    });
+
+    it('strips ANSI escapes from the persisted error text', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(0, ['tierA-public', 'a.spec.ts', 'fails loudly'], 'unexpected'), {
+          status: 'unexpected',
+          retry: 0,
+          duration: 1,
+          error: { stack: '[31mExpected true, got false[0m' },
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines[0].error).toBe('Expected true, got false');
+    });
+
+    it('swallows a write failure instead of throwing (best-effort contract)', () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      // Make the checkpoint file's own path a directory, so appendFileSync
+      // throws EISDIR — without touching cwd itself (deleting cwd is
+      // unreliable across platforms, notably Windows).
+      mkdirSync(join(dir, EXEC_CHECKPOINT_FILENAME));
+      process.chdir(dir);
+      try {
+        expect(() =>
+          reporter.onTestEnd(fakeTest(0, ['tierA-public', 'a.spec.ts', 'whatever']), {
+            status: 'passed',
+            retry: 0,
+            duration: 1,
+          }),
+        ).not.toThrow();
+      } finally {
+        process.chdir(cwd);
+      }
+    });
+  });
 });
 
 describe('mockFixtureContents', () => {
-  it('embeds the given routes and re-exports test/expect from @playwright/test', () => {
+  it('embeds the given routes and re-exports test/expect from the action-highlighter fixture', () => {
     const src = mockFixtureContents([
       { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
     ]);
-    expect(src).toContain("from '@playwright/test'");
+    // Chains on top of the highlighter (not '@playwright/test' directly) so a
+    // mocked run's recorded video still gets the visual action highlighter.
+    expect(src).toContain("from './action-highlighter.js'");
     expect(src).toContain('"id": "pkg:twilio"');
     expect(src).toContain('"api.twilio.com"');
     expect(src).toContain('page.route(');
@@ -63,10 +352,20 @@ describe('authSetupContents — locale-aware login fixture', () => {
     expect(fixture).toContain('prihl');
   });
 
-  it('clicks through a login-reveal control before searching for the form when no email field is visible', () => {
+  it('clicks through a login-reveal control before searching for the form when no identifier field is visible', () => {
     const fixture = authSetupContents();
-    expect(fixture).toContain('hasEmailField');
+    expect(fixture).toContain('hasIdentifierField');
     expect(fixture).toContain('submitButtonLocator(page, loginRevealRe)');
+  });
+
+  it('matches a plain "Username" field, not just "email" — a real timeout-with-no-selector-context bug found live', () => {
+    const fixture = authSetupContents();
+    // The identifier field isn't always an email; plenty of real apps label it
+    // just "Username" with nothing "email"-ish in the label, placeholder, or
+    // name/id attributes either. Matching only /e-?mail/i finds nothing and
+    // hangs the auth-setup for the full 60s test timeout.
+    expect(fixture).toContain('user\\s*name');
+    expect(fixture).toContain('autocomplete="username"');
   });
 
   it('prefers native submit semantics and test-hint attributes over localized button text when finding the submit button', () => {

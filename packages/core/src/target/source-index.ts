@@ -1,3 +1,5 @@
+import { createHash } from 'node:crypto';
+import fs from 'node:fs';
 import path from 'node:path';
 import type { File } from '@babel/types';
 import { detect } from './detector.js';
@@ -30,6 +32,39 @@ import type { SourceContext } from './source-context.js';
 const DEFAULT_MAX_UNITS = 300;
 const MULTILANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.php']);
 const JS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
+/** Same hard file-count cap indexSource() itself walks with (via walkSourceFiles below). */
+const WALK_HARD_CAP = 5000;
+
+/**
+ * Cheap fingerprint of a repo's source tree — the file list plus each file's size and mtime,
+ * NEVER content (hashing every file's bytes would cost close to what indexSource() itself
+ * costs, defeating the point of a cache check). Mirrors indexSource()'s own walkSourceFiles()
+ * call (same cap, same extra extensions) so the hash reflects exactly the file set indexSource()
+ * would process — a file added/removed/touched anywhere in that set changes the hash. Also folds
+ * in findSpecFiles()'s OpenAPI/Postman/GraphQL spec files: indexSource() treats those as
+ * AUTHORITATIVE (a spec-derived unit always overrides a code-derived one on a key collision), so
+ * editing one must invalidate the cache exactly like editing a route file does — omitting them
+ * would silently serve a stale, incorrect sourceContext after a spec-only change.
+ */
+export function computeRepoSourceHash(repoPath: string): string {
+  const root = path.resolve(repoPath);
+  const { files } = walkSourceFiles(root, WALK_HARD_CAP, { extraExtensions: MULTILANG_EXTENSIONS });
+  const specFiles = findSpecFiles(root);
+  const fingerprint = (abs: string, rel: string): string => {
+    try {
+      const st = fs.statSync(abs);
+      return `${rel}:${st.size}:${st.mtimeMs}`;
+    } catch {
+      return `${rel}:?:?`;
+    }
+  };
+  const parts = [
+    ...files.map((f) => fingerprint(f.abs, f.rel)),
+    ...specFiles.map((abs) => fingerprint(abs, path.relative(root, abs).split(path.sep).join('/'))),
+  ];
+  parts.sort();
+  return createHash('sha256').update(parts.join('\n')).digest('hex');
+}
 
 /**
  * Build the full white-box static-analysis context for a repo: routes/endpoints (AST-based, with
@@ -56,7 +91,7 @@ export async function indexSource(repoPath: string, opts?: { maxUnits?: number }
     framework = null;
   }
 
-  const { files, truncated: filesTruncated } = walkSourceFiles(root, 5000, {
+  const { files, truncated: filesTruncated } = walkSourceFiles(root, WALK_HARD_CAP, {
     extraExtensions: MULTILANG_EXTENSIONS,
   });
 

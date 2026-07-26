@@ -1,12 +1,15 @@
 import { describe, expect, it } from 'vitest';
 import type { Project } from '../storage/types.js';
 import { tiersForScope } from '../modes/types.js';
+import type { TestPlanItem } from '../modes/types.js';
+import type { CompleteOptions, ProviderAdapter } from '../providers/types.js';
 import {
   buildBatchPlanPrompt,
   buildGapFillPlanPrompt,
   buildPlanPrompt,
   parsePlan,
   parsePlanWithDiagnostics,
+  reviseItem,
   synthesizePlan,
 } from './plan.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
@@ -286,6 +289,11 @@ describe('buildBatchPlanPrompt', () => {
     expect(prompt).toContain('route:/checkout');
     // Only this batch's unit is listed, not the other detected unit.
     expect(prompt).not.toContain('route:/other');
+    // The batch-position note must be appended AFTER buildPlanPrompt's static
+    // preamble, not prepended before it — otherwise the preamble stops being
+    // a stable, cacheable leading prefix shared across plan-generate/gap-fill/
+    // batch calls (see orchestrator/plan.ts's buildScopedPlanPrompt).
+    expect(prompt.startsWith('You are Healix, an autonomous QA engineer.')).toBe(true);
   });
 
   it('omits the batch-position prefix entirely when there is only one batch', () => {
@@ -408,6 +416,41 @@ describe('buildPlanPrompt (repo context)', () => {
     expect(prompt).toContain('one item per distinct route/endpoint');
     expect(prompt).toContain('"unitKey"');
   });
+
+  it('warns against pairing tierC-api items with a route/component-kind unit when tierC-api is in scope', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/', kind: 'route', label: 'page: /', file: 'src/routes/AppRouter.tsx' },
+      {
+        key: 'endpoint:GET /get-customers',
+        kind: 'endpoint',
+        label: 'GET /get-customers',
+        file: 'src/server.ts',
+      },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id, testingScope: 'both' },
+      { summary: 'Framework: next.', files: [], functionality: units },
+    );
+
+    expect(prompt).toContain('RULE for tierC-api items');
+    expect(prompt).toContain('only pair a tierC-api item with a "[endpoint]"-kind unit');
+  });
+
+  it('omits the tierC-api route-pairing rule when tierC-api is out of scope', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/checkout', kind: 'route', label: 'page: /checkout', file: 'app/checkout/page.tsx' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id, testingScope: 'frontend' },
+      { summary: 'Framework: next.', files: [], functionality: units },
+    );
+
+    expect(prompt).not.toContain('RULE for tierC-api items');
+  });
 });
 
 describe('buildPlanPrompt (PRD + interactive instructions)', () => {
@@ -470,6 +513,9 @@ describe('buildGapFillPlanPrompt', () => {
     expect(prompt).toContain('route:/settings');
     // Only the uncovered unit is listed, not the already-covered one.
     expect(prompt).not.toContain('route:/checkout');
+    // The "previous pass" note must be appended AFTER buildPlanPrompt's static
+    // preamble, not prepended before it — see the batch-prompt test above.
+    expect(prompt.startsWith('You are Healix, an autonomous QA engineer.')).toBe(true);
   });
 });
 
@@ -508,5 +554,61 @@ describe('buildPlanPrompt (testing scope)', () => {
     expect(buildPlanPrompt(makeProject(), { projectId: 'p', testingScope: 'both' })).toContain(
       'Testing scope: Frontend + backend testing',
     );
+  });
+});
+
+describe('reviseItem — provider call wiring', () => {
+  const ITEM: TestPlanItem = {
+    id: 'pli_1',
+    title: 'Home loads',
+    reqTag: 'REQ-001',
+    tier: 'tierA-public',
+    intent: 'Landing renders.',
+    scenarios: [{ kind: 'positive', description: 'Home page loads successfully.' }],
+  };
+
+  function fakeProvider(onComplete: (opts: CompleteOptions | undefined) => void): ProviderAdapter {
+    return {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      async detect() {
+        return { installed: true, binPath: '/fake', version: '0.0.0' };
+      },
+      async health() {
+        return {
+          provider: 'claude',
+          status: 'ready',
+          installed: true,
+          binPath: '/fake',
+          version: '0.0.0',
+          authenticated: true,
+          model: null,
+          latencyMs: null,
+          detail: '',
+        };
+      },
+      async plan() {
+        return { provider: 'claude', ok: true, plan: '', raw: null, detail: '' };
+      },
+      async complete(_prompt, opts) {
+        onComplete(opts);
+        // A parse failure here is fine — this test only cares about how
+        // reviseItem calls the provider, not the revision's own outcome.
+        return { provider: 'claude', ok: false, text: '', raw: null, detail: 'unused' };
+      },
+    };
+  }
+
+  it('requests taskType "plan-revise-item" (per-task-type model/effort routing)', async () => {
+    let seenOpts: CompleteOptions | undefined;
+    const provider = fakeProvider((opts) => {
+      seenOpts = opts;
+    });
+
+    await reviseItem(provider, makeProject(), { projectId: 'prj_test' }, ITEM, 'Also check the footer.');
+
+    expect(seenOpts?.taskType).toBe('plan-revise-item');
+    expect(seenOpts?.mode).toBe('plan');
   });
 });

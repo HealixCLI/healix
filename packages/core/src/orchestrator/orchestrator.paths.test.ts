@@ -2,11 +2,12 @@ import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { readFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createOrchestrator } from './index.js';
 import type { OrchestratorEvent, PlanApprovalResult } from './types.js';
 import type { RunReport } from './report.js';
+import { persistExplorationCache } from './exploration-cache.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import { projectsDir } from '../env/app-data.js';
 import { ProviderRouter } from '../providers/router.js';
@@ -20,6 +21,7 @@ import type {
 } from '../providers/types.js';
 import type {
   ExecOutcome,
+  ExplorationArtifact,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
@@ -1225,6 +1227,156 @@ describe('orchestrator paths (offline DI seam)', () => {
       expect(opts.signal?.aborted).toBe(false);
     }
   });
+  it('TRIAGE AI BUDGET: escalates the least-confident baseline verdicts first when failures exceed the cap', async () => {
+    // 25 failures: 15 whose deterministic baseline is CONFIDENT (environment rule, 0.75) and 10
+    // whose baseline is the low-confidence ambiguous default (0.3, unrecognized error text) —
+    // more than TRIAGE_AI_LIMIT (20), so the cap actually excludes some. All 10 low-confidence
+    // failures must be escalated (they need AI help most); only 10 of the 15 confident ones
+    // should be, since 5 of that budget's slots go to the failures that need it more.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Triage Budget Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const confidentTitles = Array.from({ length: 15 }, (_, i) => `Confident case ${i}`);
+    const ambiguousTitles = Array.from({ length: 10 }, (_, i) => `Ambiguous case ${i}`);
+
+    const manyFailedOutcome: ExecOutcome = {
+      passed: 0,
+      failed: 25,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        ...confidentTitles.map((title) => ({
+          title,
+          status: 'failed' as const,
+          durationMs: 10,
+          error: 'page.goto: net::ERR_CONNECTION_REFUSED at https://app.example.test/',
+        })),
+        ...ambiguousTitles.map((title) => ({
+          title,
+          status: 'failed' as const,
+          durationMs: 10,
+          error: 'Error: something completely unrecognized happened',
+        })),
+      ],
+    };
+
+    const escalatedPrompts: string[] = [];
+    const triageAwareProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
+        }
+        // Isolate batched-triage-escalation calls specifically — the run also
+        // makes ONE additional 'triage-summary' call afterward (the end-of-run
+        // grouping summary), which is not what this test measures.
+        if (opts && !opts.readOnly && opts.taskType === 'triage') escalatedPrompts.push(prompt);
+        return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: triageAwareProvider,
+      getMode: () => makeFakeMode(manyFailedOutcome),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
+
+    // 20 candidates triaged in TRIAGE_AI_BATCH_SIZE(5)-sized batches = 4 calls,
+    // not 20 — each batched call covers up to 5 failures' full evidence in one
+    // provider round trip instead of one call per failure (see
+    // TriageEngine.analyzeBatch).
+    expect(escalatedPrompts.length).toBe(4);
+    const escalatedAmbiguousCount = ambiguousTitles.filter((t) =>
+      escalatedPrompts.some((p) => p.includes(t)),
+    ).length;
+    const escalatedConfidentCount = confidentTitles.filter((t) =>
+      escalatedPrompts.some((p) => p.includes(t)),
+    ).length;
+    expect(escalatedAmbiguousCount).toBe(10);
+    expect(escalatedConfidentCount).toBe(10);
+  });
+
+  it('TRIAGE PERSISTENCE: recordTriageResult is written incrementally per batch, not once at phase end, and never duplicated', async () => {
+    // 12 failures, all with unrecognized error text so every one is AI-eligible
+    // (low-confidence ambiguous baseline) — with TRIAGE_AI_BATCH_SIZE=5 that's
+    // 3 AI batches (5 + 5 + 2), enough to observe persistence interleaved
+    // between batches rather than only after the whole phase finishes.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Triage Persistence Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const titles = Array.from({ length: 12 }, (_, i) => `Ambiguous case ${i}`);
+    const manyFailedOutcome: ExecOutcome = {
+      passed: 0,
+      failed: 12,
+      blocked: 0,
+      flaky: 0,
+      results: titles.map((title) => ({
+        title,
+        status: 'failed' as const,
+        durationMs: 10,
+        error: 'Error: something completely unrecognized happened',
+      })),
+    };
+
+    // recordTriageResult calls already made by the time each AI batch's
+    // provider call fires — captured BEFORE that call resolves, so a spy
+    // count of 0 for the first batch and >0 for later ones proves rows land
+    // between batches, not only after the loop finishes.
+    const recordCallsSeenBeforeBatch: number[] = [];
+    let recordCalls = 0;
+    const recordSpy = vi.spyOn(store, 'recordTriageResult');
+
+    const triageAwareProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts?.mode === 'plan') {
+          return { provider: 'claude', ok: true, text: fencedPlan(), raw: CANNED_PLAN, detail: 'OK' };
+        }
+        if (opts && !opts.readOnly && opts.taskType === 'triage') {
+          recordCalls = recordSpy.mock.calls.length;
+          recordCallsSeenBeforeBatch.push(recordCalls);
+        }
+        return { provider: 'claude', ok: true, text: 'canned text', raw: null, detail: 'OK' };
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: triageAwareProvider,
+      getMode: () => makeFakeMode(manyFailedOutcome),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
+
+    // 3 AI batches (5 + 5 + 2) plus 1 end-of-run triage-summary call.
+    expect(recordCallsSeenBeforeBatch.length).toBeGreaterThanOrEqual(3);
+    // The FIRST batch fires before anything has been persisted yet (nothing
+    // to persist before any batch has resolved), but at least one LATER
+    // batch must see calls already recorded from an earlier one — proving
+    // persistence happens as each batch finishes, not only at phase end.
+    expect(recordCallsSeenBeforeBatch[0]).toBe(0);
+    expect(Math.max(...recordCallsSeenBeforeBatch)).toBeGreaterThan(0);
+
+    // Exactly one row per triaged failure — never duplicated (e.g. once for
+    // the rule baseline, again after AI enrichment).
+    const rows = store.listTriageResults(summary.runId);
+    expect(rows.length).toBe(titles.length);
+    const testIds = rows.map((r) => r.testId);
+    expect(new Set(testIds).size).toBe(testIds.length);
+  });
+
   it('LAUNCH RECOVERY: missing-deps failure installs dependencies and retries the launch once', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
@@ -1516,5 +1668,170 @@ describe('orchestrator paths (offline DI seam)', () => {
     const report = JSON.parse(await readFile(reportPath, 'utf8')) as RunReport;
     expect(report.dependencies.length).toBe(1);
     expect(report.dependencies[0]?.packageName).toBe('twilio');
+  });
+
+  it('SOURCE-CONTEXT CACHE: reuses the cached context when the repo is unchanged, and recomputes after a real edit', async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-srcctx-'));
+    try {
+      mkdirSync(join(repoPath, 'src'), { recursive: true });
+      writeFileSync(
+        join(repoPath, 'src', 'app.js'),
+        "const express = require('express');\nconst app = express();\napp.get('/health', (req, res) => res.status(200).send('ok'));\n",
+      );
+
+      const store = (await getStore()) as HealixStore;
+      const project = store.createProject({
+        name: 'Source Context Cache Demo',
+        mode: 'playwright',
+        repoPath,
+        baseUrl: 'https://app.example.test',
+      });
+
+      const makeRunOrchestrator = (): ReturnType<typeof createOrchestrator> =>
+        createOrchestrator({
+          provider: fakeProvider,
+          getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+          makeTarget: () => fakeTarget,
+          makeBrowser: () => fakeBrowser,
+        });
+
+      const reusedMessage = (events: OrchestratorEvent[]): OrchestratorEvent | undefined =>
+        events.find((e) => e.message.includes('Reused cached source context'));
+
+      // Run 1: nothing persisted yet — must compute fresh (no "Reused" message).
+      const events1: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events1.push(e) },
+      );
+      expect(reusedMessage(events1)).toBeUndefined();
+
+      // Run 2: same project, repo untouched — the persisted hash matches, so this run must
+      // reuse the cache instead of walking the repo again.
+      const events2: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events2.push(e) },
+      );
+      expect(reusedMessage(events2)).toBeDefined();
+
+      // Real edit: add a second real endpoint to the repo — the fingerprint must change.
+      writeFileSync(
+        join(repoPath, 'src', 'app.js'),
+        "const express = require('express');\nconst app = express();\napp.get('/health', (req, res) => res.status(200).send('ok'));\napp.get('/status', (req, res) => res.status(200).send('ok'));\n",
+      );
+
+      // Run 3: repo changed since the last persist — must recompute (no "Reused" message).
+      const events3: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events3.push(e) },
+      );
+      expect(reusedMessage(events3)).toBeUndefined();
+
+      // Run 4: repo untouched again since run 3 — must reuse (re-establishes a clean baseline).
+      const events4: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events4.push(e) },
+      );
+      expect(reusedMessage(events4)).toBeDefined();
+
+      // Spec-only edit: no .js file touched, only a Postman collection — indexSource() treats
+      // spec files as AUTHORITATIVE, so this alone must invalidate the cache too (regression
+      // check for computeRepoSourceHash folding findSpecFiles() into its fingerprint).
+      writeFileSync(
+        join(repoPath, 'API.postman_collection.json'),
+        JSON.stringify({ info: { name: 'API' }, item: [] }),
+      );
+
+      // Run 5: only the spec file changed — must recompute (no "Reused" message).
+      const events5: OrchestratorEvent[] = [];
+      await makeRunOrchestrator().run(
+        { projectId: project.id, autoApprove: true },
+        { onEvent: (e) => events5.push(e) },
+      );
+      expect(reusedMessage(events5)).toBeUndefined();
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('EXPLORATION CACHE: a thin/not-useful cached crawl is re-crawled, never silently reused', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Exploration Cache Quality Gate Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProvider,
+      getMode: () => makeFakeMode(ALL_PASS_OUTCOME),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const reusedMessage = (events: OrchestratorEvent[]): OrchestratorEvent | undefined =>
+      events.find((e) => e.message.includes('Reusing cached exploration artifact'));
+    const recrawledMessage = (events: OrchestratorEvent[]): OrchestratorEvent | undefined =>
+      events.find((e) => e.message.includes('re-crawling instead of reusing it'));
+
+    // Run 1: fakeBrowser's snapshot() always returns the same near-empty page, so the resulting
+    // crawl is naturally `useful: false` (assessExplorationUsefulness's "single thin route" case)
+    // — exactly the low-quality artifact this gate must never trust on a later run.
+    const events1: OrchestratorEvent[] = [];
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, { onEvent: (e) => events1.push(e) });
+    expect(reusedMessage(events1)).toBeUndefined();
+
+    // Run 2: same project/baseUrl, cache from run 1 is within its staleness window — must NOT be
+    // silently reused (it was never useful), must re-crawl instead.
+    const events2: OrchestratorEvent[] = [];
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, { onEvent: (e) => events2.push(e) });
+    expect(reusedMessage(events2)).toBeUndefined();
+    expect(recrawledMessage(events2)).toBeDefined();
+
+    // Now simulate a genuinely GOOD cached crawl (useful, not budget-exhausted) for the same
+    // project/baseUrl — this one SHOULD be trusted and reused on the next run.
+    const goodArtifact: ExplorationArtifact = {
+      crawl: {
+        routes: [
+          {
+            url: 'https://app.example.test/',
+            title: 'Home',
+            snapshot: {
+              url: 'https://app.example.test/',
+              title: 'Home',
+              interactiveElements: Array.from({ length: 6 }, (_, i) => ({
+                role: 'button',
+                name: `Action ${i}`,
+                selector: `#action-${i}`,
+              })),
+            },
+            depth: 0,
+            hasPasswordField: false,
+            role: 'anonymous',
+            networkEvents: [],
+          },
+        ],
+        visitedCount: 1,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+    persistExplorationCache(project.id, 'https://app.example.test', goodArtifact);
+
+    const events3: OrchestratorEvent[] = [];
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, { onEvent: (e) => events3.push(e) });
+    expect(reusedMessage(events3)).toBeDefined();
+    expect(recrawledMessage(events3)).toBeUndefined();
   });
 });

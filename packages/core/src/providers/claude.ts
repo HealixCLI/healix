@@ -1,4 +1,5 @@
 import { extractSemver, runCli, which } from '../exec/run-cli.js';
+import { readModelConfigOverrides, resolveModelAndEffort } from './model-config.js';
 import type {
   Capability,
   CompleteOptions,
@@ -6,11 +7,30 @@ import type {
   DetectResult,
   HealthOptions,
   HealthResult,
+  PlanOptions,
   PlanResult,
   ProviderAdapter,
+  TaskType,
 } from './types.js';
 
 const PING = 'Reply with exactly this token and nothing else: HEALIX_OK';
+
+/**
+ * Resolve `taskType` (against the user's global overrides) into the
+ * `--model`/`--effort` argv pair, plus the resolved values themselves so
+ * callers can surface "what actually ran" in the completion/plan result.
+ * Returns empty args and undefined model/effort when no taskType was passed —
+ * this keeps existing/test call sites that predate task-type routing working
+ * unchanged (they simply ride the CLI's own default model).
+ */
+async function resolveModelArgs(
+  taskType: TaskType | undefined,
+): Promise<{ args: string[]; model?: string; effort?: string }> {
+  if (!taskType) return { args: [] };
+  const overrides = await readModelConfigOverrides();
+  const { model, effort } = resolveModelAndEffort(taskType, overrides);
+  return { args: ['--model', model, '--effort', effort], model, effort };
+}
 
 interface ClaudeJsonResult {
   type?: string;
@@ -139,7 +159,8 @@ export class ClaudeProvider implements ProviderAdapter {
     }
 
     const timeoutMs = opts.timeoutMs ?? 60_000;
-    const r = await runCli(this.bin, ['-p', PING, '--output-format', 'json'], {
+    const { args: modelArgs } = await resolveModelArgs('health-probe');
+    const r = await runCli(this.bin, ['-p', PING, '--output-format', 'json', ...modelArgs], {
       timeoutMs,
       signal: opts.signal,
     });
@@ -202,6 +223,13 @@ export class ClaudeProvider implements ProviderAdapter {
     // but every file-modifying tool is blocked, which is exactly the readOnly
     // contract (analysis over a user's working tree must never mutate it).
     if (opts.readOnly || opts.mode === 'plan') args.push('--permission-mode', 'plan');
+    // Resolved once per call (not per retry attempt) — callers that retry the
+    // same task type (e.g. generate.ts's 2-attempt loop) naturally reuse the
+    // same model/effort every attempt since each attempt is its own complete()
+    // call with the same fixed taskType, keeping the prompt-cache prefix
+    // stable across the retry rather than switching models mid-task.
+    const { args: modelArgs, model, effort } = await resolveModelArgs(opts.taskType);
+    args.push(...modelArgs);
     const r = await runCli(this.bin, args, {
       timeoutMs: opts.timeoutMs ?? 300_000,
       cwd: opts.cwd,
@@ -210,10 +238,18 @@ export class ClaudeProvider implements ProviderAdapter {
     });
     // Kill reasons first — see health() for why.
     if (r.timedOut) {
-      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion timed out.' };
+      return {
+        provider: this.id,
+        ok: false,
+        text: '',
+        raw: r,
+        detail: 'Completion timed out.',
+        model,
+        effort,
+      };
     }
     if (r.aborted) {
-      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion aborted.' };
+      return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion aborted.', model, effort };
     }
     const json = parseClaudeJson(r.stdout);
     if (json) {
@@ -224,6 +260,8 @@ export class ClaudeProvider implements ProviderAdapter {
         text: String(json.result ?? ''),
         raw: json,
         detail: ok ? 'ok' : `error (subtype: ${json.subtype ?? 'unknown'})`,
+        model,
+        effort,
       };
     }
     return {
@@ -232,17 +270,24 @@ export class ClaudeProvider implements ProviderAdapter {
       text: '',
       raw: r,
       detail: `Could not parse output: ${(r.stderr || r.stdout).slice(0, 200).trim()}`,
+      model,
+      effort,
     };
   }
 
-  async plan(task: string, opts: { timeoutMs?: number; signal?: AbortSignal } = {}): Promise<PlanResult> {
+  async plan(task: string, opts: PlanOptions = {}): Promise<PlanResult> {
     const timeoutMs = opts.timeoutMs ?? 120_000;
+    const { args: modelArgs, model, effort } = await resolveModelArgs(opts.taskType);
     // Same stdin-not-argv rationale as complete() above.
-    const r = await runCli(this.bin, ['-p', '--permission-mode', 'plan', '--output-format', 'json'], {
-      timeoutMs,
-      signal: opts.signal,
-      input: task,
-    });
+    const r = await runCli(
+      this.bin,
+      ['-p', '--permission-mode', 'plan', '--output-format', 'json', ...modelArgs],
+      {
+        timeoutMs,
+        signal: opts.signal,
+        input: task,
+      },
+    );
     // Kill reasons BEFORE parsing: a timed-out/aborted run leaves partial or
     // empty stdout, and reporting that as "could not parse" hides the real
     // cause from the user (who should raise the timeout, not debug JSON).
@@ -253,10 +298,20 @@ export class ClaudeProvider implements ProviderAdapter {
         plan: '',
         raw: r,
         detail: `Plan generation timed out after ${timeoutMs}ms.`,
+        model,
+        effort,
       };
     }
     if (r.aborted) {
-      return { provider: this.id, ok: false, plan: '', raw: r, detail: 'Plan generation aborted.' };
+      return {
+        provider: this.id,
+        ok: false,
+        plan: '',
+        raw: r,
+        detail: 'Plan generation aborted.',
+        model,
+        effort,
+      };
     }
     const json = parseClaudeJson(r.stdout);
     if (json) {
@@ -267,6 +322,8 @@ export class ClaudeProvider implements ProviderAdapter {
         plan: String(json.result ?? ''),
         raw: json,
         detail: ok ? 'Plan generated in plan mode.' : 'Plan generation failed.',
+        model,
+        effort,
       };
     }
     return {
@@ -275,6 +332,8 @@ export class ClaudeProvider implements ProviderAdapter {
       plan: '',
       raw: r,
       detail: `Could not parse plan output: ${(r.stderr || r.stdout).slice(0, 160).trim()}`,
+      model,
+      effort,
     };
   }
 }

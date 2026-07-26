@@ -11,6 +11,7 @@ import type {
   TestResult,
   TestingScope,
   TestPlan,
+  UsageRow,
 } from '@healix/core';
 
 export interface ProviderSummary {
@@ -33,10 +34,31 @@ export interface StartRunArgs {
    * distinct from the PRD, which describes WHAT the app does.
    */
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
   /** Suite lifecycle: fresh (default), top-up an existing suite, or reuse one as-is. */
   suiteMode?: SuiteMode;
   /** Pin top-up/reuse to a specific prior run instead of the project's latest passed run. */
   baseRunId?: string;
+  /**
+   * Opt-in for the coverage feedback loop's iterative re-plan/generate/execute
+   * retry — off by default (each iteration can add a full extra cycle, up to
+   * 4). Coverage is still measured once regardless; this only gates whether
+   * the loop retries to chase the target higher. No effect for suiteMode 'reuse'.
+   */
+  coverageLoopEnabled?: boolean;
+  /** Overrides the coverage loop's target ratio (0-1) when coverageLoopEnabled is true. */
+  coverageTarget?: number;
+  /**
+   * Targeted regeneration for the results-page Retry-pass/Repair actions:
+   * when set (requires suiteMode 'topup'), only these base-run plan item ids
+   * are regenerated — everything else is carried forward untouched.
+   */
+  retryItemIds?: string[];
 }
 
 /** Result of attempting to launch a provider's subscription login flow. */
@@ -46,11 +68,43 @@ export interface ProviderLoginResult {
   detail: string;
 }
 
-/** Result of the native "upload a PRD" file picker (pdf/doc/docx/md/txt). */
+/** Header-only preview of one worksheet, cheap enough to compute for every sheet in a workbook. */
+export interface SheetPreview {
+  name: string;
+  rowCount: number;
+  /** First ~8 column headers, truncated with an ellipsis marker if the sheet is wider. */
+  headers: string[];
+}
+
+/** Result of the native "upload a PRD" file picker (pdf/doc/docx/md/txt/xlsx/xls/csv). */
 export interface PickPrdFileResult {
   canceled: boolean;
   fileName?: string;
   text?: string;
+  error?: string;
+  /** True only when the workbook has more than one non-empty sheet and the renderer must show a picker. */
+  needsSheetPicker?: boolean;
+  /** Present alongside needsSheetPicker so the follow-up extractPrdSheets call knows which file to reread. */
+  filePath?: string;
+  /** Preview of every non-empty sheet, present alongside needsSheetPicker. */
+  sheets?: SheetPreview[];
+  /** Present when text came from a spreadsheet (single-sheet fast path or after picker selection). */
+  sourceKind?: 'file' | 'spreadsheet';
+  selectedSheets?: string[];
+  /** Non-fatal notes (e.g. row-cap truncation) — distinct from `error`, which means the upload failed outright. */
+  warnings?: string[];
+}
+
+/** Result of previewing an already-picked spreadsheet's sheets (re-opening the picker). */
+export interface PreviewPrdSheetsResult {
+  sheets?: SheetPreview[];
+  error?: string;
+}
+
+/** Result of extracting the user's selected sheets from an already-picked spreadsheet. */
+export interface ExtractPrdSheetsResult {
+  sheets?: { name: string; content: string }[];
+  warnings?: string[];
   error?: string;
 }
 
@@ -88,6 +142,8 @@ export interface RunDetail {
    * (a run from before this feature existed, or the write failed).
    */
   runConfig: RunConfigSnapshot | null;
+  /** Per-call token/cost usage captured during this run (plan/generate/triage) — feeds the Usage tab. */
+  usage: UsageRow[];
 }
 
 /** The options a run was started with, permanently recorded (unlike the pausable checkpoint). */
@@ -97,6 +153,18 @@ export interface RunConfigSnapshot {
   provider?: ProviderId;
   prd?: string;
   instructions?: string;
+  /** How `prd` was produced — free typing, a prose file upload, or a parsed spreadsheet. */
+  prdSourceKind?: 'text' | 'file' | 'spreadsheet';
+  /** Original uploaded file name, when `prd` came from a file/spreadsheet upload. */
+  prdFileName?: string;
+  /** Sheet names included in `prd`, when `prdSourceKind` is 'spreadsheet'. */
+  prdSelectedSheets?: string[];
+  /** Whether the coverage feedback loop's iterative retry was enabled for this run. */
+  coverageLoopEnabled?: boolean;
+  /** The coverage target this run used, when coverageLoopEnabled. */
+  coverageTarget?: number;
+  /** Plan item ids this run targeted for regeneration (Retry-pass/Repair), when set. */
+  retryItemIds?: string[];
 }
 
 /**
@@ -122,6 +190,8 @@ export interface RunReportShape {
   fallbackReason?: string;
   generation?: { requestedItems: number; acceptedItems: number };
   coverage?: { ratio: number; target: number } | null;
+  /** End-of-run AI synthesis across every triaged failure — see @healix/core's triage/grouping.ts. */
+  groupingSummary?: string | null;
 }
 
 /** Best-effort narrowing of the opaque report.json payload. Returns null when unusable. */
@@ -161,6 +231,7 @@ export function asRunReport(value: unknown): RunReportShape | null {
       coverage && typeof coverage.ratio === 'number' && typeof coverage.target === 'number'
         ? { ratio: coverage.ratio, target: coverage.target }
         : null,
+    groupingSummary: typeof v.groupingSummary === 'string' ? v.groupingSummary : null,
   };
 }
 
@@ -205,6 +276,14 @@ export interface SuiteDiffSummary {
   carriedCount: number;
   removedCount: number;
   totalCount: number;
+}
+
+/** A base-run plan item whose spec never got generated (Retry-pass) or whose test was triaged test_is_wrong (Repair) — a regeneration candidate. */
+export interface GenerationGapItem {
+  id: string;
+  title: string;
+  tier: string;
+  reqTag?: string;
 }
 
 export interface TestCaseHistoryEntry {

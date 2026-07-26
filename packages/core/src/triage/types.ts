@@ -1,4 +1,5 @@
 import type { ProviderAdapter } from '../providers/types.js';
+import type { UsageRecorder } from '../providers/usage.js';
 
 export type Verdict = 'test_is_wrong' | 'app_is_wrong' | 'environment' | 'flaky' | 'ambiguous';
 
@@ -29,6 +30,12 @@ export interface TriageResult {
   suggestedPatch?: string;
 }
 
+/** One failure entered into a batched analyze() call, keyed by a caller-assigned id (stable across the batch/split-retry lifecycle — not the test's own reqTag/title, which may repeat or be absent). */
+export interface TriageBatchItem {
+  id: string;
+  input: TriageInput;
+}
+
 /** Deterministic classifier first, AI hypothesis second (ported from TestBot failure-triage). */
 export interface TriageEngine {
   classify(input: TriageInput): TriageResult;
@@ -37,5 +44,35 @@ export interface TriageEngine {
    * CLI child process) when its own patience runs out, instead of abandoning
    * it to keep running in the background untracked.
    */
-  analyze(input: TriageInput, provider: ProviderAdapter, signal?: AbortSignal): Promise<TriageResult>;
+  analyze(
+    input: TriageInput,
+    provider: ProviderAdapter,
+    signal?: AbortSignal,
+    onUsage?: UsageRecorder,
+    cwd?: string,
+  ): Promise<TriageResult>;
+  /**
+   * Analyze several failures in ONE provider call instead of N separate ones —
+   * each item still gets its own evidence block in the prompt, but the fixed
+   * instructions/schema preamble is only paid once per batch.
+   *
+   * `results` is keyed by each item's `id`; an id absent from it means that
+   * one item's entry within an otherwise-parseable reply was missing or
+   * malformed — the caller falls back to `classify()`'s baseline for it,
+   * exactly as it already does for a solo `analyze()` timeout/failure.
+   *
+   * `truncated` is true only when the reply genuinely attempted a JSON array
+   * but was cut off mid-object (see prompt.ts's looksLikeTruncatedBatchReply)
+   * — the ONE case worth halving the batch and retrying (smaller output has a
+   * real chance of not truncating). A reply with no array-like structure at
+   * all (garbled text, a stub response) is NOT truncated — a smaller batch
+   * has no reason to fix that, so the caller should not retry-split for it.
+   */
+  analyzeBatch(
+    items: TriageBatchItem[],
+    provider: ProviderAdapter,
+    signal?: AbortSignal,
+    onUsage?: UsageRecorder,
+    cwd?: string,
+  ): Promise<{ results: Map<string, TriageResult>; truncated: boolean }>;
 }

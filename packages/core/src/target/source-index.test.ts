@@ -2,7 +2,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { afterEach, describe, expect, it } from 'vitest';
-import { indexSource } from './source-index.js';
+import { computeRepoSourceHash, indexSource } from './source-index.js';
 
 const tempDirs: string[] = [];
 
@@ -23,6 +23,61 @@ afterEach(() => {
     const dir = tempDirs.pop();
     if (dir) fs.rmSync(dir, { recursive: true, force: true });
   }
+});
+
+describe('computeRepoSourceHash', () => {
+  it('is stable across repeated calls when nothing changed', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    expect(computeRepoSourceHash(dir)).toBe(computeRepoSourceHash(dir));
+  });
+
+  it('changes when a file is added', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    const before = computeRepoSourceHash(dir);
+    write(dir, 'src/New.tsx', 'export const x = 1;');
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
+
+  it('changes when an existing file is modified (size and mtime change)', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    const before = computeRepoSourceHash(dir);
+
+    const abs = path.join(dir, 'src', 'App.tsx');
+    fs.writeFileSync(abs, 'export default function App() { return null; }', 'utf-8');
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(abs, future, future);
+
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
+
+  // indexSource() treats spec files as AUTHORITATIVE (a spec-derived unit always overrides a
+  // code-derived one on a key collision) — the hash must notice a spec-only edit even when no
+  // regular source file changed, or a stale sourceContext would silently keep serving pre-edit
+  // spec-derived units forever.
+  it('changes when a Postman collection is added (spec files are authoritative, not just source)', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    const before = computeRepoSourceHash(dir);
+    write(dir, 'API.postman_collection.json', '{"info":{"name":"API"},"item":[]}');
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
+
+  it('changes when an existing OpenAPI spec is modified, with no other file touched', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() {}');
+    write(dir, 'docs/openapi.yaml', 'openapi: 3.0.0\npaths: {}\n');
+    const before = computeRepoSourceHash(dir);
+
+    const abs = path.join(dir, 'docs', 'openapi.yaml');
+    fs.writeFileSync(abs, 'openapi: 3.0.0\npaths:\n  /new:\n    get: {}\n', 'utf-8');
+    const future = new Date(Date.now() + 5000);
+    fs.utimesSync(abs, future, future);
+
+    expect(computeRepoSourceHash(dir)).not.toBe(before);
+  });
 });
 
 describe('indexSource', () => {
@@ -87,6 +142,39 @@ describe('indexSource', () => {
         attribute: 'data-testid',
         value: 'login-email',
       });
+    });
+  });
+
+  // Regression test: detect() returns the specific string 'vite-react' (not the bare 'vite') for
+  // any Vite + React app — by far the most common modern React SPA setup — and
+  // RELEVANT_FRAMEWORKS_FOR_ROUTER previously didn't include it, silently skipping ALL React
+  // Router extraction for such a repo (confirmed live against a real vite-react app, where
+  // indexSource() returned zero `route` units despite a real, nested <Route> config in source).
+  it('extracts <Route> units for a real Vite + React app (detect() returns "vite-react", not "vite")', () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({ dependencies: { vite: '^5.0.0', react: '^18.0.0' } }));
+    write(
+      dir,
+      'src/routes/AppRoutes.tsx',
+      `
+        import { Route, Routes } from 'react-router-dom';
+        export function AppRoutes() {
+          return (
+            <Routes>
+              <Route path="login">
+                <Route index element={<LoginPage />} />
+                <Route path="resetpassword" element={<ResetPasswordPage />} />
+              </Route>
+            </Routes>
+          );
+        }
+      `,
+    );
+
+    return indexSource(dir).then((ctx) => {
+      const keys = ctx.units.filter((u) => u.kind === 'route').map((u) => u.key);
+      expect(keys).toContain('route:/login');
+      expect(keys).toContain('route:/login/resetpassword');
     });
   });
 

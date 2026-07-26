@@ -8,6 +8,8 @@ import type {
   EventLevel,
   NewProject,
   NewProjectCredential,
+  NewTriageResult,
+  NewUsage,
   PauseReason,
   Project,
   ProjectCredential,
@@ -17,6 +19,9 @@ import type {
   TestCase,
   TestResult,
   TestStatus,
+  TriageResultRow,
+  UsageAggregate,
+  UsageRow,
 } from './types.js';
 
 /**
@@ -174,17 +179,23 @@ export class HealixStore {
           'DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?))',
         )
         .run(id);
-      // 2. agent_events of runs of this project
+      // 2. triage_results whose test belongs to a test of a run of this project
+      this.db
+        .prepare(
+          'DELETE FROM triage_results WHERE test_id IN (SELECT id FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?))',
+        )
+        .run(id);
+      // 3. agent_events of runs of this project
       this.db
         .prepare('DELETE FROM agent_events WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)')
         .run(id);
-      // 3. tests of runs of this project
+      // 4. tests of runs of this project
       this.db.prepare('DELETE FROM tests WHERE run_id IN (SELECT id FROM runs WHERE project_id = ?)').run(id);
-      // 4. runs of this project
+      // 5. runs of this project
       this.db.prepare('DELETE FROM runs WHERE project_id = ?').run(id);
-      // 5. this project's credentials
+      // 6. this project's credentials
       this.db.prepare('DELETE FROM project_credentials WHERE project_id = ?').run(id);
-      // 6. the project row itself
+      // 7. the project row itself
       this.db.prepare('DELETE FROM projects WHERE id = ?').run(id);
       this.db.exec('COMMIT');
     } catch (err) {
@@ -312,15 +323,16 @@ export class HealixStore {
   }
 
   /**
-   * Runs currently 'paused' with a reason other than 'manual' — candidates
-   * for boot-time auto-resume (see checkpoint.ts / the desktop app's
-   * reconciliation step). A manually-paused run never appears here; the user
-   * must resume it themselves.
+   * Runs currently 'paused' with a transient reason ('network' or
+   * 'credits-exhausted') — candidates for boot-time auto-resume (see
+   * checkpoint.ts / the desktop app's reconciliation step). 'manual' and
+   * 'budget-exceeded' never appear here: both need a human decision (resume
+   * as-is, or — for a budget ceiling — raise it) rather than an automatic retry.
    */
   listAutoResumableRuns(): Run[] {
     const rows = this.db
       .prepare(
-        `SELECT * FROM runs WHERE status = 'paused' AND pause_reason != 'manual' ORDER BY created_at ASC`,
+        `SELECT * FROM runs WHERE status = 'paused' AND pause_reason NOT IN ('manual', 'budget-exceeded') ORDER BY created_at ASC`,
       )
       .all() as Array<Record<string, unknown>>;
     return rows.map(rowToRun);
@@ -366,11 +378,17 @@ export class HealixStore {
     try {
       // 1. results whose test belongs to this run
       this.db.prepare('DELETE FROM results WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)').run(id);
-      // 2. agent_events of this run
+      // 2. triage_results whose test belongs to this run
+      this.db
+        .prepare('DELETE FROM triage_results WHERE test_id IN (SELECT id FROM tests WHERE run_id = ?)')
+        .run(id);
+      // 3. agent_events of this run
       this.db.prepare('DELETE FROM agent_events WHERE run_id = ?').run(id);
-      // 3. tests of this run
+      // 4. usage rows of this run
+      this.db.prepare('DELETE FROM usage WHERE run_id = ?').run(id);
+      // 5. tests of this run
       this.db.prepare('DELETE FROM tests WHERE run_id = ?').run(id);
-      // 4. the run row itself
+      // 6. the run row itself
       this.db.prepare('DELETE FROM runs WHERE id = ?').run(id);
       this.db.exec('COMMIT');
     } catch (err) {
@@ -385,11 +403,12 @@ export class HealixStore {
 
   // ---- tests + results ----
   insertTest(
-    test: Omit<TestCase, 'id' | 'specPath' | 'description' | 'details'> & {
+    test: Omit<TestCase, 'id' | 'specPath' | 'description' | 'details' | 'specCode'> & {
       id?: string;
       specPath?: string | null;
       description?: string | null;
       details?: string | null;
+      specCode?: string | null;
     },
   ): TestCase {
     const full: TestCase = {
@@ -398,10 +417,11 @@ export class HealixStore {
       specPath: test.specPath ?? null,
       description: test.description ?? null,
       details: test.details ?? null,
+      specCode: test.specCode ?? null,
     };
     this.db
       .prepare(
-        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path, description, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO tests (id, run_id, title, req_tag, tier, status, spec_path, description, details, spec_code) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         full.id,
@@ -413,6 +433,7 @@ export class HealixStore {
         full.specPath,
         full.description,
         full.details,
+        full.specCode,
       );
     return full;
   }
@@ -440,10 +461,11 @@ export class HealixStore {
    * joining through one-row-per-test.
    */
   insertResult(
-    result: Omit<TestResult, 'id' | 'description' | 'details'> & {
+    result: Omit<TestResult, 'id' | 'description' | 'details' | 'stepsJson'> & {
       id?: string;
       description?: string | null;
       details?: string | null;
+      stepsJson?: string | null;
     },
   ): TestResult {
     const full: TestResult = {
@@ -451,11 +473,12 @@ export class HealixStore {
       id: result.id ?? `res_${nanoid(10)}`,
       description: result.description ?? null,
       details: result.details ?? null,
+      stepsJson: result.stepsJson ?? null,
     };
     this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
-        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details, steps_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         full.id,
@@ -466,6 +489,7 @@ export class HealixStore {
         full.artifactsJson,
         full.description,
         full.details,
+        full.stepsJson,
       );
     return full;
   }
@@ -491,6 +515,69 @@ export class HealixStore {
         .prepare('SELECT r.* FROM results r JOIN tests t ON r.test_id = t.id WHERE t.run_id = ?')
         .all(runId) as Array<Record<string, unknown>>
     ).map(rowToResult);
+  }
+
+  /**
+   * Persist one FK-keyed triage verdict for a test — upserts by testId (one
+   * current verdict per test), rather than accumulating a new row every call.
+   * Best-effort by design (mirrors recordUsage/insertResult's own style) — a
+   * bad testId or a store fault here must never block report-writing, since
+   * report.json's title-joined ReportTriageEntry already carries the verdict
+   * either way; this is an additional, queryable record, not the source of
+   * truth. The upsert matters because triage can legitimately run against the
+   * same test more than once — a resumed mid-TRIAGE crash re-triages
+   * candidates the orchestrator doesn't track as already-done (unlike
+   * Generate/Execute's item-level skip), and Retry-pass/Repair re-triage a
+   * targeted test outright — so a plain INSERT would leave stale duplicate
+   * rows for the same test rather than replacing them.
+   */
+  recordTriageResult(input: NewTriageResult): TriageResultRow {
+    const row: TriageResultRow = {
+      id: `trg_${nanoid(10)}`,
+      testId: input.testId,
+      verdict: input.verdict,
+      confidence: input.confidence,
+      rationale: input.rationale,
+      suggestedPatch: input.suggestedPatch ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db.exec('BEGIN IMMEDIATE');
+    try {
+      this.db.prepare('DELETE FROM triage_results WHERE test_id = ?').run(row.testId);
+      this.db
+        .prepare(
+          'INSERT INTO triage_results (id, test_id, verdict, confidence, rationale, suggested_patch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          row.id,
+          row.testId,
+          row.verdict,
+          row.confidence,
+          row.rationale,
+          row.suggestedPatch,
+          row.createdAt,
+        );
+      this.db.exec('COMMIT');
+    } catch (err) {
+      try {
+        this.db.exec('ROLLBACK');
+      } catch {
+        /* best-effort rollback */
+      }
+      throw err;
+    }
+    return row;
+  }
+
+  /** All triage-result rows for a run, joined through tests (triage_results has no run_id of its own). */
+  listTriageResults(runId: string): TriageResultRow[] {
+    return (
+      this.db
+        .prepare(
+          'SELECT tr.* FROM triage_results tr JOIN tests t ON tr.test_id = t.id WHERE t.run_id = ? ORDER BY tr.created_at ASC, tr.rowid ASC',
+        )
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToTriageResult);
   }
 
   /**
@@ -548,6 +635,151 @@ export class HealixStore {
           .all(runId) as Array<Record<string, unknown>>
       ).map(rowToEvent)
     );
+  }
+
+  /** Persist one captured provider.complete() call's token/cost usage. Never throws on a bad runId — this schema never enables `PRAGMA foreign_keys`, so the runId REFERENCES is unenforced (like every other FK here); an orphaned row is simply possible, at the caller's own risk, matching insertResult's best-effort style. */
+  recordUsage(input: NewUsage): UsageRow {
+    const row: UsageRow = {
+      id: `usg_${nanoid(10)}`,
+      runId: input.runId,
+      phase: input.phase,
+      task: input.task ?? null,
+      provider: input.provider,
+      inputTokens: input.inputTokens ?? null,
+      outputTokens: input.outputTokens ?? null,
+      costUsd: input.costUsd ?? null,
+      cacheCreationInputTokens: input.cacheCreationInputTokens ?? null,
+      cacheReadInputTokens: input.cacheReadInputTokens ?? null,
+      model: input.model ?? null,
+      createdAt: new Date().toISOString(),
+    };
+    this.db
+      .prepare(
+        'INSERT INTO usage (id, run_id, phase, task, provider, input_tokens, output_tokens, cost_usd, cache_creation_input_tokens, cache_read_input_tokens, model, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        row.id,
+        row.runId,
+        row.phase,
+        row.task,
+        row.provider,
+        row.inputTokens,
+        row.outputTokens,
+        row.costUsd,
+        row.cacheCreationInputTokens,
+        row.cacheReadInputTokens,
+        row.model,
+        row.createdAt,
+      );
+    return row;
+  }
+
+  listUsageForRun(runId: string): UsageRow[] {
+    return (
+      this.db
+        .prepare('SELECT * FROM usage WHERE run_id = ? ORDER BY created_at ASC, rowid ASC')
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToUsage);
+  }
+
+  /**
+   * Cross-run usage aggregation for the Reports/Usage page: one row per run
+   * (its own total tokens/cost, newest-first) plus per-phase averages across
+   * every matching run. Scoped to a project when given, else every run in the
+   * store — mirrors listRuns' own (projectId?) scoping.
+   */
+  getUsageAggregate(opts: { projectId?: string } = {}): UsageAggregate {
+    const runFilter = opts.projectId ? 'WHERE r.project_id = ?' : '';
+    const params = opts.projectId ? [opts.projectId] : [];
+
+    // rowid tiebreaker: same reasoning as listRuns/listEvents — created_at has
+    // only second resolution, so two runs created within the same second (easy
+    // on a fast CI runner) would otherwise sort nondeterministically.
+    const perRunRows = this.db
+      .prepare(
+        `SELECT r.id AS run_id, r.created_at AS run_created_at,
+                SUM(u.input_tokens) AS input_tokens, SUM(u.output_tokens) AS output_tokens, SUM(u.cost_usd) AS cost_usd,
+                SUM(u.cache_creation_input_tokens) AS cache_creation_input_tokens, SUM(u.cache_read_input_tokens) AS cache_read_input_tokens
+         FROM runs r
+         LEFT JOIN usage u ON u.run_id = r.id
+         ${runFilter}
+         GROUP BY r.id
+         ORDER BY r.created_at DESC, r.rowid DESC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+
+    const perPhaseRows = this.db
+      .prepare(
+        `SELECT u.phase AS phase, COUNT(*) AS call_count,
+                AVG(u.input_tokens) AS avg_input_tokens, AVG(u.output_tokens) AS avg_output_tokens, AVG(u.cost_usd) AS avg_cost_usd,
+                SUM(u.input_tokens) AS total_input_tokens, SUM(u.output_tokens) AS total_output_tokens, SUM(u.cost_usd) AS total_cost_usd,
+                AVG(u.cache_creation_input_tokens) AS avg_cache_creation_input_tokens, AVG(u.cache_read_input_tokens) AS avg_cache_read_input_tokens,
+                SUM(u.cache_creation_input_tokens) AS total_cache_creation_input_tokens, SUM(u.cache_read_input_tokens) AS total_cache_read_input_tokens
+         FROM usage u
+         JOIN runs r ON r.id = u.run_id
+         ${runFilter}
+         GROUP BY u.phase
+         ORDER BY u.phase ASC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+
+    // model IS NOT NULL: a call that reported no usage at all has model=NULL
+    // (see recordUsage) — grouping on NULL would otherwise surface a bogus
+    // "unknown model" row, unlike per-phase (phase is always a real string).
+    const perModelRows = this.db
+      .prepare(
+        `SELECT u.model AS model, COUNT(*) AS call_count,
+                AVG(u.input_tokens) AS avg_input_tokens, AVG(u.output_tokens) AS avg_output_tokens, AVG(u.cost_usd) AS avg_cost_usd,
+                SUM(u.input_tokens) AS total_input_tokens, SUM(u.output_tokens) AS total_output_tokens, SUM(u.cost_usd) AS total_cost_usd,
+                AVG(u.cache_creation_input_tokens) AS avg_cache_creation_input_tokens, AVG(u.cache_read_input_tokens) AS avg_cache_read_input_tokens,
+                SUM(u.cache_creation_input_tokens) AS total_cache_creation_input_tokens, SUM(u.cache_read_input_tokens) AS total_cache_read_input_tokens
+         FROM usage u
+         JOIN runs r ON r.id = u.run_id
+         ${runFilter ? `${runFilter} AND u.model IS NOT NULL` : 'WHERE u.model IS NOT NULL'}
+         GROUP BY u.model
+         ORDER BY u.model ASC`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+
+    return {
+      perRun: perRunRows.map((r) => ({
+        runId: String(r.run_id),
+        runCreatedAt: String(r.run_created_at),
+        inputTokens: n(r.input_tokens),
+        outputTokens: n(r.output_tokens),
+        costUsd: n(r.cost_usd),
+        cacheCreationInputTokens: n(r.cache_creation_input_tokens),
+        cacheReadInputTokens: n(r.cache_read_input_tokens),
+      })),
+      perPhase: perPhaseRows.map((r) => ({
+        phase: String(r.phase),
+        callCount: Number(r.call_count ?? 0),
+        avgInputTokens: n(r.avg_input_tokens),
+        avgOutputTokens: n(r.avg_output_tokens),
+        avgCostUsd: n(r.avg_cost_usd),
+        totalInputTokens: n(r.total_input_tokens),
+        totalOutputTokens: n(r.total_output_tokens),
+        totalCostUsd: n(r.total_cost_usd),
+        avgCacheCreationInputTokens: n(r.avg_cache_creation_input_tokens),
+        avgCacheReadInputTokens: n(r.avg_cache_read_input_tokens),
+        totalCacheCreationInputTokens: n(r.total_cache_creation_input_tokens),
+        totalCacheReadInputTokens: n(r.total_cache_read_input_tokens),
+      })),
+      perModel: perModelRows.map((r) => ({
+        model: String(r.model),
+        callCount: Number(r.call_count ?? 0),
+        avgInputTokens: n(r.avg_input_tokens),
+        avgOutputTokens: n(r.avg_output_tokens),
+        avgCostUsd: n(r.avg_cost_usd),
+        totalInputTokens: n(r.total_input_tokens),
+        totalOutputTokens: n(r.total_output_tokens),
+        totalCostUsd: n(r.total_cost_usd),
+        avgCacheCreationInputTokens: n(r.avg_cache_creation_input_tokens),
+        avgCacheReadInputTokens: n(r.avg_cache_read_input_tokens),
+        totalCacheCreationInputTokens: n(r.total_cache_creation_input_tokens),
+        totalCacheReadInputTokens: n(r.total_cache_read_input_tokens),
+      })),
+    };
   }
 }
 
@@ -642,6 +874,7 @@ function rowToTest(r: Record<string, unknown>): TestCase {
     specPath: s(r.spec_path),
     description: s(r.description),
     details: s(r.details),
+    specCode: s(r.spec_code),
   };
 }
 
@@ -655,6 +888,19 @@ function rowToResult(r: Record<string, unknown>): TestResult {
     artifactsJson: s(r.artifacts_json),
     description: s(r.description),
     details: s(r.details),
+    stepsJson: s(r.steps_json),
+  };
+}
+
+function rowToTriageResult(r: Record<string, unknown>): TriageResultRow {
+  return {
+    id: String(r.id),
+    testId: String(r.test_id),
+    verdict: String(r.verdict) as TriageResultRow['verdict'],
+    confidence: Number(r.confidence),
+    rationale: String(r.rationale),
+    suggestedPatch: s(r.suggested_patch),
+    createdAt: String(r.created_at),
   };
 }
 
@@ -666,6 +912,23 @@ function rowToEvent(r: Record<string, unknown>): AgentEvent {
     level: String(r.level) as EventLevel,
     message: String(r.message),
     dataJson: s(r.data_json),
+    createdAt: String(r.created_at),
+  };
+}
+
+function rowToUsage(r: Record<string, unknown>): UsageRow {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    phase: String(r.phase),
+    task: s(r.task),
+    provider: String(r.provider) as UsageRow['provider'],
+    inputTokens: n(r.input_tokens),
+    outputTokens: n(r.output_tokens),
+    costUsd: n(r.cost_usd),
+    cacheCreationInputTokens: n(r.cache_creation_input_tokens),
+    cacheReadInputTokens: n(r.cache_read_input_tokens),
+    model: s(r.model),
     createdAt: String(r.created_at),
   };
 }

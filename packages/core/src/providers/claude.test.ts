@@ -16,11 +16,22 @@ import { beforeEach, describe, expect, it, vi } from 'vitest';
 
 vi.mock('../exec/run-cli.js', async (importOriginal) => {
   const actual = await importOriginal<typeof import('../exec/run-cli.js')>();
-  return { ...actual, runCli: vi.fn() };
+  return { ...actual, runCli: vi.fn(), which: vi.fn() };
 });
 
-import { runCli } from '../exec/run-cli.js';
+// readModelConfigOverrides hits the filesystem (appDataDir()); keep it
+// deterministic/offline in unit tests, with resolveModelAndEffort's pure
+// merge logic left real so its own defaults still apply.
+vi.mock('./model-config.js', async (importOriginal) => {
+  const actual = await importOriginal<typeof import('./model-config.js')>();
+  return { ...actual, readModelConfigOverrides: vi.fn() };
+});
+
+import { runCli, which } from '../exec/run-cli.js';
+import { readModelConfigOverrides } from './model-config.js';
 import { ClaudeProvider, parseClaudeJson } from './claude.js';
+
+const readOverridesMock = vi.mocked(readModelConfigOverrides);
 
 // Module-wide mock: give it a harmless default so unrelated calls (e.g. the
 // existing detect() test's `--version` probe) don't blow up, and clear call
@@ -35,8 +46,18 @@ runCliMock.mockResolvedValue({
   aborted: false,
   durationMs: 0,
 });
+// which() shells out to the real PATH — CI runners don't have the `claude`
+// binary installed, so leaving this unmocked makes detect() (and anything
+// that calls it, like health()) non-deterministic across environments.
+// Force it to report installed so detect()/health() always reach runCli.
+const whichMock = vi.mocked(which);
+whichMock.mockResolvedValue('/usr/local/bin/claude');
 beforeEach(() => {
   runCliMock.mockClear();
+  whichMock.mockClear();
+  whichMock.mockResolvedValue('/usr/local/bin/claude');
+  readOverridesMock.mockReset();
+  readOverridesMock.mockResolvedValue(null);
 });
 
 describe('parseClaudeJson (tolerant --output-format json parsing)', () => {
@@ -237,5 +258,75 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     await provider.complete('prompt', { timeoutMs: 42_000 });
     const [, , callOpts] = runCliMock.mock.calls[0]!;
     expect(callOpts?.timeoutMs).toBe(42_000);
+  });
+});
+
+describe('ClaudeProvider — per-task-type model/effort routing', () => {
+  const provider = new ClaudeProvider();
+  const okStdout = JSON.stringify({ is_error: false, result: 'ok' });
+
+  beforeEach(() => {
+    runCliMock.mockResolvedValue({
+      code: 0,
+      stdout: okStdout,
+      stderr: '',
+      timedOut: false,
+      aborted: false,
+      durationMs: 1,
+    });
+  });
+
+  it('complete() omits --model/--effort when no taskType is given (back-compat)', async () => {
+    await provider.complete('prompt');
+    const [, args] = runCliMock.mock.calls[0]!;
+    expect(args).not.toContain('--model');
+    expect(args).not.toContain('--effort');
+  });
+
+  it('complete() appends --model/--effort resolved from the hardcoded default for a given taskType', async () => {
+    const res = await provider.complete('prompt', { taskType: 'triage' });
+    const [, args] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(expect.arrayContaining(['--model', 'haiku', '--effort', 'high']));
+    expect(res.model).toBe('haiku');
+    expect(res.effort).toBe('high');
+  });
+
+  it('complete() prefers a user override over the hardcoded default', async () => {
+    readOverridesMock.mockResolvedValue({ triage: { model: 'sonnet' } });
+    const res = await provider.complete('prompt', { taskType: 'triage' });
+    const [, args] = runCliMock.mock.calls[0]!;
+    // model overridden to sonnet; effort falls back to the default (high) since unset.
+    expect(args).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
+    expect(res.model).toBe('sonnet');
+    expect(res.effort).toBe('high');
+  });
+
+  it('plan() resolves model/effort from taskType the same way complete() does', async () => {
+    const res = await provider.plan('task', { taskType: 'plan-generate' });
+    const [, args] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
+    expect(res.model).toBe('sonnet');
+    expect(res.effort).toBe('high');
+  });
+
+  it('health() resolves the health-probe task type internally', async () => {
+    await provider.health();
+    const [, args] = runCliMock.mock.calls.at(-1)!;
+    expect(args).toEqual(expect.arrayContaining(['--model', 'haiku', '--effort', 'low']));
+  });
+
+  it('a failed/timed-out completion still surfaces the resolved model/effort', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: 1,
+      stdout: '',
+      stderr: '',
+      timedOut: true,
+      aborted: false,
+      durationMs: 1,
+    });
+    const res = await provider.complete('prompt', { taskType: 'mock-response' });
+    expect(res.ok).toBe(false);
+    expect(res.model).toBe('haiku');
+    expect(res.effort).toBe('high');
   });
 });

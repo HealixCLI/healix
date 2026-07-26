@@ -335,6 +335,40 @@ describe('orchestrator integration (offline DI seam)', () => {
     expect(report.outcome?.failed).toBe(1);
   });
 
+  it('passes the project repoPath as cwd into the triage analyze() completion call', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Cwd Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      repoPath: '/repo/cwd-demo',
+    });
+
+    const capturedOpts: CompleteOptions[] = [];
+    const capturingProvider: ProviderAdapter = {
+      ...fakeProvider,
+      async complete(prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
+        if (opts) capturedOpts.push(opts);
+        return fakeProvider.complete(prompt, opts);
+      },
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: capturingProvider,
+      getMode: () => fakeMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
+
+    const triageCalls = capturedOpts.filter((o) => o.taskType === 'triage');
+    expect(triageCalls.length).toBeGreaterThan(0);
+    for (const call of triageCalls) {
+      expect(call.cwd).toBe('/repo/cwd-demo');
+    }
+  });
+
   it('createOrchestrator() with no overrides is the same factory shape', () => {
     // No-arg construction must not throw; behavior parity is exercised elsewhere.
     const orchestrator = createOrchestrator();

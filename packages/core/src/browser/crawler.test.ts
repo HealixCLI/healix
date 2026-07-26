@@ -14,6 +14,8 @@ interface FakePage {
   elements: InteractiveElement[];
   /** Network traffic to hand back from drainNetworkEvents() after navigating to this page. */
   network?: CapturedNetworkEvent[];
+  /** Simulated `ariaSnapshot()` output — a plain string, matching the real DomSnapshot.axTree shape. */
+  axTree?: unknown;
 }
 
 /**
@@ -79,6 +81,7 @@ function makeFakeBrowser(config: {
         url: currentUrl,
         title: page.title ?? currentUrl,
         interactiveElements: revealedElements ?? page.elements,
+        axTree: page.axTree,
       };
     },
     async click(selector: string): Promise<void> {
@@ -372,7 +375,7 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
   });
 
   it('never click-probes a control whose name reads as a destructive/mutating action', async () => {
-    const unsafeButton = button('Register now');
+    const unsafeButton = button('Delete account');
     const safeButton = button('View Menu');
     const recordClicks: string[] = [];
     const browser = makeFakeBrowser({
@@ -388,6 +391,28 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
 
     expect(recordClicks).not.toContain(unsafeButton.selector);
     expect(recordClicks).toContain(safeButton.selector);
+  });
+
+  it('DOES click-probe a "Register"/"Sign up" nav control — navigating there is safe, only the submit is excluded', async () => {
+    // A button-driven SPA nav often renders "Register"/"Create account" as a plain <button
+    // onClick> rather than a real <a href> — excluding it by name would hide that whole route on
+    // any app whose primary entry point uses that wording, when the actual mutation (account
+    // creation) is already independently blocked via buttonType==='submit'.
+    const registerButton = button('Register now');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [registerButton] },
+        'https://a.test/register': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/register' },
+      recordClicks,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(registerButton.selector);
+    expect(result.routes.map((r) => r.url)).toContain('https://a.test/register');
   });
 
   it('does click-probe a non-submit control inside a <form> (e.g. a login/register view toggle)', async () => {
@@ -517,7 +542,7 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toEqual([]);
   });
 
-  it('does not click-probe a page while the link-following queue still has 3+ pending URLs', async () => {
+  it('does not click-probe a page while the link-following queue still has 5+ pending URLs', async () => {
     const extraNav = button('Extra Nav');
     const recordClicks: string[] = [];
     const browser = makeFakeBrowser({
@@ -527,12 +552,16 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
             link('https://a.test/p1'),
             link('https://a.test/p2'),
             link('https://a.test/p3'),
+            link('https://a.test/p4'),
+            link('https://a.test/p5'),
             extraNav,
           ],
         },
         'https://a.test/p1': { elements: [] },
         'https://a.test/p2': { elements: [] },
         'https://a.test/p3': { elements: [] },
+        'https://a.test/p4': { elements: [] },
+        'https://a.test/p5': { elements: [] },
       },
       recordClicks,
     });
@@ -542,8 +571,8 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toEqual([]);
   });
 
-  it('caps click-probes at 4 candidates on a single page even with more safe candidates available', async () => {
-    const buttons = Array.from({ length: 6 }, (_, i) => button(`Nav ${i}`));
+  it('caps click-probes at 8 candidates on a single page even with more safe candidates available', async () => {
+    const buttons = Array.from({ length: 10 }, (_, i) => button(`Nav ${i}`));
     const recordClicks: string[] = [];
     const browser = makeFakeBrowser({
       pages: { 'https://a.test/': { elements: buttons } },
@@ -552,7 +581,7 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
 
     await crawl(browser, 'https://a.test/');
 
-    expect(recordClicks.length).toBeLessThanOrEqual(4);
+    expect(recordClicks.length).toBeLessThanOrEqual(8);
   });
 
   it('resets to the original page after each navigating click, so every safe candidate is tried from the same starting point', async () => {
@@ -823,6 +852,16 @@ describe('reconcileStaticRoutePaths()', () => {
     expect(out).toEqual(['https://a.test/#/checkout']);
   });
 
+  it('inserts the separating slash a naive string concat would drop when the static path has no leading slash', () => {
+    const out = reconcileStaticRoutePaths(
+      ['home'],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+    expect(out).toEqual(['https://a.test/#/SK/home']);
+    expect(out).not.toEqual(['https://a.test/#/SKhome']);
+  });
+
   it('drops paths with a dynamic segment (:id, [id], or *) instead of guessing a value', () => {
     const out = reconcileStaticRoutePaths(
       ['/users/:id', '/posts/[slug]', '/files/*', '/checkout'],
@@ -835,6 +874,167 @@ describe('reconcileStaticRoutePaths()', () => {
   it('skips a path that fails to resolve against a malformed base URL rather than throwing', () => {
     expect(() => reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).not.toThrow();
     expect(reconcileStaticRoutePaths(['/checkout'], { hashRouted: false }, 'not-a-url')).toEqual([]);
+  });
+});
+
+describe('crawl() subpath-hosted entry navigation (GAP-052)', () => {
+  it('navigates to the entry URL exactly as given, trailing slash intact', async () => {
+    const log: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/app/': { elements: [] } },
+      log,
+    });
+
+    await crawl(browser, 'https://a.test/app/');
+
+    // normalizeUrl() would strip this to "https://a.test/app" — a subpath-hosted
+    // dev server (e.g. Vite's `base` config) can 404/diagnostic-page on that
+    // stripped form even though the trailing-slash form is the real app.
+    expect(log).toContain('goto:https://a.test/app/');
+  });
+
+  it('navigates to a discovered link exactly as resolved, trailing slash intact', async () => {
+    const log: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/app/': { elements: [link('https://a.test/app/about/')] },
+        'https://a.test/app/about/': { elements: [] },
+      },
+      log,
+    });
+
+    const result = await crawl(browser, 'https://a.test/app/');
+
+    // The navigated URL keeps the trailing slash (this is the actual fix)...
+    expect(log).toContain('goto:https://a.test/app/about/');
+    // ...while the RECORDED route url is still normalizeUrl()'s canonical
+    // (stripped) form — that's an intentional, separate concern (dedup/
+    // reporting key), untouched by this fix.
+    expect(result.routes.map((r) => r.url).sort()).toEqual([
+      'https://a.test/app',
+      'https://a.test/app/about',
+    ]);
+  });
+
+  it('still dedupes a trailing-slash and non-trailing-slash variant of the same link as one route', async () => {
+    // normalizeUrl() remains the DEDUP key even though it's no longer the
+    // navigated URL — two links differing only by trailing slash must still
+    // collapse to a single visited route, not be crawled twice.
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/about'), link('https://a.test/about/')],
+        },
+        'https://a.test/about': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.visitedCount).toBe(2);
+  });
+});
+
+describe('crawl() href="#" phantom routes (GAP-054)', () => {
+  it('does not queue a bare href="#" as a new route', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [
+            { role: 'link', name: 'brand', selector: 'a.brand', href: '#' },
+            link('https://a.test/about'),
+          ],
+        },
+        'https://a.test/about': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.visitedCount).toBe(2);
+    expect(result.routes.map((r) => r.url).sort()).toEqual(['https://a.test/', 'https://a.test/about']);
+  });
+
+  it('still follows a real hash-route href (content after the "#")', async () => {
+    // Raw attribute is "#/login" (not a bare "#") — must resolve and be
+    // followed like any other same-origin link, unlike the phantom-route case above.
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('#/login')] },
+        'https://a.test/#/login': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.visitedCount).toBe(2);
+  });
+});
+
+describe('crawl() non-semantic clickable elements are click-probe eligible (GAP-053)', () => {
+  it('click-probes a role: generic candidate (a cursor-pointer div/span with an onClick handler)', async () => {
+    const genericTrigger: InteractiveElement = {
+      role: 'generic',
+      name: 'Change birthday',
+      selector: 'div.change-birthday',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [genericTrigger] },
+        'https://a.test/modal': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/modal' },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(genericTrigger.selector);
+  });
+
+  it('still excludes a role: generic candidate whose name reads as a destructive/mutating action', async () => {
+    const deleteTrigger: InteractiveElement = {
+      role: 'generic',
+      name: 'Delete account',
+      selector: 'div.delete-account',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [deleteTrigger] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).not.toContain(deleteTrigger.selector);
+  });
+});
+
+describe('crawl() per-route crash signal', () => {
+  it('flags a route whose accessible tree reads as an unhandled app-side crash', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/admin': {
+          elements: [],
+          axTree: '- heading "Unexpected Application Error!"\n- text "users.filter is not a function"',
+        },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/admin');
+
+    expect(result.routes[0]?.crashed).toBe(true);
+  });
+
+  it('does not flag an ordinary sparse route as crashed', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/blank': { elements: [], axTree: '- text "Nothing here yet"' } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/blank');
+
+    expect(result.routes[0]?.crashed).toBe(false);
   });
 });
 

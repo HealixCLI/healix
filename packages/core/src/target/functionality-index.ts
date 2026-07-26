@@ -26,6 +26,10 @@ export interface FunctionalityUnit {
   responseSchema?: unknown;
   /** Whether this endpoint/route requires auth, when derivable from a spec's security scheme. */
   authRequired?: boolean;
+  /** Distinct HTTP status codes this unit's handler body explicitly sets — see target/ast/handler-signals.ts. Populated only by the post-approve deep-dive pass (target/deep-dive.ts), scoped to approved plan items; absent otherwise. */
+  observedStatusCodes?: number[];
+  /** Distinct thrown-error messages from this unit's handler body — same deep-dive-only provenance as observedStatusCodes. */
+  thrownErrorMessages?: string[];
 }
 
 export interface FunctionalityIndex {
@@ -264,11 +268,22 @@ export function extractExportedHandlers(rel: string, source: string): Functional
   return units;
 }
 
-/** Exported so source-index.ts's AST-based extraction gates on the same framework sets. */
+/**
+ * Exported so source-index.ts's AST-based extraction gates on the same framework sets.
+ * Must be kept in sync with every frontend-router-relevant string detector.ts can actually return
+ * (see its `detectFramework`) — `'vite'` alone does NOT cover `'vite-react'`/`'vite-vue'`, the two
+ * most common real-world results (any Vite + React or Vite + Vue app), which detector.ts returns
+ * instead of the bare `'vite'` whenever it also finds a `react`/`vue` dependency. Missing them here
+ * silently skipped ALL React/Vue Router extraction for such an app — confirmed live against a real
+ * Vite+React app (`detect()` returned `framework: 'vite-react'`), which meant `sourceContext.units`
+ * had zero `route` units, so PLAN never had anything to resolve a plan item's `unitKey` against.
+ */
 export const RELEVANT_FRAMEWORKS_FOR_ROUTER = new Set([
   'react',
   'cra',
   'vite',
+  'vite-react',
+  'vite-vue',
   'vue',
   'svelte',
   'angular',

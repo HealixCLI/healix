@@ -259,6 +259,16 @@ export interface ExecOutcome {
   skipped?: number;
   results: ExecResultItem[];
   raw?: unknown;
+  /**
+   * Browser-level mock hits (page.route()/`request` fixture overrides — see
+   * F-15), keyed by dependency id, tallied from execute.ts's
+   * readMockRequestCounts(). Distinct from the orchestrator's separate,
+   * launch-time mock HTTP server counts — the two mocking mechanisms are
+   * unrelated, so the orchestrator merges both into one total for the report
+   * rather than either silently overwriting the other. Optional/mode-specific:
+   * a mode with no fixture-level mocking (or no mocking at all) simply omits it.
+   */
+  mockedRequestCounts?: Record<string, number>;
 }
 
 export interface SuiteBundle {

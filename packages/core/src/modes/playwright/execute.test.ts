@@ -51,9 +51,14 @@ import {
   writeInvertFile,
   clearExecCheckpoint,
   playwrightProjectArgs,
+  readMockRequestCounts,
   type AuthSignals,
 } from './execute.js';
-import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
+import {
+  EXEC_CHECKPOINT_FILENAME,
+  EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_REQUEST_LOG_FILENAME,
+} from './templates.js';
 
 function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
   return {
@@ -849,6 +854,49 @@ describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / cl
     expect(await readCheckpointEntries(dir)).toEqual([]);
     // Second call: both files are already gone — must stay a no-op, not throw.
     await expect(clearExecCheckpoint(dir)).resolves.toBeUndefined();
+  });
+
+  it('F-15: clearExecCheckpoint also clears the mock-request log, so a later unrelated execute() call starts counting fresh', async () => {
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${JSON.stringify({ id: 'pkg:twilio' })}\n`);
+    await clearExecCheckpoint(dir);
+    expect(await readMockRequestCounts(dir)).toEqual({});
+  });
+});
+
+describe('readMockRequestCounts — F-15: tallies the mock fixture\'s write-through hit log', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-request-log-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (mocking disabled, or nothing was ever intercepted)', async () => {
+    expect(await readMockRequestCounts(dir)).toEqual({});
+  });
+
+  it('tallies hits by dependency id across multiple lines', async () => {
+    const lines = [{ id: 'pkg:twilio' }, { id: 'pkg:twilio' }, { id: 'env:VITE_API_BASE_URL' }]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 2, 'env:VITE_API_BASE_URL': 1 });
+  });
+
+  it('attributes a hit with no resolvable dependency id to "override" instead of dropping it', async () => {
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), '{}\n{}\n');
+    expect(await readMockRequestCounts(dir)).toEqual({ override: 2 });
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio' })}\nnot valid json\n\n`,
+    );
+    expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 1 });
   });
 });
 

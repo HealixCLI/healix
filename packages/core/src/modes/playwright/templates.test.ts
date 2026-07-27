@@ -10,6 +10,7 @@ import {
   checkpointReporterContents,
   EXEC_CHECKPOINT_FILENAME,
   mockFixtureContents,
+  MOCK_REQUEST_LOG_FILENAME,
   playwrightConfigContents,
   stepsReporterContents,
 } from './templates.js';
@@ -371,17 +372,17 @@ describe('mockFixtureContents', () => {
       return m[0];
     }
 
-    /** Re-evaluates the generated fixture's real pathMatches()/resolveResponseAnyRoute(), with a controllable `overrides` array closed over the same way the fixture's own module-scoped `let overrides` is. */
-    function loadResolveResponseAnyRoute(
+    /** Re-evaluates the generated fixture's real pathMatches()/matchAnyRoute(), with a controllable `overrides` array closed over the same way the fixture's own module-scoped `let overrides` is. */
+    function loadMatchAnyRoute(
       src: string,
       overrides: Array<{ method: string; pathPattern: string; response: unknown }>,
-    ): (routes: unknown[], method: string, path: string) => { body?: unknown } | undefined {
+    ): (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown } {
       const pathMatchesSrc = extractFunctionSource(src, 'pathMatches');
-      const resolveSrc = extractFunctionSource(src, 'resolveResponseAnyRoute');
+      const matchSrc = extractFunctionSource(src, 'matchAnyRoute');
       const factory = new Function(
         'overrides',
-        `${pathMatchesSrc}\n${resolveSrc}\nreturn resolveResponseAnyRoute;`,
-      ) as (o: unknown) => (routes: unknown[], method: string, path: string) => { body?: unknown } | undefined;
+        `${pathMatchesSrc}\n${matchSrc}\nreturn matchAnyRoute;`,
+      ) as (o: unknown) => (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown };
       return factory(overrides);
     }
 
@@ -405,32 +406,37 @@ describe('mockFixtureContents', () => {
 
     it('F-13: a request-fixture-style call matches the CORRECT dependency\'s endpoint, not always the first registered route', () => {
       const src = mockFixtureContents([depB, depA]); // depB registered FIRST — the old bug always served this one
-      const resolve = loadResolveResponseAnyRoute(src, []);
-      const response = resolve([depB, depA], 'POST', '/v3/oauth/token/generate');
+      const match = loadMatchAnyRoute(src, []);
+      const result = match([depB, depA], 'POST', '/v3/oauth/token/generate');
       // Must resolve depA's specific endpoint response, not depB's generic default.
-      expect(response).toEqual({ status: 200, body: { token: 'real-token' } });
+      expect(result.response).toEqual({ status: 200, body: { token: 'real-token' } });
+      expect(result.id).toBe('dep-a');
     });
 
     it('falls back to the first route\'s generic default only when NO route anywhere has a matching endpoint', () => {
       const src = mockFixtureContents([depA, depB]);
-      const resolve = loadResolveResponseAnyRoute(src, []);
-      const response = resolve([depA, depB], 'GET', '/unmatched/path');
-      expect(response).toEqual(depA.response);
+      const match = loadMatchAnyRoute(src, []);
+      const result = match([depA, depB], 'GET', '/unmatched/path');
+      expect(result.response).toEqual(depA.response);
+      expect(result.id).toBe('dep-a');
     });
 
     it('a per-test mockOverride still wins over every route\'s own endpoint/default response', () => {
       const src = mockFixtureContents([depA, depB]);
       const overrideResponse = { status: 500, body: { error: 'forced' } };
-      const resolve = loadResolveResponseAnyRoute(src, [
+      const match = loadMatchAnyRoute(src, [
         { method: 'POST', pathPattern: '/v3/oauth/token/generate', response: overrideResponse },
       ]);
-      const response = resolve([depA, depB], 'POST', '/v3/oauth/token/generate');
-      expect(response).toEqual(overrideResponse);
+      const result = match([depA, depB], 'POST', '/v3/oauth/token/generate');
+      expect(result.response).toEqual(overrideResponse);
+      // The override still resolves against depA's own endpoint match, so the
+      // hit is still attributable to the right dependency for F-15's counting.
+      expect(result.id).toBe('dep-a');
     });
 
-    it('the `request` fixture resolves via resolveResponseAnyRoute (all routes), not MOCKED_ROUTES[0] alone', () => {
+    it('the `request` fixture resolves via matchAnyRoute (all routes), not MOCKED_ROUTES[0] alone', () => {
       const src = mockFixtureContents([depB, depA]);
-      expect(src).toContain('resolveResponseAnyRoute(MOCKED_ROUTES, method,');
+      expect(src).toContain('matchAnyRoute(MOCKED_ROUTES, method,');
       expect(src).not.toMatch(/const route = MOCKED_ROUTES\[0\]/);
     });
 
@@ -447,7 +453,33 @@ describe('mockFixtureContents', () => {
       // When there's no host match, resolution still goes through the
       // any-route resolver (which checks overrides) instead of skipping the
       // override-only, same-origin case.
-      expect(src).toContain('resolveResponseAnyRoute(MOCKED_ROUTES, method, requestPath)');
+      expect(src).toContain('matchAnyRoute(MOCKED_ROUTES, method, requestPath)');
+    });
+  });
+
+  describe('F-15 — every intercepted request is logged so mockedRequestCounts can reflect fixture-level mocking', () => {
+    it('logs a hit (with the resolved dependency id) whenever page.route() fulfills a mocked request', () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      expect(src).toContain('await logMockHit(matchedId);');
+      expect(src).toContain("import { appendFile } from 'node:fs/promises';");
+      expect(src).toContain('MOCK_REQUEST_LOG_PATH');
+      expect(src).toContain(JSON.stringify(MOCK_REQUEST_LOG_FILENAME));
+    });
+
+    it('logs a hit whenever the `request` fixture serves a mocked response', () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      expect(src).toContain('await logMockHit(match.id);');
+    });
+
+    it('a logging failure never blocks or throws through the actual mocked response (best-effort contract)', () => {
+      const src = mockFixtureContents([]);
+      const fnSrc = /async function logMockHit\(id\) \{[\s\S]*?\n\}/.exec(src)?.[0];
+      expect(fnSrc).toBeDefined();
+      expect(fnSrc).toMatch(/catch\s*\{/);
     });
   });
 });

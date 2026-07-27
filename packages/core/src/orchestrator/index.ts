@@ -1262,7 +1262,7 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
           noteStoreOk,
           noteStoreFailure,
         );
@@ -1544,7 +1544,7 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -1737,7 +1737,7 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -1816,7 +1816,7 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -2311,7 +2311,7 @@ async function runPipeline(
         triageEntries,
         artifactFiles,
         externalDependencies,
-        computeMockedRequestCounts(mockServerHandle),
+        mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
         noteStoreOk,
         noteStoreFailure,
         { generationStats, coverage: coverageSummary, groupingSummary },
@@ -2391,7 +2391,7 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -3383,6 +3383,25 @@ function computeMockedRequestCounts(handle: MockServerHandle | null): Record<str
   const counts: Record<string, number> = {};
   for (const r of handle.requestLog) counts[r.dependencyId] = (counts[r.dependencyId] ?? 0) + 1;
   return counts;
+}
+
+/**
+ * See F-15: the launch-time mock HTTP server's own counts (above) and the
+ * mode's browser-level fixture mocking (execute.ts's ExecOutcome.
+ * mockedRequestCounts — page.route()/`request`-fixture hits) are two
+ * completely independent mocking mechanisms with no shared bookkeeping.
+ * mockedRequestCounts used to only ever reflect the former, reading `{}` for
+ * any run whose mocking happened entirely at the fixture level. Sums both
+ * into one true total for the report.
+ */
+export function mergeMockedRequestCounts(
+  a: Record<string, number>,
+  b: Record<string, number> | undefined,
+): Record<string, number> {
+  if (!b || Object.keys(b).length === 0) return a;
+  const merged: Record<string, number> = { ...a };
+  for (const [id, count] of Object.entries(b)) merged[id] = (merged[id] ?? 0) + count;
+  return merged;
 }
 
 function errMsg(err: unknown): string {

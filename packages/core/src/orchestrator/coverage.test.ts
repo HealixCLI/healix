@@ -178,4 +178,18 @@ describe('mergeExecOutcomes', () => {
     expect(merged.skipped).toBe(2);
     expect(merged.passed).toBe(1);
   });
+
+  it('F-15: sums mockedRequestCounts across a merge instead of one side silently replacing the other', () => {
+    const a: ExecOutcome = { ...outcome([]), mockedRequestCounts: { 'pkg:twilio': 2, 'env:API': 1 } };
+    const b: ExecOutcome = { ...outcome([]), mockedRequestCounts: { 'pkg:twilio': 1 } };
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.mockedRequestCounts).toEqual({ 'pkg:twilio': 3, 'env:API': 1 });
+  });
+
+  it('F-15: omits mockedRequestCounts entirely when neither side has any (no empty-object noise)', () => {
+    const merged = mergeExecOutcomes(outcome([]), outcome([]));
+    expect(merged.mockedRequestCounts).toBeUndefined();
+  });
 });

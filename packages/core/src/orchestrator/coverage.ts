@@ -101,6 +101,19 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
   for (const r of a.results) byIdentity.set(mergeIdentity(r), r);
   for (const r of b.results) byIdentity.set(mergeIdentity(r), r);
   const results = [...byIdentity.values()];
+
+  // See F-15: each mode.execute() call's mock-fixture log only ever covers
+  // ITS OWN invocation (execute.ts clears it once the phase completes), so —
+  // unlike the result-based counters above — these are summed rather than
+  // recomputed, otherwise a later gap-fill iteration's hits would silently
+  // replace an earlier iteration's instead of adding to them.
+  const mockedRequestCounts: Record<string, number> = {};
+  for (const counts of [a.mockedRequestCounts, b.mockedRequestCounts]) {
+    for (const [id, count] of Object.entries(counts ?? {})) {
+      mockedRequestCounts[id] = (mockedRequestCounts[id] ?? 0) + count;
+    }
+  }
+
   return {
     passed: results.filter((r) => r.status === 'passed').length,
     failed: results.filter((r) => r.status === 'failed').length,
@@ -108,5 +121,6 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
     flaky: results.filter((r) => r.status === 'flaky').length,
     skipped: results.filter((r) => r.status === 'skipped').length,
     results,
+    ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
   };
 }

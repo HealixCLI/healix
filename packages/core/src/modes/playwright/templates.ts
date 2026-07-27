@@ -14,6 +14,20 @@ export const EXEC_CHECKPOINT_FILENAME = 'healix-exec-checkpoint.ndjson';
 /** `--test-list-invert` file execute.ts builds from EXEC_CHECKPOINT_FILENAME's entries before a resumed run. */
 export const EXEC_CHECKPOINT_INVERT_FILENAME = 'healix-completed-tests.txt';
 
+/**
+ * Write-through log of every request the mock fixture (page.route()/`request`
+ * override) actually intercepted, one JSON line per hit — see F-15: the
+ * report's `mockedRequestCounts` used to only ever reflect the launch-time,
+ * env-var mock HTTP server (target/mock-server.ts), which has no visibility
+ * at all into THIS (browser-level) mocking path, so it read `{}` even for
+ * runs whose fixture-level mocking was working perfectly. execute.ts reads
+ * this back (readMockRequestCounts) and folds it into ExecOutcome so the
+ * orchestrator can merge it with the launch-time server's own counts into
+ * one true total. Lives at the suite's project root, alongside results.json
+ * — same placement as EXEC_CHECKPOINT_FILENAME.
+ */
+export const MOCK_REQUEST_LOG_FILENAME = 'healix-mock-request-log.ndjson';
+
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -842,6 +856,8 @@ export interface MockRouteEntry {
 export function mockFixtureContents(routes: MockRouteEntry[]): string {
   const serialized = JSON.stringify(routes, null, 2);
   return `import { test as base, expect } from './action-highlighter.js';
+import { appendFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 /**
  * Healix-generated mock fixture — intercepts network requests to detected
@@ -851,6 +867,20 @@ export function mockFixtureContents(routes: MockRouteEntry[]): string {
  */
 
 const MOCKED_ROUTES = ${serialized};
+
+// F-15: write-through log of every request this fixture actually intercepted,
+// read back by execute.ts's readMockRequestCounts() so the report's
+// mockedRequestCounts reflects THIS (browser-level) mocking path too, not
+// just the separate launch-time mock HTTP server. Best-effort — a logging
+// failure must never affect the actual mocked response a test receives.
+const MOCK_REQUEST_LOG_PATH = join(process.cwd(), ${JSON.stringify(MOCK_REQUEST_LOG_FILENAME)});
+async function logMockHit(id) {
+  try {
+    await appendFile(MOCK_REQUEST_LOG_PATH, JSON.stringify({ id: id || 'override' }) + '\\n', 'utf-8');
+  } catch {
+    // best-effort — never fail the actual test run over this
+  }
+}
 
 function hostMatches(url, pattern) {
   let parsed;
@@ -914,22 +944,28 @@ function resolveResponse(route, method, requestPath) {
 // endpoints for a (method, path) match BEFORE falling back to a generic
 // default, instead of unconditionally trusting whichever dependency happens
 // to be first — that used to silently serve dependency A's canned payload to
-// a call that was actually meant for dependency B.
-function resolveResponseAnyRoute(routes, method, requestPath) {
+// a call that was actually meant for dependency B. Returns the MATCHED
+// route's id alongside the response (F-15) so the caller can attribute this
+// hit to the right dependency in mockedRequestCounts instead of the count
+// being unattributable once there's more than one candidate route.
+function matchAnyRoute(routes, method, requestPath) {
   const override = overrides.find(
     (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
   );
-  if (override) return override.response;
   for (const route of routes) {
     const endpoint = route.endpoints?.find(
       (e) => e.method.toUpperCase() === method.toUpperCase() && pathMatches(e.pathPattern, requestPath),
     );
-    if (endpoint?.response) return endpoint.response;
+    if (endpoint?.response) {
+      return { id: route.id, response: override ? override.response : endpoint.response };
+    }
   }
+  if (override) return { id: undefined, response: override.response };
   // No endpoint-level match anywhere — fall back to the first route's own
   // generic default (the common case: exactly one mocked dependency with no
   // endpoint-level detail at all).
-  return routes[0]?.response;
+  const fallback = routes[0];
+  return fallback ? { id: fallback.id, response: fallback.response } : { id: undefined, response: undefined };
 }
 
 export const test = base.extend({
@@ -981,9 +1017,17 @@ export const test = base.extend({
         await r.continue();
         return;
       }
-      const response = hostRoute
-        ? resolveResponse(hostRoute, method, requestPath)
-        : resolveResponseAnyRoute(MOCKED_ROUTES, method, requestPath);
+      let matchedId;
+      let response;
+      if (hostRoute) {
+        matchedId = hostRoute.id;
+        response = resolveResponse(hostRoute, method, requestPath);
+      } else {
+        const match = matchAnyRoute(MOCKED_ROUTES, method, requestPath);
+        matchedId = match.id;
+        response = match.response;
+      }
+      await logMockHit(matchedId);
       const { contentType, text } = serializeBody(response);
       await r.fulfill({
         status: response.status,
@@ -998,17 +1042,19 @@ export const test = base.extend({
   // API-contract-style specs), since that's a raw HTTP client with no
   // interception hooks at all. Fake it directly instead, matching by (method,
   // path) against every registered route's endpoints/overrides (see
-  // resolveResponseAnyRoute) rather than unconditionally trusting whichever
-  // dependency happens to be first — request-fixture calls use relative paths
-  // with no hostname to disambiguate between multiple mocked dependencies.
+  // matchAnyRoute) rather than unconditionally trusting whichever dependency
+  // happens to be first — request-fixture calls use relative paths with no
+  // hostname to disambiguate between multiple mocked dependencies.
   request: async ({ request, mockOverride }, use) => {
     void mockOverride;
     if (MOCKED_ROUTES.length === 0) {
       await use(request);
       return;
     }
-    const respond = (method, requestPath) => {
-      const canned = resolveResponseAnyRoute(MOCKED_ROUTES, method, (requestPath || '/').split('?')[0]);
+    const respond = async (method, requestPath) => {
+      const match = matchAnyRoute(MOCKED_ROUTES, method, (requestPath || '/').split('?')[0]);
+      await logMockHit(match.id);
+      const canned = match.response;
       const { contentType, text } = serializeBody(canned);
       return {
         ok: () => canned.status >= 200 && canned.status < 300,

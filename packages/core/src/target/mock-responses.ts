@@ -9,7 +9,11 @@ const STATIC_TEMPLATES: Record<ExternalDependencyCategory, MockResponse> = {
   otp: { status: 200, body: { status: 'pending', message: 'OTP sent (mocked by Healix)' } },
   email: { status: 202, body: { status: 'queued', id: 'healix-mock-email-000000' } },
   payment: { status: 200, body: { status: 'succeeded', id: 'healix_mock_pi_000000' } },
-  auth: { status: 200, body: { success: true, token: 'healix-mock-token' } },
+  // Nested `status: { success: true }` — matching capillary-style auth APIs
+  // that return a status OBJECT the app destructures as `status?.success`,
+  // not a flat status string (a flat `{ success: true }` silently reads as
+  // `undefined` through that pattern and breaks every login-dependent test).
+  auth: { status: 200, body: { status: { success: true }, token: 'healix-mock-token' } },
   backend: { status: 200, body: {} },
   other: { status: 200, body: {} },
 };

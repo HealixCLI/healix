@@ -106,6 +106,7 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
     failed: results.filter((r) => r.status === 'failed').length,
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
+    skipped: results.filter((r) => r.status === 'skipped').length,
     results,
   };
 }

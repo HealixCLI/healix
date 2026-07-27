@@ -696,6 +696,7 @@ interface ParsedReport {
   failed: number;
   blocked: number;
   flaky: number;
+  skipped: number;
 }
 
 // ---- Write-through per-test checkpoint (see templates.ts's checkpointReporterContents()) ----
@@ -801,6 +802,7 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
   let failed = 0;
   let blocked = 0;
   let flaky = 0;
+  let skipped = 0;
 
   for (const entry of entries) {
     let status = normalizeStatus(entry.status);
@@ -842,12 +844,15 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
       case 'failed':
         failed += 1;
         break;
+      case 'skipped':
+        skipped += 1;
+        break;
       default:
         break;
     }
   }
 
-  return { results, passed, failed, blocked, flaky };
+  return { results, passed, failed, blocked, flaky, skipped };
 }
 
 /**
@@ -870,6 +875,7 @@ export function mergeParsedReports(a: ParsedReport, b: ParsedReport): ParsedRepo
     failed: results.filter((r) => r.status === 'failed').length,
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
+    skipped: results.filter((r) => r.status === 'skipped').length,
   };
 }
 
@@ -879,6 +885,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let failed = 0;
   let blocked = 0;
   let flaky = 0;
+  let skipped = 0;
 
   const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
@@ -977,8 +984,11 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       case 'failed':
         failed += 1;
         break;
+      case 'skipped':
+        skipped += 1;
+        break;
       default:
-        // skipped/pending do not move pass/fail headline counters
+        // pending does not move any headline counter
         break;
     }
   };
@@ -997,7 +1007,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   };
 
   for (const suite of report.suites ?? []) walk(suite, '', undefined);
-  return { results, passed, failed, blocked, flaky };
+  return { results, passed, failed, blocked, flaky, skipped };
 }
 
 /** Read results.json if present and newer than the run start. */
@@ -1107,12 +1117,21 @@ function parseSummaryText(combined: string): ParsedReport {
   const passed = num(/(\d+)\s+passed/i);
   const failed = num(/(\d+)\s+failed/i);
   const flaky = num(/(\d+)\s+flaky/i);
-  return { results: [], passed, failed, blocked: 0, flaky };
+  const skipped = num(/(\d+)\s+skipped/i);
+  return { results: [], passed, failed, blocked: 0, flaky, skipped };
 }
 
 /** Outcome returned when the caller cancelled the run — never a throw. */
 function abortedOutcome(exitCode: number | null = null): ExecOutcome {
-  return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [], raw: { aborted: true, exitCode } };
+  return {
+    passed: 0,
+    failed: 0,
+    blocked: 0,
+    flaky: 0,
+    skipped: 0,
+    results: [],
+    raw: { aborted: true, exitCode },
+  };
 }
 
 /**
@@ -1128,7 +1147,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');
-    return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+    return { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] };
   }
 
   // Already cancelled? Return before ANY subprocess (npm install / npx) spawns.
@@ -1264,6 +1283,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     failed: parsed.failed,
     blocked: parsed.blocked,
     flaky: parsed.flaky,
+    skipped: parsed.skipped,
     results: parsed.results,
     raw: {
       exitCode: cmd.code,
@@ -1285,6 +1305,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     failed: outcome.failed,
     blocked: outcome.blocked,
     flaky: outcome.flaky,
+    skipped: outcome.skipped,
   });
   return outcome;
 }

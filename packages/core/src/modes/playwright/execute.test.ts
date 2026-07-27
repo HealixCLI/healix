@@ -383,7 +383,7 @@ describe('execute — cooperative cancellation', () => {
     const controller = new AbortController();
     controller.abort();
     const outcome = await execute(makeCtx({ signal: controller.signal }), []);
-    expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] });
+    expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] });
     expect(spawn).not.toHaveBeenCalled();
   });
 });
@@ -713,6 +713,23 @@ describe('parseReport — error text stays simple, not a wall of duplicates', ()
   });
 });
 
+describe('parseReport — F-24: counts skipped tests instead of leaving them invisible', () => {
+  it('tallies a skipped test into outcome.skipped, distinct from passed/failed/blocked/flaky', () => {
+    const r = report([
+      { title: 'a', projectName: 'tierA-public', status: 'passed' },
+      { title: 'b', projectName: 'tierA-public', status: 'failed' },
+      { title: 'c', projectName: 'tierA-public', status: 'skipped' },
+      { title: 'd', projectName: 'tierA-public', status: 'skipped' },
+    ]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.passed).toBe(1);
+    expect(parsed.failed).toBe(1);
+    expect(parsed.skipped).toBe(2);
+    expect(parsed.blocked).toBe(0);
+    expect(parsed.results.filter((x) => x.status === 'skipped')).toHaveLength(2);
+  });
+});
+
 describe('parseReport — specFile inheritance through nested describe() suites', () => {
   it('inherits the file from an ancestor suite when the immediate (nested) suite and spec both lack one', () => {
     // Real shape: Playwright's JSON reporter sets `file` on the outermost
@@ -921,6 +938,7 @@ describe('mergeParsedReports', () => {
       failed: 0,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const b = {
       results: [{ title: 'b', status: 'failed' as const }],
@@ -928,6 +946,7 @@ describe('mergeParsedReports', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
@@ -942,6 +961,7 @@ describe('mergeParsedReports', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const b = {
       results: [{ title: 'a', specFile: 'x.spec.ts', status: 'passed' as const }],
@@ -949,6 +969,7 @@ describe('mergeParsedReports', () => {
       failed: 0,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results).toHaveLength(1);

@@ -244,6 +244,19 @@ export interface ExecOutcome {
   failed: number;
   blocked: number;
   flaky: number;
+  /**
+   * Tests the runner recorded as `skipped` (TestStatus already had this
+   * value — see storage/types.ts — but nothing here previously counted it).
+   * See F-24 in the Set-2 fixtures/mock/auth-execution findings: a report
+   * that only shows total/passed/failed/blocked/flaky leaves the fraction of
+   * a suite that never actually ran invisible, since a reader has no
+   * `skipped` figure to subtract out of `total`. Optional (rather than
+   * matching the other counters' required-number style) purely so every
+   * pre-existing ExecOutcome literal elsewhere in the codebase/tests doesn't
+   * need a mechanical touch just to keep compiling; always populated by
+   * execute.ts/coverage.ts — treat an absent value as 0.
+   */
+  skipped?: number;
   results: ExecResultItem[];
   raw?: unknown;
 }
@@ -289,6 +302,17 @@ export interface TestModeContext {
   externalDependencies?: ExternalDependency[];
   /** Resolved canned response per dependency id (see externalDependencies), keyed by ExternalDependency.id. */
   mockResponses?: Record<string, MockResponse>;
+  /**
+   * Whether the approved plan contains at least one (non-rejected) tierB-auth
+   * item. Undefined (not yet known, e.g. in tests that build a bare context)
+   * is treated as true — the pre-existing "always scaffold auth-setup"
+   * behavior — so this only ever narrows behavior for callers that
+   * deliberately set it. See F-18: scaffold() uses this to skip registering
+   * the `auth-setup` Playwright project when the plan has no auth surface at
+   * all, instead of running it unconditionally and misreporting its
+   * "no credentials configured" throw as an ordinary test failure.
+   */
+  hasTierBAuthPlanItems?: boolean;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

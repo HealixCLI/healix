@@ -101,6 +101,28 @@ describe('playwrightConfigContents — artifact capture policy', () => {
     expect(cfg).toContain("['./fixtures/steps-reporter.cjs']");
     expect(cfg).toContain("['./fixtures/checkpoint-reporter.cjs']");
   });
+
+  describe('F-18 — auth-setup registration gated on the plan actually having tierB-auth items', () => {
+    it('registers the auth-setup project by default (includeAuthSetup unset)', () => {
+      const cfg = playwrightConfigContents();
+      expect(cfg).toContain("name: 'auth-setup'");
+      expect(cfg).toContain("dependencies: ['auth-setup']");
+    });
+
+    it('still registers auth-setup when includeAuthSetup is explicitly true', () => {
+      const cfg = playwrightConfigContents({ includeAuthSetup: true });
+      expect(cfg).toContain("name: 'auth-setup'");
+      expect(cfg).toContain("dependencies: ['auth-setup']");
+    });
+
+    it('omits the auth-setup project AND tierB-auth\'s dependency on it when includeAuthSetup is false — an app with no auth surface must never get a phantom auth-setup failure', () => {
+      const cfg = playwrightConfigContents({ includeAuthSetup: false });
+      expect(cfg).not.toContain("name: 'auth-setup'");
+      expect(cfg).not.toContain("dependencies: ['auth-setup']");
+      // tierB-auth's project entry itself must still exist (harmless empty project).
+      expect(cfg).toContain("name: 'tierB-auth'");
+    });
+  });
 });
 
 describe('actionHighlighterFixtureContents', () => {
@@ -339,6 +361,95 @@ describe('mockFixtureContents', () => {
     const src = mockFixtureContents([]);
     expect(src).toContain('const MOCKED_ROUTES = []');
   });
+
+  describe('F-13/F-14 — path-aware resolution across ALL mocked routes, not just the first one', () => {
+    /** Pulls a named top-level function's source out of the generated fixture so its actual logic (not just a substring) is exercised. */
+    function extractFunctionSource(src: string, name: string): string {
+      const re = new RegExp(`function ${name}\\([^)]*\\) \\{[\\s\\S]*?\\n\\}`);
+      const m = re.exec(src);
+      if (!m) throw new Error(`${name} not found in generated fixture`);
+      return m[0];
+    }
+
+    /** Re-evaluates the generated fixture's real pathMatches()/resolveResponseAnyRoute(), with a controllable `overrides` array closed over the same way the fixture's own module-scoped `let overrides` is. */
+    function loadResolveResponseAnyRoute(
+      src: string,
+      overrides: Array<{ method: string; pathPattern: string; response: unknown }>,
+    ): (routes: unknown[], method: string, path: string) => { body?: unknown } | undefined {
+      const pathMatchesSrc = extractFunctionSource(src, 'pathMatches');
+      const resolveSrc = extractFunctionSource(src, 'resolveResponseAnyRoute');
+      const factory = new Function(
+        'overrides',
+        `${pathMatchesSrc}\n${resolveSrc}\nreturn resolveResponseAnyRoute;`,
+      ) as (o: unknown) => (routes: unknown[], method: string, path: string) => { body?: unknown } | undefined;
+      return factory(overrides);
+    }
+
+    const depA = {
+      id: 'dep-a',
+      hostnames: ['a.example.com'],
+      response: { status: 200, body: { from: 'a-default' } },
+      endpoints: [
+        {
+          method: 'POST',
+          pathPattern: '/v3/oauth/token/generate',
+          response: { status: 200, body: { token: 'real-token' } },
+        },
+      ],
+    };
+    const depB = {
+      id: 'dep-b',
+      hostnames: ['b.example.com'],
+      response: { status: 200, body: { from: 'b-default', customerProfile: true } },
+    };
+
+    it('F-13: a request-fixture-style call matches the CORRECT dependency\'s endpoint, not always the first registered route', () => {
+      const src = mockFixtureContents([depB, depA]); // depB registered FIRST — the old bug always served this one
+      const resolve = loadResolveResponseAnyRoute(src, []);
+      const response = resolve([depB, depA], 'POST', '/v3/oauth/token/generate');
+      // Must resolve depA's specific endpoint response, not depB's generic default.
+      expect(response).toEqual({ status: 200, body: { token: 'real-token' } });
+    });
+
+    it('falls back to the first route\'s generic default only when NO route anywhere has a matching endpoint', () => {
+      const src = mockFixtureContents([depA, depB]);
+      const resolve = loadResolveResponseAnyRoute(src, []);
+      const response = resolve([depA, depB], 'GET', '/unmatched/path');
+      expect(response).toEqual(depA.response);
+    });
+
+    it('a per-test mockOverride still wins over every route\'s own endpoint/default response', () => {
+      const src = mockFixtureContents([depA, depB]);
+      const overrideResponse = { status: 500, body: { error: 'forced' } };
+      const resolve = loadResolveResponseAnyRoute(src, [
+        { method: 'POST', pathPattern: '/v3/oauth/token/generate', response: overrideResponse },
+      ]);
+      const response = resolve([depA, depB], 'POST', '/v3/oauth/token/generate');
+      expect(response).toEqual(overrideResponse);
+    });
+
+    it('the `request` fixture resolves via resolveResponseAnyRoute (all routes), not MOCKED_ROUTES[0] alone', () => {
+      const src = mockFixtureContents([depB, depA]);
+      expect(src).toContain('resolveResponseAnyRoute(MOCKED_ROUTES, method,');
+      expect(src).not.toMatch(/const route = MOCKED_ROUTES\[0\]/);
+    });
+
+    it('F-14: page.route() registers ONE catch-all interceptor and decides per-request whether a host OR an override matches, instead of one predicate per hostname', () => {
+      const src = mockFixtureContents([depA]);
+      expect(src).toContain("page.route('**/*', async (r) => {");
+      // Must consult BOTH signals — a configured host, or an explicitly
+      // registered override — since an override registered for a relative
+      // path has no hostname to match against at all (a same-origin fetch).
+      expect(src).toContain('const hostRoute = MOCKED_ROUTES.find(');
+      expect(src).toContain('const overrideMatches = overrides.some(');
+      expect(src).toContain('if (!hostRoute && !overrideMatches) {');
+      expect(src).toContain('await r.continue();');
+      // When there's no host match, resolution still goes through the
+      // any-route resolver (which checks overrides) instead of skipping the
+      // override-only, same-origin case.
+      expect(src).toContain('resolveResponseAnyRoute(MOCKED_ROUTES, method, requestPath)');
+    });
+  });
 });
 
 describe('authSetupContents — locale-aware login fixture', () => {
@@ -377,7 +488,21 @@ describe('authSetupContents — locale-aware login fixture', () => {
     expect(fixture).toContain('function submitButtonLocator(page, textRe)');
     expect(fixture).toContain('button[type="submit"], input[type="submit"]');
     expect(fixture).toContain('[data-testid*="submit" i]');
-    expect(fixture).toContain('submitButtonLocator(page, /prihl|sign in|log ?in|continue/i)');
+    expect(fixture).toContain('submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i)');
+  });
+
+  it('F-16: matches a plain "Submit" button label — the RBAC live-run gap (an MUI <Button> with no type="submit" and no data-testid)', () => {
+    const fixture = authSetupContents();
+    const match = /submitButton = await submitButtonLocator\(page, (\/[^/]+\/i)\)/.exec(fixture);
+    expect(match).not.toBeNull();
+    const re = new Function(`return ${match![1]}`)();
+    for (const label of ['Submit', 'SUBMIT', 'submit']) {
+      expect(re.test(label)).toBe(true);
+    }
+    // Must not regress the pre-existing supported labels.
+    for (const label of ['Sign in', 'Log in', 'Continue', 'Prihlásiť']) {
+      expect(re.test(label)).toBe(true);
+    }
   });
 
   it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {

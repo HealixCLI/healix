@@ -7,6 +7,15 @@ export interface CrawledRoute {
   snapshot: DomSnapshot;
   /** BFS distance from the seed URL(s); 0 for the entry route(s). */
   depth: number;
+  /**
+   * Set only for a state revealed by `probeThinRouteState` (a modal/panel/wizard step that
+   * opened without changing `url`) — the parent URL plus an ordered chain of click selectors
+   * used to reach it (e.g. `"https://x/#/dashboard>>[data-testid=wallet-tab]"`). Absent for a
+   * normal top-level route, whose identity is its `url` alone. Exists because the crawl's only
+   * prior notion of "state" was the URL — a same-URL modal/tab had nowhere to be recorded once
+   * discovered, so it was always discarded after a single probing click (see GAP-055).
+   */
+  stateKey?: string;
   hasPasswordField: boolean;
   /** Whether this route was reached before or after a verified login. */
   role: 'anonymous' | 'authenticated';
@@ -168,6 +177,30 @@ const MAX_CLICK_PROBES_PER_CRAWL = 60;
  */
 const LINK_QUEUE_THIN_THRESHOLD = 5;
 
+/** How many levels deep a single revealed state (modal -> tab-inside-modal -> ...) may be chased. */
+const MAX_STATE_DEPTH = 2;
+/**
+ * Total deep-probe budget across a whole crawl() call — a separate pool from
+ * MAX_CLICK_PROBES_PER_CRAWL so multi-step-flow probing (click + fill + recurse, materially
+ * pricier than a single discovery click) never cannibalizes ordinary route-discovery budget.
+ * Deliberately NOT gated on the parent route's own element count: a live audit of the real C&A
+ * app found a healthy, well-populated "My account" page (~15 elements) whose "change password"
+ * button reveals a same-URL form via exactly this mechanism — gating on route-thinness alone
+ * would silently keep missing it, since a page can be well-populated overall and STILL hide an
+ * important modal behind one specific button. STATE_REVEAL_MIN_NEW_ELEMENTS is what keeps this
+ * targeted instead (an ordinary dropdown/menu reveals too few elements to qualify), and this
+ * crawl-wide cap is what keeps the cost bounded on every page, healthy or not.
+ */
+const MAX_STATE_PROBES_PER_CRAWL = 20;
+/** A same-URL click only counts as "revealed a real state" (worth recording/recursing into),
+ * not just a small dropdown/menu, when it adds at least this many interactive elements. */
+const STATE_REVEAL_MIN_NEW_ELEMENTS = 5;
+/** Input name/id/selector hints that read as a one-time/verification code — never auto-filled,
+ * since a real OTP requires a code delivered over an external channel (email/SMS) that a crawl
+ * has no way to observe or synthesize. Flows gated behind this remain a `test.fixme()` case by
+ * design, not a bug in `fillSafeInputs`. */
+const OTP_HINT_RE = /otp|verification.?code|one.?time|\b2fa\b|\bmfa\b/i;
+
 function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
   return (
     snapshot.interactiveElements
@@ -189,6 +222,24 @@ export interface ClickDiscoveryResult {
    * (matches LOGIN_TEXT_RE by name, and a password field is present afterward)
    * without navigating — see `discoverClickRoutes`. */
   loginToggleSelectors: string[];
+  /** New states revealed and recorded during deep-probing (see `DeepProbeOpts`), each carrying
+   * its own `stateKey` — see `CrawledRoute.stateKey`. Empty unless `opts.deepProbe` was set. */
+  discoveredStates: CrawledRoute[];
+}
+
+/** Enables the deep-probe behavior in `discoverClickRoutes` — engaged on every route (see
+ * GAP-055; NOT gated on the route's own element count), bounded instead by
+ * MAX_STATE_PROBES_PER_CRAWL/MAX_STATE_DEPTH and by STATE_REVEAL_MIN_NEW_ELEMENTS only ever
+ * recording a click that reveals a real, materially larger state. */
+interface DeepProbeOpts {
+  /** This state's identity so far: the route URL plus every selector clicked to reach it. */
+  stateKeyPrefix: string;
+  /** How many state-levels deep this call already is (0 for the initial call on a page). */
+  depth: number;
+  /** The originating route's own BFS depth — carried through unchanged onto any recorded state. */
+  parentDepth: number;
+  /** Shared, mutable across the whole recursion tree for this page — see MAX_STATE_PROBES_PER_CRAWL. */
+  budget: { remaining: number };
 }
 
 /**
@@ -208,21 +259,41 @@ export interface ClickDiscoveryResult {
  * view (it would fall through to the "menu/dropdown" branch and get
  * Escape-reverted) — leaving every login attempt to wrongly fill in the
  * registration form instead (the exact bug this guards against).
+ *
+ * When `opts.deepProbe` is set (engaged on every route, see GAP-055), a same-URL click that
+ * reveals a MATERIALLY LARGER DOM state (>= STATE_REVEAL_MIN_NEW_ELEMENTS more interactive
+ * elements than a small dropdown/menu — those still fall through to the ordinary harvest-and-
+ * revert branch) is instead recorded as its own `CrawledRoute` (keyed by `stateKey`, not `url`,
+ * see `CrawledRoute.stateKey`) and, budget/depth permitting, probed one level deeper via a
+ * recursive call after a best-effort `fillSafeInputs` pass — the one piece deliberately missing
+ * from ordinary route discovery: a wallet/subscription-management modal, or a filter panel, needs
+ * a second interaction to reveal its real content, and reverting immediately (the ordinary
+ * behavior) never gives it the chance. Bounded by `MAX_STATE_DEPTH`/`MAX_STATE_PROBES_PER_CRAWL`
+ * (shared via `opts.deepProbe.budget` across the whole recursion for one page) so this stays a
+ * targeted, opt-in cost. OTP entry is deliberately out of scope for `fillSafeInputs` (see
+ * OTP_HINT_RE) — a real code requires an external channel no crawl can observe, so those flows
+ * correctly remain ungrounded for GENERATE's escape hatch.
  */
 async function discoverClickRoutes(
   browser: BrowserSurface,
   snapshot: DomSnapshot,
   origin: string,
   maxClicks: number,
+  opts: { deepProbe?: DeepProbeOpts } = {},
 ): Promise<ClickDiscoveryResult> {
   const originalUrl = snapshot.url;
+  const beforeCount = snapshot.interactiveElements.length;
   const candidates = extractClickCandidates(snapshot).slice(0, Math.max(0, maxClicks));
   const discoveredUrls: string[] = [];
   const loginToggleSelectors: string[] = [];
+  const discoveredStates: CrawledRoute[] = [];
   let attempted = 0;
+  const deepProbe = opts.deepProbe;
 
   for (const candidate of candidates) {
+    if (deepProbe && deepProbe.budget.remaining <= 0) break;
     attempted += 1;
+    if (deepProbe) deepProbe.budget.remaining -= 1;
     try {
       await browser.click(candidate.selector);
       const after = await browser.snapshot();
@@ -233,6 +304,46 @@ async function discoverClickRoutes(
       } else if (LOGIN_TEXT_RE.test(candidate.name) && hasPasswordField(after)) {
         loginToggleSelectors.push(candidate.selector);
         await browser.pressKey('Escape').catch(() => undefined);
+      } else if (
+        deepProbe &&
+        after.interactiveElements.length - beforeCount >= STATE_REVEAL_MIN_NEW_ELEMENTS
+      ) {
+        const stateKey = `${deepProbe.stateKeyPrefix}>>${candidate.selector}`;
+        discoveredStates.push({
+          url: originalUrl,
+          stateKey,
+          title: after.title,
+          snapshot: after,
+          depth: deepProbe.parentDepth,
+          hasPasswordField: hasPasswordField(after),
+          role: 'anonymous',
+          networkEvents: [],
+          crashed: looksCrashed(after),
+        });
+        discoveredUrls.push(...extractLinks(after, origin));
+
+        // MAX_STATE_DEPTH counts recorded hops: this candidate's reveal is hop `deepProbe.depth +
+        // 1`. Only recurse (look for one more hop past it) while that count still has room —
+        // e.g. MAX_STATE_DEPTH=2 records hop1 and hop2, but never explores INSIDE hop2 looking
+        // for a hop3, so a hop3 candidate is simply never clicked at all.
+        if (deepProbe.depth + 1 < MAX_STATE_DEPTH && deepProbe.budget.remaining > 0) {
+          await fillSafeInputs(browser, after).catch(() => 0);
+          const settled = await browser.snapshot().catch(() => after);
+          const nested = await discoverClickRoutes(browser, settled, origin, MAX_CLICKS_PER_PAGE, {
+            deepProbe: {
+              stateKeyPrefix: stateKey,
+              depth: deepProbe.depth + 1,
+              parentDepth: deepProbe.parentDepth,
+              budget: deepProbe.budget,
+            },
+          });
+          discoveredUrls.push(...nested.discoveredUrls);
+          loginToggleSelectors.push(...nested.loginToggleSelectors);
+          discoveredStates.push(...nested.discoveredStates);
+        }
+
+        await browser.pressKey('Escape').catch(() => undefined);
+        await browser.goto(originalUrl).catch(() => undefined);
       } else {
         // Click likely opened a menu/dropdown in place rather than navigating
         // — collect any newly revealed anchors, then close it.
@@ -245,7 +356,42 @@ async function discoverClickRoutes(
     }
   }
 
-  return { attempted, discoveredUrls, loginToggleSelectors };
+  return { attempted, discoveredUrls, loginToggleSelectors, discoveredStates };
+}
+
+/**
+ * Best-effort, safety-scoped fill of visible text-like inputs revealed inside a deep-probed
+ * state (a filter form, a wizard step) so a bounded follow-up click can actually advance past
+ * it — generalizes `login.ts`'s "fill, don't assert" pattern beyond username/password. Never
+ * touches a password or file input, or anything OTP-shaped (see OTP_HINT_RE); a field this skips
+ * simply stays empty, which is safe — worst case the next click no-ops on an empty filter rather
+ * than mutating anything. Returns the number of fields actually filled.
+ */
+async function fillSafeInputs(browser: BrowserSurface, snapshot: DomSnapshot): Promise<number> {
+  let filled = 0;
+  for (const el of snapshot.interactiveElements) {
+    if (el.role !== 'textbox' || el.disabled) continue;
+    if (el.inputType === 'password' || el.inputType === 'file') continue;
+    if (OTP_HINT_RE.test(el.name) || OTP_HINT_RE.test(el.selector)) continue;
+    const value =
+      el.inputType === 'email'
+        ? 'healix-explore@example.com'
+        : el.inputType === 'number'
+          ? '1'
+          : el.inputType === 'tel'
+            ? '5555555555'
+            : el.inputType === 'date' || el.inputType === 'month' || el.inputType === 'week'
+              ? undefined // format varies too much to guess safely without risking a bad value
+              : 'healix test';
+    if (value === undefined) continue;
+    try {
+      await browser.type(el.selector, value);
+      filled += 1;
+    } catch {
+      // Dead/unfillable target — skip, keep filling the rest.
+    }
+  }
+  return filled;
 }
 
 /** A stable per-route signature used to detect a single-shell SPA (every route looks identical). */
@@ -341,6 +487,7 @@ export async function crawl(
   const routes: CrawledRoute[] = [];
   let budgetExhausted = false;
   let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
+  let remainingStateProbes = MAX_STATE_PROBES_PER_CRAWL;
 
   // Discard anything buffered before this crawl started so it doesn't leak into route 0.
   browser.drainNetworkEvents();
@@ -432,14 +579,36 @@ export async function crawl(
     // via button/onClick handlers rather than real `<a href>` anchors (see
     // GAP-042). Only probe once the link queue is running thin — following a
     // real link is cheaper and safer than guessing at a click target.
-    if (remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD) {
-      const maxClicks = Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes);
-      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks).catch(
-        (): ClickDiscoveryResult => ({ attempted: 0, discoveredUrls: [], loginToggleSelectors: [] }),
+    const wantsClickProbe = remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD;
+    // Every route is deep-probe eligible (see GAP-055) — NOT gated on this route's own element
+    // count. A live audit of the real C&A app found a healthy, well-populated "My account" page
+    // whose "change password" button still reveals an un-grounded same-URL form; gating on
+    // route-thinness would keep missing exactly that shape. STATE_REVEAL_MIN_NEW_ELEMENTS (only a
+    // click that reveals a real, materially larger state ever gets recorded) and the separate
+    // MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
+    const wantsStateProbe = remainingStateProbes > 0;
+    if (wantsClickProbe || wantsStateProbe) {
+      const maxClicks = wantsClickProbe ? Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes) : MAX_CLICKS_PER_PAGE;
+      const stateBudget = wantsStateProbe ? { remaining: remainingStateProbes } : undefined;
+      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks, {
+        deepProbe: stateBudget
+          ? { stateKeyPrefix: resolvedUrl, depth: 0, parentDepth: item.depth, budget: stateBudget }
+          : undefined,
+      }).catch(
+        (): ClickDiscoveryResult => ({
+          attempted: 0,
+          discoveredUrls: [],
+          loginToggleSelectors: [],
+          discoveredStates: [],
+        }),
       );
-      remainingClickProbes -= clickResult.attempted;
+      if (wantsClickProbe) remainingClickProbes -= clickResult.attempted;
+      if (stateBudget) remainingStateProbes = stateBudget.remaining;
       if (clickResult.loginToggleSelectors.length > 0) {
         routes[routes.length - 1].loginToggleSelector = clickResult.loginToggleSelectors[0];
+      }
+      if (clickResult.discoveredStates.length > 0) {
+        routes.push(...clickResult.discoveredStates);
       }
       for (const discovered of clickResult.discoveredUrls) {
         const norm = normalizeUrl(discovered);

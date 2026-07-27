@@ -20,7 +20,10 @@ function emit(ctx: TestModeContext, message: string, data?: unknown): void {
 }
 
 const MAX_MOCK_CONTENT_LINES = 20;
-const MAX_MOCK_BODY_CHARS = 400;
+// The 'auth' category's static mock body (mock-responses.ts) serializes to ~550 chars —
+// 400 would mid-JSON-truncate it in this prompt, which invites the model to invent the
+// rest of the shape rather than see the real one.
+const MAX_MOCK_BODY_CHARS = 800;
 
 /**
  * Ground assertions in the ACTUAL resolved mock content, not a guess. Without

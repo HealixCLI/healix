@@ -51,6 +51,38 @@ describe('classifyByRules / engine.classify', () => {
       });
       expect(result.rationale).toContain('BLOCKED, not failed');
     });
+
+    it('classifies the auth-setup fixture\'s OWN "no credentials configured" message as environment (on the setup row itself, not just its cascaded dependants)', () => {
+      const result = engine.classify({
+        title: 'authenticate',
+        error:
+          'Tier B auth setup skipped: no test credentials configured for this project ' +
+          '(and no HEALIX_TIERB_EMAIL/PASSWORD/LOGIN_URL env vars set). Set testUsername/testPassword on the project.',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('classifies the auth-setup fixture\'s "submit button never became enabled" message as environment, not test_is_wrong', () => {
+      const result = engine.classify({
+        title: 'authenticate',
+        error:
+          'Login submit button never became enabled within 8s of filling both credential fields ' +
+          '(still on http://localhost:4202/#/SK/login). Both fields were located (identifier field ' +
+          'non-empty: true, password field non-empty: true), so this is not a selector gap — the ' +
+          "app's own client-side validation is still refusing to enable submit.",
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('does NOT over-match a plain, unrelated 60s timeout that lacks any Tier B phrase (regression guard)', () => {
+      const result = engine.classify({
+        title: 'some other test',
+        error: 'Test timeout of 60000ms exceeded.\nwaiting for locator(\'button[type="submit"]\')',
+      });
+      expect(result.verdict).not.toBe('environment');
+    });
   });
 
   describe('environment failures', () => {

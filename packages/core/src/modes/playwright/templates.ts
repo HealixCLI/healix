@@ -481,6 +481,45 @@ async function waitForLoginOutcome(page, beforeUrl) {
 }
 
 /**
+ * Polls \`locator.count()\` until it's identical across two checks ~250ms apart, or
+ * \`timeoutMs\` elapses. This login form is reached via a reveal-click (see
+ * \`loginRevealRe\` below), and some apps briefly mount a SECOND form/tab — e.g. a
+ * "register/join" panel — before settling on the login one. Filling a field
+ * immediately off one snapshot can land the fill on an element that's about to be
+ * replaced, silently leaving the real login field empty while everything else looks
+ * normal. A stable count across two checks is a much stronger signal than "found it
+ * once," though it's still best-effort — it doesn't prove which form is final, only
+ * that the DOM has stopped visibly churning around this locator.
+ */
+async function waitForStableCount(locator, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let last = await locator.count().catch(() => 0);
+  while (Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 250));
+    const count = await locator.count().catch(() => 0);
+    if (count === last) return;
+    last = count;
+  }
+}
+
+/**
+ * Polls until \`button\` reports enabled, or \`timeoutMs\` elapses. \`submitButton.click()\`
+ * has its own built-in actionability wait that would otherwise block on a disabled
+ * button for the FULL test timeout (60s), surfacing a generic "Test timeout exceeded"
+ * error whose call log reads like a selector problem even though the button WAS
+ * found — a short, explicit budget converts that into a fast, correctly-diagnosed
+ * failure instead.
+ */
+async function waitForSubmitEnabled(button, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (await button.isEnabled().catch(() => false)) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, 200));
+  }
+}
+
+/**
  * One username/password form login against \`page\`, saving storageState to
  * \`path\` on success. Throws on failure — including when the submit click
  * "succeeded" (no exception) but the page never actually left the login
@@ -530,11 +569,40 @@ async function loginForm(page, email, password, loginUrl, path) {
     await reveal.click({ timeout: 5000 }).catch(() => {});
   }
 
+  // See waitForStableCount's doc comment: waits out a possible transient second
+  // form/tab before any field gets touched.
+  await waitForStableCount(identifierField, 2000);
+
   await identifierField.first().fill(email);
   await passwordField.first().fill(password);
+
+  // Direct, mechanism-agnostic guard against a field getting silently swapped/cleared
+  // out from under the fill (the failure waitForStableCount above reduces but can't
+  // fully rule out) — re-verify the identifier field actually holds what was just set,
+  // and re-fill once if not.
+  const identifierValue = await identifierField.first().inputValue().catch(() => '');
+  if (identifierValue !== email) {
+    await identifierField.first().fill(email).catch(() => {});
+  }
+
   const beforeUrl = page.url();
   const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i);
-  await submitButton.click();
+
+  if (!(await waitForSubmitEnabled(submitButton, 8000))) {
+    // Never interpolate the credential VALUES here — this text reaches the AI triage
+    // provider (see triage/prompt.ts). Lengths/booleans only.
+    const identifierFilled = (await identifierField.first().inputValue().catch(() => '')).length > 0;
+    const passwordFilled = (await passwordField.first().inputValue().catch(() => '')).length > 0;
+    throw new Error(
+      \`Login submit button never became enabled within 8s of filling both credential fields (still on \${page.url()}). \` +
+        \`Both fields were located (identifier field non-empty: \${identifierFilled}, password field non-empty: \${passwordFilled}), \` +
+        "so this is not a selector gap — the app's own client-side validation is still refusing to enable submit. " +
+        "Check that the configured test credentials are valid and match the app's format rules, and that the form has no " +
+        'additional required field (tenant/company code, consent checkbox, captcha, OTP) this fixture does not fill.',
+    );
+  }
+
+  await submitButton.click({ timeout: 15_000 });
 
   const { navigatedAway, stillHasPasswordField } = await waitForLoginOutcome(page, beforeUrl);
   if (stillHasPasswordField && !navigatedAway) {

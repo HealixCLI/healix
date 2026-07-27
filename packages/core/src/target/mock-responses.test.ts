@@ -6,7 +6,7 @@ import type { ExternalDependency } from './types.js';
 function fakeProvider(
   text: string,
   ok = true,
-  onComplete?: (opts: CompleteOptions | undefined) => void,
+  onComplete?: (opts: CompleteOptions | undefined, prompt?: string) => void,
 ): ProviderAdapter {
   return {
     id: 'claude',
@@ -25,8 +25,8 @@ function fakeProvider(
       detail: '',
     }),
     plan: async () => ({ provider: 'claude', ok: true, plan: '', raw: null, detail: '' }),
-    complete: async (_prompt, opts) => {
-      onComplete?.(opts);
+    complete: async (prompt, opts) => {
+      onComplete?.(opts, prompt);
       return { provider: 'claude', ok, text, raw: null, detail: '' };
     },
   };
@@ -129,5 +129,123 @@ describe('generateMockResponses', () => {
     const result = await generateMockResponses([smsDep], provider);
     expect(result.get('pkg:twilio')).toEqual(staticMockResponse('sms'));
     expect(result.has('pkg:unknown')).toBe(false);
+  });
+
+  it('gives a "backend"-category endpoint tagged auth by dependencies.ts the auth body, with no provider at all', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'POST', pathPattern: '/auth/token/generate', category: 'auth' }],
+    };
+    const result = await generateMockResponses([backendDep]);
+    expect(result.get('env:VITE_API_URL')).toEqual(staticMockResponse('backend'));
+    const endpointResponse = backendDep.endpoints?.[0]?.response;
+    expect(endpointResponse?.body).toMatchObject({
+      token: expect.any(String),
+      access_token: expect.any(String),
+    });
+    expect((endpointResponse?.body as { status?: { success?: boolean } })?.status?.success).toBe(true);
+  });
+
+  it('falls back to path-sniffing an untagged auth-looking endpoint on a non-auth dependency', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'POST', pathPattern: '/auth/login' }],
+    };
+    await generateMockResponses([backendDep]);
+    const endpointResponse = backendDep.endpoints?.[0]?.response;
+    expect((endpointResponse?.body as { token?: unknown })?.token).toBeDefined();
+  });
+
+  it('leaves a non-auth endpoint on a non-auth dependency alone (no auth body leakage)', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'GET', pathPattern: '/orders' }],
+    };
+    await generateMockResponses([backendDep]);
+    expect(backendDep.endpoints?.[0]?.response).toEqual(staticMockResponse('backend'));
+  });
+
+  it('merges an AI-generated auth-endpoint body OVER the static auth floor, rather than replacing it', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'POST', pathPattern: '/auth/token/generate', category: 'auth' }],
+    };
+    const provider = fakeProvider(
+      '```json\n{"responses":[{"id":"env:VITE_API_URL::POST::/auth/token/generate","status":200,"body":{"customerId":"CUST-1"}}]}\n```',
+    );
+    await generateMockResponses([backendDep], provider);
+    const body = backendDep.endpoints?.[0]?.response?.body as Record<string, unknown>;
+    // The AI's own field survives...
+    expect(body.customerId).toBe('CUST-1');
+    // ...and so does the guaranteed floor the AI response omitted.
+    expect((body.status as { success?: boolean })?.success).toBe(true);
+    expect(body.access_token).toBeDefined();
+  });
+
+  it('clamps an AI-returned error status to 200 for an auth endpoint (a 401 there would fail every login-dependent test)', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'POST', pathPattern: '/auth/token/generate', category: 'auth' }],
+    };
+    const provider = fakeProvider(
+      '```json\n{"responses":[{"id":"env:VITE_API_URL::POST::/auth/token/generate","status":401,"body":{}}]}\n```',
+    );
+    await generateMockResponses([backendDep], provider);
+    expect(backendDep.endpoints?.[0]?.response?.status).toBe(200);
+  });
+
+  it('does NOT apply the auth floor to a non-auth endpoint (AI body replaces wholesale)', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'GET', pathPattern: '/orders' }],
+    };
+    const provider = fakeProvider(
+      '```json\n{"responses":[{"id":"env:VITE_API_URL::GET::/orders","status":200,"body":{"orders":[]}}]}\n```',
+    );
+    await generateMockResponses([backendDep], provider);
+    const body = backendDep.endpoints?.[0]?.response?.body;
+    expect(body).toEqual({ orders: [] });
+  });
+
+  it('surfaces the auth-endpoint key and category marker in the prompt sent to the provider', async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'backend',
+      label: 'Backend API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'POST', pathPattern: '/auth/token/generate', category: 'auth' }],
+    };
+    let capturedPrompt = '';
+    const provider = fakeProvider('```json\n{"responses":[]}\n```', true, (_opts, prompt) => {
+      capturedPrompt = prompt ?? '';
+    });
+    await generateMockResponses([backendDep], provider);
+    expect(capturedPrompt).toContain('env:VITE_API_URL::POST::/auth/token/generate');
+    expect(capturedPrompt).toContain('category: auth (LOGIN HANDSHAKE)');
   });
 });

@@ -38,7 +38,16 @@ const RE_ENVIRONMENT =
 // gap that only project configuration can close. Must run BEFORE the generic environment
 // rule below, since a wrapped setup error can itself contain environment-flavored text
 // (e.g. a real ECONNREFUSED from a failed login attempt) that would otherwise steal the match.
-const RE_BLOCKED_TIERB = /Tier B prerequisite not met|Tier B ran without credentials/;
+//
+// The third alternative also covers the generated auth fixture's OWN messages
+// (authSetupContents() in templates.ts), which surface on the auth-setup row itself —
+// the row execute.ts deliberately keeps visible as the root cause of a blocked Tier B —
+// rather than only on its cascaded dependants: "Tier B auth setup skipped: no test
+// credentials configured..." and "Login submit button never became enabled...". Without
+// this, those rows fell through to the generic selector/timeout rules below and were
+// misclassified as test_is_wrong/ambiguous instead of the environment/config issue they are.
+const RE_BLOCKED_TIERB =
+  /Tier B prerequisite not met|Tier B ran without credentials|Tier B auth setup skipped|submit button never became enabled/;
 
 // A bare Timeout (action/wait level) that is not already a navigation or
 // selector timeout — treated as environment/slowness.

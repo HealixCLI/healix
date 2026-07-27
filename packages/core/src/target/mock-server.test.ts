@@ -1,7 +1,7 @@
 import http from 'node:http';
 import { afterEach, describe, expect, it } from 'vitest';
 import { mockDependencyUrl, startMockServer } from './mock-server.js';
-import type { MockResponse, MockServerHandle } from './types.js';
+import type { ExternalDependency, MockResponse, MockServerHandle } from './types.js';
 
 const handles: MockServerHandle[] = [];
 
@@ -55,6 +55,42 @@ describe('startMockServer', () => {
     const res = await get(mockDependencyUrl(handle.baseUrl, 'pkg:unknown'));
     expect(res.status).toBe(200);
     expect(JSON.parse(res.body)).toEqual({});
+  });
+
+  it('serves an auth-tagged endpoint\'s own (token-bearing) response for a "backend"-category dependency, not the dependency-level body (Fix 1 end-to-end)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_URL',
+        category: 'backend',
+        label: 'Backend API',
+        source: 'env-var',
+        mockStrategy: 'both',
+        endpoints: [
+          {
+            method: 'POST',
+            pathPattern: '/auth/token/generate',
+            category: 'auth',
+            response: { status: 200, body: { token: 'healix-mock-jwt-token' } },
+          },
+        ],
+      },
+    ];
+    const responses = new Map<string, MockResponse>([['env:VITE_API_URL', { status: 200, body: {} }]]);
+    const handle = await startMockServer(deps, responses);
+    handles.push(handle);
+
+    const url = mockDependencyUrl(handle.baseUrl, 'env:VITE_API_URL');
+    const res = await new Promise<{ status: number; body: string }>((resolve, reject) => {
+      const req = http.request(`${url}/auth/token/generate`, { method: 'POST' }, (r) => {
+        let body = '';
+        r.on('data', (chunk: Buffer) => (body += chunk.toString()));
+        r.on('end', () => resolve({ status: r.statusCode ?? 0, body }));
+      });
+      req.on('error', reject);
+      req.end();
+    });
+    expect(res.status).toBe(200);
+    expect(JSON.parse(res.body)).toMatchObject({ token: 'healix-mock-jwt-token' });
   });
 
   it('applies custom response headers on top of the default content-type', async () => {

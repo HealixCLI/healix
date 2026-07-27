@@ -51,9 +51,14 @@ import {
   writeInvertFile,
   clearExecCheckpoint,
   playwrightProjectArgs,
+  readMockRequestCounts,
   type AuthSignals,
 } from './execute.js';
-import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
+import {
+  EXEC_CHECKPOINT_FILENAME,
+  EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_REQUEST_LOG_FILENAME,
+} from './templates.js';
 
 function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
   return {
@@ -383,7 +388,7 @@ describe('execute — cooperative cancellation', () => {
     const controller = new AbortController();
     controller.abort();
     const outcome = await execute(makeCtx({ signal: controller.signal }), []);
-    expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] });
+    expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] });
     expect(spawn).not.toHaveBeenCalled();
   });
 });
@@ -713,6 +718,23 @@ describe('parseReport — error text stays simple, not a wall of duplicates', ()
   });
 });
 
+describe('parseReport — F-24: counts skipped tests instead of leaving them invisible', () => {
+  it('tallies a skipped test into outcome.skipped, distinct from passed/failed/blocked/flaky', () => {
+    const r = report([
+      { title: 'a', projectName: 'tierA-public', status: 'passed' },
+      { title: 'b', projectName: 'tierA-public', status: 'failed' },
+      { title: 'c', projectName: 'tierA-public', status: 'skipped' },
+      { title: 'd', projectName: 'tierA-public', status: 'skipped' },
+    ]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.passed).toBe(1);
+    expect(parsed.failed).toBe(1);
+    expect(parsed.skipped).toBe(2);
+    expect(parsed.blocked).toBe(0);
+    expect(parsed.results.filter((x) => x.status === 'skipped')).toHaveLength(2);
+  });
+});
+
 describe('parseReport — specFile inheritance through nested describe() suites', () => {
   it('inherits the file from an ancestor suite when the immediate (nested) suite and spec both lack one', () => {
     // Real shape: Playwright's JSON reporter sets `file` on the outermost
@@ -833,6 +855,49 @@ describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / cl
     // Second call: both files are already gone — must stay a no-op, not throw.
     await expect(clearExecCheckpoint(dir)).resolves.toBeUndefined();
   });
+
+  it('F-15: clearExecCheckpoint also clears the mock-request log, so a later unrelated execute() call starts counting fresh', async () => {
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${JSON.stringify({ id: 'pkg:twilio' })}\n`);
+    await clearExecCheckpoint(dir);
+    expect(await readMockRequestCounts(dir)).toEqual({});
+  });
+});
+
+describe("readMockRequestCounts — F-15: tallies the mock fixture's write-through hit log", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-request-log-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (mocking disabled, or nothing was ever intercepted)', async () => {
+    expect(await readMockRequestCounts(dir)).toEqual({});
+  });
+
+  it('tallies hits by dependency id across multiple lines', async () => {
+    const lines = [{ id: 'pkg:twilio' }, { id: 'pkg:twilio' }, { id: 'env:VITE_API_BASE_URL' }]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 2, 'env:VITE_API_BASE_URL': 1 });
+  });
+
+  it('attributes a hit with no resolvable dependency id to "override" instead of dropping it', async () => {
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), '{}\n{}\n');
+    expect(await readMockRequestCounts(dir)).toEqual({ override: 2 });
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio' })}\nnot valid json\n\n`,
+    );
+    expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 1 });
+  });
 });
 
 describe('findAuthSetupOutcomeFromEntries', () => {
@@ -921,6 +986,7 @@ describe('mergeParsedReports', () => {
       failed: 0,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const b = {
       results: [{ title: 'b', status: 'failed' as const }],
@@ -928,6 +994,7 @@ describe('mergeParsedReports', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
@@ -942,6 +1009,7 @@ describe('mergeParsedReports', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const b = {
       results: [{ title: 'a', specFile: 'x.spec.ts', status: 'passed' as const }],
@@ -949,6 +1017,7 @@ describe('mergeParsedReports', () => {
       failed: 0,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results).toHaveLength(1);

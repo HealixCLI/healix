@@ -33,6 +33,7 @@ function outcome(results: ExecOutcome['results']): ExecOutcome {
     failed: results.filter((r) => r.status === 'failed').length,
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
+    skipped: results.filter((r) => r.status === 'skipped').length,
     results,
   };
 }
@@ -163,5 +164,32 @@ describe('mergeExecOutcomes', () => {
 
     expect(merged.results).toHaveLength(1);
     expect(merged.results[0]?.status).toBe('passed');
+  });
+
+  it('F-24: carries skipped counts forward across a merge, recomputed from the deduplicated results like every other counter', () => {
+    const a = outcome([
+      { title: 'a', status: 'skipped' },
+      { title: 'b', status: 'passed' },
+    ]);
+    const b = outcome([{ title: 'c', status: 'skipped' }]);
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.skipped).toBe(2);
+    expect(merged.passed).toBe(1);
+  });
+
+  it('F-15: sums mockedRequestCounts across a merge instead of one side silently replacing the other', () => {
+    const a: ExecOutcome = { ...outcome([]), mockedRequestCounts: { 'pkg:twilio': 2, 'env:API': 1 } };
+    const b: ExecOutcome = { ...outcome([]), mockedRequestCounts: { 'pkg:twilio': 1 } };
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.mockedRequestCounts).toEqual({ 'pkg:twilio': 3, 'env:API': 1 });
+  });
+
+  it('F-15: omits mockedRequestCounts entirely when neither side has any (no empty-object noise)', () => {
+    const merged = mergeExecOutcomes(outcome([]), outcome([]));
+    expect(merged.mockedRequestCounts).toBeUndefined();
   });
 });

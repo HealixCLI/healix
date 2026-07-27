@@ -14,6 +14,20 @@ export const EXEC_CHECKPOINT_FILENAME = 'healix-exec-checkpoint.ndjson';
 /** `--test-list-invert` file execute.ts builds from EXEC_CHECKPOINT_FILENAME's entries before a resumed run. */
 export const EXEC_CHECKPOINT_INVERT_FILENAME = 'healix-completed-tests.txt';
 
+/**
+ * Write-through log of every request the mock fixture (page.route()/`request`
+ * override) actually intercepted, one JSON line per hit — see F-15: the
+ * report's `mockedRequestCounts` used to only ever reflect the launch-time,
+ * env-var mock HTTP server (target/mock-server.ts), which has no visibility
+ * at all into THIS (browser-level) mocking path, so it read `{}` even for
+ * runs whose fixture-level mocking was working perfectly. execute.ts reads
+ * this back (readMockRequestCounts) and folds it into ExecOutcome so the
+ * orchestrator can merge it with the launch-time server's own counts into
+ * one true total. Lives at the suite's project root, alongside results.json
+ * — same placement as EXEC_CHECKPOINT_FILENAME.
+ */
+export const MOCK_REQUEST_LOG_FILENAME = 'healix-mock-request-log.ndjson';
+
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -59,6 +73,15 @@ export function packageJsonContents(opts: PackageJsonOptions = {}): string {
 
 export interface ConfigOptions {
   baseUrl?: string | null;
+  /**
+   * Whether to register the `auth-setup` project (and Tier B's dependency on
+   * it) at all. Defaults to true. See F-18: when the plan has no tierB-auth
+   * items (e.g. a project with no auth surface at all), registering
+   * auth-setup anyway means it unconditionally runs and throws — "no test
+   * credentials configured" — and that throw gets counted as an ordinary
+   * test failure even though zero planned scenarios ever depended on it.
+   */
+  includeAuthSetup?: boolean;
 }
 
 /**
@@ -72,6 +95,7 @@ export interface ConfigOptions {
  */
 export function playwrightConfigContents(opts: ConfigOptions = {}): string {
   const baseUrl = (opts.baseUrl ?? '').trim();
+  const includeAuthSetup = opts.includeAuthSetup ?? true;
   // Always honor the HEALIX_BASE_URL env override, even when a literal default is baked in.
   const baseUrlLiteral = baseUrl
     ? `process.env.HEALIX_BASE_URL || ${JSON.stringify(baseUrl)}`
@@ -151,13 +175,20 @@ export default defineConfig({
     trace: 'on',
   },
   projects: [
-    {
+    ${
+      includeAuthSetup
+        ? `{
       name: 'auth-setup',
       // Override the inherited testDir ('./tests') so the setup file under
       // ./fixtures is actually discovered by testMatch.
       testDir: '.',
       testMatch: /fixtures\\/auth\\.setup\\.ts/,
-    },
+    },`
+        : `// auth-setup is omitted: the plan has no tierB-auth items for this run
+    // (see F-18) — registering it anyway would run authenticate() unconditionally
+    // and its "no test credentials configured" throw would be counted as an
+    // ordinary test failure despite zero planned scenarios depending on it.`
+    }
     {
       name: 'tierA-public',
       testDir: './tests/tierA-public',
@@ -170,7 +201,7 @@ export default defineConfig({
         ...devices['Desktop Chrome'],
         storageState: 'fixtures/.auth/user.json',
       },
-      dependencies: ['auth-setup'],
+      ${includeAuthSetup ? `dependencies: ['auth-setup'],` : ''}
     },
     {
       name: 'tierC-api',
@@ -502,7 +533,7 @@ async function loginForm(page, email, password, loginUrl, path) {
   await identifierField.first().fill(email);
   await passwordField.first().fill(password);
   const beforeUrl = page.url();
-  const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue/i);
+  const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i);
   await submitButton.click();
 
   const { navigatedAway, stillHasPasswordField } = await waitForLoginOutcome(page, beforeUrl);
@@ -825,6 +856,8 @@ export interface MockRouteEntry {
 export function mockFixtureContents(routes: MockRouteEntry[]): string {
   const serialized = JSON.stringify(routes, null, 2);
   return `import { test as base, expect } from './action-highlighter.js';
+import { appendFile } from 'node:fs/promises';
+import { join } from 'node:path';
 
 /**
  * Healix-generated mock fixture — intercepts network requests to detected
@@ -834,6 +867,20 @@ export function mockFixtureContents(routes: MockRouteEntry[]): string {
  */
 
 const MOCKED_ROUTES = ${serialized};
+
+// F-15: write-through log of every request this fixture actually intercepted,
+// read back by execute.ts's readMockRequestCounts() so the report's
+// mockedRequestCounts reflects THIS (browser-level) mocking path too, not
+// just the separate launch-time mock HTTP server. Best-effort — a logging
+// failure must never affect the actual mocked response a test receives.
+const MOCK_REQUEST_LOG_PATH = join(process.cwd(), ${JSON.stringify(MOCK_REQUEST_LOG_FILENAME)});
+async function logMockHit(id) {
+  try {
+    await appendFile(MOCK_REQUEST_LOG_PATH, JSON.stringify({ id: id || 'override' }) + '\\n', 'utf-8');
+  } catch {
+    // best-effort — never fail the actual test run over this
+  }
+}
 
 function hostMatches(url, pattern) {
   let parsed;
@@ -889,6 +936,38 @@ function resolveResponse(route, method, requestPath) {
   return route.response;
 }
 
+// Used when there is no single hostname-matched route to resolve against —
+// either a same-origin relative call (F-14: page.route() has no external
+// hostname to key off of) or the standalone \`request\` fixture (F-13: a raw
+// HTTP client call, always relative, with no hostname to disambiguate between
+// multiple mocked dependencies at all). Searches every registered route's
+// endpoints for a (method, path) match BEFORE falling back to a generic
+// default, instead of unconditionally trusting whichever dependency happens
+// to be first — that used to silently serve dependency A's canned payload to
+// a call that was actually meant for dependency B. Returns the MATCHED
+// route's id alongside the response (F-15) so the caller can attribute this
+// hit to the right dependency in mockedRequestCounts instead of the count
+// being unattributable once there's more than one candidate route.
+function matchAnyRoute(routes, method, requestPath) {
+  const override = overrides.find(
+    (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
+  );
+  for (const route of routes) {
+    const endpoint = route.endpoints?.find(
+      (e) => e.method.toUpperCase() === method.toUpperCase() && pathMatches(e.pathPattern, requestPath),
+    );
+    if (endpoint?.response) {
+      return { id: route.id, response: override ? override.response : endpoint.response };
+    }
+  }
+  if (override) return { id: undefined, response: override.response };
+  // No endpoint-level match anywhere — fall back to the first route's own
+  // generic default (the common case: exactly one mocked dependency with no
+  // endpoint-level detail at all).
+  const fallback = routes[0];
+  return fallback ? { id: fallback.id, response: fallback.response } : { id: undefined, response: undefined };
+}
+
 export const test = base.extend({
   // Lets a spec force a specific status/body for one (method, path) call,
   // scoped to just that test — e.g.
@@ -911,45 +990,71 @@ export const test = base.extend({
   },
   page: async ({ page, mockOverride }, use) => {
     void mockOverride; // ensures overrides reset alongside this test via the fixture above
-    for (const route of MOCKED_ROUTES) {
-      await page.route(
-        (url) => route.hostnames.some((h) => hostMatches(url.toString(), h)),
-        async (r) => {
-          let requestPath = '/';
-          try {
-            requestPath = new URL(r.request().url()).pathname;
-          } catch {
-            // keep default '/'
-          }
-          const response = resolveResponse(route, r.request().method(), requestPath);
-          const { contentType, text } = serializeBody(response);
-          await r.fulfill({
-            status: response.status,
-            headers: { 'content-type': contentType, ...(response.headers || {}) },
-            body: text,
-          });
-        },
+    // A SINGLE catch-all route, rather than one per hostname: a per-hostname
+    // predicate (the old approach) can never see a same-origin relative fetch
+    // (e.g. page.evaluate(() => fetch('/auth/v1/token/generate'))) — it
+    // resolves against the page's own origin, not any external mocked
+    // hostname, so it silently fell straight through to a real (failing)
+    // network call. Intercepting everything and deciding inside the handler
+    // lets an explicitly-registered mockOverride catch a same-origin path
+    // too, while anything neither host-matched nor override-matched still
+    // continues to the real network exactly as before.
+    await page.route('**/*', async (r) => {
+      const req = r.request();
+      const url = req.url();
+      const method = req.method();
+      let requestPath = '/';
+      try {
+        requestPath = new URL(url).pathname;
+      } catch {
+        // keep default '/'
+      }
+      const hostRoute = MOCKED_ROUTES.find((route) => route.hostnames.some((h) => hostMatches(url, h)));
+      const overrideMatches = overrides.some(
+        (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
       );
-    }
+      if (!hostRoute && !overrideMatches) {
+        await r.continue();
+        return;
+      }
+      let matchedId;
+      let response;
+      if (hostRoute) {
+        matchedId = hostRoute.id;
+        response = resolveResponse(hostRoute, method, requestPath);
+      } else {
+        const match = matchAnyRoute(MOCKED_ROUTES, method, requestPath);
+        matchedId = match.id;
+        response = match.response;
+      }
+      await logMockHit(matchedId);
+      const { contentType, text } = serializeBody(response);
+      await r.fulfill({
+        status: response.status,
+        headers: { 'content-type': contentType, ...(response.headers || {}) },
+        body: text,
+      });
+    });
     await use(page);
   },
   // Playwright's page.route() only intercepts requests a BROWSER makes — it
   // cannot see calls made through the standalone \`request\` fixture (used by
   // API-contract-style specs), since that's a raw HTTP client with no
   // interception hooks at all. Fake it directly instead, matching by (method,
-  // path) against the same route.endpoints/overrides resolution page uses
-  // above. Only the first mocked dependency is served this way — request-
-  // fixture calls use relative paths with no hostname to disambiguate between
-  // multiple dependencies.
+  // path) against every registered route's endpoints/overrides (see
+  // matchAnyRoute) rather than unconditionally trusting whichever dependency
+  // happens to be first — request-fixture calls use relative paths with no
+  // hostname to disambiguate between multiple mocked dependencies.
   request: async ({ request, mockOverride }, use) => {
     void mockOverride;
     if (MOCKED_ROUTES.length === 0) {
       await use(request);
       return;
     }
-    const route = MOCKED_ROUTES[0];
-    const respond = (method, requestPath) => {
-      const canned = resolveResponse(route, method, (requestPath || '/').split('?')[0]);
+    const respond = async (method, requestPath) => {
+      const match = matchAnyRoute(MOCKED_ROUTES, method, (requestPath || '/').split('?')[0]);
+      await logMockHit(match.id);
+      const canned = match.response;
       const { contentType, text } = serializeBody(canned);
       return {
         ok: () => canned.status >= 200 && canned.status < 300,

@@ -43,6 +43,29 @@ describe('scaffold — mock fixture generation', () => {
     expect(await fixtureExists()).toBe(false);
   });
 
+  describe('F-18 — auth-setup registration follows ctx.hasTierBAuthPlanItems', () => {
+    async function readConfig(): Promise<string> {
+      return readFile(join(projectDir, 'playwright.config.ts'), 'utf-8');
+    }
+
+    it("registers auth-setup by default when hasTierBAuthPlanItems is unset (today's behavior, unchanged)", async () => {
+      await scaffold(makeCtx());
+      expect(await readConfig()).toContain("name: 'auth-setup'");
+    });
+
+    it('registers auth-setup when the plan has at least one tierB-auth item', async () => {
+      await scaffold(makeCtx({ hasTierBAuthPlanItems: true }));
+      expect(await readConfig()).toContain("name: 'auth-setup'");
+    });
+
+    it('omits auth-setup when the plan has NO tierB-auth items at all (Flask-CRUD-style no-auth app)', async () => {
+      await scaffold(makeCtx({ hasTierBAuthPlanItems: false }));
+      const cfg = await readConfig();
+      expect(cfg).not.toContain("name: 'auth-setup'");
+      expect(cfg).not.toContain("dependencies: ['auth-setup']");
+    });
+  });
+
   it('writes an empty-routes mock fixture when mocking is enabled but nothing is route-interceptable', async () => {
     await scaffold(makeCtx({ mockExternalDependencies: true }));
     expect(await fixtureExists()).toBe(true);

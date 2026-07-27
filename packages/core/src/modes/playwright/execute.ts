@@ -14,7 +14,11 @@ import type {
   TestModeContext,
 } from '../types.js';
 import { tiersForScope } from '../types.js';
-import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
+import {
+  EXEC_CHECKPOINT_FILENAME,
+  EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_REQUEST_LOG_FILENAME,
+} from './templates.js';
 
 const EXEC_TIMEOUT_MS = 30 * 60_000; // generous: full suite across three tiers
 const INSTALL_TIMEOUT_MS = 300_000; // generous: npm install for the scaffolded suite
@@ -696,6 +700,7 @@ interface ParsedReport {
   failed: number;
   blocked: number;
   flaky: number;
+  skipped: number;
 }
 
 // ---- Write-through per-test checkpoint (see templates.ts's checkpointReporterContents()) ----
@@ -724,6 +729,39 @@ function checkpointFilePath(projectDir: string): string {
 }
 function invertFilePath(projectDir: string): string {
   return join(projectDir, EXEC_CHECKPOINT_INVERT_FILENAME);
+}
+
+/**
+ * Best-effort read of the mock fixture's write-through request log (see
+ * MOCK_REQUEST_LOG_FILENAME's doc comment in templates.ts) — tallies hits by
+ * dependency id. A missing file (mocking disabled, or nothing was ever
+ * intercepted) just means "no browser-level mock hits" (`{}`), same
+ * "best-effort, never fail the run" contract as readCheckpointEntries above.
+ * See F-15: this is what lets the report's mockedRequestCounts reflect
+ * fixture-level (page.route()/`request` override) mocking, which the
+ * pre-existing counter — built only from the separate launch-time mock HTTP
+ * server — had no visibility into at all.
+ */
+export async function readMockRequestCounts(projectDir: string): Promise<Record<string, number>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_REQUEST_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const counts: Record<string, number> = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as { id?: unknown };
+      const id = typeof entry.id === 'string' && entry.id ? entry.id : 'override';
+      counts[id] = (counts[id] ?? 0) + 1;
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  return counts;
 }
 
 /** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
@@ -772,6 +810,13 @@ export async function clearExecCheckpoint(projectDir: string): Promise<void> {
   await Promise.all([
     unlink(checkpointFilePath(projectDir)).catch(() => {}),
     unlink(invertFilePath(projectDir)).catch(() => {}),
+    // See F-15: cleared here too (not at the start of execute()) for the SAME
+    // reason as the two files above — an interrupted attempt's mock hits must
+    // survive into the resumed attempt's count (readMockRequestCounts is read
+    // BEFORE this runs), but a genuinely later, unrelated execute() call
+    // reusing this projectDir (next coverage-loop gap-fill iteration) must
+    // start counting fresh rather than inheriting this phase's hits.
+    unlink(join(projectDir, MOCK_REQUEST_LOG_FILENAME)).catch(() => {}),
   ]);
 }
 
@@ -801,6 +846,7 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
   let failed = 0;
   let blocked = 0;
   let flaky = 0;
+  let skipped = 0;
 
   for (const entry of entries) {
     let status = normalizeStatus(entry.status);
@@ -842,12 +888,15 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
       case 'failed':
         failed += 1;
         break;
+      case 'skipped':
+        skipped += 1;
+        break;
       default:
         break;
     }
   }
 
-  return { results, passed, failed, blocked, flaky };
+  return { results, passed, failed, blocked, flaky, skipped };
 }
 
 /**
@@ -870,6 +919,7 @@ export function mergeParsedReports(a: ParsedReport, b: ParsedReport): ParsedRepo
     failed: results.filter((r) => r.status === 'failed').length,
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
+    skipped: results.filter((r) => r.status === 'skipped').length,
   };
 }
 
@@ -879,6 +929,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let failed = 0;
   let blocked = 0;
   let flaky = 0;
+  let skipped = 0;
 
   const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
@@ -977,8 +1028,11 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       case 'failed':
         failed += 1;
         break;
+      case 'skipped':
+        skipped += 1;
+        break;
       default:
-        // skipped/pending do not move pass/fail headline counters
+        // pending does not move any headline counter
         break;
     }
   };
@@ -997,7 +1051,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   };
 
   for (const suite of report.suites ?? []) walk(suite, '', undefined);
-  return { results, passed, failed, blocked, flaky };
+  return { results, passed, failed, blocked, flaky, skipped };
 }
 
 /** Read results.json if present and newer than the run start. */
@@ -1107,12 +1161,21 @@ function parseSummaryText(combined: string): ParsedReport {
   const passed = num(/(\d+)\s+passed/i);
   const failed = num(/(\d+)\s+failed/i);
   const flaky = num(/(\d+)\s+flaky/i);
-  return { results: [], passed, failed, blocked: 0, flaky };
+  const skipped = num(/(\d+)\s+skipped/i);
+  return { results: [], passed, failed, blocked: 0, flaky, skipped };
 }
 
 /** Outcome returned when the caller cancelled the run — never a throw. */
 function abortedOutcome(exitCode: number | null = null): ExecOutcome {
-  return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [], raw: { aborted: true, exitCode } };
+  return {
+    passed: 0,
+    failed: 0,
+    blocked: 0,
+    flaky: 0,
+    skipped: 0,
+    results: [],
+    raw: { aborted: true, exitCode },
+  };
 }
 
 /**
@@ -1128,7 +1191,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');
-    return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+    return { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] };
   }
 
   // Already cancelled? Return before ANY subprocess (npm install / npx) spawns.
@@ -1259,12 +1322,19 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     }
   }
 
+  // See F-15: tallies the mock fixture's OWN write-through log, independent
+  // of results.json/steps.json — present regardless of whether the report
+  // parsed, since the fixture logs a hit the moment it fulfills a request.
+  const mockedRequestCounts = await readMockRequestCounts(ctx.projectDir);
+
   const outcome: ExecOutcome = {
     passed: parsed.passed,
     failed: parsed.failed,
     blocked: parsed.blocked,
     flaky: parsed.flaky,
+    skipped: parsed.skipped,
     results: parsed.results,
+    ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
     raw: {
       exitCode: cmd.code,
       signal: cmd.signal,
@@ -1285,6 +1355,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     failed: outcome.failed,
     blocked: outcome.blocked,
     flaky: outcome.flaky,
+    skipped: outcome.skipped,
   });
   return outcome;
 }

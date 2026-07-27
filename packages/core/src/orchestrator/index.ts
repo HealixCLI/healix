@@ -1262,7 +1262,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
         );
@@ -1544,7 +1547,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -1737,7 +1743,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -1816,7 +1825,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -2391,7 +2403,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -3334,7 +3349,9 @@ const ANY_PARAM_RE = /(?:^|[?&#/])([a-zA-Z0-9_]+)=([^&]+)/g;
  * that case is not this function's job to diagnose further; the caller's
  * ordinary "no credentials configured" hard-fail is still correct there.
  */
-export function deriveUrlTokenCredentialFromBaseUrl(baseUrl: string | null | undefined): ProjectCredential | null {
+export function deriveUrlTokenCredentialFromBaseUrl(
+  baseUrl: string | null | undefined,
+): ProjectCredential | null {
   if (!baseUrl) return null;
   const tokenMatch = TOKEN_PARAM_RE.exec(baseUrl);
   if (!tokenMatch) return null;

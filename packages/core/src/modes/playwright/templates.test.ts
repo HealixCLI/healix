@@ -116,7 +116,7 @@ describe('playwrightConfigContents — artifact capture policy', () => {
       expect(cfg).toContain("dependencies: ['auth-setup']");
     });
 
-    it('omits the auth-setup project AND tierB-auth\'s dependency on it when includeAuthSetup is false — an app with no auth surface must never get a phantom auth-setup failure', () => {
+    it("omits the auth-setup project AND tierB-auth's dependency on it when includeAuthSetup is false — an app with no auth surface must never get a phantom auth-setup failure", () => {
       const cfg = playwrightConfigContents({ includeAuthSetup: false });
       expect(cfg).not.toContain("name: 'auth-setup'");
       expect(cfg).not.toContain("dependencies: ['auth-setup']");
@@ -379,10 +379,9 @@ describe('mockFixtureContents', () => {
     ): (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown } {
       const pathMatchesSrc = extractFunctionSource(src, 'pathMatches');
       const matchSrc = extractFunctionSource(src, 'matchAnyRoute');
-      const factory = new Function(
-        'overrides',
-        `${pathMatchesSrc}\n${matchSrc}\nreturn matchAnyRoute;`,
-      ) as (o: unknown) => (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown };
+      const factory = new Function('overrides', `${pathMatchesSrc}\n${matchSrc}\nreturn matchAnyRoute;`) as (
+        o: unknown,
+      ) => (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown };
       return factory(overrides);
     }
 
@@ -404,7 +403,7 @@ describe('mockFixtureContents', () => {
       response: { status: 200, body: { from: 'b-default', customerProfile: true } },
     };
 
-    it('F-13: a request-fixture-style call matches the CORRECT dependency\'s endpoint, not always the first registered route', () => {
+    it("F-13: a request-fixture-style call matches the CORRECT dependency's endpoint, not always the first registered route", () => {
       const src = mockFixtureContents([depB, depA]); // depB registered FIRST — the old bug always served this one
       const match = loadMatchAnyRoute(src, []);
       const result = match([depB, depA], 'POST', '/v3/oauth/token/generate');
@@ -413,7 +412,7 @@ describe('mockFixtureContents', () => {
       expect(result.id).toBe('dep-a');
     });
 
-    it('falls back to the first route\'s generic default only when NO route anywhere has a matching endpoint', () => {
+    it("falls back to the first route's generic default only when NO route anywhere has a matching endpoint", () => {
       const src = mockFixtureContents([depA, depB]);
       const match = loadMatchAnyRoute(src, []);
       const result = match([depA, depB], 'GET', '/unmatched/path');
@@ -421,7 +420,7 @@ describe('mockFixtureContents', () => {
       expect(result.id).toBe('dep-a');
     });
 
-    it('a per-test mockOverride still wins over every route\'s own endpoint/default response', () => {
+    it("a per-test mockOverride still wins over every route's own endpoint/default response", () => {
       const src = mockFixtureContents([depA, depB]);
       const overrideResponse = { status: 500, body: { error: 'forced' } };
       const match = loadMatchAnyRoute(src, [

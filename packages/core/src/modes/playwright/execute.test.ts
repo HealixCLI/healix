@@ -863,7 +863,7 @@ describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / cl
   });
 });
 
-describe('readMockRequestCounts — F-15: tallies the mock fixture\'s write-through hit log', () => {
+describe("readMockRequestCounts — F-15: tallies the mock fixture's write-through hit log", () => {
   let dir: string;
 
   beforeEach(() => {

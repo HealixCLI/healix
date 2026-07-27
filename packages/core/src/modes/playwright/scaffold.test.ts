@@ -48,7 +48,7 @@ describe('scaffold — mock fixture generation', () => {
       return readFile(join(projectDir, 'playwright.config.ts'), 'utf-8');
     }
 
-    it('registers auth-setup by default when hasTierBAuthPlanItems is unset (today\'s behavior, unchanged)', async () => {
+    it("registers auth-setup by default when hasTierBAuthPlanItems is unset (today's behavior, unchanged)", async () => {
       await scaffold(makeCtx());
       expect(await readConfig()).toContain("name: 'auth-setup'");
     });

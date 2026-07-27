@@ -683,7 +683,7 @@ describe('buildWeightedBatches', () => {
   it('caps batch size at PLAN_BATCH_MAX_UNITS even when the weight budget would allow more', () => {
     const units = makeUnits(50); // weight 2 each — well under budget by weight alone
     const batches = buildWeightedBatches(units);
-    for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(20);
+    for (const batch of batches) expect(batch.length).toBeLessThanOrEqual(10);
     expect(batches.flat()).toHaveLength(50);
   });
 

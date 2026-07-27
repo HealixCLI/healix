@@ -141,7 +141,7 @@ const PLAN_SAME_PROVIDER_RETRY_DELAY_MS = 2_000;
 const PLAN_BATCH_WEIGHT_BUDGET = 45;
 
 /** Hard cap on units per batch regardless of weight — a structural safety net against pathological inputs. */
-const PLAN_BATCH_MAX_UNITS = 20;
+const PLAN_BATCH_MAX_UNITS = 10;
 
 /** Max recursive halvings of a still-truncating batch before its units are left uncovered. */
 const PLAN_MAX_SPLIT_DEPTH = 3;

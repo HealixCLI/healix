@@ -5,6 +5,7 @@ import { getStore, type HealixStore } from '../storage/store.js';
 import type {
   PauseReason,
   Project,
+  ProjectCredential,
   Run,
   RunStatus,
   SuiteMode,
@@ -1261,7 +1262,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
         );
@@ -1291,11 +1295,38 @@ async function runPipeline(
       }
     }
 
+    // F-17 (Set 2 — fixtures/mock/auth execution): a project's baseUrl can
+    // itself already be a working url-token deep link (`?token=...&mobile=...`,
+    // including the hash-routed equivalent) even though no credential was
+    // ever configured. authSetupContents()'s loginUrlToken() fully supports
+    // this scheme, but with an empty project.credentials it never gets a
+    // chance to run — auth setup takes the form-only hard-failure branch
+    // instead and blocks every Tier B test. Auto-derive a usable url-token
+    // credential straight from the URL's own token/params when that's the
+    // only thing missing, so this is a provisioning gap fixed automatically
+    // rather than a capability gap the user has to work around by hand.
+    const effectiveCredentials: ProjectCredential[] =
+      project.credentials.length === 0
+        ? (() => {
+            const derived = deriveUrlTokenCredentialFromBaseUrl(effectiveBaseUrl);
+            if (derived) {
+              emit(
+                'plan',
+                'info',
+                'No credentials configured, but the base URL looks like a url-token deep link — ' +
+                  'auto-derived a url-token credential from it for Tier B auth.',
+              );
+              return [derived];
+            }
+            return project.credentials;
+          })()
+        : project.credentials;
+
     ctx = {
       projectDir: join(runDir, 'suite'),
       repoPath: project.repoPath,
       baseUrl: effectiveBaseUrl,
-      credentials: project.credentials,
+      credentials: effectiveCredentials,
       provider,
       target,
       browser,
@@ -1308,6 +1339,21 @@ async function runPipeline(
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
       signal,
+      // See F-18: lets scaffold() skip registering the auth-setup Playwright
+      // project entirely when the plan has no auth surface, instead of
+      // running it unconditionally and misreporting its "no credentials
+      // configured" throw as an ordinary test failure. suiteMode 'reuse'
+      // carries no new plan at all (planForGeneration is empty there) — this
+      // deliberately stays undefined (today's always-scaffold behavior) in
+      // that case, since scaffold() is a no-op re-run over an already-working
+      // carried-forward suite, not a fresh decision about auth surface.
+      ...(suiteMode !== 'reuse'
+        ? {
+            hasTierBAuthPlanItems: planForGeneration.items.some(
+              (item) => item.tier === 'tierB-auth' && isPlanItemIncluded(item),
+            ),
+          }
+        : {}),
       ...(externalDependencies.length > 0
         ? {
             mockExternalDependencies: true,
@@ -1501,7 +1547,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -1694,7 +1743,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -1717,7 +1769,7 @@ async function runPipeline(
     // whether the WHOLE execute step is done yet.
     if (checkCancelled()) return await pauseOrCancel('execute');
     setStatus('executing');
-    if (!outcome) outcome = { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+    if (!outcome) outcome = { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] };
     let executeComplete =
       resumeFrom?.checkpoint.phase === 'execute' ? resumeFrom.checkpoint.executeComplete : false;
     if (executeComplete) {
@@ -1773,7 +1825,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -2268,7 +2323,7 @@ async function runPipeline(
         triageEntries,
         artifactFiles,
         externalDependencies,
-        computeMockedRequestCounts(mockServerHandle),
+        mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
         noteStoreOk,
         noteStoreFailure,
         { generationStats, coverage: coverageSummary, groupingSummary },
@@ -2348,7 +2403,10 @@ async function runPipeline(
           triageEntries,
           artifactFiles,
           externalDependencies,
-          computeMockedRequestCounts(mockServerHandle),
+          mergeMockedRequestCounts(
+            computeMockedRequestCounts(mockServerHandle),
+            outcome?.mockedRequestCounts,
+          ),
           noteStoreOk,
           noteStoreFailure,
           { generationStats, coverage: coverageSummary, groupingSummary },
@@ -3275,12 +3333,92 @@ function delay(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
+/** A `token=...` param, in the ordinary query string, a hash-routed fragment (`#/...?token=...`), or a bare `#/token=...` segment. */
+const TOKEN_PARAM_RE = /(?:^|[?&#/])token=([^&]+)/i;
+/** Any `key=value` pair in the path/query/hash portion of a URL, for pulling out extra substitutable params. */
+const ANY_PARAM_RE = /(?:^|[?&#/])([a-zA-Z0-9_]+)=([^&]+)/g;
+
+/**
+ * See F-17 (Set 2 — fixtures/mock/auth execution): detects a token-like deep
+ * link already sitting in a project's own baseUrl (`?token=...&mobile=...`,
+ * or the same shape after a hash route) and synthesizes a usable url-token
+ * ProjectCredential from it — `urlTemplate`/`extraParams` substituted back to
+ * placeholders exactly as authSetupContents()'s loginUrlToken() expects, so
+ * the run's baseUrl (origin only) plus this template reproduces the original,
+ * already-working URL. Returns null when no token-like param is present —
+ * that case is not this function's job to diagnose further; the caller's
+ * ordinary "no credentials configured" hard-fail is still correct there.
+ */
+export function deriveUrlTokenCredentialFromBaseUrl(
+  baseUrl: string | null | undefined,
+): ProjectCredential | null {
+  if (!baseUrl) return null;
+  const tokenMatch = TOKEN_PARAM_RE.exec(baseUrl);
+  if (!tokenMatch) return null;
+  const rawToken = tokenMatch[1];
+
+  let origin: string;
+  try {
+    origin = new URL(baseUrl).origin;
+  } catch {
+    return null;
+  }
+  const rest = baseUrl.slice(origin.length);
+  if (!rest) return null;
+
+  const extraParams: Record<string, string> = {};
+  ANY_PARAM_RE.lastIndex = 0;
+  let m: RegExpExecArray | null;
+  while ((m = ANY_PARAM_RE.exec(rest))) {
+    const [, key, rawValue] = m;
+    if (key.toLowerCase() === 'token') continue;
+    extraParams[key] = decodeURIComponent(rawValue);
+  }
+
+  let urlTemplate = rest.split(rawToken).join('{token}');
+  for (const [key, rawValue] of Object.entries(extraParams)) {
+    urlTemplate = urlTemplate.split(encodeURIComponent(rawValue)).join(`{${key}}`);
+    urlTemplate = urlTemplate.split(rawValue).join(`{${key}}`);
+  }
+
+  return {
+    id: 'auto-derived-url-token',
+    authType: 'url-token',
+    role: null,
+    username: '',
+    password: '',
+    token: decodeURIComponent(rawToken),
+    urlTemplate,
+    extraParams: Object.keys(extraParams).length > 0 ? extraParams : null,
+    authCheckText: null,
+  };
+}
+
 /** Tally the mock server's request log by dependency id, for the report. */
 function computeMockedRequestCounts(handle: MockServerHandle | null): Record<string, number> {
   if (!handle) return {};
   const counts: Record<string, number> = {};
   for (const r of handle.requestLog) counts[r.dependencyId] = (counts[r.dependencyId] ?? 0) + 1;
   return counts;
+}
+
+/**
+ * See F-15: the launch-time mock HTTP server's own counts (above) and the
+ * mode's browser-level fixture mocking (execute.ts's ExecOutcome.
+ * mockedRequestCounts — page.route()/`request`-fixture hits) are two
+ * completely independent mocking mechanisms with no shared bookkeeping.
+ * mockedRequestCounts used to only ever reflect the former, reading `{}` for
+ * any run whose mocking happened entirely at the fixture level. Sums both
+ * into one true total for the report.
+ */
+export function mergeMockedRequestCounts(
+  a: Record<string, number>,
+  b: Record<string, number> | undefined,
+): Record<string, number> {
+  if (!b || Object.keys(b).length === 0) return a;
+  const merged: Record<string, number> = { ...a };
+  for (const [id, count] of Object.entries(b)) merged[id] = (merged[id] ?? 0) + count;
+  return merged;
 }
 
 function errMsg(err: unknown): string {

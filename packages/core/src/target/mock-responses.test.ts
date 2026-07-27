@@ -53,6 +53,20 @@ describe('staticMockResponse', () => {
     expect(staticMockResponse('sms').status).toBe(200);
     expect(staticMockResponse('payment').body).toMatchObject({ status: 'succeeded' });
   });
+
+  it('F-12: nests the auth category\'s "status" under an object with a "success" boolean, not a flat string', () => {
+    // A capillary-style login handshake destructures the response as
+    // `status?.success` — a flat `status: "success"` string reads as
+    // `undefined` through that pattern and silently breaks every
+    // login-dependent test with no error at all.
+    const body = staticMockResponse('auth').body as { status?: unknown };
+    expect(typeof body.status).toBe('object');
+    expect(body.status).toMatchObject({ success: true });
+    expect((body.status as { success?: unknown })?.success).toBe(true);
+    // Guard against the destructuring pattern this category exists to satisfy.
+    const destructured = (body as { status?: { success?: boolean } }).status?.success;
+    expect(destructured).toBe(true);
+  });
 });
 
 describe('generateMockResponses', () => {

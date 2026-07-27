@@ -67,9 +67,46 @@ describe('classifyByRules / engine.classify', () => {
     });
 
     it('classifies a missing Node module (Cannot find module) as environment', () => {
-      expect(verdictFor("Error: Cannot find module 'express'\nRequire stack:\n- /app/server.js")).toBe(
-        'environment',
-      );
+      const result = engine.classify({
+        title: 'authenticate',
+        error: "Error: Cannot find module 'express'\nRequire stack:\n- /app/server.js",
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.8);
+    });
+
+    it.each([
+      ['Cannot find package', "Error: Cannot find package '@playwright/test'"],
+      ['ERR_MODULE_NOT_FOUND', 'Error [ERR_MODULE_NOT_FOUND]: Cannot resolve module'],
+      ['MODULE_NOT_FOUND', "Error: Cannot resolve\n  code: 'MODULE_NOT_FOUND'"],
+      ['npx playwright install (bare)', 'Please run the following command:\n\n    npx playwright install\n'],
+      ['pnpm exec playwright install', '    pnpm exec playwright install\n'],
+      ['yarn playwright install', '    yarn playwright install\n'],
+      [
+        'please run the following command to download new browsers (no install line)',
+        'Please run the following command to download new browsers:',
+      ],
+    ])('classifies "%s" as environment', (_label, error) => {
+      expect(verdictFor(error)).toBe('environment');
+    });
+
+    it('takes precedence over the generic bare-timeout rule when a missing-module error also mentions a timeout', () => {
+      // A require() hang wrapped by some tooling can surface alongside timeout-flavored text;
+      // the missing-dependency signal must still win rather than being read as generic slowness.
+      const result = engine.classify({
+        title: 'setup',
+        error: "Error: Cannot find module 'left-pad'\nTimeout of 30000ms exceeded while loading.",
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.rationale).toMatch(/dependency|installed/i);
+    });
+
+    it('does not fire on an ordinary selector or assertion failure that merely mentions "module" in passing', () => {
+      expect(
+        verdictFor(
+          "locator.click: Error: locator not found for getByRole('button', { name: 'Submit module' })",
+        ),
+      ).toBe('test_is_wrong');
     });
   });
 

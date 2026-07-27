@@ -464,7 +464,10 @@ export function runCommand(
 /**
  * Ensure the scaffolded suite has its node_modules. The Playwright browser
  * binaries live in the shared global cache, so only the npm deps need
- * installing here; browsers are handled lazily on a missing-browser failure.
+ * installing here; browsers are handled lazily on a missing-browser failure
+ * (see looksLikeMissingBrowser's retry below) rather than checked proactively
+ * on every call — the only local, network-free way to know a browser binary
+ * is missing is to actually try to launch it.
  *
  * Exported so validate.ts's parse-check gate can call it too — that gate runs
  * `npx playwright test --list` right after generation, before execute() ever
@@ -506,6 +509,19 @@ function looksLikeMissingBrowser(cmd: RawCommand): boolean {
   return /Executable doesn't exist|playwright install|browserType\.launch|Failed to launch|please run the following command/i.test(
     text,
   );
+}
+
+/** Heuristic: did the run fail because some OTHER npm package (not a browser
+ * binary) the scaffolded suite depends on was never installed, or a prior
+ * `npm install` here silently failed partway (ensureSuiteDeps logs and
+ * continues rather than hard-failing on that, see above) — e.g. a corrupted
+ * node_modules, or a package that only resolves once install actually runs to
+ * completion. Same signatures orchestrator/index.ts's looksLikeMissingDeps
+ * uses for the TARGET app's own dependencies; not shared code because this
+ * one reads a RawCommand (stdout+stderr) instead of a plain error message. */
+function looksLikeMissingSuiteDeps(cmd: RawCommand): boolean {
+  const text = stripAnsi(`${cmd.stderr}\n${cmd.stdout}`);
+  return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND/i.test(text);
 }
 
 // ---- Playwright JSON report shapes (only the fields we read) ----------------
@@ -1258,21 +1274,39 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     return abortedOutcome(cmd.code);
   }
 
-  // The browser binaries normally come from the shared global cache; if a run
-  // fails because one is missing, install chromium into the cache and retry once.
-  if (cmd.code !== 0 && looksLikeMissingBrowser(cmd)) {
-    emit(ctx, '[execute] missing browser binary; running npx playwright install chromium…');
-    const browserInstall = await runCommand(
-      ctx,
-      'npx',
-      ['playwright', 'install', 'chromium'],
-      INSTALL_TIMEOUT_MS,
-    );
-    emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
+  // Self-heal missing dependencies and retry ONCE, rather than surfacing a raw
+  // "module not found" / "browser not found" crash as if it were a real test
+  // failure. Two independent kinds, each gets its own install command:
+  //  - a Playwright browser binary (shared global cache, outside node_modules)
+  //  - any OTHER npm package the scaffolded suite depends on (node_modules) —
+  //    covers a prior ensureSuiteDeps() install that exited non-zero but was
+  //    allowed to continue (see its own comment), or a corrupted node_modules.
+  if (cmd.code !== 0 && (looksLikeMissingBrowser(cmd) || looksLikeMissingSuiteDeps(cmd))) {
+    if (looksLikeMissingBrowser(cmd)) {
+      // No browser name is passed: newer Playwright versions can fail on a
+      // binary (e.g. the separately-downloaded chrome-headless-shell) that a
+      // targeted `install chromium` does not cover, so this runs the same
+      // bare `playwright install` the tool's own error message recommends,
+      // which installs whatever the project's config actually needs.
+      emit(ctx, '[execute] missing browser binary; running npx playwright install…');
+      const browserInstall = await runCommand(ctx, 'npx', ['playwright', 'install'], INSTALL_TIMEOUT_MS);
+      emit(ctx, '[execute] browser install complete', { code: browserInstall.code });
+    }
+    if (looksLikeMissingSuiteDeps(cmd)) {
+      emit(ctx, '[execute] missing suite dependency; re-running npm install…');
+      const depsInstall = await runCommand(
+        ctx,
+        'npm',
+        ['install', '--no-audit', '--no-fund', '--silent'],
+        INSTALL_TIMEOUT_MS,
+      );
+      emit(ctx, '[execute] npm install complete', { code: depsInstall.code });
+    }
+    emit(ctx, '[execute] re-running suite after dependency install');
     startedAt = Date.now();
     cmd = await runPlaywright(ctx, invertFile);
 
-    // The retry run can be cancelled too (as can the install before it).
+    // The retry run can be cancelled too (as can the install(s) before it).
     if (cmd.aborted || ctx.signal?.aborted) {
       emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
       return abortedOutcome(cmd.code);

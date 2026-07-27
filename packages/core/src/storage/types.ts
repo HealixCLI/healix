@@ -152,6 +152,8 @@ export interface TestResult {
   details: string | null;
   /** JSON array of {title, durationMs, error?} — the action/assertion steps Playwright performed. Null for older rows or when the reporter produced none. */
   stepsJson: string | null;
+  /** Why a 'skipped' result was skipped (Playwright's own test.skip(cond, 'reason')/test.fixme(...) annotation description, when given). Null for a non-skipped result, a skip with no reason, or an older row from before this column existed. */
+  skipReason: string | null;
 }
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error';

@@ -95,6 +95,42 @@ describe('classifyByRules / engine.classify', () => {
     });
   });
 
+  describe('F-20: bare_timeout confidence lowered to reliably reach AI escalation', () => {
+    it('a bare timeout now gets a LOWER confidence than flaky (previously tied at 0.55)', () => {
+      const timeout = engine.classify({ title: 'x', error: 'page.waitForURL: Timeout 30000ms exceeded.' });
+      const flaky = engine.classify({ title: 'y', error: 'locator.click: Error: element is not visible' });
+      expect(timeout.verdict).toBe('environment');
+      expect(timeout.confidence).toBeLessThan(flaky.confidence);
+    });
+
+    it("reliably wins an AI-escalation slot over tied-confidence flaky rivals (reproduces orchestrator/index.ts's ascending-sort + TRIAGE_AI_LIMIT slice)", () => {
+      // Mirrors the Flask CRUD scenario: a bare-timeout failure (the real
+      // root cause is a DIFFERENT, already-diagnosed app_is_wrong bug
+      // earlier in the same test — e.g. a broken form submit that hangs a
+      // subsequent waitForURL) competing for a scarce AI-escalation slot
+      // against several flaky-confidence rivals.
+      const flakyInputs = Array.from({ length: 5 }, (_, i) => ({
+        title: `flaky ${i}`,
+        error: 'locator.click: Error: element is not visible',
+      }));
+      const timeoutInput = { title: 'hung waitForURL', error: 'page.waitForURL: Timeout 30000ms exceeded.' };
+
+      const all = [...flakyInputs, timeoutInput].map((input) => ({ input, triage: engine.classify(input) }));
+
+      // Same selection logic as orchestrator/index.ts's aiCandidates: sort
+      // ascending by confidence, cap to a limit (stand-in for TRIAGE_AI_LIMIT).
+      const LIMIT = 5;
+      const selected = [...all].sort((a, b) => a.triage.confidence - b.triage.confidence).slice(0, LIMIT);
+      const selectedTitles = new Set(selected.map((s) => s.input.title));
+
+      expect(selectedTitles.has(timeoutInput.title)).toBe(true);
+      // Exactly one flaky candidate was bumped out to make room — proves the
+      // lowered confidence actually changed selection order, not just the
+      // number itself.
+      expect(flakyInputs.filter((f) => selectedTitles.has(f.title))).toHaveLength(4);
+    });
+  });
+
   describe('selector / locator failures → test_is_wrong', () => {
     it("classifies pure 'locator not found' as test_is_wrong", () => {
       expect(
@@ -112,6 +148,36 @@ describe('classifyByRules / engine.classify', () => {
       expect(verdictFor("Error: locator.waitFor: getByText('Welcome back') resolved to 0 elements")).toBe(
         'test_is_wrong',
       );
+    });
+  });
+
+  describe('F-19: redirect assertion without maxRedirects → test_is_wrong', () => {
+    it('classifies "expected 302, got 200" (Flask CRUD update-entry-api-contract case) as test_is_wrong, not ambiguous', () => {
+      // Real shape captured from the Flask CRUD run's error-context.md for
+      // update-entry-api-contract-and-error-handling.spec.ts: the app DID
+      // respond with a 302, but the request auto-followed it (no
+      // maxRedirects: 0), so Playwright observed the terminal 200 instead.
+      const error = [
+        'Error: expect(received).toBe(expected) // Object.is equality',
+        '',
+        'Expected: 302',
+        'Received: 200',
+        '',
+        '    at update-entry-api-contract-and-error-handling.spec.ts:45:34',
+      ].join('\n');
+      const result = engine.classify({
+        title: '[REQ:REQ-1] update entry API contract and error handling',
+        error,
+      });
+      expect(result.verdict).toBe('test_is_wrong');
+    });
+
+    it('also matches a 3xx other than 302 (e.g. 301) expected-vs-followed-200', () => {
+      expect(verdictFor('Expected: 301\nReceived: 200')).toBe('test_is_wrong');
+    });
+
+    it('does not fire when the received status is not 200 (a genuinely different mismatch)', () => {
+      expect(verdictFor('Expected: 302\nReceived: 500')).not.toBe('test_is_wrong');
     });
   });
 

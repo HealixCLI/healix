@@ -510,6 +510,46 @@ describe('insertResult', () => {
     expect(results[0]).toMatchObject({ testId: t.id, status: 'passed', durationMs: 12 });
     expect(await countRows('results')).toBe(1);
   });
+
+  it('QA request: round-trips skipReason through insertResult/listResults', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'skip-reason-project', baseUrl: 'https://skip-reason.test' });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({
+      runId: run.id,
+      title: 'staging-only check',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+
+    s.insertResult({
+      testId: t.id,
+      status: 'skipped',
+      durationMs: 0,
+      error: null,
+      artifactsJson: null,
+      skipReason: 'staging-only feature not enabled here',
+    });
+
+    const [result] = s.listResults(run.id);
+    expect(result?.skipReason).toBe('staging-only feature not enabled here');
+  });
+
+  it('defaults skipReason to null when omitted (a non-skipped result, or an older call site)', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'no-skip-reason-project',
+      baseUrl: 'https://no-skip-reason.test',
+    });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({ runId: run.id, title: 't0', reqTag: null, tier: null, status: 'pending' });
+
+    s.insertResult({ testId: t.id, status: 'passed', durationMs: 5, error: null, artifactsJson: null });
+
+    const [result] = s.listResults(run.id);
+    expect(result?.skipReason).toBeNull();
+  });
 });
 
 describe('deleteUnexecutedTests', () => {

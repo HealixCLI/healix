@@ -202,6 +202,12 @@ describe('checkpointReporterContents', () => {
     expect(src).toMatch(/catch\s*\{/);
   });
 
+  it("QA request: recovers a skip reason from test.skip(cond, 'reason')/test.fixme(...) annotations", () => {
+    const src = checkpointReporterContents();
+    expect(src).toContain("a.type === 'skip' || a.type === 'fixme'");
+    expect(src).toContain('skipReason:');
+  });
+
   describe('live execution — the generated reporter actually run, not just grepped', () => {
     let dir: string;
 
@@ -221,8 +227,13 @@ describe('checkpointReporterContents', () => {
       return req(reporterPath);
     }
 
-    function fakeTest(retries: number, titlePath: string[], outcome = 'expected') {
-      return { retries, titlePath: () => ['', ...titlePath], outcome: () => outcome };
+    function fakeTest(
+      retries: number,
+      titlePath: string[],
+      outcome = 'expected',
+      annotations?: Array<{ type?: string; description?: string }>,
+    ) {
+      return { retries, titlePath: () => ['', ...titlePath], outcome: () => outcome, annotations };
     }
 
     async function readCheckpointLines(): Promise<Array<Record<string, unknown>>> {
@@ -318,6 +329,46 @@ describe('checkpointReporterContents', () => {
       }
       const lines = await readCheckpointLines();
       expect(lines[0].error).toBe('Expected true, got false');
+    });
+
+    it("QA request: captures the skip reason from a real test.skip(cond, 'reason') annotation", async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(
+          fakeTest(0, ['tierA-public', 'a.spec.ts', 'staging-only check'], 'skipped', [
+            { type: 'skip', description: 'staging-only feature not enabled here' },
+          ]),
+          { status: 'skipped', retry: 0, duration: 0 },
+        );
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines[0]).toMatchObject({
+        status: 'skipped',
+        skipReason: 'staging-only feature not enabled here',
+      });
+    });
+
+    it('omits skipReason for a bare skip with no annotation description', async () => {
+      const Reporter = loadReporter();
+      const reporter = new Reporter();
+      const cwd = process.cwd();
+      process.chdir(dir);
+      try {
+        reporter.onTestEnd(fakeTest(0, ['tierA-public', 'a.spec.ts', 'bare skip'], 'skipped', []), {
+          status: 'skipped',
+          retry: 0,
+          duration: 0,
+        });
+      } finally {
+        process.chdir(cwd);
+      }
+      const lines = await readCheckpointLines();
+      expect(lines[0].skipReason).toBeUndefined();
     });
 
     it('swallows a write failure instead of throwing (best-effort contract)', () => {

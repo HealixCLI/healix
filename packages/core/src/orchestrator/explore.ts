@@ -40,14 +40,24 @@ function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
+/** A route with fewer captured interactive elements than this is "thin" for the F-03/F-06 coverage ratio. */
+const THIN_ROUTE_ELEMENT_THRESHOLD = 5;
+
 /**
  * A login-only or near-empty single route is explicitly NOT "useful context"
  * — generation would be no better grounded than with no exploration at all.
  * Never blocks the run; callers surface the reason as a breadcrumb instead.
+ *
+ * Beyond that binary verdict, `thinRouteRatio` is a DEGRADATION signal (not a
+ * hard fail) for a multi-route crawl that technically has enough total
+ * elements to pass the checks above but where most individual routes still
+ * captured almost nothing (e.g. 8/10 routes with 0-1 elements) — the "zero
+ * components, one generic testid" collapse this was missing before (F-03/F-06).
  */
 export function assessExplorationUsefulness(result: CrawlWithAuthResult): {
   useful: boolean;
   reason?: string;
+  thinRouteRatio?: number;
 } {
   if (result.routes.length === 0) {
     return { useful: false, reason: 'exploration crawled zero routes' };
@@ -62,8 +72,14 @@ export function assessExplorationUsefulness(result: CrawlWithAuthResult): {
       reason: 'crawled routes render a near-identical DOM (single-shell SPA collapse)',
     };
   }
-  return { useful: true };
+  const thinRoutes = result.routes.filter(
+    (r) => r.snapshot.interactiveElements.length < THIN_ROUTE_ELEMENT_THRESHOLD,
+  ).length;
+  return { useful: true, thinRouteRatio: thinRoutes / result.routes.length };
 }
+
+/** Majority of routes thin enough to warrant a degradation breadcrumb, even though the crawl overall passed. */
+const THIN_ROUTE_RATIO_WARN_THRESHOLD = 0.5;
 
 /** Cap on API-only units probed via HTTP instead of a browser crawl seed (see splitStaticUnitsForExplore). */
 const MAX_ENDPOINT_PROBES = 10;
@@ -272,6 +288,19 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
         visitedCount: crawlResult.visitedCount,
         shellCollapsed: crawlResult.shellCollapsed,
       });
+    } else if (
+      quality.thinRouteRatio !== undefined &&
+      quality.thinRouteRatio >= THIN_ROUTE_RATIO_WARN_THRESHOLD
+    ) {
+      // Crawl passed the hard useful/useless gate, but most individual routes
+      // still captured almost nothing — a degradation signal (F-03/F-06), not
+      // a reason to distrust the whole crawl.
+      emit(
+        'explore',
+        'warn',
+        `Exploration coverage is thin: ${Math.round(quality.thinRouteRatio * 100)}% of routes captured fewer than ${THIN_ROUTE_ELEMENT_THRESHOLD} interactive elements.`,
+        { thinRouteRatio: quality.thinRouteRatio },
+      );
     }
 
     if (firstFrame) {
@@ -284,6 +313,7 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       loginCandidates,
       useful: quality.useful,
       uselessReason: quality.reason,
+      thinRouteRatio: quality.thinRouteRatio,
       observedEndpoints: collectObservedEndpoints(crawlResult),
     };
   } finally {

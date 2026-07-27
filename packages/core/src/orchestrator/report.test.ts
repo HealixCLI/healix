@@ -1,8 +1,14 @@
 import { join } from 'node:path';
 import { describe, expect, it } from 'vitest';
-import { buildReport, degradationNotes, renderReportHtml, type RunReport } from './report.js';
+import {
+  buildReport,
+  degradationNotes,
+  renderReportHtml,
+  suspiciousUniformStatusNotes,
+  type RunReport,
+} from './report.js';
 import type { Project, Run, TestCase } from '../storage/types.js';
-import type { ExecOutcome, TestPlan } from '../modes/types.js';
+import type { ExecOutcome, ExecResultItem, TestPlan } from '../modes/types.js';
 
 function makeRun(overrides: Partial<Run> = {}): Run {
   return {
@@ -118,6 +124,263 @@ describe('degradationNotes', () => {
       coverage: { ratio: 0.85, target: 0.8, coveredCount: 17, totalCount: 20, uncovered: [] },
     });
     expect(degradationNotes(report)).toEqual([]);
+  });
+
+  describe('F-25: banner wording respects coverageLoopEnabled', () => {
+    it('reads as "not enabled" (not "stopped") when the loop was never turned on, while still surfacing the real percentage', () => {
+      const report = buildReport({
+        run: makeRun(),
+        project: makeProject(),
+        plan: REAL_PLAN,
+        outcome: null,
+        triage: [],
+        coverage: {
+          ratio: 0.62,
+          target: 0.8,
+          coveredCount: 6,
+          totalCount: 10,
+          uncovered: [],
+          loopEnabled: false,
+        },
+      });
+      const notes = degradationNotes(report);
+      expect(notes).toHaveLength(1);
+      expect(notes[0]).not.toContain('stopped');
+      expect(notes[0]).toContain('not enabled');
+      expect(notes[0]).toContain('62%');
+      expect(notes[0]).toContain('80%');
+    });
+
+    it('keeps today\'s "stopped" wording when the loop was enabled', () => {
+      const report = buildReport({
+        run: makeRun(),
+        project: makeProject(),
+        plan: REAL_PLAN,
+        outcome: null,
+        triage: [],
+        coverage: {
+          ratio: 0.62,
+          target: 0.8,
+          coveredCount: 6,
+          totalCount: 10,
+          uncovered: [],
+          loopEnabled: true,
+        },
+      });
+      const notes = degradationNotes(report);
+      expect(notes[0]).toContain('stopped');
+      expect(notes[0]).not.toContain('not enabled');
+    });
+
+    it('keeps today\'s "stopped" wording when loopEnabled is absent (a report built before this field existed)', () => {
+      const report = buildReport({
+        run: makeRun(),
+        project: makeProject(),
+        plan: REAL_PLAN,
+        outcome: null,
+        triage: [],
+        coverage: { ratio: 0.62, target: 0.8, coveredCount: 6, totalCount: 10, uncovered: [] },
+      });
+      const notes = degradationNotes(report);
+      expect(notes[0]).toContain('stopped');
+    });
+  });
+});
+
+describe('F-22: suspiciousUniformStatusNotes', () => {
+  // RBAC evidence: 86 tierC-api results, 68x404 + 6x200 failures, one
+  // "passing" test that only passes because every request landed on the
+  // same wrong-base-URL 404 anyway.
+  function statusResult(title: string, status: ExecResultItem['status'], error?: string): ExecResultItem {
+    return { title, status, durationMs: 1, error, specFile: 'tierC-api/rbac.spec.ts' };
+  }
+
+  it('flags a tier whose failures overwhelmingly share the identical status code, alongside a passing result', () => {
+    const results: ExecResultItem[] = [
+      ...Array.from({ length: 8 }, (_, i) =>
+        statusResult(`neg ${i}`, 'failed', 'Expected: 200\nReceived: 404'),
+      ),
+      statusResult('the one pass', 'passed'),
+    ];
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome: { passed: 1, failed: 8, blocked: 0, flaky: 0, results },
+      triage: [],
+    });
+    const notes = suspiciousUniformStatusNotes(report);
+    expect(notes).toHaveLength(1);
+    expect(notes[0]).toContain('8/8 tierC-api failures');
+    expect(notes[0]).toContain('status 404');
+    expect(notes[0]).toContain('accidental pass');
+    // Wired into the main degradation banner, not a separate silent channel.
+    expect(degradationNotes(report)).toEqual(notes);
+  });
+
+  it('does not flag when the tier has no passing result to doubt (uniform failure alone is not the concern here)', () => {
+    const results: ExecResultItem[] = Array.from({ length: 8 }, (_, i) =>
+      statusResult(`neg ${i}`, 'failed', 'Expected: 200\nReceived: 404'),
+    );
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome: { passed: 0, failed: 8, blocked: 0, flaky: 0, results },
+      triage: [],
+    });
+    expect(suspiciousUniformStatusNotes(report)).toEqual([]);
+  });
+
+  it('does not flag when failures return genuinely varied status codes (no uniform pattern)', () => {
+    const codes = ['404', '500', '403', '401', '404', '500', '403', '401'];
+    const results: ExecResultItem[] = [
+      ...codes.map((c, i) => statusResult(`neg ${i}`, 'failed', `Expected: 200\nReceived: ${c}`)),
+      statusResult('the one pass', 'passed'),
+    ];
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome: { passed: 1, failed: 8, blocked: 0, flaky: 0, results },
+      triage: [],
+    });
+    expect(suspiciousUniformStatusNotes(report)).toEqual([]);
+  });
+
+  it('does not flag a tier with too few failures to mean anything (small sample)', () => {
+    const results: ExecResultItem[] = [
+      statusResult('neg 0', 'failed', 'Expected: 200\nReceived: 404'),
+      statusResult('neg 1', 'failed', 'Expected: 200\nReceived: 404'),
+      statusResult('the one pass', 'passed'),
+    ];
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome: { passed: 1, failed: 2, blocked: 0, flaky: 0, results },
+      triage: [],
+    });
+    expect(suspiciousUniformStatusNotes(report)).toEqual([]);
+  });
+
+  it("ignores results with no specFile (can't attribute a tier) and a healthy multi-tier report with no uniform pattern", () => {
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome: {
+        passed: 5,
+        failed: 1,
+        blocked: 0,
+        flaky: 0,
+        results: [
+          { title: 'a', status: 'passed', durationMs: 1 },
+          { title: 'b', status: 'failed', durationMs: 1, error: 'boom', specFile: 'tierA-public/x.spec.ts' },
+        ],
+      },
+      triage: [],
+    });
+    expect(suspiciousUniformStatusNotes(report)).toEqual([]);
+  });
+});
+
+describe('QA request: skip-reason surfaced for skipped Results rows', () => {
+  it("renders a skipped row's reason (from Playwright's test.skip(cond, 'reason') annotation)", () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      skipped: 1,
+      results: [
+        {
+          title: '[REQ:REQ-1] positive: only runs on staging',
+          status: 'skipped',
+          durationMs: 0,
+          skipReason: 'staging-only feature flag not enabled in this environment',
+        },
+      ],
+    };
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome,
+      triage: [],
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<div class="skip-reason">');
+    expect(html).toContain('staging-only feature flag not enabled in this environment');
+    expect(html).toContain('<span class="tag">Skipped</span>');
+  });
+
+  it('renders an empty cell (no crash) for a skipped row with no reason given', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      skipped: 1,
+      results: [{ title: 'bare skip', status: 'skipped', durationMs: 0 }],
+    };
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome,
+      triage: [],
+    });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('<div class="skip-reason">');
+  });
+
+  it('shows the skip reason instead of the normal error/triage cell, even if a stale error string is somehow present', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      skipped: 1,
+      results: [
+        {
+          title: 'x',
+          status: 'skipped',
+          durationMs: 0,
+          error: 'stale error text that should not render for a skip',
+          skipReason: 'real reason',
+        },
+      ],
+    };
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome,
+      triage: [],
+    });
+    const html = renderReportHtml(report);
+    expect(html).toContain('real reason');
+    expect(html).not.toContain('stale error text');
+  });
+
+  it('does not render a skip-reason block for a non-skipped row', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: 'x', status: 'passed', durationMs: 1 }],
+    };
+    const report = buildReport({
+      run: makeRun(),
+      project: makeProject(),
+      plan: REAL_PLAN,
+      outcome,
+      triage: [],
+    });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('<div class="skip-reason">');
   });
 });
 
@@ -415,6 +678,47 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     const html = renderReportHtml(report);
     expect(html).not.toContain('>coverage<');
     expect(html).not.toContain('<h2>Coverage</h2>');
+  });
+
+  it("F-24: surfaces a non-zero skipped count as its own card, counted from the result rows (not the never-populated outcome.skipped aggregate), and preserves outcome.skipped in buildReport()'s returned shape too", () => {
+    const outcome: ExecOutcome = {
+      passed: 14,
+      failed: 16,
+      blocked: 0,
+      flaky: 0,
+      // Deliberately stale/never-populated by any real execute() — the card
+      // must ignore this and count status:'skipped' rows instead.
+      skipped: 999,
+      results: [
+        { title: 'A', status: 'passed', durationMs: 1 },
+        { title: 'B', status: 'failed', durationMs: 1, error: 'boom' },
+        { title: 'C', status: 'skipped', durationMs: 0 },
+        { title: 'D', status: 'skipped', durationMs: 0 },
+        { title: 'E', status: 'skipped', durationMs: 0 },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    // Persisted shape: whatever outcome.skipped was still rides through
+    // buildReport() unchanged (report.json / `healix report <runId> --json`
+    // reflect the raw outcome as-is) — only the HTML card's own count is
+    // recomputed from the rows.
+    expect(report.outcome?.skipped).toBe(999);
+
+    const html = renderReportHtml(report);
+    expect(html).toContain('<div class="n warn">3</div><div>skipped</div>');
+  });
+
+  it('F-24: shows a 0 skipped card (not omitted) when the field is absent, matching the other always-shown cards', () => {
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [{ title: 'A', status: 'passed', durationMs: 1 }],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).toContain('<div class="n warn">0</div><div>skipped</div>');
   });
 
   it("joins a matched TestCase's description/details into the Results table", () => {
@@ -735,5 +1039,74 @@ describe('groupingSummary — round-trips through buildReport/renderReportHtml',
     const report = buildReport({ run, project, plan, outcome, triage });
     const html = renderReportHtml(report);
     expect(html).not.toContain('<p class="grouping-summary">');
+  });
+
+  describe('F-23: groupingSummaryUnavailableReason', () => {
+    it('defaults to null when omitted', () => {
+      const report = buildReport({ run, project, plan, outcome, triage });
+      expect(report.groupingSummaryUnavailableReason).toBeNull();
+    });
+
+    it('carries a provided reason through to the report object', () => {
+      const report = buildReport({
+        run,
+        project,
+        plan,
+        outcome,
+        triage,
+        groupingSummaryUnavailableReason: 'timeout',
+      });
+      expect(report.groupingSummaryUnavailableReason).toBe('timeout');
+    });
+
+    it('renders a visible "AI summary unavailable" note when groupingSummary is null with a reason set, instead of silently omitting the paragraph', () => {
+      const report = buildReport({
+        run,
+        project,
+        plan,
+        outcome,
+        triage,
+        groupingSummaryUnavailableReason: 'timeout',
+      });
+      const html = renderReportHtml(report);
+      expect(html).not.toContain('<p class="grouping-summary">');
+      expect(html).toContain('<p class="grouping-summary-unavailable">');
+      expect(html).toContain('AI summary unavailable (timed out).');
+    });
+
+    it('renders the provider-error reason with its own human-readable label', () => {
+      const report = buildReport({
+        run,
+        project,
+        plan,
+        outcome,
+        triage,
+        groupingSummaryUnavailableReason: 'provider-error',
+      });
+      const html = renderReportHtml(report);
+      expect(html).toContain('AI summary unavailable (the AI call failed or returned nothing usable).');
+    });
+
+    it('shows nothing (neither paragraph) when both groupingSummary and the reason are null', () => {
+      const report = buildReport({ run, project, plan, outcome, triage });
+      const html = renderReportHtml(report);
+      expect(html).not.toContain('<p class="grouping-summary">');
+      expect(html).not.toContain('<p class="grouping-summary-unavailable">');
+    });
+
+    it('prefers rendering the real summary over the unavailable note when (incoherently) both are set', () => {
+      const report = buildReport({
+        run,
+        project,
+        plan,
+        outcome,
+        triage,
+        groupingSummary: 'Real summary.',
+        groupingSummaryUnavailableReason: 'timeout',
+      });
+      const html = renderReportHtml(report);
+      expect(html).toContain('<p class="grouping-summary">');
+      expect(html).not.toContain('<p class="grouping-summary-unavailable">');
+    });
   });
 });

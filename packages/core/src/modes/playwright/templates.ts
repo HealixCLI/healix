@@ -342,6 +342,14 @@ function titleInfo(test) {
   };
 }
 
+// Mirrors execute.ts's extractSkipReason: Playwright's own test.skip(cond,
+// 'reason')/test.fixme(cond, 'reason') annotation, when one was given.
+function skipReasonOf(test) {
+  const annotation = (test.annotations || []).find((a) => a.type === 'skip' || a.type === 'fixme');
+  const description = annotation && annotation.description ? annotation.description.trim() : '';
+  return description.length > 0 ? description : undefined;
+}
+
 class HealixCheckpointReporter {
   onTestEnd(test, result) {
     const isFinal = result.status === 'passed' || result.retry >= test.retries;
@@ -351,15 +359,17 @@ class HealixCheckpointReporter {
       const errorText = result.error
         ? stripAnsi(result.error.stack || result.error.message || String(result.error))
         : undefined;
+      const outcome = test.outcome();
       const line =
         JSON.stringify({
           key: info.key,
           title: info.title,
           project: info.project,
           specFile: info.specFile,
-          status: test.outcome(),
+          status: outcome,
           durationMs: Math.round(result.duration || 0),
           error: errorText,
+          skipReason: outcome === 'skipped' ? skipReasonOf(test) : undefined,
         }) + '\\n';
       fs.appendFileSync(path.join(process.cwd(), CHECKPOINT_FILE), line, 'utf-8');
     } catch {

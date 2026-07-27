@@ -49,6 +49,15 @@ const RE_ENVIRONMENT =
 const RE_BLOCKED_TIERB =
   /Tier B prerequisite not met|Tier B ran without credentials|Tier B auth setup skipped|submit button never became enabled/;
 
+// Missing local dependency (a Playwright browser binary never downloaded, or
+// a Node package never installed) — a Healix/CI environment setup gap, not a
+// defect in the app or the test. Must run before the generic environment rule
+// (and before selector/assertion) since "Executable doesn't exist" carries no
+// navigation/connection signal of its own and would otherwise fall through to
+// the low-confidence ambiguous default.
+const RE_MISSING_DEPENDENCY =
+  /(Executable doesn't exist|browserType\.launch:|please run the following command to download new browsers|npx playwright install|pnpm (?:exec )?playwright install|yarn playwright install|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND)/i;
+
 // A bare Timeout (action/wait level) that is not already a navigation or
 // selector timeout — treated as environment/slowness.
 const RE_TIMEOUT = /\bTimeout(?:Error)?\b|timed out/i;
@@ -66,6 +75,14 @@ const RE_ASSERTION =
 const RE_CONTENT_ASSERTION =
   /(toHaveText|toContainText|toHaveURL|toHaveValue|Expected substring|Expected string|Received string|toHaveTitle)/i;
 
+// A status-code assertion that expected a redirect (3xx) but observed the
+// FOLLOWED redirect's terminal response (200) instead — the signature of a
+// request made without disabling auto-redirect-following (e.g. missing
+// `maxRedirects: 0`). This is the test's own request configuration being
+// incomplete, not the app misbehaving: the app DID redirect; the test just
+// never stopped to look at the intermediate response.
+const RE_REDIRECT_NOT_FOLLOWED = /Expected:?\s*"?3\d{2}"?[\s\S]{0,120}?Received:?\s*"?200"?\b/i;
+
 // Signals that an error is fundamentally an assertion failure, even though it
 // may also mention a locator (Playwright includes "waiting for locator" /
 // getBy* text inside expect() timeout output). When any of these are present we
@@ -82,18 +99,28 @@ function mk(verdict: Verdict, confidence: number, rationale: string): TriageResu
  *  1. blocked_tierb — Healix's own synthetic "prerequisite not met" message;
  *     must pre-empt everything else since a wrapped setup error can contain
  *     any other signal (environment, assertion, ...) inside it.
- *  2. environment   — a down server makes every selector lookup "fail", so it
+ *  2. missing_dependency — a browser binary or Node package was never
+ *     installed; carries no navigation/connection signal of its own, so it
+ *     must run before the generic environment/selector/assertion rules or it
+ *     falls through to the low-confidence ambiguous default.
+ *  3. environment   — a down server makes every selector lookup "fail", so it
  *     must pre-empt the selector rule.
- *  3. assertion     — expect() mismatch; content checks lean app_is_wrong,
+ *  4. redirect_not_followed — expected a 3xx, observed the followed
+ *     redirect's terminal 200 → the test's own request is missing
+ *     `maxRedirects: 0`. Runs BEFORE the generic assertion rule so this
+ *     specific, high-confidence test_is_wrong signal isn't swallowed by the
+ *     lower-confidence default-ambiguous/app_is_wrong assertion bucket
+ *     first (first-match wins).
+ *  5. assertion     — expect() mismatch; content checks lean app_is_wrong,
  *     everything else is genuinely ambiguous. Runs BEFORE the selector rule
  *     because Playwright assertion-timeout output embeds locator phrases
  *     ("waiting for locator", getBy*) that would otherwise be misclassified as
  *     test_is_wrong.
- *  4. selector      — locator not found / strict-mode → the test is wrong.
+ *  6. selector      — locator not found / strict-mode → the test is wrong.
  *     Suppressed when assertion signals (expect(), Expected/Received,
  *     toHaveText/toBeVisible …) are present.
- *  5. flaky         — visibility/detached/instability.
- *  6. timeout       — residual bare timeouts → environment/slowness.
+ *  7. flaky         — visibility/detached/instability.
+ *  8. timeout       — residual bare timeouts → environment/slowness.
  */
 const RULES: readonly Rule[] = [
   {
@@ -108,6 +135,17 @@ const RULES: readonly Rule[] = [
     },
   },
   {
+    id: 'missing_dependency',
+    match(error) {
+      if (!RE_MISSING_DEPENDENCY.test(error)) return null;
+      return mk(
+        'environment',
+        0.85,
+        'A required local dependency (a Playwright browser binary, or a Node package) was never installed in this execution environment — not an app or test defect. Install the missing dependency (e.g. `npx playwright install`, or a package install) and re-run.',
+      );
+    },
+  },
+  {
     id: 'environment_unreachable',
     match(error) {
       if (!RE_ENVIRONMENT.test(error)) return null;
@@ -115,6 +153,17 @@ const RULES: readonly Rule[] = [
         'environment',
         0.75,
         'Connection/navigation failure (server unreachable, DNS, or navigation timeout) — the app under test could not be loaded, so this is an environment issue rather than a real defect.',
+      );
+    },
+  },
+  {
+    id: 'redirect_not_followed',
+    match(error) {
+      if (!RE_REDIRECT_NOT_FOLLOWED.test(error)) return null;
+      return mk(
+        'test_is_wrong',
+        0.7,
+        "The test expected a redirect status (3xx) but observed 200 — the app almost certainly DID redirect, but the request auto-followed it and landed on the redirect target's own response instead. The test's own request is missing `maxRedirects: 0` (or an equivalent no-follow option), not an app defect.",
       );
     },
   },
@@ -168,8 +217,20 @@ const RULES: readonly Rule[] = [
       if (!RE_TIMEOUT.test(error)) return null;
       return mk(
         'environment',
-        0.55,
-        'A timeout fired with no selector or assertion context — most likely the app or environment was slow to respond rather than a deterministic defect.',
+        // F-20: was 0.55 (same as flaky) — deliberately lowered so a bare
+        // timeout reliably lands in orchestrator/index.ts's AI-escalation
+        // candidate pool (aiCandidates sorts ascending by confidence, takes
+        // the lowest TRIAGE_AI_LIMIT). classifyByRules() only ever sees ONE
+        // failure at a time and has no way to notice that a bare timeout is
+        // actually a downstream symptom of a DIFFERENT, already-diagnosed
+        // app_is_wrong failure in the same run (e.g. a broken form submit
+        // that hangs every subsequent waitForURL) — only a human-quality AI
+        // pass (which receives full run context) has a real chance of
+        // catching that correlation, so this confidence must be low enough
+        // to reliably win a slot over higher-confidence rivals rather than
+        // being silently left on this generic "environment" label.
+        0.4,
+        'A timeout fired with no selector or assertion context — most likely the app or environment was slow to respond, though this can also be a downstream symptom of a different, already-broken interaction earlier in the same test (e.g. a hung page after a broken form submit) rather than genuine infrastructure slowness.',
       );
     },
   },

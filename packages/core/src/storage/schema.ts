@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 14;
+export const SCHEMA_VERSION = 15;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -64,7 +64,8 @@ CREATE TABLE IF NOT EXISTS results (
   artifacts_json TEXT,
   description    TEXT,
   details        TEXT,
-  steps_json     TEXT
+  steps_json     TEXT,
+  skip_reason    TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_events (

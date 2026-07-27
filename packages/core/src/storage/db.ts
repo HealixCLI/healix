@@ -146,6 +146,11 @@ function migrate(db: DatabaseSync): void {
     // ensureColumn needed for the table itself, same reasoning as v11's usage
     // table: CREATE TABLE IF NOT EXISTS already retrofits it.
     ensureColumn(db, 'tests', 'spec_code', 'TEXT');
+    // v15: skip_reason on results — QA-requested visibility into WHY a
+    // skipped test was skipped (Playwright's own test.skip(cond,
+    // 'reason')/test.fixme(...) annotation description, when given), added
+    // via ensureColumn for existing DBs.
+    ensureColumn(db, 'results', 'skip_reason', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

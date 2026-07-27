@@ -45,6 +45,7 @@ import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageBatchItem, TriageInput, TriageResult } from '../triage/types.js';
 import { summarizeTriageGroups } from '../triage/grouping.js';
+import type { GroupingSummaryUnavailableReason } from '../triage/grouping.js';
 import {
   buildPlanPrompt,
   buildGapFillPlanPrompt,
@@ -581,6 +582,12 @@ async function runPipeline(
   // stays null when there were fewer than 2 failures to compare, or the summary
   // call failed/was skipped — best-effort, never blocks report-writing.
   let groupingSummary: string | null = null;
+  // F-23: WHY groupingSummary is null, so the report can say so explicitly
+  // instead of silently omitting the paragraph. Stays null when a summary
+  // WAS produced (nothing to explain) or when this step never even ran
+  // (fewer than 2 triaged failures — see below, that path leaves BOTH
+  // groupingSummary and this null, matching pre-F-23 behavior exactly).
+  let groupingSummaryUnavailableReason: GroupingSummaryUnavailableReason | null = null;
   // Stable key -> testId, so EXECUTE reuses the rows inserted in GENERATE (no duplicates).
   // Rehydrated from the checkpoint on resume so an EXECUTE-only resume updates
   // the SAME rows GENERATE already inserted, instead of inserting duplicates.
@@ -1553,7 +1560,7 @@ async function runPipeline(
           ),
           noteStoreOk,
           noteStoreFailure,
-          { generationStats, coverage: coverageSummary, groupingSummary },
+          { generationStats, coverage: coverageSummary, groupingSummary, groupingSummaryUnavailableReason },
         );
         return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
       }
@@ -1749,7 +1756,7 @@ async function runPipeline(
           ),
           noteStoreOk,
           noteStoreFailure,
-          { generationStats, coverage: coverageSummary, groupingSummary },
+          { generationStats, coverage: coverageSummary, groupingSummary, groupingSummaryUnavailableReason },
         );
         return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
       }
@@ -1831,7 +1838,7 @@ async function runPipeline(
           ),
           noteStoreOk,
           noteStoreFailure,
-          { generationStats, coverage: coverageSummary, groupingSummary },
+          { generationStats, coverage: coverageSummary, groupingSummary, groupingSummaryUnavailableReason },
         );
         return { runId, status: 'error', reportPath: summary.reportPath, outcome: outcome ?? undefined };
       }
@@ -1992,6 +1999,12 @@ async function runPipeline(
         coveredCount: coverage.coveredUnitKeys.size,
         totalCount: units.length,
         uncovered: coverage.uncovered,
+        // F-25: report.ts's degradationNotes() needs this to distinguish "the
+        // loop ran and stopped short" from "the loop was never enabled" —
+        // target/ratio alone can't tell those apart, and previously the
+        // report-facing banner always implied the former even when
+        // coverageLoopEnabled was false and no iterative attempt ever ran.
+        loopEnabled: coverageLoopEnabled,
       };
     }
 
@@ -2283,7 +2296,7 @@ async function runPipeline(
     if (!checkCancelled() && triageEntries.length >= 2) {
       const controller = new AbortController();
       try {
-        groupingSummary = await withTimeoutAbort(
+        const result = await withTimeoutAbort(
           summarizeTriageGroups(triageEntries, provider, {
             signal: controller.signal,
             onUsage: recordUsage,
@@ -2292,8 +2305,15 @@ async function runPipeline(
           TRIAGE_ANALYZE_TIMEOUT_MS,
           controller,
         );
+        groupingSummary = result.summary;
+        groupingSummaryUnavailableReason = result.reason;
         if (groupingSummary) emit('triage', 'info', 'Grouping summary generated.');
       } catch (err) {
+        // withTimeoutAbort itself rejected — the timer won the race against
+        // summarizeTriageGroups' own settling, so THIS is the one path that
+        // is genuinely a timeout rather than something summarizeTriageGroups
+        // already classified as 'provider-error' internally.
+        groupingSummaryUnavailableReason = 'timeout';
         emit('triage', 'debug', `Grouping summary skipped: ${errMsg(err)}`);
       }
     }
@@ -2326,7 +2346,7 @@ async function runPipeline(
         mergeMockedRequestCounts(computeMockedRequestCounts(mockServerHandle), outcome?.mockedRequestCounts),
         noteStoreOk,
         noteStoreFailure,
-        { generationStats, coverage: coverageSummary, groupingSummary },
+        { generationStats, coverage: coverageSummary, groupingSummary, groupingSummaryUnavailableReason },
       )
     ).reportPath;
 
@@ -2409,7 +2429,7 @@ async function runPipeline(
           ),
           noteStoreOk,
           noteStoreFailure,
-          { generationStats, coverage: coverageSummary, groupingSummary },
+          { generationStats, coverage: coverageSummary, groupingSummary, groupingSummaryUnavailableReason },
         )
       ).reportPath;
     } catch {
@@ -3047,6 +3067,7 @@ function persistResults(
         description: parentTest?.description ?? null,
         details: parentTest?.details ?? null,
         stepsJson: r.steps && r.steps.length > 0 ? JSON.stringify(r.steps) : null,
+        skipReason: r.skipReason ?? null,
       });
       noteStoreOk();
     } catch (err) {
@@ -3203,6 +3224,7 @@ async function finalizeReport(
     generationStats?: { requestedItems: number; acceptedItems: number };
     coverage?: ReportCoverageSummary | null;
     groupingSummary?: string | null;
+    groupingSummaryUnavailableReason?: GroupingSummaryUnavailableReason | null;
   },
 ): Promise<{ reportPath: string | undefined }> {
   const effectivePlan: TestPlan = plan ?? { summary: 'No plan generated.', items: [] };
@@ -3219,6 +3241,7 @@ async function finalizeReport(
     generation: degradation?.generationStats,
     coverage: degradation?.coverage ?? null,
     groupingSummary: degradation?.groupingSummary ?? null,
+    groupingSummaryUnavailableReason: degradation?.groupingSummaryUnavailableReason ?? null,
   });
   const reportsDir = join(runDir, 'reports');
   const reportPath = join(reportsDir, 'report.json');

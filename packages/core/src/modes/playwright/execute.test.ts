@@ -549,6 +549,90 @@ describe('parseReport — structural Tier B classification', () => {
   });
 });
 
+describe('parseReport — QA request: skip reason from test.skip(cond, "reason") annotations', () => {
+  function skipReport(annotations: Array<{ type?: string; description?: string }> | undefined): PwReportArg {
+    return {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'staging-only check',
+              file: 'tests/tierA-public/staging-only-check.spec.ts',
+              tests: [
+                {
+                  status: 'skipped',
+                  projectName: 'tierA-public',
+                  results: [{ status: 'skipped', duration: 0 }],
+                  annotations,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  it('recovers the description from a real test.skip(cond, "reason") annotation', () => {
+    const r = skipReport([{ type: 'skip', description: 'staging-only feature not enabled here' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.status).toBe('skipped');
+    expect(parsed.results[0]?.skipReason).toBe('staging-only feature not enabled here');
+  });
+
+  it('also recognizes a test.fixme(cond, "reason") annotation', () => {
+    const r = skipReport([{ type: 'fixme', description: 'flaky pending investigation' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBe('flaky pending investigation');
+  });
+
+  it('leaves skipReason undefined for a bare skip with no description given', () => {
+    const r = skipReport([{ type: 'skip' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  it('leaves skipReason undefined when there are no annotations at all', () => {
+    const r = skipReport(undefined);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  it('ignores an unrelated annotation type (e.g. "slow")', () => {
+    const r = skipReport([{ type: 'slow', description: 'this suite is known to be slow' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  it('never attaches a skipReason to a non-skipped result, even if annotations are present', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'x',
+              file: 'tests/tierA-public/x.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierA-public',
+                  results: [{ status: 'passed', duration: 5 }],
+                  annotations: [{ type: 'skip', description: 'irrelevant leftover annotation' }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.status).toBe('passed');
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+});
+
 describe('parseReport — drops blank-recording videos, keeps everything else', () => {
   const tmpDir = mkdtempSync(join(tmpdir(), 'healix-video-test-'));
   const blankVideo = join(tmpDir, 'blank-video.webm');
@@ -976,6 +1060,29 @@ describe('checkpointEntriesToOutcome', () => {
     expect(parsed.blocked).toBe(1);
     expect(parsed.results[0].error).toContain('without credentials');
   });
+
+  it('QA request: carries a checkpoint-restored skip reason through to the resumed outcome', () => {
+    const parsed = checkpointEntriesToOutcome(
+      [
+        {
+          key: 'k1',
+          title: 'staging-only check',
+          status: 'skipped',
+          skipReason: 'staging-only, disabled here',
+        },
+      ],
+      LOGGED_IN,
+    );
+    expect(parsed.results[0]?.skipReason).toBe('staging-only, disabled here');
+  });
+
+  it('never attaches a skipReason to a non-skipped checkpoint entry', () => {
+    const parsed = checkpointEntriesToOutcome(
+      [{ key: 'k1', title: 'x', status: 'expected', skipReason: 'stale leftover value' }],
+      LOGGED_IN,
+    );
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
 });
 
 describe('mergeParsedReports', () => {
@@ -1190,6 +1297,172 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(outcome.failed).toBe(1);
     const row = outcome.results.find((r) => r.title === 'login works');
     expect(row?.error).toContain('Auth setup failed');
+  });
+
+  /** A child process that emits `stderrText` on stderr, then closes with `exitCode`. */
+  function fakeFailingProcess(exitCode: number, stderrText: string): ChildProcess {
+    const proc = new EventEmitter() as unknown as ChildProcess & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    proc.stdout = new EventEmitter() as never;
+    proc.stderr = new EventEmitter() as never;
+    (proc as unknown as { pid: number }).pid = 4242;
+    (proc as unknown as { kill: () => boolean }).kill = () => true;
+    queueMicrotask(() => {
+      proc.stderr.emit('data', Buffer.from(stderrText));
+      proc.emit('close', exitCode, null);
+    });
+    return proc;
+  }
+
+  /** A child process that writes a passing results.json then exits 0 — a successful (retried) Playwright run. */
+  function fakePassingRun(title: string): ChildProcess {
+    writeFileSync(
+      join(dir, 'results.json'),
+      JSON.stringify(report([{ title, projectName: 'tierA-public', status: 'passed' }])),
+      'utf-8',
+    );
+    return fakeChildProcess(0);
+  }
+
+  it('self-heals a missing Node module by re-running npm install and retrying once (not just missing browsers)', async () => {
+    const spawnedCommands: string[] = [];
+
+    // 1st spawn: `npx playwright test` fails with a "Cannot find module" signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module '@playwright/test'\n");
+    });
+    // 2nd spawn: the recovery `npm install`.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0);
+    });
+    // 3rd spawn: the retried `npx playwright test`, this time succeeding.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('self-heals a missing Playwright browser binary by running a bare `npx playwright install` (no npm install)', async () => {
+    const spawnedCommands: Array<{ cmd: string; args: unknown }> = [];
+
+    // 1st spawn: `npx playwright test` fails with the real chrome-headless-shell signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeFailingProcess(
+        1,
+        "browserType.launch: Executable doesn't exist at ...chrome-headless-shell.exe\n" +
+          'Please run the following command to download new browsers:\n\n    npx playwright install\n',
+      );
+    });
+    // 2nd spawn: the recovery browser install.
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeChildProcess(0);
+    });
+    // 3rd spawn: the retried `npx playwright test`, this time succeeding.
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands.map((c) => c.cmd)).toEqual(['npx', 'npx', 'npx']);
+    // No browser name filter — installs whatever the local Playwright version needs.
+    expect(spawnedCommands[1]?.args).toEqual(['playwright', 'install']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('runs BOTH recovery installs when a failure carries both a missing-browser and a missing-module signature', async () => {
+    const spawnedCommands: Array<{ cmd: string; args: unknown }> = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeFailingProcess(
+        1,
+        "browserType.launch: Executable doesn't exist at ...chrome-headless-shell.exe\n" +
+          "Error: Cannot find module 'some-helper-package'\n",
+      );
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeChildProcess(0);
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeChildProcess(0);
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    // Order matches the source: browser install (if applicable) runs before the npm install.
+    expect(spawnedCommands.map((c) => c.cmd)).toEqual(['npx', 'npx', 'npm', 'npx']);
+    expect(spawnedCommands[1]?.args).toEqual(['playwright', 'install']);
+    expect(outcome.passed).toBe(1);
+  });
+
+  it('does NOT run any recovery install for a failure that matches neither signature (no spurious retry)', async () => {
+    const spawnedCommands: string[] = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, 'Error: expect(locator).toHaveText(expected) failed\n');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    // Exactly one spawn — the original run — no install, no retry.
+    expect(spawnedCommands).toEqual(['npx']);
+    expect(outcome.passed).toBe(0);
+  });
+
+  it('retries at most once: a still-failing retry does not loop or spawn a second recovery attempt', async () => {
+    const spawnedCommands: string[] = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module 'still-missing'\n");
+    });
+    // Recovery npm install "succeeds"...
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0);
+    });
+    // ...but the retried run fails with the SAME signature again.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module 'still-missing'\n");
+    });
+
+    await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    // Exactly 3 spawns total — original, one recovery install, one retry — never a second recovery round.
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
   });
 
   it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {

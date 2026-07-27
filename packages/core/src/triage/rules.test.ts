@@ -85,6 +85,63 @@ describe('classifyByRules / engine.classify', () => {
     });
   });
 
+  describe('missing local dependency (browser binary / Node package never installed)', () => {
+    it('classifies a missing Playwright browser executable as environment, not ambiguous', () => {
+      const result = engine.classify({
+        title: 'Exploring https://example.test/ (codegen)',
+        error:
+          "browserType.launch: Executable doesn't exist at C:\\Users\\x\\AppData\\Local\\ms-playwright\\chromium_headless_shell-1228\\chrome-headless-shell-win64\\chrome-headless-shell.exe\n" +
+          'Looks like Playwright was just installed or updated.\n' +
+          'Please run the following command to download new browsers:\n\n    pnpm exec playwright install\n',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.8);
+    });
+
+    it('classifies a missing Node module (Cannot find module) as environment', () => {
+      const result = engine.classify({
+        title: 'authenticate',
+        error: "Error: Cannot find module 'express'\nRequire stack:\n- /app/server.js",
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.8);
+    });
+
+    it.each([
+      ['Cannot find package', "Error: Cannot find package '@playwright/test'"],
+      ['ERR_MODULE_NOT_FOUND', 'Error [ERR_MODULE_NOT_FOUND]: Cannot resolve module'],
+      ['MODULE_NOT_FOUND', "Error: Cannot resolve\n  code: 'MODULE_NOT_FOUND'"],
+      ['npx playwright install (bare)', 'Please run the following command:\n\n    npx playwright install\n'],
+      ['pnpm exec playwright install', '    pnpm exec playwright install\n'],
+      ['yarn playwright install', '    yarn playwright install\n'],
+      [
+        'please run the following command to download new browsers (no install line)',
+        'Please run the following command to download new browsers:',
+      ],
+    ])('classifies "%s" as environment', (_label, error) => {
+      expect(verdictFor(error)).toBe('environment');
+    });
+
+    it('takes precedence over the generic bare-timeout rule when a missing-module error also mentions a timeout', () => {
+      // A require() hang wrapped by some tooling can surface alongside timeout-flavored text;
+      // the missing-dependency signal must still win rather than being read as generic slowness.
+      const result = engine.classify({
+        title: 'setup',
+        error: "Error: Cannot find module 'left-pad'\nTimeout of 30000ms exceeded while loading.",
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.rationale).toMatch(/dependency|installed/i);
+    });
+
+    it('does not fire on an ordinary selector or assertion failure that merely mentions "module" in passing', () => {
+      expect(
+        verdictFor(
+          "locator.click: Error: locator not found for getByRole('button', { name: 'Submit module' })",
+        ),
+      ).toBe('test_is_wrong');
+    });
+  });
+
   describe('environment failures', () => {
     it('classifies ECONNREFUSED as environment', () => {
       expect(verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000')).toBe('environment');
@@ -127,6 +184,42 @@ describe('classifyByRules / engine.classify', () => {
     });
   });
 
+  describe('F-20: bare_timeout confidence lowered to reliably reach AI escalation', () => {
+    it('a bare timeout now gets a LOWER confidence than flaky (previously tied at 0.55)', () => {
+      const timeout = engine.classify({ title: 'x', error: 'page.waitForURL: Timeout 30000ms exceeded.' });
+      const flaky = engine.classify({ title: 'y', error: 'locator.click: Error: element is not visible' });
+      expect(timeout.verdict).toBe('environment');
+      expect(timeout.confidence).toBeLessThan(flaky.confidence);
+    });
+
+    it("reliably wins an AI-escalation slot over tied-confidence flaky rivals (reproduces orchestrator/index.ts's ascending-sort + TRIAGE_AI_LIMIT slice)", () => {
+      // Mirrors the Flask CRUD scenario: a bare-timeout failure (the real
+      // root cause is a DIFFERENT, already-diagnosed app_is_wrong bug
+      // earlier in the same test — e.g. a broken form submit that hangs a
+      // subsequent waitForURL) competing for a scarce AI-escalation slot
+      // against several flaky-confidence rivals.
+      const flakyInputs = Array.from({ length: 5 }, (_, i) => ({
+        title: `flaky ${i}`,
+        error: 'locator.click: Error: element is not visible',
+      }));
+      const timeoutInput = { title: 'hung waitForURL', error: 'page.waitForURL: Timeout 30000ms exceeded.' };
+
+      const all = [...flakyInputs, timeoutInput].map((input) => ({ input, triage: engine.classify(input) }));
+
+      // Same selection logic as orchestrator/index.ts's aiCandidates: sort
+      // ascending by confidence, cap to a limit (stand-in for TRIAGE_AI_LIMIT).
+      const LIMIT = 5;
+      const selected = [...all].sort((a, b) => a.triage.confidence - b.triage.confidence).slice(0, LIMIT);
+      const selectedTitles = new Set(selected.map((s) => s.input.title));
+
+      expect(selectedTitles.has(timeoutInput.title)).toBe(true);
+      // Exactly one flaky candidate was bumped out to make room — proves the
+      // lowered confidence actually changed selection order, not just the
+      // number itself.
+      expect(flakyInputs.filter((f) => selectedTitles.has(f.title))).toHaveLength(4);
+    });
+  });
+
   describe('selector / locator failures → test_is_wrong', () => {
     it("classifies pure 'locator not found' as test_is_wrong", () => {
       expect(
@@ -144,6 +237,36 @@ describe('classifyByRules / engine.classify', () => {
       expect(verdictFor("Error: locator.waitFor: getByText('Welcome back') resolved to 0 elements")).toBe(
         'test_is_wrong',
       );
+    });
+  });
+
+  describe('F-19: redirect assertion without maxRedirects → test_is_wrong', () => {
+    it('classifies "expected 302, got 200" (Flask CRUD update-entry-api-contract case) as test_is_wrong, not ambiguous', () => {
+      // Real shape captured from the Flask CRUD run's error-context.md for
+      // update-entry-api-contract-and-error-handling.spec.ts: the app DID
+      // respond with a 302, but the request auto-followed it (no
+      // maxRedirects: 0), so Playwright observed the terminal 200 instead.
+      const error = [
+        'Error: expect(received).toBe(expected) // Object.is equality',
+        '',
+        'Expected: 302',
+        'Received: 200',
+        '',
+        '    at update-entry-api-contract-and-error-handling.spec.ts:45:34',
+      ].join('\n');
+      const result = engine.classify({
+        title: '[REQ:REQ-1] update entry API contract and error handling',
+        error,
+      });
+      expect(result.verdict).toBe('test_is_wrong');
+    });
+
+    it('also matches a 3xx other than 302 (e.g. 301) expected-vs-followed-200', () => {
+      expect(verdictFor('Expected: 301\nReceived: 200')).toBe('test_is_wrong');
+    });
+
+    it('does not fire when the received status is not 200 (a genuinely different mismatch)', () => {
+      expect(verdictFor('Expected: 302\nReceived: 500')).not.toBe('test_is_wrong');
     });
   });
 

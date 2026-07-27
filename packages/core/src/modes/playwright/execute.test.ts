@@ -484,6 +484,52 @@ describe('parseReport — structural Tier B classification', () => {
     expect(byTitle['authenticate']?.status).toBe('failed');
   });
 
+  it("stamps the auth-setup row's own error with a marker triage can classify structurally", () => {
+    // A fixture that times out emits nothing of its own, so the row reaches triage as a bare
+    // "Test timeout of 60000ms exceeded." — no auth signal at all, previously classified as a
+    // low-confidence generic timeout. Triage sees only title+error, and matching auth-ish words
+    // in Playwright's text would resurrect the defect-leakage bug AuthSignals guards against,
+    // so the identity has to be stamped here, where isAuthSetup already established it.
+    const auth: AuthSignals = {
+      setupFailed: true,
+      setupError: 'Test timeout of 60000ms exceeded.',
+      performedLogin: false,
+    };
+    const r = report([
+      {
+        title: 'authenticate',
+        file: 'fixtures/auth.setup.ts',
+        projectName: 'auth-setup',
+        status: 'failed',
+        error: 'Test timeout of 60000ms exceeded.',
+      },
+    ]);
+    const parsed = parseReport(r, auth);
+    const row = parsed.results.find((x) => x.title === 'authenticate');
+    expect(row?.error).toContain('Tier B auth setup failed');
+    // The original Playwright text is preserved, not replaced — it's the actual diagnosis.
+    expect(row?.error).toContain('Test timeout of 60000ms exceeded.');
+  });
+
+  it('stamps the same marker on a checkpoint-restored auth-setup failure', () => {
+    const auth: AuthSignals = { setupFailed: true, setupError: 'boom', performedLogin: false };
+    const parsed = checkpointEntriesToOutcome(
+      [
+        {
+          key: 'k1',
+          title: 'authenticate',
+          project: 'auth-setup',
+          specFile: 'fixtures/auth.setup.ts',
+          status: 'failed',
+          error: 'Test timeout of 60000ms exceeded.',
+        },
+      ],
+      auth,
+    );
+    const row = parsed.results.find((x) => x.title === 'authenticate');
+    expect(row?.error).toContain('Tier B auth setup failed');
+  });
+
   it('excludes a PASSING auth-setup spec from results entirely (no phantom test row)', () => {
     // Regression: a passing auth-setup used to appear in `results` as a normal
     // "test" that can never be matched back to a generated spec — inflating
@@ -591,6 +637,23 @@ describe('parseReport — QA request: skip reason from test.skip(cond, "reason")
     const r = skipReport([{ type: 'skip' }]);
     const parsed = parseReport(r, LOGGED_IN);
     expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  // A declaration-form `test.fixme(title, { annotation: ... }, body)` — what generate.ts's
+  // demoteEscapeHatchBlocks emits — yields TWO fixme annotations from Playwright: the described
+  // one and its own bare one. Verified against Playwright 1.62's JSON reporter. Taking the first
+  // by type alone would return whichever the runner happened to list first, so both orders must
+  // resolve to the description.
+  it('finds the description when Playwright also emits its own bare fixme annotation', () => {
+    const described = { type: 'fixme', description: 'unobserved element — needs review' };
+    const bare = { type: 'fixme' };
+
+    expect(parseReport(skipReport([described, bare]), LOGGED_IN).results[0]?.skipReason).toBe(
+      'unobserved element — needs review',
+    );
+    expect(parseReport(skipReport([bare, described]), LOGGED_IN).results[0]?.skipReason).toBe(
+      'unobserved element — needs review',
+    );
   });
 
   it('leaves skipReason undefined when there are no annotations at all', () => {

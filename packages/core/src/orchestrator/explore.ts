@@ -204,6 +204,8 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
             routes: [...crawlResult.routes, ...staticRoutes],
             visitedCount: crawlResult.visitedCount + staticRoutes.length,
             budgetExhausted: crawlResult.budgetExhausted || staticCrawl.budgetExhausted,
+            unvisitedQueuedCount:
+              (crawlResult.unvisitedQueuedCount ?? 0) + (staticCrawl.unvisitedQueuedCount ?? 0),
             redirectLoopsDetected: [
               ...crawlResult.redirectLoopsDetected,
               ...staticCrawl.redirectLoopsDetected,
@@ -242,11 +244,26 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
           interactiveElements: r.snapshot.interactiveElements.length,
         })),
         budgetExhausted: crawlResult.budgetExhausted,
+        unvisitedQueuedCount: crawlResult.unvisitedQueuedCount,
         shellCollapsed: crawlResult.shellCollapsed,
         redirectLoopsDetected: crawlResult.redirectLoopsDetected,
         routing,
       },
     );
+
+    // A crawl that stopped while still holding known-but-unvisited routes has silently
+    // truncated the inventory GENERATE grounds against — the difference between "explored
+    // everything" and "explored what fit" is invisible in the route list alone, and a real run
+    // shipped every Tier B spec as an ungrounded `test.fixme` with no indication why.
+    const unvisitedQueuedCount = crawlResult.unvisitedQueuedCount ?? 0;
+    if (unvisitedQueuedCount > 0) {
+      emit(
+        'explore',
+        'warn',
+        `Exploration budget ran out with ${unvisitedQueuedCount} discovered route(s) never visited — the inventory is incomplete, so generated tests may fall back to ungrounded placeholders. Raise the crawl budget (--crawl-budget-ms) to explore further.`,
+        { unvisitedQueuedCount },
+      );
+    }
 
     if (crawlResult.authAttempted && !crawlResult.authVerified) {
       emit(

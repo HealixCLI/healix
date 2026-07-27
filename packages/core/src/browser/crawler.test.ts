@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { crawl, crawlWithAuth, reconcileStaticRoutePaths } from './crawler.js';
+import {
+  crawl,
+  crawlWithAuth,
+  reconcileStaticRoutePaths,
+  scoreLoginCandidates,
+  type RoutePrefixInfo,
+} from './crawler.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
@@ -1000,6 +1006,10 @@ describe('crawlWithAuth()', () => {
     expect(authUrls).toEqual(['https://a.test/dashboard']);
   });
 
+  // Runs ~10s on purpose: a submit that never leaves the login page is only CONFIRMED failed
+  // once login.ts's LOGIN_SETTLE_TIMEOUT_MS has elapsed, since a real login legitimately chains
+  // several requests before redirecting. Fits this package's 15s testTimeout (vitest.config.ts)
+  // without needing its own.
   it('degrades to anonymous-only when login cannot be verified (wrong credentials)', async () => {
     const browser = makeFakeBrowser({
       pages: {
@@ -1340,5 +1350,148 @@ describe('crawl() network capture (GAP-046)', () => {
     expect(result.routes).toHaveLength(1);
     expect(result.routes[0]?.url).toBe('https://a.test/ok');
     expect(result.routes[0]?.networkEvents).toEqual([]);
+  });
+});
+
+describe('scoreLoginCandidates()', () => {
+  const NO_HASH: RoutePrefixInfo = { hashRouted: false };
+
+  function route(url: string, opts: { title?: string; hasPasswordField?: boolean } = {}) {
+    return {
+      url,
+      title: opts.title ?? '',
+      snapshot: { url, title: opts.title ?? '', interactiveElements: [] },
+      depth: 0,
+      hasPasswordField: opts.hasPasswordField ?? false,
+      role: 'anonymous' as const,
+      networkEvents: [],
+    };
+  }
+
+  it('ranks a real login route above a password-bearing register route', () => {
+    const candidates = scoreLoginCandidates(
+      [
+        route('https://a.test/#/SK/register', { title: 'Registrácia', hasPasswordField: true }),
+        route('https://a.test/#/SK/login', { title: 'Prihlásiť sa', hasPasswordField: true }),
+      ],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+
+    expect(candidates[0]?.url).toBe('https://a.test/#/SK/login');
+    expect(candidates[0]?.score).toBeGreaterThan(candidates[1]?.score ?? 0);
+  });
+
+  it('a register page is not confident on its password field alone, so the /login fallback still fires', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/#/SK/register', { title: 'Registrácia', hasPasswordField: true })],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+
+    // The whole bug: +3 for the password field used to equal CONFIDENT_SCORE, so the register
+    // page was reported as a CONFIDENT login candidate and the fallback was suppressed entirely,
+    // leaving the run with no alternative to a page that isn't a login form.
+    expect(candidates.some((c) => c.source === 'common-path')).toBe(true);
+    expect(candidates.find((c) => c.url.endsWith('/register'))?.score).toBeLessThan(3);
+  });
+
+  it('ranks a crawled register page ABOVE a merely guessed /login', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/#/SK/register', { title: 'Registrácia', hasPasswordField: true })],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+
+    // Deliberate: on an app whose login is only a toggle inside the register form, there is no
+    // /login route at all, so preferring the guess would send the auth fixture to a URL that
+    // renders the SPA's fallback and lose a login that otherwise works. We positively observed
+    // the register page and its password field; /login is only a guess.
+    expect(candidates[0]?.url).toBe('https://a.test/#/SK/register');
+    const guess = candidates.find((c) => c.source === 'common-path');
+    expect(candidates[0]?.score).toBeGreaterThan(guess?.score ?? 0);
+  });
+
+  it('keeps a login-hinted route confident so no fallback candidates are added', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/login', { hasPasswordField: true })],
+      NO_HASH,
+      'https://a.test/',
+    );
+
+    expect(candidates.every((c) => c.source === 'crawled')).toBe(true);
+  });
+
+  it('collapses a route and its deep-probe states into one candidate, keeping the highest score', () => {
+    const base = route('https://a.test/login');
+    const probed = { ...route('https://a.test/login', { hasPasswordField: true }), stateKey: 'x>>y' };
+
+    const candidates = scoreLoginCandidates([base, probed], NO_HASH, 'https://a.test/');
+
+    const forLogin = candidates.filter((c) => c.url === 'https://a.test/login');
+    expect(forLogin).toHaveLength(1);
+    // 3 (password field, contributed only by the probed state) + 2 (URL hint).
+    expect(forLogin[0]?.score).toBe(5);
+  });
+
+  it('still treats a route reading as both register and login as a login candidate', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/register-or-login', { hasPasswordField: true })],
+      NO_HASH,
+      'https://a.test/',
+    );
+
+    // No signup penalty applied, so the password field alone keeps it confident.
+    expect(candidates[0]?.url).toBe('https://a.test/register-or-login');
+    expect(candidates.every((c) => c.source === 'crawled')).toBe(true);
+  });
+});
+
+describe('crawl() login-route discovery priority', () => {
+  it('visits a login-looking route before other routes queued ahead of it', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          // Register is discovered FIRST, so plain FIFO order would visit it first.
+          elements: [link('https://a.test/register'), link('https://a.test/login')],
+        },
+        'https://a.test/register': { elements: [] },
+        'https://a.test/login': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/', { maxRoutes: 2 });
+
+    // maxRoutes: 2 means exactly one of the two gets visited — it must be login.
+    expect(result.routes.map((r) => r.url)).toEqual(['https://a.test/', 'https://a.test/login']);
+  });
+
+  it('reports discovered-but-unvisited routes so a truncated crawl is not silent', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/a'), link('https://a.test/b')] },
+        'https://a.test/a': { elements: [] },
+        'https://a.test/b': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/', { maxRoutes: 1 });
+
+    expect(result.budgetExhausted).toBe(true);
+    expect(result.unvisitedQueuedCount).toBe(2);
+  });
+
+  it('reports zero unvisited routes when the queue drained normally', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/a')] },
+        'https://a.test/a': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.budgetExhausted).toBe(false);
+    expect(result.unvisitedQueuedCount).toBe(0);
   });
 });

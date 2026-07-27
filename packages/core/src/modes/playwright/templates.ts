@@ -343,11 +343,17 @@ function titleInfo(test) {
 }
 
 // Mirrors execute.ts's extractSkipReason: Playwright's own test.skip(cond,
-// 'reason')/test.fixme(cond, 'reason') annotation, when one was given.
+// 'reason')/test.fixme(cond, 'reason') annotation, when one was given. Takes the first
+// annotation WITH a description rather than the first skip/fixme one — Playwright adds its own
+// description-less 'fixme' for a declaration-form test.fixme(), which would shadow the described
+// annotation the generator attaches beside it.
 function skipReasonOf(test) {
-  const annotation = (test.annotations || []).find((a) => a.type === 'skip' || a.type === 'fixme');
-  const description = annotation && annotation.description ? annotation.description.trim() : '';
-  return description.length > 0 ? description : undefined;
+  for (const annotation of test.annotations || []) {
+    if (annotation.type !== 'skip' && annotation.type !== 'fixme') continue;
+    const description = annotation.description ? annotation.description.trim() : '';
+    if (description) return description;
+  }
+  return undefined;
 }
 
 class HealixCheckpointReporter {

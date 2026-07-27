@@ -46,8 +46,18 @@ const RE_ENVIRONMENT =
 // credentials configured..." and "Login submit button never became enabled...". Without
 // this, those rows fell through to the generic selector/timeout rules below and were
 // misclassified as test_is_wrong/ambiguous instead of the environment/config issue they are.
+//
+// "Tier B auth setup failed" is execute.ts's own AUTH_SETUP_FAILURE_MARKER, stamped on the
+// auth-setup row where that row's identity is known STRUCTURALLY (see isAuthSetup). It's what
+// catches the residual case the fixture's own messages can't: a bare
+// "Test timeout of 60000ms exceeded." carries no auth signal at all, so it landed on
+// RE_TIMEOUT as `environment` @0.55 — "a timeout fired with no selector or assertion context"
+// — burying the real cause of an entire blocked Tier B. Deliberately a marker Healix writes
+// rather than a pattern over Playwright's text: Playwright embeds the failing source snippet
+// in its errors, so matching auth-ish words would resurrect the defect-leakage bug that
+// AuthSignals in execute.ts exists to prevent.
 const RE_BLOCKED_TIERB =
-  /Tier B prerequisite not met|Tier B ran without credentials|Tier B auth setup skipped|submit button never became enabled/;
+  /Tier B prerequisite not met|Tier B ran without credentials|Tier B auth setup skipped|Tier B auth setup failed|submit button never became enabled/;
 
 // Missing local dependency (a Playwright browser binary never downloaded, or
 // a Node package never installed) — a Healix/CI environment setup gap, not a

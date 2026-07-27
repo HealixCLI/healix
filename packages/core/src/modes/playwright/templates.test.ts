@@ -204,7 +204,8 @@ describe('checkpointReporterContents', () => {
 
   it("QA request: recovers a skip reason from test.skip(cond, 'reason')/test.fixme(...) annotations", () => {
     const src = checkpointReporterContents();
-    expect(src).toContain("a.type === 'skip' || a.type === 'fixme'");
+    expect(src).toContain("'skip'");
+    expect(src).toContain("'fixme'");
     expect(src).toContain('skipReason:');
   });
 

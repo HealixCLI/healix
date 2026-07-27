@@ -76,6 +76,19 @@ describe('classifyByRules / engine.classify', () => {
       expect(result.confidence).toBeGreaterThanOrEqual(0.9);
     });
 
+    it("classifies a BARE auth-setup timeout as environment via execute.ts's own marker", () => {
+      // The residual case the fixture's own messages can't cover: a fixture that times out
+      // without emitting anything of its own. Before the marker this landed on the generic
+      // timeout rule as environment @0.55 ("no selector or assertion context"), burying the
+      // real cause of 45 blocked tests behind a low-confidence shrug.
+      const result = engine.classify({
+        title: 'authenticate',
+        error: 'Tier B auth setup failed.\nTest timeout of 60000ms exceeded.',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
     it('does NOT over-match a plain, unrelated 60s timeout that lacks any Tier B phrase (regression guard)', () => {
       const result = engine.classify({
         title: 'some other test',

@@ -305,6 +305,60 @@ describe('assessExplorationUsefulness()', () => {
     expect(result.useful).toBe(true);
     expect(result.reason).toBeUndefined();
   });
+
+  /** Builds a route with `n` heading elements (>= THIN_ROUTE_ELEMENT_THRESHOLD=5 counts as "rich", < 5 as "thin"). */
+  function routeWithElements(url: string, n: number): CrawlWithAuthResult['routes'][number] {
+    return {
+      url,
+      title: url,
+      snapshot: {
+        url,
+        title: url,
+        interactiveElements: Array.from({ length: n }, (_, i) => heading(`h${i}`)),
+      },
+      depth: 0,
+      hasPasswordField: false,
+      role: 'anonymous',
+      networkEvents: [],
+    };
+  }
+
+  it('reports a thinRouteRatio degradation signal for a multi-route crawl where most routes are near-empty (F-03/F-06)', () => {
+    const routes = [
+      ...Array.from({ length: 8 }, (_, i) => routeWithElements(`https://a.test/thin-${i}`, 1)),
+      routeWithElements('https://a.test/rich-1', 8),
+      routeWithElements('https://a.test/rich-2', 6),
+    ];
+    const result = assessExplorationUsefulness(crawlResult({ routes, visitedCount: routes.length }));
+    // Still "useful" — this is a degradation signal, not a new hard-fail.
+    expect(result.useful).toBe(true);
+    expect(result.reason).toBeUndefined();
+    expect(result.thinRouteRatio).toBeCloseTo(0.8, 5);
+  });
+
+  it('pins the thinRouteRatio boundary at exactly 50% thin routes', () => {
+    const routes = [
+      routeWithElements('https://a.test/thin-1', 0),
+      routeWithElements('https://a.test/thin-2', 2),
+      routeWithElements('https://a.test/rich-1', 5),
+      routeWithElements('https://a.test/rich-2', 10),
+    ];
+    const result = assessExplorationUsefulness(crawlResult({ routes, visitedCount: routes.length }));
+    expect(result.useful).toBe(true);
+    expect(result.thinRouteRatio).toBeCloseTo(0.5, 5);
+  });
+
+  it('returns a low thinRouteRatio when nearly all routes are richly populated', () => {
+    const routes = [
+      routeWithElements('https://a.test/rich-1', 10),
+      routeWithElements('https://a.test/rich-2', 12),
+      routeWithElements('https://a.test/rich-3', 9),
+      routeWithElements('https://a.test/thin-1', 1),
+    ];
+    const result = assessExplorationUsefulness(crawlResult({ routes, visitedCount: routes.length }));
+    expect(result.useful).toBe(true);
+    expect(result.thinRouteRatio).toBeCloseTo(0.25, 5);
+  });
 });
 
 describe('runExplorePhase()', () => {

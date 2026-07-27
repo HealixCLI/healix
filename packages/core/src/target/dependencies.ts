@@ -487,8 +487,9 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
 
     for (const m of source.matchAll(URL_LITERAL_RE)) {
       const host = m[1];
-      if (!host || LOCAL_HOSTS.has(host)) continue;
-      const known = findKnownProviderForHost(host);
+      if (!host) continue;
+      const isLocal = LOCAL_HOSTS.has(host);
+      const known = isLocal ? null : findKnownProviderForHost(host);
       const id = known ? `pkg:${known.packageNames[0]}` : `url:${host}`;
       if (seenIds.has(id)) continue;
 
@@ -496,6 +497,37 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
       // A namespace attribute (xmlns="http://www.w3.org/2000/svg") is never a
       // network call — the single most common false positive in JSX/SVG code.
       if (/\bxmlns/i.test(line)) continue;
+
+      if (isLocal) {
+        // A hardcoded local-host literal, same as the env-var pass, is the
+        // app's own dev backend — record it distinctly as 'local-backend'
+        // (with a reachability probe, unlike today which dropped it
+        // unconditionally) rather than suppressing it, so Generate (F-08) can
+        // route tierC-api requests to its real origin. Still gated on the
+        // network-call marker so a plain string constant isn't flagged.
+        if (!NETWORK_CALL_MARKER_RE.test(line)) continue;
+        const origin = parseHttpUrl(m[0])?.origin ?? `http://${host}`;
+        let reachable = false;
+        try {
+          reachable = (await probeUrl(origin, 2_000)).reachable;
+        } catch {
+          reachable = false;
+        }
+        addDep({
+          id,
+          category: 'local-backend',
+          label: 'Local backend API',
+          source: 'url-literal',
+          hostnames: [new URL(origin).host],
+          mockStrategy: 'undeterminable',
+          file: f.rel,
+          reachable,
+          note: reachable
+            ? `Hardcoded reference to ${origin} (currently reachable local dev backend).`
+            : `Hardcoded reference to ${origin}; not reachable at detection time.`,
+        });
+        continue;
+      }
 
       if (known) {
         if (!known.mockable) continue; // already recorded (or will be) via the package-based pass
@@ -549,18 +581,35 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
         reachable = false;
       }
 
-      // A LOCAL host (localhost/127.0.0.1) is almost certainly the app's OWN
-      // dev backend — only worth flagging when it's actually down right now
-      // (the classic "backend isn't running" case); a live local server has
-      // nothing to mock. A REAL external host (third-party or a remote/QA
-      // backend) is flagged regardless of current reachability: mocking it is
-      // about deterministic, offline test runs, not just "is it down".
-      if (LOCAL_HOSTS.has(parsed.hostname) && reachable) continue;
-
       // Capture the host (with port, when present) so scaffold.ts's page.route()
       // fixture can also intercept this same URL at the browser network layer —
       // 'both' means route-intercept AND env-override both apply.
       const host = parsed.host;
+
+      // A LOCAL host (localhost/127.0.0.1) that's reachable right now is
+      // almost certainly the app's OWN live dev backend — nothing to mock
+      // (Mock/Set 2 doesn't need it), but Generate (F-08) still needs its
+      // real origin to route tierC-api requests correctly instead of
+      // assuming same-origin with the frontend, so it's recorded distinctly
+      // rather than suppressed. An unreachable local host (the classic
+      // "backend isn't running" case) falls through to the same handling as
+      // a real external host below, unchanged from today.
+      if (LOCAL_HOSTS.has(parsed.hostname) && reachable) {
+        addDep({
+          id,
+          category: 'local-backend',
+          label: `Local backend API (${varName})`,
+          source: 'env-var',
+          envVar: varName,
+          mockStrategy: 'undeterminable',
+          hostnames: [host],
+          file: f.rel,
+          reachable,
+          note: `Reads ${varName}=${value} (currently reachable local dev backend — route tierC-api requests here directly, no mock needed).`,
+        });
+        continue;
+      }
+
       const category = classifyEnvUrlVar(varName);
 
       addDep({

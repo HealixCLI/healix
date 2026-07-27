@@ -119,7 +119,7 @@ describe('detectExternalDependencies', () => {
     expect(dep?.hostnames).toEqual(['localhost:59999']);
   });
 
-  it('skips a LOCAL backend that is actually up right now (nothing to mock)', async () => {
+  it('records a LOCAL backend that is actually up right now as a distinct local-backend dependency (F-04)', async () => {
     const dir = makeRepo();
     const server = http.createServer((_req, res) => res.end('ok'));
     await new Promise<void>((resolve) => server.listen(0, resolve));
@@ -132,10 +132,59 @@ describe('detectExternalDependencies', () => {
 
     try {
       const deps = await detectExternalDependencies(dir);
+      // Must NOT be suppressed, and must be distinct from a real third-party/backend dependency.
       expect(deps.find((d) => d.category === 'backend')).toBeUndefined();
+      const dep = deps.find((d) => d.category === 'local-backend');
+      expect(dep).toBeDefined();
+      expect(dep?.envVar).toBe('NEXT_PUBLIC_API_URL');
+      expect(dep?.reachable).toBe(true);
+      expect(dep?.hostnames).toEqual([`localhost:${port}`]);
     } finally {
       await new Promise<void>((resolve) => server.close(() => resolve()));
     }
+  });
+
+  it('records a hardcoded LOCAL URL literal in a network call as a local-backend dependency, reachable or not (F-04)', async () => {
+    const dir = makeRepo();
+    const server = http.createServer((_req, res) => res.end('ok'));
+    await new Promise<void>((resolve) => server.listen(0, resolve));
+    const address = server.address();
+    const port = typeof address === 'object' && address !== null ? address.port : 0;
+
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/api.ts', `fetch('http://localhost:${port}/orders');\n`);
+
+    try {
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.category === 'local-backend');
+      expect(dep).toBeDefined();
+      expect(dep?.source).toBe('url-literal');
+      expect(dep?.reachable).toBe(true);
+      expect(dep?.hostnames).toEqual([`localhost:${port}`]);
+    } finally {
+      await new Promise<void>((resolve) => server.close(() => resolve()));
+    }
+  });
+
+  it('records an UNREACHABLE hardcoded local URL literal as local-backend too (no reachability check existed before)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/api.ts', "fetch('http://localhost:59999/orders');\n");
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.category === 'local-backend');
+    expect(dep).toBeDefined();
+    expect(dep?.source).toBe('url-literal');
+    expect(dep?.reachable).toBe(false);
+  });
+
+  it('does NOT flag a hardcoded local URL literal that is just a string constant, not a network call', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/config.ts', "export const devDocsLink = 'http://localhost:59999/docs';\n");
+
+    const deps = await detectExternalDependencies(dir);
+    expect(deps.find((d) => d.category === 'local-backend')).toBeUndefined();
   });
 
   it('detects an env-configured external endpoint under an arbitrary (non "API_URL") name — Vite convention (non-local host, flagged regardless of its — here unreachable — status)', async () => {

@@ -15,6 +15,10 @@ const STATIC_TEMPLATES: Record<ExternalDependencyCategory, MockResponse> = {
   // `undefined` through that pattern and breaks every login-dependent test).
   auth: { status: 200, body: { status: { success: true }, token: 'healix-mock-token' } },
   backend: { status: 200, body: {} },
+  // Never actually served — a 'local-backend' dependency's mockStrategy is always
+  // 'undeterminable' (F-04: it's routed to directly, not mocked), so this entry only
+  // exists to keep this Record exhaustive over ExternalDependencyCategory.
+  'local-backend': { status: 200, body: {} },
   other: { status: 200, body: {} },
 };
 

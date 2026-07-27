@@ -15,6 +15,10 @@ export interface ExplorationArtifact {
   /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
   useful: boolean;
   uselessReason?: string;
+  /** Fraction of routes with fewer than THIN_ROUTE_ELEMENT_THRESHOLD interactive elements — a
+   * degradation signal distinct from `useful` (see assessExplorationUsefulness, F-03/F-06). Present
+   * only when the crawl passed the hard useful/useless gate. */
+  thinRouteRatio?: number;
   /** Real endpoints observed on the wire during the crawl — see GAP-046 and
    * `browser/network-capture.ts`'s `collectObservedEndpoints()`. */
   observedEndpoints: ObservedEndpoint[];

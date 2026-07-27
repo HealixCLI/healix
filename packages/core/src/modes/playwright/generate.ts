@@ -83,6 +83,21 @@ export function formatMockContent(ctx: TestModeContext): string {
   );
 }
 
+/**
+ * Surface a detected LOCAL backend's real origin in tierC-api guidance
+ * regardless of `mockExternalDependencies` (F-08). Without this, a
+ * non-mocked tierC-api item has no visibility into F-04's `local-backend`
+ * dependency category and defaults to a relative path against the frontend's
+ * `baseURL` — wrong whenever the real backend lives on a different origin.
+ */
+function formatLocalBackendGuidance(ctx: TestModeContext): string {
+  const dep = (ctx.externalDependencies ?? []).find((d) => d.category === 'local-backend' && d.reachable);
+  const host = dep?.hostnames?.[0];
+  if (!host) return '';
+  const origin = `http://${host}`;
+  return ` A local backend was detected and confirmed reachable at ${origin} — this is a SEPARATE origin from the frontend's configured baseURL. For tierC-api requests, use this backend's real origin directly instead of a bare relative path: either an absolute URL (e.g. \`await request.get('${origin}/api/...')\`) or a scoped context (\`await request.newContext({ baseURL: '${origin}' })\`). Do NOT assume the frontend's playwright.config.ts baseURL is this backend's origin.`;
+}
+
 /** Same slug transform as templates.ts's roleStorageStatePath — must stay in sync so a role name always resolves to the same file. */
 function roleStorageStateFilename(role: string): string {
   const slug = role
@@ -358,6 +373,40 @@ function hasSrcCitation(source: string, file: string): boolean {
 /** Retry note when the previous attempt used forbidden APIs (deny-list gate). */
 function retryNoteForbidden(violations: string[], allowedImport: string): string {
   return `Your previous output was rejected because it used forbidden APIs: ${violations.join('; ')}. The spec MUST be fully self-contained: import ONLY from '${allowedImport}'; never import or require any other module; never touch the filesystem, spawn processes, use eval/new Function, or call process.exit.`;
+}
+
+/** Matches a literal 3xx status assertion, e.g. `expect(response.status()).toBe(302)`. */
+const REDIRECT_STATUS_LITERAL_RE = /\.status\(\)\s*\)\.toBe\(\s*3\d\d\s*\)/;
+/** Matches a 3xx range-style assertion, e.g. `expect(response.status()).toBeGreaterThanOrEqual(300)`. */
+const REDIRECT_STATUS_RANGE_RE = /\.status\(\)\s*\)\.toBeGreaterThanOrEqual\(\s*3\d\d\s*\)/;
+
+/**
+ * F-09: a test asserting a 3xx-range status via the `request` fixture is asserting on
+ * something Playwright's `request` fixture will never actually let it observe unless the
+ * request call itself passes `{ maxRedirects: 0 }` — Playwright auto-follows redirects by
+ * default, so without this option the test always sees the FINAL response after every
+ * redirect, never the intermediate 3xx it thinks it's checking. Checked per test.describe
+ * block (via splitTestBlocks, same primitive demoteEscapeHatchBlocks uses) rather than
+ * globally, so one test's 3xx assertion doesn't get satisfied by another test's unrelated
+ * `maxRedirects: 0` elsewhere in the same spec file.
+ */
+function findMissingMaxRedirects(source: string): string[] {
+  const findings: string[] = [];
+  for (const block of splitTestBlocks(source)) {
+    const assertsRedirectStatus =
+      REDIRECT_STATUS_LITERAL_RE.test(block.body) || REDIRECT_STATUS_RANGE_RE.test(block.body);
+    if (!assertsRedirectStatus) continue;
+    if (/maxRedirects\s*:\s*0\b/.test(block.body)) continue;
+    findings.push(
+      'a test asserts a 3xx-range response status but its request call is missing `{ maxRedirects: 0 }` — without it, Playwright auto-follows the redirect and the test will never actually observe that status',
+    );
+  }
+  return findings;
+}
+
+/** Retry note when the previous attempt asserted a 3xx status without `maxRedirects: 0` (F-09). */
+function retryNoteMissingMaxRedirects(): string {
+  return "Your previous output was rejected because it asserted a 3xx-range response status without passing `{ maxRedirects: 0 }` on the request call. Playwright's `request` fixture auto-follows redirects by default, so without this option your test will always see the FINAL response after the redirect, never the 3xx status itself. Add `maxRedirects: 0` to the SAME request call whose response status you assert against, e.g. `await request.post(url, { maxRedirects: 0, ... })`.";
 }
 
 // ---- Grounding-validation gate ------------------------------------------------
@@ -651,6 +700,28 @@ export function findUngroundedReferences(
     const label = `getByText("${unmatched.join('|')}") not found in the observed accessible-name inventory`;
     if (inventoryKnown && !gt.inventoryTruncated && !hasEscapeHatch) hard.push(label);
     else warn.push(label);
+  }
+
+  // F-07: a BARE getByText(...) whose text is shared by more than one distinct role in the
+  // observed inventory (e.g. an <h1> and a <button> with the same visible text) is a
+  // guaranteed Playwright strict-mode violation, independent of whether the text is grounded —
+  // grounded-but-ambiguous is still broken. Checked as its own pass since it can fire for TEXT
+  // that DID match above (this isn't a hallucination, it's an ambiguity). A locator already
+  // narrowed with .first()/.nth()/.filter(...) right after the getByText(...) call is exempt.
+  for (const m of source.matchAll(TEXT_CALL_RE)) {
+    const alternatives = m[1] ? splitTextAlternatives(m[1]) : [normalizeText(m[2] ?? '')];
+    const matchEnd = (m.index ?? 0) + m[0].length;
+    const tail = source.slice(matchEnd, matchEnd + 40);
+    const isNarrowed = /^\s*\)\s*\.\s*(first|nth|filter)\s*\(/.test(tail);
+    if (isNarrowed) continue;
+    for (const alt of alternatives) {
+      if (!alt) continue;
+      const roles = gt.roleByName.get(alt);
+      if (!roles || roles.size <= 1) continue;
+      const label = `getByText("${alt}") is ambiguous — shared by multiple elements with different roles (${[...roles].join('/')}) and WILL throw a Playwright strict-mode violation unless narrowed (e.g. .filter({ hasText: ... }).first(), a role-qualified locator, or .first()/.nth())`;
+      if (!hasEscapeHatch) hard.push(label);
+      else warn.push(label);
+    }
   }
 
   for (const m of source.matchAll(MOCK_OVERRIDE_RE)) {
@@ -1152,7 +1223,7 @@ function buildPrompt(
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. `expect(response.status()).not.toBe(200)`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the `multipart` option on the request call (e.g. `await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.'
+      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}`
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';
@@ -1404,6 +1475,14 @@ interface ValidationOutcome {
    * (see InventoryOpts.expand).
    */
   hallucinated?: boolean;
+  /**
+   * True when this item's DOM inventory (post selectInventoryElements, at the SAME expand
+   * setting as this attempt) had to omit elements for length — there was more real context not
+   * shown. F-10: generateOne widens the retry inventory whenever a rejection happens AND this is
+   * true, regardless of rejection reason — not just on a hallucinated-selector rejection — since a
+   * thin/truncated inventory is just as plausibly the root cause of any other rejection reason.
+   */
+  inventoryTruncated?: boolean;
 }
 
 /**
@@ -1428,19 +1507,25 @@ async function validateAndPersist(
   const extraAllowedImport = ctx.mockExternalDependencies
     ? MOCK_FIXTURE_IMPORT_PATH
     : ACTION_HIGHLIGHTER_IMPORT_PATH;
+  // Computed once up front (not just at the grounding gate further down) so EVERY rejection
+  // reason — not only a hallucinated selector — can report whether this attempt's inventory was
+  // truncated (see ValidationOutcome.inventoryTruncated, F-10).
+  const groundTruth = collectGroundTruth(ctx, tier, item, opts);
+  const inventoryTruncated = groundTruth.inventoryTruncated;
 
   let source = stripCodeFences(text);
   if (!source) {
-    return { spec: null, reason: 'empty output' };
+    return { spec: null, reason: 'empty output', inventoryTruncated };
   }
   if (!looksLikePlaywrightSpec(source, extraAllowedImport)) {
-    return { spec: null, reason: 'did not look like a Playwright spec' };
+    return { spec: null, reason: 'did not look like a Playwright spec', inventoryTruncated };
   }
   if (!hasExpect(source)) {
     return {
       spec: null,
       reason: 'no valid spec with an expect(...)',
       retryNote: RETRY_NOTE_NO_EXPECT,
+      inventoryTruncated,
     };
   }
 
@@ -1451,6 +1536,7 @@ async function validateAndPersist(
       spec: null,
       reason: `only ${actualTestCases}/${expectedScenarios} scenario(s) covered`,
       retryNote: retryNoteMissingScenarios(expectedScenarios, actualTestCases),
+      inventoryTruncated,
     };
   }
 
@@ -1462,6 +1548,7 @@ async function validateAndPersist(
       spec: null,
       reason: `[REQ:${reqTag}] missing from individual test titles`,
       retryNote: retryNoteMissingPerTestTag(reqTag),
+      inventoryTruncated,
     };
   }
 
@@ -1474,6 +1561,7 @@ async function validateAndPersist(
       spec: null,
       reason: `missing [SRC:${matchedUnit.file}] citation`,
       retryNote: retryNoteMissingSrcCitation(matchedUnit.file),
+      inventoryTruncated,
     };
   }
 
@@ -1485,13 +1573,27 @@ async function validateAndPersist(
       reason: `forbidden APIs in generated spec: ${violations.join('; ')}`,
       violations,
       retryNote: retryNoteForbidden(violations, extraAllowedImport ?? '@playwright/test'),
+      inventoryTruncated,
     };
+  }
+
+  // F-09: a tierC-api spec asserting a 3xx status must pass maxRedirects: 0 on the same
+  // request call, or the assertion can never actually observe that status.
+  if (tier === 'tierC-api') {
+    const missingMaxRedirects = findMissingMaxRedirects(source);
+    if (missingMaxRedirects.length > 0) {
+      return {
+        spec: null,
+        reason: `redirect assertion missing maxRedirects: 0: ${missingMaxRedirects.join('; ')}`,
+        retryNote: retryNoteMissingMaxRedirects(),
+        inventoryTruncated,
+      };
+    }
   }
 
   // Grounding-validation gate: catches selectors/endpoints the model wrote that don't
   // correspond to anything actually observed during EXPLORE (or statically detected for
   // mocks) — see findUngroundedReferences' doc comment for the hard/warn severity split.
-  const groundTruth = collectGroundTruth(ctx, tier, item, opts);
   const { hard: ungroundedHard, warn: ungroundedWarn } = findUngroundedReferences(source, groundTruth);
   if (ungroundedHard.length > 0) {
     return {
@@ -1500,6 +1602,7 @@ async function validateAndPersist(
       retryNote: retryNoteUngrounded(ungroundedHard, groundTruth),
       ungroundedWarn,
       hallucinated: true,
+      inventoryTruncated,
     };
   }
 
@@ -1598,7 +1701,10 @@ async function generateOne(
     retryNote = validated.retryNote ?? null;
     lastReason = validated.reason ? `${validated.reason} after retry` : lastReason;
     lastViolations = validated.violations ?? lastViolations;
-    if (validated.hallucinated) expandInventory = true;
+    // F-10: widen on ANY rejection when this attempt's inventory was truncated, not just a
+    // hallucinated-selector rejection — a thin/truncated inventory is just as plausibly the root
+    // cause of a missing-expect, forbidden-API, or any other rejection reason.
+    if (validated.hallucinated || validated.inventoryTruncated) expandInventory = true;
   }
 
   return { spec: null, reason: lastReason, violations: lastViolations, providerFailureDetail };
@@ -1805,7 +1911,7 @@ function buildBatchPrompt(items: TestPlanItem[], ctx: TestModeContext, tier: Tie
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? 'This is an API/backend test: use the `request` fixture (e.g. `await request.get(...)`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. `expect(response.status()).not.toBe(200)`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the `multipart` option on the request call (e.g. `await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.'
+      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}`
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
         : 'This is a public flow requiring no authentication.';

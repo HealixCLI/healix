@@ -71,7 +71,15 @@ export interface TargetAdapter {
 }
 
 /** Broad kind of external dependency, used to pick a plausible canned mock response. */
-export type ExternalDependencyCategory = 'sms' | 'email' | 'payment' | 'auth' | 'otp' | 'backend' | 'other';
+export type ExternalDependencyCategory =
+  | 'sms'
+  | 'email'
+  | 'payment'
+  | 'auth'
+  | 'otp'
+  | 'backend'
+  | 'local-backend'
+  | 'other';
 
 /** How a dependency was discovered. */
 export type ExternalDependencySource = 'package' | 'url-literal' | 'env-var';
@@ -106,7 +114,7 @@ export interface ExternalDependency {
   envVar?: string;
   /** Source file the dependency was detected in, when applicable. */
   file?: string;
-  /** For category 'backend': whether the resolved URL was reachable at detection time. */
+  /** For category 'backend'/'local-backend': whether the resolved URL was reachable at detection time. */
   reachable?: boolean;
   /** Human-readable explanation, e.g. why a dependency is undeterminable. */
   note?: string;

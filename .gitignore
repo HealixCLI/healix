@@ -16,6 +16,10 @@ out/
 *.log
 .DS_Store
 coverage/
+# Playwright's own HTML/JSON reporter output when the real-Playwright
+# integration tests (execute.integration.test.ts) are run from a package dir
+# directly instead of an os-tmpdir scaffold.
+test-results/
 # Persisted source-context artifact written into a project's own repoPath by
 # target/context-store.ts; also created here when a test uses repoPath: process.cwd().
 .healix/

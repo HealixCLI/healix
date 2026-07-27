@@ -527,10 +527,16 @@ interface PwResult {
   errors?: PwError[];
   attachments?: PwAttachment[];
 }
+interface PwAnnotation {
+  type?: string;
+  description?: string;
+}
 interface PwTest {
   status?: string;
   projectName?: string;
   results?: PwResult[];
+  /** Playwright's own `test.skip(condition, 'reason')`/`test.fixme(...)` annotations, when the test/suite provided one. */
+  annotations?: PwAnnotation[];
 }
 interface PwSpec {
   title?: string;
@@ -669,6 +675,20 @@ function errorText(result: PwResult | undefined): string {
   return '';
 }
 
+/**
+ * Recovers WHY a test was skipped, from Playwright's own `test.skip(cond,
+ * 'reason')` / `test.fixme(cond, 'reason')` annotations — QA-requested
+ * visibility for a 'skipped' Results row, which otherwise shows no
+ * indication of why the test never actually ran. Returns undefined when the
+ * test carries no skip/fixme annotation, or the annotation has no
+ * description (a bare `test.skip()` with no reason given).
+ */
+function extractSkipReason(test: PwTest): string | undefined {
+  const annotation = (test.annotations ?? []).find((a) => a.type === 'skip' || a.type === 'fixme');
+  const description = annotation?.description?.trim();
+  return description && description.length > 0 ? description : undefined;
+}
+
 const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
 // Playwright still writes a video file when the page never repainted before
 // the context closed (a very fast test, or one that only ever saw about:blank)
@@ -722,6 +742,8 @@ export interface CheckpointEntry {
   status: string;
   durationMs?: number;
   error?: string;
+  /** Why a 'skipped' entry was skipped (see ExecResultItem.skipReason's own doc comment). */
+  skipReason?: string;
 }
 
 function checkpointFilePath(projectDir: string): string {
@@ -873,6 +895,7 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
       durationMs: entry.durationMs,
       error: errText || undefined,
       specFile: entry.specFile,
+      skipReason: status === 'skipped' ? entry.skipReason : undefined,
     });
     switch (status) {
       case 'passed':
@@ -949,6 +972,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
 
     let worst: TestStatus = 'pending';
     let worstError = '';
+    let worstSkipReason: string | undefined;
     let totalDuration = 0;
     let artifacts: string[] = [];
     let isFlaky = false;
@@ -991,6 +1015,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       if ((STATUS_PRIORITY[status] ?? 0) >= (STATUS_PRIORITY[worst] ?? 0)) {
         worst = status;
         if (status === 'failed' || status === 'blocked') worstError = errText;
+        worstSkipReason = status === 'skipped' ? extractSkipReason(test) : undefined;
         const a = collectArtifactPaths(last?.attachments);
         if (a.length > 0) artifacts = a;
       }
@@ -1011,6 +1036,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       error: worstError || undefined,
       artifacts: artifacts.length > 0 ? artifacts : undefined,
       specFile: spec.file ?? suiteFile,
+      skipReason: worstSkipReason,
     };
     results.push(item);
 

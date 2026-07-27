@@ -152,6 +152,7 @@ describe('shapeRunShow', () => {
         description: null,
         details: null,
         stepsJson: null,
+        skipReason: null,
       },
     ];
 

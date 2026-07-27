@@ -9,3 +9,12 @@
  * true later shows full history, nothing is lost while it's off.
  */
 export const SHOW_TOKEN_USAGE = true;
+
+/**
+ * Master switch for the results-page Repair button (RunDetailPanel). Held
+ * back for a later release — set true to re-enable. All underlying code
+ * (startRepair, the runs:repairCandidates IPC handler, matchRepairCandidates)
+ * stays fully intact and functional while this is off; only the button's
+ * render is gated.
+ */
+export const SHOW_REPAIR_ACTION = false;

@@ -547,11 +547,11 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toEqual([]);
   });
 
-  it('does not spend route-discovery click budget on a page while the link-following queue still has 5+ pending URLs, but still deep-probes it (GAP-055)', async () => {
+  it('does not spend route-discovery click budget on a page while the link-following queue still has 5+ pending URLs, but still deep-probes it (GAP-056)', async () => {
     // The link-queue-thin gate exists to avoid GUESSING at a new route via a click when there
     // are plenty of real links left to follow — a route-discovery-specific tradeoff. It does NOT
     // apply to deep-probing (looking for a same-URL modal/panel behind a button on THIS page,
-    // see GAP-055): a live audit found exactly this shape on a page that had plenty of other
+    // see GAP-056): a live audit found exactly this shape on a page that had plenty of other
     // content too, so gating deep-probing on "is the link queue idle" would keep missing it.
     const extraNav = button('Extra Nav');
     const recordClicks: string[] = [];
@@ -664,7 +664,7 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
   });
 });
 
-describe('crawl() deep-probes for modal/multi-step state (GAP-055)', () => {
+describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
   it('records a same-URL click that reveals a materially larger DOM as its own state, then reverts', async () => {
     // A thin page (< 5 elements) whose "Manage wallet" button opens a modal with 6 real
     // interactive elements — the exact wallet/subscription-panel shape the plain click-probing
@@ -780,7 +780,13 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-055)', () => {
       button('Z9'),
       button('Z10'),
     ];
-    const level3 = [button('past-depth-cap-1'), button('past-depth-cap-2'), button('past-depth-cap-3'), button('past-depth-cap-4'), button('past-depth-cap-5')];
+    const level3 = [
+      button('past-depth-cap-1'),
+      button('past-depth-cap-2'),
+      button('past-depth-cap-3'),
+      button('past-depth-cap-4'),
+      button('past-depth-cap-5'),
+    ];
     const recordTypes: string[] = [];
     const browser = makeFakeBrowser({
       pages: { 'https://a.test/dashboard': { elements: [openWallet] } },
@@ -1190,6 +1196,69 @@ describe('crawl() non-semantic clickable elements are click-probe eligible (GAP-
     await crawl(browser, 'https://a.test/');
 
     expect(recordClicks).not.toContain(deleteTrigger.selector);
+  });
+});
+
+describe('crawl() drops over-long generic candidate names to avoid crowding real targets out of the probe slice (GAP-057)', () => {
+  it('excludes a role: generic candidate whose name exceeds the length cap', async () => {
+    // A pointer-styled CONTAINER (widened discovery from GAP-057's '*' scan) whose textContent
+    // swept up a whole panel's text, not a real click target.
+    const container: InteractiveElement = {
+      role: 'generic',
+      name: 'x'.repeat(61),
+      selector: 'div.panel',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [container] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).not.toContain(container.selector);
+  });
+
+  it('keeps a role: generic candidate whose name is exactly at the length cap (boundary)', async () => {
+    const atLimit: InteractiveElement = {
+      role: 'generic',
+      name: 'x'.repeat(60),
+      selector: 'div.at-limit',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [atLimit] },
+        'https://a.test/modal': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/modal' },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(atLimit.selector);
+  });
+
+  it('never applies the length cap to a semantic button candidate, however long its name', async () => {
+    const longButton: InteractiveElement = {
+      role: 'button',
+      name: 'y'.repeat(300),
+      selector: 'button.long-name',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [longButton] },
+        'https://a.test/modal': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/modal' },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(longButton.selector);
   });
 });
 

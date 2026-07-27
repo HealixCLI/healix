@@ -642,7 +642,7 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
   });
 });
 
-// --- Mirrored GAP-053 (non-semantic clickable element) detection ---
+// --- Mirrored GAP-053/GAP-057 (non-semantic clickable element) detection ---
 
 /** Mirrors `isSemanticInteractive()`. */
 function isSemanticInteractiveMirror(el: FakeEl): boolean {
@@ -664,6 +664,96 @@ function hasInteractiveAncestorMirror(el: FakeEl, seen: Set<FakeEl>): boolean {
   return false;
 }
 
+/** Mirrors the NEW `el.querySelector(INTERACTIVE_ELEMENT_SELECTOR)` descendant check (GAP-057) —
+ * does `el` WRAP a real interactive element (e.g. a `<label>` around a checkbox, or a
+ * cursor-pointer `<div>` around a `<button>`). `hasInteractiveAncestorMirror` only walks up; this
+ * walks down, fixing the duplicate-capture direction that was previously unguarded. */
+function hasInteractiveDescendantMirror(el: FakeEl): boolean {
+  return el.children.some(
+    (child) => isSemanticInteractiveMirror(child) || hasInteractiveDescendantMirror(child),
+  );
+}
+
+/** Verbatim copy of `NON_CLICKABLE_TAGS` from selectors.ts — see that file for the full,
+ * grouped/commented list and rationale. Kept in sync manually per this file's stated
+ * byte-for-byte mirroring convention. */
+const NON_CLICKABLE_TAGS_MIRROR = new Set([
+  'html',
+  'head',
+  'body',
+  'script',
+  'style',
+  'link',
+  'meta',
+  'title',
+  'base',
+  'noscript',
+  'template',
+  'br',
+  'hr',
+  'source',
+  'track',
+  'param',
+  'col',
+  'wbr',
+  'iframe',
+  'canvas',
+  'video',
+  'audio',
+  'object',
+  'embed',
+  'map',
+  'area',
+  'svg',
+  'path',
+  'g',
+  'defs',
+  'use',
+  'circle',
+  'rect',
+  'line',
+  'polyline',
+  'polygon',
+  'ellipse',
+  'tspan',
+  'lineargradient',
+  'radialgradient',
+  'stop',
+  'clippath',
+  'mask',
+  'filter',
+  'symbol',
+  'marker',
+  'desc',
+  'foreignobject',
+]);
+
+/** Mirrors `accessibleName()`'s fallback chain, restricted to what `FakeEl.attrs` can express
+ * (aria-label -> textContent -> title -> alt; `aria-labelledby`'s id-lookup and input
+ * value/placeholder are out of scope for these fixtures). */
+function accessibleNameMirror(el: FakeEl): string {
+  const ariaLabel = el.attrs['aria-label'];
+  if (ariaLabel && ariaLabel.trim()) return clamp(ariaLabel);
+  const text = (el.textContent ?? '').trim();
+  if (text) return clamp(text);
+  const title = el.attrs['title'];
+  if (title && title.trim()) return clamp(title);
+  const alt = el.attrs['alt'];
+  if (alt && alt.trim()) return clamp(alt);
+  return '';
+}
+
+/** Pre-order DFS over a `FakeEl` tree — a faithful mirror of `querySelectorAll('*')`'s
+ * document-order traversal, replacing the old hand-picked `candidates` array (which never
+ * actually mirrored tag/selector matching at all — see the GAP-057 fix note below). */
+function descendantsInDocumentOrder(root: FakeEl): FakeEl[] {
+  const out: FakeEl[] = [root];
+  for (const child of root.children) {
+    out.push(...descendantsInDocumentOrder(child));
+  }
+  return out;
+}
+
 interface GenericClickResult {
   role: 'generic';
   name: string;
@@ -671,42 +761,53 @@ interface GenericClickResult {
 }
 
 /**
- * Mirrors `collectInteractiveElements()`'s second pass over
- * GENERIC_CLICK_CANDIDATE_SELECTOR (div/span/li/td/tr/[onclick]): visible,
- * non-empty text, no semantic-interactive OR already-collected ancestor, cursor:pointer.
- * `seen` accumulates across `candidates` in order, mirroring document-order iteration.
+ * Mirrors `collectInteractiveElements()`'s second pass (GAP-053, widened to '*' + a structural
+ * denylist by GAP-057), in the SAME cheapest-first order as the real code: denylisted tag -> not
+ * cursor:pointer/no onclick attr -> hidden -> empty text (with accessibleName fallback) ->
+ * semantic/already-seen ancestor -> interactive descendant. `seen` accumulates across nodes in
+ * document order, mirroring real iteration order.
+ *
+ * GAP-057 fix note: the PRIOR version of this mirror took a hand-picked `candidates: FakeEl[]`
+ * array and never checked tag/selector matching at all — a `<p cursor:pointer>` fixture would
+ * have passed even against the UNFIXED source, since nothing here ever asked "does this element's
+ * tag actually match the selector". This version derives real candidates via
+ * `descendantsInDocumentOrder` + the denylist, so a test asserting a new tag is captured is only
+ * meaningful because this mirror can actually reject the wrong tags too.
  */
-function collectGenericClickCandidatesMirror(root: FakeEl[], candidates: FakeEl[]): GenericClickResult[] {
+function collectGenericClickCandidatesMirror(root: FakeEl): GenericClickResult[] {
   const out: GenericClickResult[] = [];
   const seen = new Set<FakeEl>();
-  for (const el of candidates) {
+  for (const el of descendantsInDocumentOrder(root)) {
+    if (seen.has(el)) continue;
+    if (NON_CLICKABLE_TAGS_MIRROR.has(el.tagName.toLowerCase())) continue;
+    if (el.cursor !== 'pointer' && el.attrs['onclick'] === undefined) continue;
     if (el.hidden) continue;
-    const text = clamp(el.textContent ?? '');
-    if (!text) continue;
+    const name = accessibleNameMirror(el);
+    if (!name) continue;
     if (hasInteractiveAncestorMirror(el, seen)) continue;
-    if (el.cursor !== 'pointer') continue;
+    if (hasInteractiveDescendantMirror(el)) continue;
     seen.add(el);
-    out.push({ role: 'generic', name: text, selector: selectorForMirror(root, el).selector });
+    out.push({ role: 'generic', name, selector: selectorForMirror([root], el).selector });
   }
   return out;
 }
 
-describe('selectors.GAP-053 non-semantic clickable elements (mirrored)', () => {
+describe('selectors.GAP-053/GAP-057 non-semantic clickable elements (mirrored)', () => {
   it('captures a cursor-pointer div with an onclick-shaped handler and visible text as role generic', () => {
     const trigger = fakeEl('div', { textContent: 'Zmeniť', cursor: 'pointer' });
-    const result = collectGenericClickCandidatesMirror([trigger], [trigger]);
+    const result = collectGenericClickCandidatesMirror(trigger);
     expect(result).toEqual([{ role: 'generic', name: 'Zmeniť', selector: expect.any(String) }]);
   });
 
   it('does not capture a cursor-pointer wrapper with no visible text', () => {
     const wrapper = fakeEl('div', { cursor: 'pointer' });
-    const result = collectGenericClickCandidatesMirror([wrapper], [wrapper]);
+    const result = collectGenericClickCandidatesMirror(wrapper);
     expect(result).toEqual([]);
   });
 
   it('does not capture a div with text but no cursor:pointer styling', () => {
     const plain = fakeEl('div', { textContent: 'Just some text' });
-    const result = collectGenericClickCandidatesMirror([plain], [plain]);
+    const result = collectGenericClickCandidatesMirror(plain);
     expect(result).toEqual([]);
   });
 
@@ -715,22 +816,149 @@ describe('selectors.GAP-053 non-semantic clickable elements (mirrored)', () => {
     const innerSpan = fakeEl('span', { textContent: 'Export', cursor: 'pointer' });
     appendChild(button, innerSpan);
 
-    const result = collectGenericClickCandidatesMirror([button], [innerSpan]);
+    const result = collectGenericClickCandidatesMirror(button);
     expect(result).toEqual([]);
   });
 
   it('does not double-capture nested cursor-pointer wrapper layers around one logical click target', () => {
     // A card with 3 nested cursor-pointer divs (common in real apps — Herfy's reward
-    // cards) is ONE click target, not 3 — only the outermost (first in document order,
-    // i.e. first in `candidates`) should survive.
+    // cards) is ONE click target, not 3 — only the outermost (first in document order)
+    // should survive.
     const outer = fakeEl('div', { textContent: '100 Off reward', cursor: 'pointer' });
     const middle = fakeEl('div', { textContent: '100 Off reward', cursor: 'pointer' });
     const inner = fakeEl('div', { textContent: '100 Off reward', cursor: 'pointer' });
     appendChild(outer, middle);
     appendChild(middle, inner);
 
-    const result = collectGenericClickCandidatesMirror([outer], [outer, middle, inner]);
+    const result = collectGenericClickCandidatesMirror(outer);
     expect(result).toEqual([{ role: 'generic', name: '100 Off reward', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: captures a cursor-pointer <p> with text — the live C&A regression case', () => {
+    // C&A's account-settings panel used <p> for change-password/change-name/delete-account
+    // triggers — invisible to GAP-053's div/span/li/td/tr allowlist entirely.
+    const trigger = fakeEl('p', { textContent: 'Zmeniť heslo', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(trigger);
+    expect(result).toEqual([{ role: 'generic', name: 'Zmeniť heslo', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: captures a heading used as a clickable accordion toggle', () => {
+    const heading = fakeEl('h3', { textContent: 'Shipping details', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(heading);
+    expect(result).toEqual([{ role: 'generic', name: 'Shipping details', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: captures a cursor-pointer <img> using its alt text as the name (no textContent possible)', () => {
+    const icon = fakeEl('img', { attrs: { alt: 'Edit profile' }, cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(icon);
+    expect(result).toEqual([{ role: 'generic', name: 'Edit profile', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: an <img> with no alt/aria-label/title still yields no name and is not captured', () => {
+    // Regression guard: the accessibleName fallback must not start fabricating names for
+    // genuinely unlabeled icons.
+    const icon = fakeEl('img', { cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(icon);
+    expect(result).toEqual([]);
+  });
+
+  it('GAP-057: captures a bare <a> with no href — invisible to INTERACTIVE_ELEMENT_SELECTOR (a[href]) too', () => {
+    const jsLink = fakeEl('a', { textContent: 'My account', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(jsLink);
+    expect(result).toEqual([{ role: 'generic', name: 'My account', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: captures an arbitrary custom element styled cursor:pointer, proving the allowlist is gone', () => {
+    const tile = fakeEl('cx-tile', { textContent: 'Promo card', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(tile);
+    expect(result).toEqual([{ role: 'generic', name: 'Promo card', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: a second, unrelated custom element tag is also captured (not a substring/prefix match fluke)', () => {
+    const item = fakeEl('ion-item', { textContent: 'Settings', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(item);
+    expect(result).toEqual([{ role: 'generic', name: 'Settings', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: a denylisted tag is excluded even with cursor:pointer AND text (denylist short-circuits first)', () => {
+    const script = fakeEl('script', { textContent: 'window.onclick = doThing', cursor: 'pointer' });
+    const result = collectGenericClickCandidatesMirror(script);
+    expect(result).toEqual([]);
+  });
+
+  it('GAP-057: an SVG <path> inside a pointer-styled icon is excluded (denylist, not just ancestor check)', () => {
+    const path = fakeEl('path', { textContent: '', cursor: 'pointer', attrs: { d: 'M0 0' } });
+    const result = collectGenericClickCandidatesMirror(path);
+    expect(result).toEqual([]);
+  });
+
+  it('GAP-057: an element with a literal onclick attribute but no cursor:pointer styling is still captured', () => {
+    // Preserves [onclick]'s one real value: legacy/server-rendered markup with an inline
+    // handler but no CSS cursor styling.
+    const legacy = fakeEl('p', { textContent: 'Delete', attrs: { onclick: 'doDelete()' } });
+    const result = collectGenericClickCandidatesMirror(legacy);
+    expect(result).toEqual([{ role: 'generic', name: 'Delete', selector: expect.any(String) }]);
+  });
+
+  it('GAP-057: an element with neither cursor:pointer nor onclick is excluded', () => {
+    const inert = fakeEl('p', { textContent: 'Just static text' });
+    const result = collectGenericClickCandidatesMirror(inert);
+    expect(result).toEqual([]);
+  });
+
+  it('GAP-057: does not double-capture a cursor-pointer <label> wrapping a checkbox (descendant dedup)', () => {
+    const label = fakeEl('label', { textContent: 'Remember me', cursor: 'pointer' });
+    const checkbox = fakeEl('input', {});
+    appendChild(label, checkbox);
+    const result = collectGenericClickCandidatesMirror(label);
+    expect(result).toEqual([]);
+  });
+
+  it('GAP-057: does not double-capture a cursor-pointer <div> wrapping a real <button> (descendant dedup, div variant)', () => {
+    const card = fakeEl('div', { textContent: 'Export', cursor: 'pointer' });
+    const button = fakeEl('button', { textContent: 'Export' });
+    appendChild(card, button);
+    const result = collectGenericClickCandidatesMirror(card);
+    expect(result).toEqual([]);
+  });
+
+  it('GAP-057: descendant dedup is not shallow — a 2-level-nested real control is still detected', () => {
+    const outer = fakeEl('div', { textContent: 'Card', cursor: 'pointer' });
+    const middle = fakeEl('div', { cursor: 'pointer' });
+    const input = fakeEl('input', {});
+    appendChild(outer, middle);
+    appendChild(middle, input);
+    const result = collectGenericClickCandidatesMirror(outer);
+    expect(result).toEqual([]);
+  });
+
+  it(
+    'GAP-057: an element inside an already-captured ancestor is excluded via the ancestor path alone ' +
+      '(no interactive descendant of its own, isolating which check is responsible)',
+    () => {
+      // Unlike the descendant-dedup cases above, `middle` wraps nothing interactive — if the
+      // ancestor check were ever skipped, the descendant check would NOT catch this case either,
+      // so a passing result here is attributable only to the (existing, cheaper) ancestor check.
+      const outer = fakeEl('div', { textContent: 'Outer card', cursor: 'pointer' });
+      const middle = fakeEl('div', { textContent: 'Middle wrapper', cursor: 'pointer' });
+      appendChild(outer, middle);
+      const result = collectGenericClickCandidatesMirror(outer);
+      expect(result).toEqual([{ role: 'generic', name: 'Outer card', selector: expect.any(String) }]);
+    },
+  );
+
+  it('GAP-057: textContent is never read on an element that fails the cursor/onclick check (ordering-as-contract)', () => {
+    let textContentRead = false;
+    const spyEl = fakeEl('p', { cursor: undefined });
+    Object.defineProperty(spyEl, 'textContent', {
+      get() {
+        textContentRead = true;
+        return 'should never be read';
+      },
+    });
+    const result = collectGenericClickCandidatesMirror(spyEl);
+    expect(result).toEqual([]);
+    expect(textContentRead).toBe(false);
   });
 });
 

@@ -13,7 +13,7 @@ export interface CrawledRoute {
    * used to reach it (e.g. `"https://x/#/dashboard>>[data-testid=wallet-tab]"`). Absent for a
    * normal top-level route, whose identity is its `url` alone. Exists because the crawl's only
    * prior notion of "state" was the URL — a same-URL modal/tab had nowhere to be recorded once
-   * discovered, so it was always discarded after a single probing click (see GAP-055).
+   * discovered, so it was always discarded after a single probing click (see GAP-056).
    */
   stateKey?: string;
   hasPasswordField: boolean;
@@ -201,16 +201,31 @@ const STATE_REVEAL_MIN_NEW_ELEMENTS = 5;
  * design, not a bug in `fillSafeInputs`. */
 const OTP_HINT_RE = /otp|verification.?code|one.?time|\b2fa\b|\bmfa\b/i;
 
+/**
+ * A `role: 'generic'` candidate's accessible name longer than this is almost certainly a
+ * pointer-styled CONTAINER whose `textContent` swept up a whole panel/card, not a real click
+ * target (a genuine non-semantic control is a short label — "Zmeniť heslo", "Export", "Môj účet").
+ * GAP-057 widened generic-candidate discovery from a fixed tag allowlist to any tag (pruned by a
+ * structural denylist + the `cursor:pointer` gate), which can surface more such containers; this
+ * keeps them from crowding real candidates out of the fixed `CLICK_CANDIDATES_PER_PAGE` slice
+ * below, without needing to raise the slice size itself (see the budget note at the top of this
+ * file — that budget was already retuned once for GAP-053 and shouldn't be spent twice on
+ * speculation). Semantic roles (`button`/`link`) are never subject to this cap — a long button
+ * name is still a real button.
+ */
+const GENERIC_CANDIDATE_NAME_MAX_LENGTH = 60;
+
 function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
   return (
     snapshot.interactiveElements
-      // 'generic' includes GAP-053's non-semantic cursor-pointer div/span click
-      // targets — eligible for the same click-probing under the same safety
-      // filters below (disabled, non-submit, UNSAFE_CLICK_TEXT_RE).
+      // 'generic' includes GAP-053/GAP-057's non-semantic cursor-pointer click targets —
+      // eligible for the same click-probing under the same safety filters below (disabled,
+      // non-submit, UNSAFE_CLICK_TEXT_RE).
       .filter((el) => el.role === 'button' || el.role === 'generic' || (el.role === 'link' && !el.href))
       .filter((el) => !el.disabled)
       .filter((el) => el.buttonType !== 'submit')
       .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
+      .filter((el) => el.role !== 'generic' || el.name.length <= GENERIC_CANDIDATE_NAME_MAX_LENGTH)
       .slice(0, CLICK_CANDIDATES_PER_PAGE)
   );
 }
@@ -228,7 +243,7 @@ export interface ClickDiscoveryResult {
 }
 
 /** Enables the deep-probe behavior in `discoverClickRoutes` — engaged on every route (see
- * GAP-055; NOT gated on the route's own element count), bounded instead by
+ * GAP-056; NOT gated on the route's own element count), bounded instead by
  * MAX_STATE_PROBES_PER_CRAWL/MAX_STATE_DEPTH and by STATE_REVEAL_MIN_NEW_ELEMENTS only ever
  * recording a click that reveals a real, materially larger state. */
 interface DeepProbeOpts {
@@ -260,7 +275,7 @@ interface DeepProbeOpts {
  * Escape-reverted) — leaving every login attempt to wrongly fill in the
  * registration form instead (the exact bug this guards against).
  *
- * When `opts.deepProbe` is set (engaged on every route, see GAP-055), a same-URL click that
+ * When `opts.deepProbe` is set (engaged on every route, see GAP-056), a same-URL click that
  * reveals a MATERIALLY LARGER DOM state (>= STATE_REVEAL_MIN_NEW_ELEMENTS more interactive
  * elements than a small dropdown/menu — those still fall through to the ordinary harvest-and-
  * revert branch) is instead recorded as its own `CrawledRoute` (keyed by `stateKey`, not `url`,
@@ -580,7 +595,7 @@ export async function crawl(
     // GAP-042). Only probe once the link queue is running thin — following a
     // real link is cheaper and safer than guessing at a click target.
     const wantsClickProbe = remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD;
-    // Every route is deep-probe eligible (see GAP-055) — NOT gated on this route's own element
+    // Every route is deep-probe eligible (see GAP-056) — NOT gated on this route's own element
     // count. A live audit of the real C&A app found a healthy, well-populated "My account" page
     // whose "change password" button still reveals an un-grounded same-URL form; gating on
     // route-thinness would keep missing exactly that shape. STATE_REVEAL_MIN_NEW_ELEMENTS (only a
@@ -588,7 +603,9 @@ export async function crawl(
     // MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
     const wantsStateProbe = remainingStateProbes > 0;
     if (wantsClickProbe || wantsStateProbe) {
-      const maxClicks = wantsClickProbe ? Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes) : MAX_CLICKS_PER_PAGE;
+      const maxClicks = wantsClickProbe
+        ? Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes)
+        : MAX_CLICKS_PER_PAGE;
       const stateBudget = wantsStateProbe ? { remaining: remainingStateProbes } : undefined;
       const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks, {
         deepProbe: stateBudget

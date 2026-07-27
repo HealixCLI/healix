@@ -53,6 +53,26 @@ describe('classifyByRules / engine.classify', () => {
     });
   });
 
+  describe('missing local dependency (browser binary / Node package never installed)', () => {
+    it('classifies a missing Playwright browser executable as environment, not ambiguous', () => {
+      const result = engine.classify({
+        title: 'Exploring https://example.test/ (codegen)',
+        error:
+          "browserType.launch: Executable doesn't exist at C:\\Users\\x\\AppData\\Local\\ms-playwright\\chromium_headless_shell-1228\\chrome-headless-shell-win64\\chrome-headless-shell.exe\n" +
+          'Looks like Playwright was just installed or updated.\n' +
+          'Please run the following command to download new browsers:\n\n    pnpm exec playwright install\n',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.8);
+    });
+
+    it('classifies a missing Node module (Cannot find module) as environment', () => {
+      expect(verdictFor("Error: Cannot find module 'express'\nRequire stack:\n- /app/server.js")).toBe(
+        'environment',
+      );
+    });
+  });
+
   describe('environment failures', () => {
     it('classifies ECONNREFUSED as environment', () => {
       expect(verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000')).toBe('environment');

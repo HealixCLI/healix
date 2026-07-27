@@ -1192,6 +1192,51 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(row?.error).toContain('Auth setup failed');
   });
 
+  it('self-heals a missing Node module by re-running npm install and retrying once (not just missing browsers)', async () => {
+    const spawnedCommands: string[] = [];
+
+    // 1st spawn: `npx playwright test` fails with a "Cannot find module" signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      const proc = new EventEmitter() as unknown as ChildProcess & {
+        stdout: EventEmitter;
+        stderr: EventEmitter;
+      };
+      proc.stdout = new EventEmitter() as never;
+      proc.stderr = new EventEmitter() as never;
+      (proc as unknown as { pid: number }).pid = 4242;
+      (proc as unknown as { kill: () => boolean }).kill = () => true;
+      queueMicrotask(() => {
+        proc.stderr.emit('data', Buffer.from("Error: Cannot find module '@playwright/test'\n"));
+        proc.emit('close', 1, null);
+      });
+      return proc;
+    });
+    // 2nd spawn: the recovery `npm install`.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0);
+    });
+    // 3rd spawn: the retried `npx playwright test`, this time succeeding.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(report([{ title: 'a', projectName: 'tierA-public', status: 'passed' }])),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
   it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {
     writeCheckpointEntries([
       {

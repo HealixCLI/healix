@@ -40,6 +40,15 @@ const RE_ENVIRONMENT =
 // (e.g. a real ECONNREFUSED from a failed login attempt) that would otherwise steal the match.
 const RE_BLOCKED_TIERB = /Tier B prerequisite not met|Tier B ran without credentials/;
 
+// Missing local dependency (a Playwright browser binary never downloaded, or
+// a Node package never installed) — a Healix/CI environment setup gap, not a
+// defect in the app or the test. Must run before the generic environment rule
+// (and before selector/assertion) since "Executable doesn't exist" carries no
+// navigation/connection signal of its own and would otherwise fall through to
+// the low-confidence ambiguous default.
+const RE_MISSING_DEPENDENCY =
+  /(Executable doesn't exist|browserType\.launch:|please run the following command to download new browsers|npx playwright install|pnpm (?:exec )?playwright install|yarn playwright install|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND)/i;
+
 // A bare Timeout (action/wait level) that is not already a navigation or
 // selector timeout — treated as environment/slowness.
 const RE_TIMEOUT = /\bTimeout(?:Error)?\b|timed out/i;
@@ -73,18 +82,22 @@ function mk(verdict: Verdict, confidence: number, rationale: string): TriageResu
  *  1. blocked_tierb — Healix's own synthetic "prerequisite not met" message;
  *     must pre-empt everything else since a wrapped setup error can contain
  *     any other signal (environment, assertion, ...) inside it.
- *  2. environment   — a down server makes every selector lookup "fail", so it
+ *  2. missing_dependency — a browser binary or Node package was never
+ *     installed; carries no navigation/connection signal of its own, so it
+ *     must run before the generic environment/selector/assertion rules or it
+ *     falls through to the low-confidence ambiguous default.
+ *  3. environment   — a down server makes every selector lookup "fail", so it
  *     must pre-empt the selector rule.
- *  3. assertion     — expect() mismatch; content checks lean app_is_wrong,
+ *  4. assertion     — expect() mismatch; content checks lean app_is_wrong,
  *     everything else is genuinely ambiguous. Runs BEFORE the selector rule
  *     because Playwright assertion-timeout output embeds locator phrases
  *     ("waiting for locator", getBy*) that would otherwise be misclassified as
  *     test_is_wrong.
- *  4. selector      — locator not found / strict-mode → the test is wrong.
+ *  5. selector      — locator not found / strict-mode → the test is wrong.
  *     Suppressed when assertion signals (expect(), Expected/Received,
  *     toHaveText/toBeVisible …) are present.
- *  5. flaky         — visibility/detached/instability.
- *  6. timeout       — residual bare timeouts → environment/slowness.
+ *  6. flaky         — visibility/detached/instability.
+ *  7. timeout       — residual bare timeouts → environment/slowness.
  */
 const RULES: readonly Rule[] = [
   {
@@ -95,6 +108,17 @@ const RULES: readonly Rule[] = [
         'environment',
         0.9,
         'This test was BLOCKED, not failed: a Tier-B auth prerequisite was not met (either the auth setup fixture itself failed, or the project has no test credentials configured, so the session ran anonymously). Neither the app nor the test is defective — add test credentials (or fix the underlying auth setup failure) to unblock this coverage.',
+      );
+    },
+  },
+  {
+    id: 'missing_dependency',
+    match(error) {
+      if (!RE_MISSING_DEPENDENCY.test(error)) return null;
+      return mk(
+        'environment',
+        0.85,
+        'A required local dependency (a Playwright browser binary, or a Node package) was never installed in this execution environment — not an app or test defect. Install the missing dependency (e.g. `npx playwright install`, or a package install) and re-run.',
       );
     },
   },

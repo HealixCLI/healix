@@ -1,5 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Response } from 'playwright';
 import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
+import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
 import { FrameMirror } from './mirror.js';
 import type {
   BrowserSurface,
@@ -179,7 +180,18 @@ export function createBrowserSurface(): BrowserSurface {
         const viewport = opts.viewport ?? { ...DEFAULT_VIEWPORT };
         baseUrl = opts.baseUrl;
 
-        browser = await chromium.launch({ headless });
+        try {
+          browser = await chromium.launch({ headless });
+        } catch (err) {
+          // The browser binary comes from a shared global cache Playwright manages
+          // itself; a first-ever run (or one after a Playwright upgrade) can find it
+          // empty. Install once and retry rather than failing every exploration until
+          // someone runs the command by hand.
+          if (!looksLikeMissingBrowser(err)) throw err;
+          const installed = await ensurePlaywrightBrowsersInstalled();
+          if (!installed) throw err;
+          browser = await chromium.launch({ headless });
+        }
         try {
           context = await browser.newContext({ viewport });
           page = await context.newPage();

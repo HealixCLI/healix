@@ -65,22 +65,53 @@ export function buildGroupingPrompt(entries: GroupingTriageEntry[]): string {
     'find a real shared root cause, name it and reference which failures (by',
     'their number above) share it. If the failures look genuinely unrelated, say',
     "so briefly instead of forcing a pattern that isn't there.",
+    '',
+    'Be conservative about naming a SPECIFIC unverified infrastructure cause',
+    '(e.g. "the backend crashed", "the service is down", "a startup failure") —',
+    'that is a strong, falsifiable claim, and asserting it wrongly is worse than',
+    'not asserting it at all. Before naming one, check whether any failure above',
+    'contradicts it — in particular, a PASSING test elsewhere in the same run',
+    'that required a successful call to the same dependency/origin means the',
+    'dependency was not actually down, and a "crashed backend" theory is wrong.',
+    'When you are not certain of the underlying MECHANISM, describe the',
+    'observable SYMPTOM PATTERN instead (e.g. "most requests to this origin',
+    'return an unexpected status code") rather than asserting an unverified',
+    'root cause.',
   ].join('\n');
 }
 
 /**
+ * F-23: why summarizeTriageGroups came back without a summary — surfaced in
+ * the report instead of a silent `null` indistinguishable from "nothing to
+ * summarize". `null` itself means it succeeded (a summary IS present).
+ * `'timeout'` is set by the ORCHESTRATOR's own withTimeoutAbort wrapper
+ * around this call (see orchestrator/index.ts's grouping-summary block) —
+ * this function has no timeout of its own, so it never produces that reason
+ * itself.
+ */
+export type GroupingSummaryUnavailableReason = 'empty-batch' | 'provider-error' | 'timeout';
+
+export interface GroupingSummaryResult {
+  summary: string | null;
+  /** Set only when `summary` is null; explains why. */
+  reason: GroupingSummaryUnavailableReason | null;
+}
+
+/**
  * One AI call summarizing cross-failure patterns across every triaged entry.
- * Returns null when there's nothing worth summarizing (fewer than 2 failures
- * — a single failure has no cross-failure pattern to find), or when the call
- * fails/is aborted/returns empty text — this is best-effort prose, not
- * something report-writing can't proceed without.
+ * Returns `{ summary: null, reason: 'empty-batch' }` when there's nothing
+ * worth summarizing (fewer than 2 failures — a single failure has no
+ * cross-failure pattern to find), or `{ summary: null, reason:
+ * 'provider-error' }` when the call fails/is aborted/returns empty text —
+ * this is best-effort prose, not something report-writing can't proceed
+ * without, but the reason is worth showing rather than silently omitting.
  */
 export async function summarizeTriageGroups(
   entries: GroupingTriageEntry[],
   provider: ProviderAdapter,
   opts: { signal?: AbortSignal; onUsage?: UsageRecorder; cwd?: string } = {},
-): Promise<string | null> {
-  if (entries.length < 2) return null;
+): Promise<GroupingSummaryResult> {
+  if (entries.length < 2) return { summary: null, reason: 'empty-batch' };
 
   const prompt = buildGroupingPrompt(entries);
   try {
@@ -90,9 +121,11 @@ export async function summarizeTriageGroups(
       taskType: 'triage-summary',
     });
     opts.onUsage?.('triage-summary', 'grouping', provider.id, reply.raw);
-    if (!reply.ok || !reply.text || !reply.text.trim()) return null;
-    return reply.text.trim();
+    if (!reply.ok || !reply.text || !reply.text.trim()) {
+      return { summary: null, reason: 'provider-error' };
+    }
+    return { summary: reply.text.trim(), reason: null };
   } catch {
-    return null;
+    return { summary: null, reason: 'provider-error' };
   }
 }

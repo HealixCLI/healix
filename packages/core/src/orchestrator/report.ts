@@ -1,7 +1,8 @@
 import { relative, sep } from 'node:path';
 import type { Project, Run, TestCase } from '../storage/types.js';
-import type { ExecOutcome, ExecStepItem, TestPlan } from '../modes/types.js';
+import type { ExecOutcome, ExecResultItem, ExecStepItem, TestPlan } from '../modes/types.js';
 import type { TriageResult } from '../triage/types.js';
+import type { GroupingSummaryUnavailableReason } from '../triage/grouping.js';
 import type { ExternalDependency } from '../target/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 
@@ -29,6 +30,17 @@ export interface ReportCoverageSummary {
   coveredCount: number;
   totalCount: number;
   uncovered: FunctionalityUnit[];
+  /**
+   * F-25: whether the coverage-feedback loop's iterative retry
+   * (RunOptions.coverageLoopEnabled) was actually turned on for this run.
+   * Coverage is always MEASURED regardless — this only distinguishes "the
+   * loop ran and stopped short of target" from "the loop was never enabled,
+   * so of course it didn't reach target" for degradationNotes()'s banner
+   * wording. Optional/undefined for reports built before this field existed;
+   * treated the same as `true` (today's wording) so old report.json files
+   * don't silently change their banner meaning on re-render.
+   */
+  loopEnabled?: boolean;
 }
 
 /** Serializable run report written to reports/report.json. */
@@ -57,6 +69,14 @@ export interface RunReport {
    * failures to compare, or the summary call failed/was skipped.
    */
   groupingSummary?: string | null;
+  /**
+   * F-23: WHY groupingSummary is null, so the report can say so explicitly
+   * instead of silently omitting the paragraph (previously indistinguishable
+   * from "nothing to summarize"). Null both when a summary IS present, and
+   * when grouping never applied in the first place (fewer than 2 triaged
+   * failures) — there's nothing to explain as "unavailable" in that case.
+   */
+  groupingSummaryUnavailableReason?: GroupingSummaryUnavailableReason | null;
   generatedAt: string;
 }
 
@@ -73,6 +93,7 @@ export function buildReport(input: {
   generation?: GenerationStats;
   coverage?: ReportCoverageSummary | null;
   groupingSummary?: string | null;
+  groupingSummaryUnavailableReason?: GroupingSummaryUnavailableReason | null;
 }): RunReport {
   return {
     run: input.run,
@@ -87,14 +108,84 @@ export function buildReport(input: {
     generation: input.generation,
     coverage: input.coverage ?? null,
     groupingSummary: input.groupingSummary ?? null,
+    groupingSummaryUnavailableReason: input.groupingSummaryUnavailableReason ?? null,
     generatedAt: new Date().toISOString(),
   };
 }
 
+/** Recovers an HTTP-status-shaped token from Playwright's own "Received: NNN" assertion-failure vocabulary. */
+function extractStatusCode(error: string | undefined): string | null {
+  const m = (error ?? '').match(/Received:?\s*"?(\d{3})"?/i);
+  return m ? m[1] : null;
+}
+
+/** Tier name from a result's specFile (e.g. "tierC-api/foo.spec.ts" -> "tierC-api"), or null when absent. */
+function tierOf(result: ExecResultItem): string | null {
+  return result.specFile?.split(/[\\/]/)[0] ?? null;
+}
+
+const MIN_SAMPLE = 4;
+const UNIFORM_THRESHOLD = 0.9;
+
+/**
+ * F-22: a lightweight sanity signal, NOT a hard verdict change — see this
+ * finding's own note that over-engineering a general statistical system for
+ * one observed case is out of scope. If an overwhelming majority (>90%) of
+ * one tier's FAILURES carry the identical HTTP-status-shaped token in their
+ * error text (Playwright's own "Received: NNN" assertion vocabulary), every
+ * request in that tier likely landed on the same (probably wrong) endpoint
+ * response rather than genuinely exercising different behavior — e.g. every
+ * request hitting a wrong base URL and 404ing identically. When that tier
+ * ALSO has a passing result, that pass is worth a second look: it may be an
+ * accidental pass (its own expectation happens to match the uniform broken
+ * response) rather than a genuine one.
+ *
+ * Scoped deliberately to "same tier" as the dependency-grouping proxy (the
+ * report has no structured per-request origin/dependency data today) and to
+ * only FAILURES (a passing result carries no error text to extract a status
+ * from) — both documented simplifications, not an attempt at a general
+ * cross-dependency statistical system.
+ */
+export function suspiciousUniformStatusNotes(report: RunReport): string[] {
+  const results = report.outcome?.results ?? [];
+  const byTier = new Map<string, ExecResultItem[]>();
+  for (const r of results) {
+    const tier = tierOf(r);
+    if (!tier) continue;
+    const list = byTier.get(tier);
+    if (list) list.push(r);
+    else byTier.set(tier, [r]);
+  }
+
+  const notes: string[] = [];
+  for (const [tier, tierResults] of byTier) {
+    const failures = tierResults.filter((r) => r.status === 'failed');
+    if (failures.length < MIN_SAMPLE) continue;
+    const codes = failures.map((r) => extractStatusCode(r.error)).filter((c): c is string => c !== null);
+    if (codes.length < failures.length * UNIFORM_THRESHOLD) continue;
+
+    const counts = new Map<string, number>();
+    for (const c of codes) counts.set(c, (counts.get(c) ?? 0) + 1);
+    const [dominantCode, dominantCount] = [...counts.entries()].sort((a, b) => b[1] - a[1])[0]!;
+    if (dominantCount / failures.length < UNIFORM_THRESHOLD) continue;
+
+    const hasPass = tierResults.some((r) => r.status === 'passed');
+    if (!hasPass) continue; // the "accidental pass" concern only applies when there IS a pass to doubt
+
+    notes.push(
+      `${dominantCount}/${failures.length} ${tier} failures all returned status ${dominantCode} — this looks ` +
+        `like every request hit the same (likely broken) endpoint/dependency rather than exercising different ` +
+        `behavior. Any passing ${tier} test in this run may be an accidental pass rather than a genuine one — ` +
+        `check the underlying endpoint/base URL before trusting individual verdicts.`,
+    );
+  }
+  return notes;
+}
+
 /**
  * Human-readable degradation notes for this report, or an empty array when
- * nothing degraded. Covers three independent silent-failure paths that used
- * to look identical to a normal, fully-AI-authored run:
+ * nothing degraded. Covers independent silent-failure paths that used to
+ * look identical to a normal, fully-AI-authored run:
  *   1. planSource === 'fallback' — every planning attempt failed and this is
  *      synthesizePlan()'s minimal hardcoded smoke plan.
  *   2. plan.fallbackReason present with planSource still 'ai' — a batched
@@ -102,7 +193,10 @@ export function buildReport(input: {
  *   3. generation.acceptedItems < requestedItems — items were planned but
  *      silently dropped after failed generation attempts.
  *   4. coverage.ratio < coverage.target — the coverage-feedback loop stopped
- *      short of its target.
+ *      short of its target (wording depends on coverage.loopEnabled — see
+ *      ReportCoverageSummary's own doc comment).
+ *   5. suspiciousUniformStatusNotes — a tier whose failures suspiciously all
+ *      return the identical status code (see its own doc comment).
  */
 export function degradationNotes(report: RunReport): string[] {
   const notes: string[] = [];
@@ -123,10 +217,16 @@ export function degradationNotes(report: RunReport): string[] {
   }
   const cov = report.coverage;
   if (cov && cov.ratio < cov.target) {
+    // F-25: `undefined` (a report built before loopEnabled existed) is
+    // treated the same as `true` — today's "stopped" wording — so an old
+    // report.json's banner meaning doesn't silently change on re-render.
     notes.push(
-      `Coverage-feedback loop stopped at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%).`,
+      cov.loopEnabled === false
+        ? `Coverage is at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%); the coverage-feedback loop was not enabled for this run.`
+        : `Coverage-feedback loop stopped at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%).`,
     );
   }
+  notes.push(...suspiciousUniformStatusNotes(report));
   return notes;
 }
 
@@ -152,6 +252,12 @@ function formatDuration(ms: number | null | undefined): string {
   const minutes = totalMinutes % 60;
   return `${hours}h ${minutes}m`;
 }
+
+const GROUPING_UNAVAILABLE_LABEL: Record<GroupingSummaryUnavailableReason, string> = {
+  timeout: 'timed out',
+  'provider-error': 'the AI call failed or returned nothing usable',
+  'empty-batch': 'too few triaged failures to compare',
+};
 
 const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
   app_is_wrong: 'App defect',
@@ -271,6 +377,19 @@ function renderSteps(steps: ExecStepItem[] | undefined): string {
   return `<details class="steps"><summary>${steps.length} step${steps.length === 1 ? '' : 's'}</summary><ol>${items}</ol></details>`;
 }
 
+/**
+ * QA request: surface WHY a skipped test was skipped — previously this cell
+ * was simply blank for a 'skipped' row (skipped tests have no `error`),
+ * giving no indication of whether the skip was deliberate (a real
+ * `test.skip(cond, 'reason')`) or unexplained. Absent entirely for a suite
+ * scaffolded before execute.ts started capturing annotations, or a skip with
+ * no reason given — those still render blank, same as before.
+ */
+function renderSkipReasonCell(skipReason: string | undefined): string {
+  if (!skipReason) return '';
+  return `<div class="skip-reason"><span class="tag">Skipped</span> ${esc(skipReason)}</div>`;
+}
+
 function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | undefined): string {
   if (!error) return '';
   const { summary, rest } = splitErrorText(error);
@@ -310,12 +429,22 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
     mockedRequestCounts,
     coverage,
     groupingSummary,
+    groupingSummaryUnavailableReason,
   } = report;
   const total = outcome ? outcome.results.length : 0;
   const passed = outcome?.passed ?? 0;
   const failed = outcome?.failed ?? 0;
   const blocked = outcome?.blocked ?? 0;
   const flaky = outcome?.flaky ?? 0;
+  // F-24: planned scenarios never executed at all — previously omitted
+  // entirely from the cards, so a run where most of the suite never ran
+  // (e.g. 48/78 tests) still read as a normal-looking "14 passed / 16 failed"
+  // with no visible signal that most of the suite is simply missing.
+  // Counted directly from the result rows rather than trusting
+  // outcome.skipped: no execute() implementation actually populates that
+  // aggregate today, so relying on it always rendered "0 skipped" even when
+  // individual rows clearly carried status 'skipped' (and a skipReason).
+  const skipped = outcome ? outcome.results.filter((r) => r.status === 'skipped').length : 0;
   const notes = degradationNotes(report);
   const degradationBanner =
     notes.length > 0
@@ -382,9 +511,13 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
               matchedTest?.details ? `<div class="hist">${esc(matchedTest.details)}</div>` : ''
             }`
           : '';
+      const errorCell =
+        r.status === 'skipped'
+          ? renderSkipReasonCell(r.skipReason)
+          : renderErrorCell(r.error, triageByTitle.get(r.title));
       return `<tr class="status-${esc(r.status)}"><td>${esc(r.title)}</td><td>${esc(r.status)}</td><td>${esc(
         formatDuration(r.durationMs),
-      )}</td><td>${descriptionCell}</td><td>${renderErrorCell(r.error, triageByTitle.get(r.title))}</td><td>${renderSteps(
+      )}</td><td>${descriptionCell}</td><td>${errorCell}</td><td>${renderSteps(
         r.steps,
       )}</td><td>${renderArtifacts(r.artifacts, reportDir)}</td></tr>`;
     })
@@ -452,7 +585,10 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
   section.degraded h2 { color: #9a6700; }
   section.degraded ul { margin: 0; padding-left: 1.25rem; }
   .grouping-summary { background: #8884; border-radius: 8px; padding: .6rem .8rem; font-style: italic; }
+  .grouping-summary-unavailable { color: #888; font-size: .8rem; font-style: italic; }
   .err-summary { font-weight: 600; }
+  .skip-reason { font-size: .8rem; color: #9a6700; }
+  .skip-reason .tag { background: #9a670030; margin-right: .35rem; }
   .diagnosis { margin-top: .35rem; font-size: .8rem; }
   .diagnosis .hist { display: inline; }
   .verdict-app_is_wrong { background: #cf222e30; }
@@ -493,6 +629,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
     <div class="card"><div class="n fail">${failed}</div><div>failed</div></div>
     <div class="card"><div class="n warn">${blocked}</div><div>blocked</div></div>
     <div class="card"><div class="n warn">${flaky}</div><div>flaky</div></div>
+    <div class="card"><div class="n warn">${skipped}</div><div>skipped</div></div>
     ${
       coverage != null
         ? `<div class="card"><div class="n">${Math.round(coverage.ratio * 100)}%</div><div>coverage</div></div>`
@@ -523,7 +660,16 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
     triage.length > 0
       ? `<section>
     <h2>Triage</h2>
-    ${groupingSummary ? `<p class="grouping-summary">${esc(groupingSummary)}</p>` : ''}
+    ${
+      groupingSummary
+        ? `<p class="grouping-summary">${esc(groupingSummary)}</p>`
+        : groupingSummaryUnavailableReason
+          ? `<p class="grouping-summary-unavailable">AI summary unavailable (${esc(
+              GROUPING_UNAVAILABLE_LABEL[groupingSummaryUnavailableReason] ??
+                groupingSummaryUnavailableReason,
+            )}).</p>`
+          : ''
+    }
     <table>
       <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>

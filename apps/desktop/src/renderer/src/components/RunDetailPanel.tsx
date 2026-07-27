@@ -23,7 +23,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from '.
 import { Tabs } from './ui/tabs';
 import type { RunDetail, ReportTriageEntryShape, StartRunArgs } from '../lib/ipc-types';
 import { asRunReport, reportDegradationNotes } from '../lib/ipc-types';
-import { SHOW_TOKEN_USAGE } from '../lib/feature-flags';
+import { SHOW_REPAIR_ACTION, SHOW_TOKEN_USAGE } from '../lib/feature-flags';
 import { cn } from '../lib/utils';
 import {
   artifactKind,
@@ -313,7 +313,8 @@ export function RunDetailPanel({
               {busy === 'retry' ? 'Checking…' : 'Retry-pass'}
             </Button>
           )}
-          {onRetryPass && (
+          {/* Held back for a later release — see feature-flags.ts's SHOW_REPAIR_ACTION doc comment. */}
+          {onRetryPass && SHOW_REPAIR_ACTION && (
             <Button
               size="sm"
               variant="outline"
@@ -439,6 +440,8 @@ interface JoinedRow {
   status: TestResult['status'] | TestCase['status'];
   durationMs: number | null;
   error: string | null;
+  /** QA request: why a 'skipped' row was skipped (Playwright's own test.skip(cond, 'reason')/test.fixme(...) annotation description, when given). */
+  skipReason: string | null;
   description: string | null;
   details: string | null;
   /** This test's own artifact paths (relative to the suite's test-results dir), from TestResult.artifactsJson. */
@@ -494,6 +497,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
         status: r?.status ?? t.status,
         durationMs: r?.durationMs ?? null,
         error: r?.error ?? null,
+        skipReason: r?.skipReason ?? null,
         description: t.description,
         details: t.details,
         artifacts: parseArtifacts(r?.artifactsJson),
@@ -510,6 +514,7 @@ function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
     status: r.status,
     durationMs: r.durationMs,
     error: r.error,
+    skipReason: r.skipReason,
     description: null,
     details: null,
     artifacts: parseArtifacts(r.artifactsJson),
@@ -678,6 +683,14 @@ function ResultsTable({
                       {r.error}
                     </span>
                   )}
+                  {!r.error && r.status === 'skipped' && r.skipReason && (
+                    <span
+                      className="mt-0.5 block truncate font-mono text-[11px] text-warn/80"
+                      title={r.skipReason}
+                    >
+                      Skipped: {r.skipReason}
+                    </span>
+                  )}
                 </TableCell>
                 <TableCell className="font-mono text-[11px] text-muted">{r.reqTag ?? '—'}</TableCell>
                 <TableCell className="font-mono text-[11px] text-muted">{r.tier ?? '—'}</TableCell>
@@ -737,6 +750,13 @@ function ResultsTable({
                         <pre className="mt-1 max-h-80 overflow-auto whitespace-pre-wrap break-words rounded-md bg-bg p-3 font-mono text-[11px] leading-relaxed text-err/90">
                           {r.error}
                         </pre>
+                      )}
+                      {!r.error && r.status === 'skipped' && (
+                        <p className="text-xs text-warn">
+                          <span className="font-medium">Skip reason:</span>{' '}
+                          {r.skipReason ??
+                            'Not recorded (no reason given, or an older suite predating this).'}
+                        </p>
                       )}
                       <TestCaseSteps steps={r.steps} />
                       <TestCaseEvidence artifacts={r.artifacts} setPreview={setPreview} />

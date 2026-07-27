@@ -241,6 +241,13 @@ export interface ExecResultItem {
    * real spec file.
    */
   specFile?: string;
+  /**
+   * Why a 'skipped' result was skipped — Playwright's own annotation
+   * description from `test.skip(condition, 'reason')` (or `test.fixme(...)`),
+   * when the test/suite provided one. Absent for a skip with no reason
+   * given, or for any non-skipped status.
+   */
+  skipReason?: string;
 }
 
 export interface ExecOutcome {
@@ -258,7 +265,10 @@ export interface ExecOutcome {
    * matching the other counters' required-number style) purely so every
    * pre-existing ExecOutcome literal elsewhere in the codebase/tests doesn't
    * need a mechanical touch just to keep compiling; always populated by
-   * execute.ts/coverage.ts — treat an absent value as 0.
+   * execute.ts/coverage.ts — treat an absent value as 0. report.ts's own
+   * "skipped" card recounts directly from `results` rather than trusting
+   * this field, so the two stay in sync even if a caller ever forgets to
+   * set it.
    */
   skipped?: number;
   results: ExecResultItem[];

@@ -288,6 +288,7 @@ describe('HealixStore triage_results', () => {
         INSERT INTO projects (id, name, base_url) VALUES ('prj_legacy', 'Legacy', 'https://legacy.test');
         INSERT INTO runs (id, project_id, status) VALUES ('run_legacy', 'prj_legacy', 'failed');
         INSERT INTO tests (id, run_id, title, status) VALUES ('tst_legacy', 'run_legacy', 'Legacy test', 'failed');
+        INSERT INTO results (id, test_id, status) VALUES ('res_legacy', 'tst_legacy', 'failed');
       `);
     } finally {
       raw.close(); // must close before the store opens its own handle on the same file
@@ -296,7 +297,7 @@ describe('HealixStore triage_results', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(14);
+    expect(info.version).toBe(15);
     expect(info.tables).toContain('triage_results');
 
     // The pre-existing row survived, untouched, with spec_code defaulting to null.
@@ -318,5 +319,11 @@ describe('HealixStore triage_results', () => {
     const rows = s.listTriageResults('run_legacy');
     expect(rows).toHaveLength(1);
     expect(rows[0]).toMatchObject({ verdict: 'app_is_wrong', confidence: 0.7 });
+
+    // QA request (v15): the pre-existing legacy result row survives with
+    // skip_reason defaulting to null, and a freshly-inserted result can use
+    // the retrofitted column right away.
+    const legacyResults = s.listResults('run_legacy');
+    expect(legacyResults.find((r) => r.id === 'res_legacy')?.skipReason).toBeNull();
   });
 });

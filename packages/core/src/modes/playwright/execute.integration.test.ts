@@ -27,6 +27,9 @@ import type { GeneratedSpec, TestModeContext } from '../types.js';
 import { execute, readCheckpointEntries } from './execute.js';
 import { scaffold } from './scaffold.js';
 import { EXEC_CHECKPOINT_FILENAME } from './templates.js';
+import { buildReport, renderReportHtml } from '../../orchestrator/report.js';
+import type { Project, Run } from '../../storage/types.js';
+import type { TestPlan } from '../types.js';
 
 describe.skipIf(!!process.env.CI)('execute() — real Playwright process (local-only)', () => {
   let dir: string;
@@ -232,5 +235,86 @@ test('second', async ({ page }) => {
     const logAfterResume = readFileSync(runLog, 'utf-8');
     expect(logAfterResume).not.toContain('first'); // proves --test-list-invert really worked
     expect(logAfterResume).toContain('second');
+  }, 90_000);
+
+  it('QA request end-to-end: a real test.skip(cond, "reason") is captured by a genuine Playwright run and surfaces correctly in both execute()\'s outcome and the rendered report.html card/row', async () => {
+    const ctx = makeCtx();
+    await scaffold(ctx);
+
+    await writeSpec(
+      'tests/tierA-public/skip.spec.ts',
+      `import { test, expect } from '@playwright/test';
+test('a passing test', async ({ page }) => {
+  await page.goto('data:text/html,<h1>Home</h1>');
+  await expect(page.locator('h1')).toHaveText('Home');
+});
+test('a deliberately skipped test with a real reason', async () => {
+  test.skip(true, 'Feature flag X is disabled in this environment');
+  expect(true).toBe(false);
+});
+`,
+    );
+
+    const specs: GeneratedSpec[] = [
+      {
+        path: 'tests/tierA-public/skip.spec.ts',
+        title: 'a passing test',
+        tier: 'tierA-public',
+        contents: '',
+      },
+      {
+        path: 'tests/tierA-public/skip.spec.ts',
+        title: 'a deliberately skipped test with a real reason',
+        tier: 'tierA-public',
+        contents: '',
+      },
+    ];
+
+    const outcome = await execute(ctx, specs);
+
+    expect(outcome.passed).toBe(1);
+    const skippedResult = outcome.results.find(
+      (r) => r.title === 'a deliberately skipped test with a real reason',
+    );
+    expect(skippedResult?.status).toBe('skipped');
+    expect(skippedResult?.skipReason).toBe('Feature flag X is disabled in this environment');
+
+    // Full pipeline: feed the REAL outcome (not a hand-built fixture) into
+    // buildReport()/renderReportHtml() exactly as orchestrator/index.ts does,
+    // to prove the report.html "skipped" card and the row's reason text are
+    // both derived correctly from a genuine Playwright run, end to end.
+    const run: Run = {
+      id: 'run_skip_e2e',
+      projectId: 'prj_skip_e2e',
+      provider: null,
+      mode: 'playwright',
+      suiteMode: 'fresh',
+      baseRunId: null,
+      status: 'passed',
+      startedAt: '2026-01-01T00:00:00.000Z',
+      finishedAt: '2026-01-01T00:01:00.000Z',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      pauseReason: null,
+    };
+    const project: Project = {
+      id: 'prj_skip_e2e',
+      name: 'Skip E2E Demo',
+      mode: 'playwright',
+      repoPath: null,
+      baseUrl: 'https://app.example.test',
+      createdAt: '2026-01-01T00:00:00.000Z',
+      archivedAt: null,
+      credentials: [],
+    };
+    const plan: TestPlan = {
+      summary: 'A real plan.',
+      items: [{ id: 'pli_1', title: 'skip e2e', tier: 'tierA-public', intent: 'n/a', scenarios: [] }],
+      planSource: 'ai',
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+
+    expect(html).toContain('<div class="n warn">1</div><div>skipped</div>');
+    expect(html).toContain('Feature flag X is disabled in this environment');
   }, 90_000);
 });

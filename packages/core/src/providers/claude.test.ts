@@ -129,10 +129,15 @@ describe('parseClaudeStreamJson (tolerant --output-format stream-json JSONL pars
     duration_ms: 1234,
   };
   const INIT_EVENT = { type: 'system', subtype: 'init', model: 'claude-sonnet-4-5', session_id: 'abc' };
-  const DELTA_EVENT = { type: 'stream_event', event: { type: 'content_block_delta', delta: { text: 'partial' } } };
+  const DELTA_EVENT = {
+    type: 'stream_event',
+    event: { type: 'content_block_delta', delta: { text: 'partial' } },
+  };
 
   it('extracts the final result line, ignoring init/delta progress events before it', () => {
-    const stdout = [JSON.stringify(INIT_EVENT), JSON.stringify(DELTA_EVENT), JSON.stringify(RESULT)].join('\n');
+    const stdout = [JSON.stringify(INIT_EVENT), JSON.stringify(DELTA_EVENT), JSON.stringify(RESULT)].join(
+      '\n',
+    );
     const parsed = parseClaudeStreamJson(stdout);
     expect(parsed).toMatchObject({ is_error: false, result: 'HEALIX_OK' });
   });
@@ -410,7 +415,9 @@ describe('ClaudeProvider — per-task-type model/effort routing', () => {
   it('health() streams via stream-json and arms a 20s idle timeout', async () => {
     await provider.health();
     const [, args, callOpts] = runCliMock.mock.calls.at(-1)!;
-    expect(args).toEqual(expect.arrayContaining(['--output-format', 'stream-json', '--verbose', '--include-partial-messages']));
+    expect(args).toEqual(
+      expect.arrayContaining(['--output-format', 'stream-json', '--verbose', '--include-partial-messages']),
+    );
     expect(callOpts?.idleTimeoutMs).toBe(20_000);
   });
 

@@ -140,10 +140,14 @@ describe('runCli idle timeout (sliding window)', () => {
     // Writes once immediately, then sits doing nothing for 10s on its own —
     // the idle timer (150ms) must fire long before either the child's own
     // 10s no-op or the 5s hard backstop.
-    const r = await runCli(process.execPath, ['-e', 'process.stdout.write(String.fromCharCode(97));setTimeout(function(){},10000)'], {
-      timeoutMs: 5_000,
-      idleTimeoutMs: 150,
-    });
+    const r = await runCli(
+      process.execPath,
+      ['-e', 'process.stdout.write(String.fromCharCode(97));setTimeout(function(){},10000)'],
+      {
+        timeoutMs: 5_000,
+        idleTimeoutMs: 150,
+      },
+    );
     expect(r.timedOut).toBe(true);
     expect(r.timeoutKind).toBe('idle');
     expect(r.stdout).toBe('a');
@@ -154,10 +158,14 @@ describe('runCli idle timeout (sliding window)', () => {
     const start = Date.now();
     // Emits a byte every 50ms forever — never idle for longer than the 500ms
     // idle window, so only the 300ms hard backstop can end this run.
-    const r = await runCli(process.execPath, ['-e', 'setInterval(function(){process.stdout.write(String.fromCharCode(98))},50)'], {
-      timeoutMs: 300,
-      idleTimeoutMs: 500,
-    });
+    const r = await runCli(
+      process.execPath,
+      ['-e', 'setInterval(function(){process.stdout.write(String.fromCharCode(98))},50)'],
+      {
+        timeoutMs: 300,
+        idleTimeoutMs: 500,
+      },
+    );
     expect(r.timedOut).toBe(true);
     expect(r.timeoutKind).toBe('hard');
     expect(r.stdout.length).toBeGreaterThan(0);

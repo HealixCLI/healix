@@ -15,6 +15,7 @@ import type {
   TriageResultRow,
 } from '../storage/types.js';
 import { ProviderRouter } from '../providers/router.js';
+import { ABSOLUTE_BACKSTOP_MS } from '../providers/types.js';
 import type { ProviderAdapter } from '../providers/types.js';
 import { extractUsage } from '../providers/usage.js';
 import type { UsageRecorder } from '../providers/usage.js';
@@ -101,14 +102,17 @@ export type { ResumeCheckpoint } from './checkpoint.js';
  * Outer safety net for the best-effort AI triage enrichment — wraps the
  * WHOLE engine.analyzeBatch()/summarizeTriageGroups() promise via
  * withTimeoutAbort, independent of whatever timeout the provider call inside
- * it uses. Must stay >= triage/index.ts's own ANALYZE_TIMEOUT_MS (the
- * timeoutMs hard cap triage passes to provider.complete()), or this outer
- * timer fires first and kills every triage call before its own budget is
- * ever reached — exactly the bug that made triage time out even on the
- * cheap/default model tier. Kept slightly larger, purely as a margin for the
- * fixed cost of prompt-building/reconciliation around the provider call.
+ * it uses. Must stay greater than triage/index.ts's own ANALYZE_TIMEOUT_MS
+ * (now ABSOLUTE_BACKSTOP_MS — the hard cap triage passes to
+ * provider.complete()), or this outer timer fires first and kills every
+ * triage call before its own budget is ever reached — exactly the bug that
+ * made triage time out even on the cheap/default model tier. Kept slightly
+ * larger, purely as a margin for the fixed cost of prompt-building/
+ * reconciliation around the provider call — the real day-to-day enforcement
+ * is the provider's own sliding-window idle timeout, so this should rarely
+ * ever be the thing that actually fires.
  */
-const TRIAGE_ANALYZE_TIMEOUT_MS = 130_000;
+const TRIAGE_ANALYZE_TIMEOUT_MS = ABSOLUTE_BACKSTOP_MS + 60_000;
 /**
  * How many failures (at most) get escalated to AI triage analysis. Raised from 3 to 8 to 20:
  * a real 21-failure run showed 8 still left 14 failures stuck at the generic low-confidence

@@ -24,7 +24,14 @@ import {
 
 export * from './types.js';
 
-/** Provider call budget for a single triage analysis. */
+/**
+ * Provider call budget for a single triage analysis — passed as the hard
+ * backstop `timeoutMs` to provider.complete() (the Claude adapter also arms
+ * its own shorter sliding-window idle timeout on top of this). The
+ * orchestrator wraps the whole analyzeBatch()/summarizeTriageGroups() call in
+ * its own outer safety net (TRIAGE_ANALYZE_TIMEOUT_MS in orchestrator/index.ts)
+ * which must stay >= this value or it preempts this budget entirely.
+ */
 const ANALYZE_TIMEOUT_MS = 120_000;
 
 /**

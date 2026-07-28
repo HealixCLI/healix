@@ -97,8 +97,18 @@ import type {
 export * from './types.js';
 export type { ResumeCheckpoint } from './checkpoint.js';
 
-/** Per-call budget for the best-effort AI triage enrichment. */
-const TRIAGE_ANALYZE_TIMEOUT_MS = 20_000;
+/**
+ * Outer safety net for the best-effort AI triage enrichment — wraps the
+ * WHOLE engine.analyzeBatch()/summarizeTriageGroups() promise via
+ * withTimeoutAbort, independent of whatever timeout the provider call inside
+ * it uses. Must stay >= triage/index.ts's own ANALYZE_TIMEOUT_MS (the
+ * timeoutMs hard cap triage passes to provider.complete()), or this outer
+ * timer fires first and kills every triage call before its own budget is
+ * ever reached — exactly the bug that made triage time out even on the
+ * cheap/default model tier. Kept slightly larger, purely as a margin for the
+ * fixed cost of prompt-building/reconciliation around the provider call.
+ */
+const TRIAGE_ANALYZE_TIMEOUT_MS = 130_000;
 /**
  * How many failures (at most) get escalated to AI triage analysis. Raised from 3 to 8 to 20:
  * a real 21-failure run showed 8 still left 14 failures stuck at the generic low-confidence

@@ -1,5 +1,6 @@
 import { extractSemver, runCli, which } from '../exec/run-cli.js';
 import { readModelConfigOverrides, resolveModelAndEffort } from './model-config.js';
+import { ABSOLUTE_BACKSTOP_MS } from './types.js';
 import type {
   Capability,
   CompleteOptions,
@@ -25,13 +26,6 @@ const PING = 'Reply with exactly this token and nothing else: HEALIX_OK';
 const STREAM_IDLE_TIMEOUT_MS = 60_000;
 /** Same idea for the health probe's single short reply — a tighter window is fine since there's nothing substantial to wait on. */
 const HEALTH_IDLE_TIMEOUT_MS = 20_000;
-/**
- * Absolute backstop for complete()/plan(): kills a run regardless of
- * activity, so a call that streams forever without ever going idle (e.g. a
- * genuine infinite tool-use loop) is still bounded. Deliberately large —
- * normal completions finish long before this; it should rarely fire.
- */
-const ABSOLUTE_BACKSTOP_MS = 25 * 60_000;
 
 /**
  * Resolve `taskType` (against the user's global overrides) into the

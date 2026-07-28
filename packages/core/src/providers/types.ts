@@ -1,3 +1,17 @@
+/**
+ * Shared absolute ceiling for a single provider call, used as the hard-cap
+ * `timeoutMs` by every call site that doesn't need a tighter one of its own.
+ * This is deliberately generous: the day-to-day enforcement is each adapter's
+ * own sliding-window idle timeout (killed only after a stretch with NO output
+ * activity — see claude.ts), which lets a slow-but-actively-streaming call run
+ * as long as it needs to. This backstop exists only to bound a genuinely
+ * pathological call that never goes idle but also never finishes (e.g. an
+ * infinite tool-use loop) — a case the idle timer alone can't detect since
+ * such a call still "looks" alive. It should rarely, if ever, be the thing
+ * that actually fires.
+ */
+export const ABSOLUTE_BACKSTOP_MS = 25 * 60_000;
+
 export type ProviderId = 'claude' | 'openai';
 
 export type ProviderStatus = 'ready' | 'cli-missing' | 'not-authenticated' | 'error';

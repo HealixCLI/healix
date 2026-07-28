@@ -16,6 +16,24 @@ import type {
 const PING = 'Reply with exactly this token and nothing else: HEALIX_OK';
 
 /**
+ * Sliding-window idle timeout for streamed completions/plans: the run is
+ * killed only after this many ms pass with NO stream activity, not after
+ * this much total time. Generous enough to ride out Claude's initial
+ * "thinking" pause before its first stream event, since that pause is
+ * normal startup latency, not a hang.
+ */
+const STREAM_IDLE_TIMEOUT_MS = 60_000;
+/** Same idea for the health probe's single short reply — a tighter window is fine since there's nothing substantial to wait on. */
+const HEALTH_IDLE_TIMEOUT_MS = 20_000;
+/**
+ * Absolute backstop for complete()/plan(): kills a run regardless of
+ * activity, so a call that streams forever without ever going idle (e.g. a
+ * genuine infinite tool-use loop) is still bounded. Deliberately large —
+ * normal completions finish long before this; it should rarely fire.
+ */
+const ABSOLUTE_BACKSTOP_MS = 25 * 60_000;
+
+/**
  * Resolve `taskType` (against the user's global overrides) into the
  * `--model`/`--effort` argv pair, plus the resolved values themselves so
  * callers can surface "what actually ran" in the completion/plan result.
@@ -116,6 +134,75 @@ export function parseClaudeJson(stdout: string): ClaudeJsonResult | null {
 }
 
 /**
+ * Parse the JSONL event stream Claude Code prints with `--output-format
+ * stream-json --verbose --include-partial-messages`: one JSON object per
+ * line — system/init, assistant/user message events, partial-message delta
+ * events, and finally a `result` event carrying the same fields
+ * `--output-format json` used to print in a single blob (is_error, subtype,
+ * result, duration_ms, modelUsage). Every line except that last one is a
+ * progress event we only needed for the idle timer's liveness signal (see
+ * run-cli's per-chunk armIdleTimer), not for the return value, so they're
+ * parsed-and-discarded here. The result event is identified by carrying an
+ * `is_error` boolean, the same structural check the old parseClaudeJson
+ * relied on — not `type === 'result'` — so a line-for-line JSON.stringify of
+ * the old single-blob shape still parses correctly (some CLI paths, and all
+ * of today's tests, produce exactly that shape as a single line).
+ *
+ * Falls back to parseClaudeJson (the tolerant single-blob parser) when NO
+ * line parses as JSON at all — covers a CLI version/mode that ignores
+ * stream-json and prints one pretty-printed multi-line blob instead, which
+ * line-by-line JSON.parse can't handle but the balanced-brace whole-text scan
+ * can. Returns null when lines parsed but none carried is_error — the stream
+ * was cut off before its result event (killed by the idle/hard timeout,
+ * crashed, etc.), which is genuinely incomplete and correctly reported as
+ * unparseable by callers, same as before.
+ */
+export function parseClaudeStreamJson(stdout: string): ClaudeJsonResult | null {
+  const text = stdout.trim();
+  if (!text) return null;
+
+  let resultObj: ClaudeJsonResult | null = null;
+  let sawAnyJson = false;
+
+  for (const rawLine of text.split(/\r?\n/)) {
+    const line = rawLine.trim();
+    if (!line) continue;
+
+    let obj: ClaudeJsonResult | null = null;
+    try {
+      obj = JSON.parse(line) as ClaudeJsonResult;
+    } catch {
+      // Tolerate noise sharing the line with the JSON (e.g. an update banner
+      // printed on the same line as the first event) — same tolerance
+      // parseClaudeJson gives the single-blob case.
+      const brace = line.indexOf('{');
+      if (brace !== -1) {
+        const candidate = extractBalancedObject(line, brace);
+        if (candidate) {
+          try {
+            obj = JSON.parse(candidate) as ClaudeJsonResult;
+          } catch {
+            obj = null;
+          }
+        }
+      }
+    }
+    if (!obj) continue;
+    sawAnyJson = true;
+    if (typeof obj.is_error === 'boolean') resultObj = obj;
+  }
+
+  if (resultObj) return resultObj;
+  return sawAnyJson ? null : parseClaudeJson(stdout);
+}
+
+/** Human-readable reason for a timed-out RunResult, for CompletionResult/PlanResult `detail` messages. */
+function timeoutReason(timeoutKind: 'idle' | 'hard' | undefined, idleMs: number, hardMs: number): string {
+  if (timeoutKind === 'idle') return `no output for ${idleMs}ms`;
+  return `exceeded the ${hardMs}ms maximum duration`;
+}
+
+/**
  * Real adapter for the Claude Code CLI (subscription auth — no API keys).
  * Primary path is the CLI; the Agent SDK fallback is wired in a later milestone.
  */
@@ -160,20 +247,29 @@ export class ClaudeProvider implements ProviderAdapter {
 
     const timeoutMs = opts.timeoutMs ?? 60_000;
     const { args: modelArgs } = await resolveModelArgs('health-probe');
-    const r = await runCli(this.bin, ['-p', PING, '--output-format', 'json', ...modelArgs], {
-      timeoutMs,
-      signal: opts.signal,
-    });
+    const r = await runCli(
+      this.bin,
+      ['-p', PING, '--output-format', 'stream-json', '--verbose', '--include-partial-messages', ...modelArgs],
+      {
+        timeoutMs,
+        idleTimeoutMs: HEALTH_IDLE_TIMEOUT_MS,
+        signal: opts.signal,
+      },
+    );
     // A killed process leaves partial/empty stdout — check the kill reasons
     // BEFORE parsing so they aren't misreported as parse/auth failures.
     if (r.timedOut) {
-      return { ...base, status: 'error', detail: `Auth probe timed out after ${timeoutMs}ms.` };
+      return {
+        ...base,
+        status: 'error',
+        detail: `Auth probe timed out (${timeoutReason(r.timeoutKind, HEALTH_IDLE_TIMEOUT_MS, timeoutMs)}).`,
+      };
     }
     if (r.aborted) {
       return { ...base, status: 'error', detail: 'Auth probe aborted.' };
     }
 
-    const json = parseClaudeJson(r.stdout);
+    const json = parseClaudeStreamJson(r.stdout);
     if (json) {
       const ok = json.is_error === false && json.subtype === 'success';
       const model = json.modelUsage ? (Object.keys(json.modelUsage)[0] ?? null) : null;
@@ -217,7 +313,7 @@ export class ClaudeProvider implements ProviderAdapter {
     // argv element can get corrupted before `claude` ever sees it, causing the
     // CLI to fall back to its interactive first screen instead of running
     // headless. See run-cli.ts's `input` option for the stdin-write path.
-    const args = ['-p', '--output-format', 'json'];
+    const args = ['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages'];
     // readOnly and plan mode both map to --permission-mode plan: Claude Code's
     // plan permission mode is its no-writes mode — the model can read the repo
     // but every file-modifying tool is blocked, which is exactly the readOnly
@@ -230,8 +326,10 @@ export class ClaudeProvider implements ProviderAdapter {
     // stable across the retry rather than switching models mid-task.
     const { args: modelArgs, model, effort } = await resolveModelArgs(opts.taskType);
     args.push(...modelArgs);
+    const hardTimeoutMs = opts.timeoutMs ?? ABSOLUTE_BACKSTOP_MS;
     const r = await runCli(this.bin, args, {
-      timeoutMs: opts.timeoutMs ?? 300_000,
+      timeoutMs: hardTimeoutMs,
+      idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
       cwd: opts.cwd,
       signal: opts.signal,
       input: prompt,
@@ -243,7 +341,7 @@ export class ClaudeProvider implements ProviderAdapter {
         ok: false,
         text: '',
         raw: r,
-        detail: 'Completion timed out.',
+        detail: `Completion timed out (${timeoutReason(r.timeoutKind, STREAM_IDLE_TIMEOUT_MS, hardTimeoutMs)}).`,
         model,
         effort,
       };
@@ -251,7 +349,7 @@ export class ClaudeProvider implements ProviderAdapter {
     if (r.aborted) {
       return { provider: this.id, ok: false, text: '', raw: r, detail: 'Completion aborted.', model, effort };
     }
-    const json = parseClaudeJson(r.stdout);
+    const json = parseClaudeStreamJson(r.stdout);
     if (json) {
       const ok = json.is_error === false;
       return {
@@ -276,14 +374,24 @@ export class ClaudeProvider implements ProviderAdapter {
   }
 
   async plan(task: string, opts: PlanOptions = {}): Promise<PlanResult> {
-    const timeoutMs = opts.timeoutMs ?? 120_000;
+    const hardTimeoutMs = opts.timeoutMs ?? ABSOLUTE_BACKSTOP_MS;
     const { args: modelArgs, model, effort } = await resolveModelArgs(opts.taskType);
     // Same stdin-not-argv rationale as complete() above.
     const r = await runCli(
       this.bin,
-      ['-p', '--permission-mode', 'plan', '--output-format', 'json', ...modelArgs],
+      [
+        '-p',
+        '--permission-mode',
+        'plan',
+        '--output-format',
+        'stream-json',
+        '--verbose',
+        '--include-partial-messages',
+        ...modelArgs,
+      ],
       {
-        timeoutMs,
+        timeoutMs: hardTimeoutMs,
+        idleTimeoutMs: STREAM_IDLE_TIMEOUT_MS,
         signal: opts.signal,
         input: task,
       },
@@ -297,7 +405,7 @@ export class ClaudeProvider implements ProviderAdapter {
         ok: false,
         plan: '',
         raw: r,
-        detail: `Plan generation timed out after ${timeoutMs}ms.`,
+        detail: `Plan generation timed out (${timeoutReason(r.timeoutKind, STREAM_IDLE_TIMEOUT_MS, hardTimeoutMs)}).`,
         model,
         effort,
       };
@@ -313,7 +421,7 @@ export class ClaudeProvider implements ProviderAdapter {
         effort,
       };
     }
-    const json = parseClaudeJson(r.stdout);
+    const json = parseClaudeStreamJson(r.stdout);
     if (json) {
       const ok = json.is_error === false;
       return {

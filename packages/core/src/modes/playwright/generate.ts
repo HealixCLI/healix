@@ -5,10 +5,9 @@ import type { Tier } from '../../storage/types.js';
 import type { ObservedEndpoint } from '../../browser/network-capture.js';
 import type { GeneratedSpec, PlanScenario, TestModeContext, TestPlan, TestPlanItem } from '../types.js';
 import { ProviderUnavailableError } from '../types.js';
+import { ABSOLUTE_BACKSTOP_MS } from '../../providers/types.js';
 import { TIERS, tierLabel } from './templates.js';
 import { splitTestBlocks } from './quality-audit.js';
-
-const GEN_TIMEOUT_MS = 180_000;
 
 // Re-exported for call sites/tests that import it alongside generate() —
 // the class itself lives in modes/types.ts since it's shared across modes,
@@ -1719,7 +1718,7 @@ async function generateOne(
     try {
       const res = await ctx.provider.complete(buildPrompt(item, ctx, tier, retryNote, inventoryOpts), {
         cwd: ctx.repoPath ?? undefined,
-        timeoutMs: GEN_TIMEOUT_MS,
+        timeoutMs: ABSOLUTE_BACKSTOP_MS,
         // Codegen must NEVER let the provider agent mutate the user's repo:
         // cwd points INSIDE it for white-box context, and an agentic CLI with
         // default permissions could edit/delete files there. Codex already
@@ -1772,10 +1771,6 @@ async function generateOne(
 
 /** Recursion guard for the halve-and-retry split on total batch parse failure — mirrors runPlanPhase's PLAN_MAX_SPLIT_DEPTH shape (orchestrator/index.ts) for a truncated plan batch. */
 const GEN_MAX_SPLIT_DEPTH = 3;
-/** Extra time budget per expected generated test beyond the first — a batch's response length scales with the number of tests it must produce (item.scenarios.length summed across the batch), not with raw item count, so timeout scales the same way. Values are first-pass estimates, not final. */
-const GEN_BATCH_TIMEOUT_PER_TEST_MS = 20_000;
-/** Hard ceiling on the scaled batch timeout regardless of batch size, so a pathological batch can't hang indefinitely. */
-const GEN_BATCH_TIMEOUT_CAP_MS = 480_000;
 /** Target sum of scenario-weight (see binPackByScenarioWeight) per generation batch. Tunable, not final. */
 const GEN_BATCH_SCENARIO_WEIGHT_BUDGET = 12;
 /** Hard item-count cap per batch regardless of scenario weight, as a structural safety net. Tunable, not final. */
@@ -1793,24 +1788,6 @@ const GEN_DOMINANT_PREFIX_THRESHOLD = 0.4;
  * without weakening the real namespace-prefix detection. Tunable, not final.
  */
 const GEN_DOMINANT_PREFIX_MIN_OTHER_ITEMS = 5;
-
-/**
- * Timeout budget for a batch expected to produce `totalExpectedTests` tests total:
- * GEN_TIMEOUT_MS covers the first test's worth of output (base overhead + one test), plus
- * GEN_BATCH_TIMEOUT_PER_TEST_MS per additional expected test, capped at GEN_BATCH_TIMEOUT_CAP_MS.
- * The `+1` in the caller's sum (see genBatchTimeoutMs's call site) is a flat buffer since the
- * actual generated test count can legitimately exceed scenarios.length (validateAndPersist only
- * rejects FEWER tests than planned, never more). For a single-item batch this is never reached —
- * generateBatch's n===1 branch routes straight to generateOne, which uses its own fixed
- * GEN_TIMEOUT_MS budget.
- */
-export function genBatchTimeoutMs(batchItems: TestPlanItem[]): number {
-  const totalExpectedTests = batchItems.reduce((sum, it) => sum + (it.scenarios.length || 1), 0);
-  return Math.min(
-    GEN_TIMEOUT_MS + (totalExpectedTests + 1) * GEN_BATCH_TIMEOUT_PER_TEST_MS,
-    GEN_BATCH_TIMEOUT_CAP_MS,
-  );
-}
 
 /**
  * Parses a plan item's unitKey into path segments for clustering, tolerating both the
@@ -2122,7 +2099,7 @@ async function generateBatch(
   try {
     const res = await ctx.provider.complete(buildBatchPrompt(batchItems, ctx, tier), {
       cwd: ctx.repoPath ?? undefined,
-      timeoutMs: genBatchTimeoutMs(batchItems),
+      timeoutMs: ABSOLUTE_BACKSTOP_MS,
       readOnly: true,
       signal: ctx.signal,
       taskType: 'codegen',

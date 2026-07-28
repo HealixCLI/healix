@@ -404,6 +404,44 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toContain(safeButton.selector);
   });
 
+  it('never click-probes a LOCALIZED destructive control (an English-only list stops filtering entirely)', async () => {
+    // Observed live on a Slovak app: "Odhlásiť sa" (log out) was the FIRST click candidate on the
+    // authenticated dashboard, so the crawl's own opening click destroyed the session it had just
+    // established — every later candidate on that page then fired against a logged-out page and
+    // revealed nothing. "odstrániť" (delete account) sat one row outside the click slice by pure
+    // luck of DOM order.
+    const logout = button('Odhlásiť sa');
+    const deleteAccount = button('odstrániť');
+    const safe = button('Moje kupóny');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [logout, deleteAccount, safe] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/dashboard');
+
+    expect(recordClicks).not.toContain(logout.selector);
+    expect(recordClicks).not.toContain(deleteAccount.selector);
+    expect(recordClicks).toContain(safe.selector);
+  });
+
+  it('STILL click-probes "zmeniť" (change/edit) — it reveals a form rather than mutating anything', async () => {
+    // The counterpart to the test above: over-blocking here would re-hide exactly the
+    // profile-edit states GAP-060's reveal detection exists to capture. The form's own submit is
+    // already excluded independently via buttonType === 'submit'.
+    const edit = button('zmeniť');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [edit] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/dashboard');
+
+    expect(recordClicks).toContain(edit.selector);
+  });
+
   it('DOES click-probe a "Register"/"Sign up" nav control — navigating there is safe, only the submit is excluded', async () => {
     // A button-driven SPA nav often renders "Register"/"Create account" as a plain <button
     // onClick> rather than a real <a href> — excluding it by name would hide that whole route on
@@ -836,12 +874,196 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    const result = await crawl(browser, 'https://a.test/');
 
-    // Only 4 top-level candidates exist, so ordinary click-probe/link-discovery budget (60) is
-    // nowhere near the limiting factor here — MAX_STATE_PROBES_PER_CRAWL (20) is what actually
-    // caps this run, well short of the 4 * (1 + 8) = 36 clicks unbounded recursion would spend.
-    expect(recordClicks.length).toBeLessThanOrEqual(20);
+    // MAX_STATE_PROBES_PER_CRAWL is charged per ATTEMPTED deep-probe click (see
+    // discoverClickRoutes for why: the per-click charge doubles as the wall-clock throttle, and
+    // charging per recorded state instead cost route coverage without gaining states). So the
+    // clicks are what it bounds — only 4 top-level candidates exist here, so the ordinary
+    // click-probe pool (60) is nowhere near the limiting factor.
+    expect(recordClicks.length).toBeLessThanOrEqual(45);
+    expect(result.routes.filter((r) => r.stateKey).length).toBeGreaterThan(0);
+  });
+
+  // KNOWN LIMITATION (GAP-060, open): a route visited LAST does not reach its own click
+  // candidates, because the routes before it spend the shared deep-probe pool on ordinary
+  // navigation clicks. Measured on the real C&A authenticated crawl: /dashboard/vouchers and
+  // /dashboard/points each spend 8 of the 20, leaving /dashboard 4 — one short of any of its
+  // four `zmeniť` profile-edit triggers, whose forms a dashboard-only probe confirms ARE
+  // recorded once clicks reach them.
+  //
+  // Raising the pool and charging per-recorded-state were both tried; each traded this
+  // starvation for wall-clock starvation, losing route coverage entirely (see
+  // MAX_STATE_PROBES_PER_CRAWL). The fix is structural — deferring deep-probe to a real second
+  // pass over the collected routes — so this is `.fails` rather than deleted: it documents the
+  // exact shape of the gap, and it will START FAILING (i.e. demand its own update) the moment
+  // someone lands that restructure and the behaviour becomes correct.
+  it.fails('does NOT yet let a route visited LAST reach its own candidates', async () => {
+    const navOnly = (tag: string) => Array.from({ length: 8 }, (_, i) => button(`${tag} nav ${i}`));
+    const editTrigger = button('zmeniť');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/a'), link('https://a.test/b'), link('https://a.test/c')],
+        },
+        'https://a.test/a': { elements: navOnly('a') },
+        'https://a.test/b': { elements: navOnly('b') },
+        // Visited last, and the only route with a state worth recording.
+        'https://a.test/c': { elements: [...navOnly('c').slice(0, 7), editTrigger] },
+      },
+      onClickSelectorReveal: {
+        [editTrigger.selector]: [
+          { role: 'textbox', name: 'First name', selector: '#firstname' } as InteractiveElement,
+        ],
+      },
+      recordClicks,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    // These are the assertions a CORRECT crawler would satisfy. They currently do not hold —
+    // 16 navigation clicks on /a and /b exhaust the pool before /c's own slice begins.
+    expect(recordClicks).toContain(editTrigger.selector);
+    expect(result.routes.some((r) => r.stateKey?.endsWith(editTrigger.selector))).toBe(true);
+  });
+
+  // --- reveal metric: a view SWAP, not just a net-growth reveal (GAP-060) -------------------
+  //
+  // The element-count test measures NET growth, so it is structurally blind to a same-URL view
+  // swap — which is how real apps implement inline editing. Measured against C&A's dashboard:
+  // clicking "zmeniť" REPLACES ~5 edit links with a 3-input form plus submit, a net change of
+  // about MINUS ONE, so no threshold value could ever fire. These cover the input-based signal
+  // that does see it, and pin the boundaries so it doesn't start swallowing ordinary menus.
+
+  /** The measured C&A shape: four `zmeniť` edit links plus `odstrániť`, replaced by a name form. */
+  const EDIT_LINKS = [
+    button('zmeniť'),
+    button('zmeniť 2'),
+    button('zmeniť 3'),
+    button('zmeniť 4'),
+    button('odstrániť'),
+  ];
+  const NAME_FORM = [
+    { role: 'textbox', name: 'First name', selector: '#firstname' } as InteractiveElement,
+    { role: 'textbox', name: 'Surname', selector: '#surname' } as InteractiveElement,
+    { role: 'textbox', name: 'Salutation', selector: '#salutation' } as InteractiveElement,
+    { role: 'button', name: 'Save', selector: '#save', buttonType: 'submit' } as InteractiveElement,
+  ];
+
+  it('records a view swap that NETS FEWER elements but reveals input fields', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: EDIT_LINKS } },
+      onClickSelectorReveal: { [EDIT_LINKS[0]!.selector]: NAME_FORM },
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard');
+
+    // 5 elements before, 4 after: net -1, i.e. impossible for the element-count test at ANY
+    // threshold. Three previously-absent inputs is what makes it a form.
+    expect(NAME_FORM.length - EDIT_LINKS.length).toBeLessThan(0);
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.stateKey).toBe(`https://a.test/dashboard>>${EDIT_LINKS[0]!.selector}`);
+    expect(stateRoute?.snapshot.interactiveElements).toEqual(NAME_FORM);
+  });
+
+  it('still does NOT record an ordinary dropdown that reveals no inputs', async () => {
+    // The whole point of having a threshold: a menu opening must stay a menu opening. Two new
+    // links is under STATE_REVEAL_MIN_NEW_ELEMENTS and contributes no inputs, so neither signal
+    // fires and the click falls through to harvest-and-revert as before.
+    const menuButton = button('Account menu');
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [menuButton] },
+        'https://a.test/a': { elements: [] },
+        'https://a.test/b': { elements: [] },
+      },
+      onClickSelectorReveal: {
+        [menuButton.selector]: [menuButton, link('https://a.test/a'), link('https://a.test/b')],
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes.some((r) => r.stateKey)).toBe(false);
+    // ...while the links it revealed are still harvested for ordinary route discovery.
+    expect(result.routes.map((r) => r.url)).toContain('https://a.test/a');
+  });
+
+  it('compares revealed inputs BY SELECTOR, so an input-for-input swap still registers', async () => {
+    // A count-only check sees three inputs before and three after and concludes nothing changed;
+    // switching from the name form to the DOB form is a genuinely different state.
+    const toDob = button('zmeniť dob');
+    const dobForm = [
+      { role: 'textbox', name: 'Day', selector: '#dob-day' } as InteractiveElement,
+      { role: 'textbox', name: 'Month', selector: '#dob-month' } as InteractiveElement,
+      { role: 'textbox', name: 'Year', selector: '#dob-year' } as InteractiveElement,
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/dashboard': {
+          elements: [toDob, ...NAME_FORM.filter((el) => el.role === 'textbox')],
+        },
+      },
+      onClickSelectorReveal: { [toDob.selector]: dobForm },
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard');
+
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.snapshot.interactiveElements).toEqual(dobForm);
+  });
+
+  it('keeps recording an input-free reveal that clears the element-count bar (GAP-056 guard)', async () => {
+    // A date-picker is buttons, not inputs — it must keep qualifying on the original signal, or
+    // adding the input test would have traded one blind spot for another.
+    const openCalendar = button('Open calendar');
+    const calendar = [
+      openCalendar,
+      button('1'),
+      button('2'),
+      button('3'),
+      button('4'),
+      button('5'),
+      button('6'),
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [openCalendar] } },
+      onClickSelectorReveal: { [openCalendar.selector]: calendar },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.snapshot.interactiveElements.every((el) => el.role === 'button')).toBe(true);
+  });
+
+  it('does not starve route discovery now that more reveals qualify (GAP-059 guard)', async () => {
+    // The looser rule spends MAX_STATE_PROBES_PER_CRAWL faster, which is exactly what let
+    // deep-probe eat the whole budget before. Every linked route must still be visited, and
+    // nothing may be left queued.
+    const editLink = button('zmeniť');
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [editLink, link('https://a.test/x'), link('https://a.test/y')],
+        },
+        'https://a.test/x': { elements: [] },
+        'https://a.test/y': { elements: [] },
+      },
+      onClickSelectorReveal: { [editLink.selector]: NAME_FORM },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.unvisitedQueuedCount).toBe(0);
+    expect(result.budgetExhausted).toBe(false);
+    const visited = result.routes.filter((r) => !r.stateKey).map((r) => r.url);
+    expect(visited).toContain('https://a.test/x');
+    expect(visited).toContain('https://a.test/y');
   });
 });
 

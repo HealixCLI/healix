@@ -24,6 +24,22 @@ export interface InteractiveElement {
   /** True when the element is disabled (`disabled` attribute or `aria-disabled="true"`). */
   disabled?: boolean;
   /**
+   * True when the element is `readonly` (the `readonly` attribute or `aria-readonly="true"`).
+   *
+   * Deliberately SEPARATE from `disabled`, because the two mean different things to a generated
+   * test: a disabled control can't be clicked, while a readonly input is perfectly clickable and
+   * visible but cannot be typed into. Conflating them would drop readonly fields from
+   * click-probe candidates rather than merely stopping GENERATE filling them.
+   *
+   * Captured because its absence has a specific, expensive failure mode: an app that gates a
+   * field until its precondition is met (this one makes the password-reset confirm field
+   * `readonly` until the first password validates) looked perfectly fillable in the inventory,
+   * so GENERATE emitted a `.fill()` and Playwright retried "element is not editable" for the
+   * FULL 60s test timeout — a whole test's budget spent on a signal we could see and simply
+   * weren't recording.
+   */
+  readOnly?: boolean;
+  /**
    * True when another visible element on the SAME page shares this exact (role, name) pair —
    * e.g. two links both named "foo". A generated `getByRole(role, { name })` locator would
    * strict-mode-violate against either one; callers must warn generation to scope further

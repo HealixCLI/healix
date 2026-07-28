@@ -407,6 +407,12 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         return el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
       }
 
+      /** See `InteractiveElement.readOnly` — kept independent of isDisabled on purpose: a
+       * readonly input is still visible and clickable, it just can't be typed into. */
+      function isReadOnly(el: DomElement): boolean {
+        return el.hasAttribute('readonly') || el.getAttribute('aria-readonly') === 'true';
+      }
+
       type ComputedStyleLike = { visibility: string; display: string; cursor: string };
 
       /** Shared by both passes so a node's `getComputedStyle()` is fetched at most once — pass 2
@@ -504,6 +510,11 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           buttonType: tag === 'button' ? rawButtonType || (inForm ? 'submit' : '') : undefined,
           inForm,
           disabled: isDisabled(el),
+          // Only when true, and only on this (semantic) pass: `readonly` is meaningful for form
+          // fields, so emitting `readOnly: false` on every button/link — or on pass 2's
+          // cursor:pointer divs, where the attribute has no meaning at all — would be pure
+          // inventory noise for the model to read past.
+          ...(isReadOnly(el) ? { readOnly: true } : {}),
           selectorTier: tier,
           ...(repeatedRowText ? { repeatedRowText } : {}),
         });

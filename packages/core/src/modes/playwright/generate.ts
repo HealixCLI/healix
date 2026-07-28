@@ -1100,13 +1100,31 @@ function formatSnapshotInventory(
     const ambiguousNote = el.ambiguousMatch
       ? ' (⚠ AMBIGUOUS: another element on this page shares this exact role+name — a plain getByRole/getByText by role+name WILL throw a strict-mode violation here; use the selector shown, narrow it further, or chain .first()/.nth())'
       : '';
+    // A positional path encodes where the element sat on the ONE route it was captured from, so
+    // it silently resolves to nothing (or worse, to something else) on any other route. The same
+    // logical control genuinely appears in this inventory more than once with DIFFERENT paths —
+    // observed live: one "apple wallet" control listed as `div:nth-of-type(2) > …` on the vouchers
+    // route and `div:nth-of-type(6) > …` on the dashboard. A generated test picked one path and
+    // used it on the other route, so `toBeVisible()` failed on an element that was really there.
+    // Stating the route restriction inline is what the plain "prefer a better anchor" advice was
+    // missing, since the route is printed on every line but never flagged as a constraint.
+    const routeScopedNote =
+      el.selectorTier === 4
+        ? ` — this path is valid ONLY on ${el.name ? `this route (${route.url})` : route.url}; if another line lists the same element on a different route, its path differs and is NOT interchangeable`
+        : '';
     const tierNote =
       el.selectorTier === 4
         ? el.repeatedRowText
-          ? ` (⚠ POSITIONAL selector among repeated rows — prefer anchoring on this row's own text instead, e.g. .filter({ hasText: "${el.repeatedRowText.slice(0, 60)}" }), rather than trusting the index if the list can reorder)`
-          : " (⚠ POSITIONAL selector — fragile if this element's position among its siblings can change; prefer a more specific attribute/text anchor when one is available above)"
+          ? ` (⚠ POSITIONAL selector among repeated rows — prefer anchoring on this row's own text instead, e.g. .filter({ hasText: "${el.repeatedRowText.slice(0, 60)}" }), rather than trusting the index if the list can reorder${routeScopedNote})`
+          : ` (⚠ POSITIONAL selector — fragile if this element's position among its siblings can change; prefer a more specific attribute/text anchor when one is available above${routeScopedNote})`
         : '';
-    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}${tierNote}`;
+    // A readonly field is visible and enabled, so nothing else in this line hints that filling
+    // it is impossible — and a .fill() against one does not fail fast, it retries "element is
+    // not editable" until the test's whole timeout is gone.
+    const readOnlyNote = el.readOnly
+      ? ' (⚠ READONLY — this field cannot be typed into; a .fill()/.type() here will retry until the test times out. It is gated by the app (a precondition elsewhere in the flow unlocks it), so drive that precondition first, or assert its value/state instead of writing to it)'
+      : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}${tierNote}${readOnlyNote}`;
   });
 
   const omitted = totalCount - selected.length;

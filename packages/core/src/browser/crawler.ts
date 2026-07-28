@@ -199,9 +199,28 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
  * === 'submit'` click, already excluded above); blocking the nav click by
  * name too would hide a real route on any SPA whose primary "Register" entry
  * point happens to be a `<button onClick>` rather than a real `<a href>`.
+ *
+ * The list carries LOCALIZED terms alongside the English ones, because an
+ * English-only list is not a safety filter on a localized app — it just
+ * silently stops filtering. Observed live on a Slovak app: "Odhlásiť sa" (log
+ * out) was the FIRST click candidate on the authenticated dashboard, so the
+ * crawl's own opening click destroyed the session it had just established, and
+ * every later candidate on that page — including the profile-edit triggers this
+ * pass exists to find — then fired against a logged-out page and revealed
+ * nothing. One row further down sat "odstrániť" (delete account), outside the
+ * per-page click slice by nothing more than luck of DOM order. Same
+ * locale-awareness the login matchers already have (see `LOGIN_TEXT_RE` and
+ * quality-audit.ts's `SUBMIT_CLICK_RE`). Only Slovak is covered because that is
+ * what has actually been observed; this stays a known gap for other locales
+ * rather than a pretence of full i18n.
+ *
+ * Note "zmeniť" (change/edit) is deliberately NOT here: it reveals an edit form
+ * rather than mutating anything, and the form's own submit is already excluded
+ * by `buttonType === 'submit'`. Blocking it would re-hide exactly the states
+ * GAP-060's reveal detection was added to capture.
  */
 const UNSAFE_CLICK_TEXT_RE =
-  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|add to cart|clear|cancel/i;
+  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|add to cart|clear|cancel|odhl[aá]si|odstr[aá]ni|vymaza|zru[sš]i|ulo[zž]i|potvrdi|zaplati/i;
 /** An accessible name that reads as a login/sign-in action — used both to score crawled login
  * candidates (see `scoreLoginCandidates`) and, during click-probing, to recognize a same-URL
  * toggle that reveals a login view (see `discoverClickRoutes`). */
@@ -245,21 +264,37 @@ const LINK_QUEUE_THIN_THRESHOLD = 5;
 /** How many levels deep a single revealed state (modal -> tab-inside-modal -> ...) may be chased. */
 const MAX_STATE_DEPTH = 2;
 /**
- * Total deep-probe budget across a whole crawl() call — a separate pool from
+ * Total deep-probe CLICKS across a whole crawl() call — a separate pool from
  * MAX_CLICK_PROBES_PER_CRAWL so multi-step-flow probing (click + fill + recurse, materially
  * pricier than a single discovery click) never cannibalizes ordinary route-discovery budget.
- * Deliberately NOT gated on the parent route's own element count: a live audit of the real C&A
- * app found a healthy, well-populated "My account" page (~15 elements) whose "change password"
- * button reveals a same-URL form via exactly this mechanism — gating on route-thinness alone
- * would silently keep missing it, since a page can be well-populated overall and STILL hide an
- * important modal behind one specific button. STATE_REVEAL_MIN_NEW_ELEMENTS is what keeps this
- * targeted instead (an ordinary dropdown/menu reveals too few elements to qualify), and this
- * crawl-wide cap is what keeps the cost bounded on every page, healthy or not.
+ *
+ * Held at 20 deliberately, and it is NOT enough to reach every route's states on a multi-route
+ * authenticated pass — raising it was tried and made things worse. Measured on the real
+ * authenticated crawl: /dashboard/vouchers and /dashboard/points each spend 8 on ordinary
+ * navigation clicks, leaving /dashboard 4 — one short of its four `zmenit` profile-edit
+ * triggers, which a dashboard-only probe confirmed DO record their forms (dob, newemail,
+ * currentpswd/password/confirm_password) once clicks actually reach them. But at 45 the extra
+ * clicks simply consumed the wall clock instead and /dashboard was never VISITED at all (route
+ * coverage 8 -> 7, budgetExhausted false -> true). Charging per recorded state rather than per
+ * click regressed it the same way, for the same underlying reason.
+ *
+ * The real constraint is structural, not a number: `wantsStateProbe`'s `queue.length === 0`
+ * escape always fires on the FIRST route of a pass (nothing has been discovered yet), so the
+ * landing route deep-probes at full cost before any route discovery has happened, and the pass
+ * is out of wall clock by the last route. Fixing that means genuinely deferring deep-probe to a
+ * second pass over the collected routes rather than interleaving it — see GAP-060. Until then
+ * 20 is the value that at least preserves full route coverage.
  */
 const MAX_STATE_PROBES_PER_CRAWL = 20;
 /** A same-URL click only counts as "revealed a real state" (worth recording/recursing into),
  * not just a small dropdown/menu, when it adds at least this many interactive elements. */
 const STATE_REVEAL_MIN_NEW_ELEMENTS = 5;
+/**
+ * ...OR when it brings this many previously-absent INPUT fields on screen — see
+ * `revealedInputFields`. One is enough: a single input that wasn't there before is a form, and
+ * a form is exactly the state worth recording.
+ */
+const STATE_REVEAL_MIN_NEW_INPUTS = 1;
 /** Input name/id/selector hints that read as a one-time/verification code — never auto-filled,
  * since a real OTP requires a code delivered over an external channel (email/SMS) that a crawl
  * has no way to observe or synthesize. Flows gated behind this remain a `test.fixme()` case by
@@ -309,8 +344,9 @@ export interface ClickDiscoveryResult {
 
 /** Enables the deep-probe behavior in `discoverClickRoutes` — engaged on every route (see
  * GAP-056; NOT gated on the route's own element count), bounded instead by
- * MAX_STATE_PROBES_PER_CRAWL/MAX_STATE_DEPTH and by STATE_REVEAL_MIN_NEW_ELEMENTS only ever
- * recording a click that reveals a real, materially larger state. */
+ * MAX_STATE_PROBES_PER_CRAWL/MAX_STATE_DEPTH and by only ever recording a click that reveals a
+ * real state: one that is materially larger (STATE_REVEAL_MIN_NEW_ELEMENTS) or brings new input
+ * fields on screen (STATE_REVEAL_MIN_NEW_INPUTS — see `revealedInputFields`). */
 interface DeepProbeOpts {
   /** This state's identity so far: the route URL plus every selector clicked to reach it. */
   stateKeyPrefix: string;
@@ -345,9 +381,11 @@ interface DeepProbeOpts {
  * registration form instead (the exact bug this guards against).
  *
  * When `opts.deepProbe` is set (engaged on every route, see GAP-056), a same-URL click that
- * reveals a MATERIALLY LARGER DOM state (>= STATE_REVEAL_MIN_NEW_ELEMENTS more interactive
- * elements than a small dropdown/menu — those still fall through to the ordinary harvest-and-
- * revert branch) is instead recorded as its own `CrawledRoute` (keyed by `stateKey`, not `url`,
+ * reveals a REAL STATE — either a materially larger DOM (>= STATE_REVEAL_MIN_NEW_ELEMENTS more
+ * interactive elements than a small dropdown/menu) or new input fields regardless of net size
+ * (>= STATE_REVEAL_MIN_NEW_INPUTS; see `revealedInputFields` for why a net-growth test alone
+ * cannot see an inline-edit view swap) — is instead recorded as its own `CrawledRoute` (keyed by
+ * `stateKey`, not `url`,
  * see `CrawledRoute.stateKey`) and, budget/depth permitting, probed one level deeper via a
  * recursive call after a best-effort `fillSafeInputs` pass — the one piece deliberately missing
  * from ordinary route discovery: a wallet/subscription-management modal, or a filter panel, needs
@@ -375,6 +413,13 @@ async function discoverClickRoutes(
   const deepProbe = opts.deepProbe;
 
   for (const candidate of candidates) {
+    // Charged per ATTEMPTED click, not per recorded state. That looks like a misnomer next to
+    // MAX_STATE_PROBES_PER_CRAWL's name, and charging per state was tried — it starved the
+    // crawl of TIME instead: with no per-click ceiling every route spent its full click slice,
+    // the authenticated pass blew its wall clock, and route coverage regressed (8 routes ->
+    // 7, budgetExhausted false -> true) without recording a single extra state. The per-click
+    // charge is doing double duty as a cost throttle, and the fix for the starvation it caused
+    // is a bigger pool (see MAX_STATE_PROBES_PER_CRAWL), not a different charging rule.
     if (deepProbe && deepProbe.budget.remaining <= 0) break;
     attempted += 1;
     if (deepProbe) deepProbe.budget.remaining -= 1;
@@ -390,7 +435,8 @@ async function discoverClickRoutes(
         await browser.pressKey('Escape').catch(() => undefined);
       } else if (
         deepProbe &&
-        after.interactiveElements.length - beforeCount >= STATE_REVEAL_MIN_NEW_ELEMENTS
+        (after.interactiveElements.length - beforeCount >= STATE_REVEAL_MIN_NEW_ELEMENTS ||
+          revealedInputFields(snapshot, after) >= STATE_REVEAL_MIN_NEW_INPUTS)
       ) {
         const stateKey = `${deepProbe.stateKeyPrefix}>>${candidate.selector}`;
         discoveredStates.push({
@@ -488,6 +534,39 @@ function fingerprintOf(snapshot: DomSnapshot): string {
 
 function hasPasswordField(snapshot: DomSnapshot): boolean {
   return snapshot.interactiveElements.some((el) => el.inputType === 'password');
+}
+
+function isInputField(el: InteractiveElement): boolean {
+  return el.role === 'textbox' || el.inputType !== undefined;
+}
+
+/**
+ * How many input fields are on screen in `after` that were not there in `before`, compared BY
+ * SELECTOR.
+ *
+ * This exists because `STATE_REVEAL_MIN_NEW_ELEMENTS` measures NET element growth, which is
+ * structurally blind to a same-URL view SWAP — and a swap is how real apps implement inline
+ * editing. C&A's dashboard drives all four profile-edit flows off one `subpage` state: clicking
+ * "zmeniť" REPLACES a list of ~5 edit links with a form of 3 inputs plus a submit, a net change of
+ * about MINUS ONE. No value of a net-growth threshold can ever fire on that, so every one of those
+ * forms was clicked, judged a dropdown, Escape-reverted and discarded — and 38 generated Tier B
+ * specs then shipped as ungrounded `test.fixme` asking for precisely those fields ("the DOB
+ * date-picker input revealed by this zmeniť trigger", "the password-change form fields are not in
+ * the provided inventory", and so on).
+ *
+ * Counting inputs is what makes a swap visible: it is insensitive to whatever the swap REMOVED,
+ * and "new inputs appeared" is a much truer description of "a form opened" than "the element count
+ * went up" ever was. Compared by selector rather than by count for the same reason — a swap that
+ * trades three inputs for three DIFFERENT inputs (name form -> DOB form) nets zero on a count and
+ * must still register.
+ *
+ * This does not replace the element-count test, it joins it: a date-picker or a modal that piles
+ * new controls on top of an intact form is still caught by the original signal even when it adds
+ * no inputs at all (a calendar is buttons).
+ */
+function revealedInputFields(before: DomSnapshot, after: DomSnapshot): number {
+  const seen = new Set(before.interactiveElements.filter(isInputField).map((el) => el.selector));
+  return after.interactiveElements.filter((el) => isInputField(el) && !seen.has(el.selector)).length;
 }
 
 /** Recognizable "this route rendered a crash" shapes: a framework error-boundary fallback
@@ -672,9 +751,9 @@ export async function crawl(
     // Every route is deep-probe eligible (see GAP-056) — NOT gated on this route's own element
     // count. A live audit of the real C&A app found a healthy, well-populated "My account" page
     // whose "change password" button still reveals an un-grounded same-URL form; gating on
-    // route-thinness would keep missing exactly that shape. STATE_REVEAL_MIN_NEW_ELEMENTS (only a
-    // click that reveals a real, materially larger state ever gets recorded) and the separate
-    // MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
+    // route-thinness would keep missing exactly that shape. The reveal tests (only a click that
+    // grows the DOM materially, or brings new inputs on screen, ever gets recorded) and the
+    // separate MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
     // ...but past DEEP_PROBE_BUDGET_FRACTION of the budget, only when nothing is left to
     // discover — see that constant for why enrichment yields to discovery at the tail.
     const wantsStateProbe = remainingStateProbes > 0 && (queue.length === 0 || Date.now() < deepProbeCutoff);

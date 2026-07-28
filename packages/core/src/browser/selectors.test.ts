@@ -83,6 +83,33 @@ function inferButtonType(rawType: string, inForm: boolean): string {
   return rawType || (inForm ? 'submit' : '');
 }
 
+/** Minimal structural view of the attribute reads `isDisabled`/`isReadOnly` perform. */
+interface AttrEl {
+  attrs: Record<string, string>;
+}
+
+function attrEl(attrs: Record<string, string> = {}): AttrEl {
+  return { attrs };
+}
+
+function hasAttribute(el: AttrEl, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(el.attrs, name);
+}
+
+function getAttribute(el: AttrEl, name: string): string | null {
+  return hasAttribute(el, name) ? el.attrs[name]! : null;
+}
+
+/** `isDisabled`, copied verbatim from the `page.evaluate` callback. */
+function isDisabled(el: AttrEl): boolean {
+  return hasAttribute(el, 'disabled') || getAttribute(el, 'aria-disabled') === 'true';
+}
+
+/** `isReadOnly`, copied verbatim from the `page.evaluate` callback. */
+function isReadOnly(el: AttrEl): boolean {
+  return hasAttribute(el, 'readonly') || getAttribute(el, 'aria-readonly') === 'true';
+}
+
 /**
  * Dynamic-id filter, copied verbatim from `selectorFor`'s `isLikelyDynamicId` in
  * selectors.ts. These id shapes are reassigned per render tree (React's useId(), MUI's mui-N) or
@@ -162,6 +189,37 @@ describe('selectors.buttonType inference (implicit HTML submit semantics)', () =
   it('never overrides an explicit type attribute, in or out of a form', () => {
     expect(inferButtonType('button', true)).toBe('button');
     expect(inferButtonType('reset', false)).toBe('reset');
+  });
+});
+
+describe('selectors.isReadOnly (gated-field detection, mirrored)', () => {
+  it('detects the readonly attribute and aria-readonly="true"', () => {
+    expect(isReadOnly(attrEl({ readonly: '' }))).toBe(true);
+    expect(isReadOnly(attrEl({ 'aria-readonly': 'true' }))).toBe(true);
+  });
+
+  it('is false for an ordinary field, and for aria-readonly="false"', () => {
+    expect(isReadOnly(attrEl())).toBe(false);
+    expect(isReadOnly(attrEl({ 'aria-readonly': 'false' }))).toBe(false);
+  });
+
+  it('is INDEPENDENT of isDisabled in both directions', () => {
+    // The distinction has teeth: `disabled` removes an element from click-probe candidates
+    // entirely, while `readonly` must leave it clickable and merely un-fillable. Collapsing the
+    // two would silently drop gated fields out of the inventory instead of flagging them.
+    const readonlyOnly = attrEl({ readonly: '' });
+    expect(isReadOnly(readonlyOnly)).toBe(true);
+    expect(isDisabled(readonlyOnly)).toBe(false);
+
+    const disabledOnly = attrEl({ disabled: '' });
+    expect(isDisabled(disabledOnly)).toBe(true);
+    expect(isReadOnly(disabledOnly)).toBe(false);
+  });
+
+  it('reports both when a field is genuinely readonly AND disabled', () => {
+    const both = attrEl({ readonly: '', disabled: '' });
+    expect(isReadOnly(both)).toBe(true);
+    expect(isDisabled(both)).toBe(true);
   });
 });
 

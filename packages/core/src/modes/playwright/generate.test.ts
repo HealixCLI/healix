@@ -1871,6 +1871,70 @@ describe('generate — relevance-ranked DOM inventory (Phase 2 scoring)', () => 
     expect(prompt).not.toContain('.filter({ hasText:');
   });
 
+  it('states that a tier-4 positional path is valid only on the route it was captured from', async () => {
+    // Observed live: the same "apple wallet" control appears in the inventory twice with
+    // different positional paths (one per route), and a generated test used one route's path on
+    // the other route — so toBeVisible() failed on an element that was genuinely present. The
+    // route was already printed on every line but never stated as a CONSTRAINT.
+    const elements = [
+      {
+        role: 'generic',
+        name: 'apple wallet',
+        selector: 'div:nth-of-type(6) > div > div:nth-of-type(3) > div > img',
+        selectorTier: 4 as const,
+        repeatedRowText: 'Moje kupóny',
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Add to wallet'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('valid ONLY on');
+    expect(prompt).toContain('NOT interchangeable');
+  });
+
+  it('does not add the route-scoped warning to a stable (tier-1) selector', async () => {
+    const elements = [
+      {
+        role: 'button',
+        name: 'Save',
+        selector: '[data-testid="save"]',
+        selectorTier: 1 as const,
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Save the form'));
+    expect(calls[0].prompt).not.toContain('valid ONLY on');
+  });
+
+  it('flags a readonly field inline so the model does not emit a .fill() against it', async () => {
+    // A readonly input is visible and enabled, so nothing else in its inventory line hints that
+    // filling it is impossible — and a .fill() against one doesn't fail fast, it retries
+    // "element is not editable" until the whole 60s test timeout is gone (observed on the
+    // password-reset confirm field, which the app gates until the first password validates).
+    const elements = [
+      {
+        role: 'textbox',
+        name: 'Confirm password',
+        selector: 'input[data-testid="reset-confirm-password"]',
+        inputType: 'password',
+        readOnly: true,
+      },
+      {
+        role: 'textbox',
+        name: 'New password',
+        selector: 'input[data-testid="reset-new-password"]',
+        inputType: 'password',
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Reset the password'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('READONLY');
+    // Only the gated field carries the warning — the ordinary one beside it must stay clean, or
+    // the note becomes noise the model learns to ignore.
+    const confirmLine = prompt.split('\n').find((l) => l.includes('reset-confirm-password'));
+    const newLine = prompt.split('\n').find((l) => l.includes('reset-new-password'));
+    expect(confirmLine).toContain('READONLY');
+    expect(newLine).not.toContain('READONLY');
+  });
+
   it('handles a global inventory of 120+ elements across many routes without exceeding MAX_SNAPSHOT_ELEMENTS', async () => {
     const manyRoutesExploration: NonNullable<TestModeContext['exploration']> = {
       crawl: {

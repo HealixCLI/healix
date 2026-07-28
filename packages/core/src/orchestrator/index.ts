@@ -1570,6 +1570,7 @@ async function runPipeline(
                     authAttempted: explorationArtifact.crawl.authAttempted,
                     authVerified: explorationArtifact.crawl.authVerified,
                     authReason: explorationArtifact.crawl.authReason,
+                    verifiedLogin: explorationArtifact.crawl.verifiedLogin,
                   };
                   const quality = assessExplorationUsefulness(mergedCrawl);
                   explorationArtifact = {

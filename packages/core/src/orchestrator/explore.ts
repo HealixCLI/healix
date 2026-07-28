@@ -295,6 +295,7 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
             authAttempted: crawlResult.authAttempted,
             authVerified: crawlResult.authVerified,
             authReason: crawlResult.authReason,
+            verifiedLogin: crawlResult.verifiedLogin,
           };
 
           const routeCountByLabel = new Map<string, number>();
@@ -347,6 +348,7 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
             authAttempted: crawlResult.authAttempted,
             authVerified: crawlResult.authVerified,
             authReason: crawlResult.authReason,
+            verifiedLogin: crawlResult.verifiedLogin,
           };
 
           const routeCountByOrigin = new Map<string, number>();
@@ -394,6 +396,7 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
             authAttempted: crawlResult.authAttempted,
             authVerified: crawlResult.authVerified,
             authReason: crawlResult.authReason,
+            verifiedLogin: crawlResult.verifiedLogin,
           };
           if (staticRouteCount > 0) {
             emit(

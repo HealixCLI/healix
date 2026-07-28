@@ -1092,6 +1092,26 @@ export interface CrawlWithAuthResult extends CrawlResult {
   authVerified: boolean;
   /** Set whenever auth wasn't attempted or wasn't verified — never blocks the crawl. */
   authReason?: string;
+  /**
+   * The exact login page/selectors that were just PROVEN to work, present only when
+   * `authVerified: true` — distinct from (and more authoritative than) `scoreLoginCandidates`'s
+   * independently re-derived ranking, which doesn't know which route this crawl actually
+   * authenticated through and can rank a toggle-gated route below a URL that never worked.
+   * Downstream codegen (see modes/playwright/execute.ts) should prefer this over
+   * `loginCandidates` whenever present.
+   */
+  verifiedLogin?: VerifiedLoginInfo;
+}
+
+export interface VerifiedLoginInfo {
+  /** The exact URL the login form/toggle was on — not re-derived by scoring. */
+  pageUrl: string;
+  /** Present only when the login view was behind a same-URL client-side toggle. */
+  toggleSelector?: string;
+  identifierSelector: string;
+  passwordSelector: string;
+  /** Absent when submission fell back to pressing Enter (no submit button was found). */
+  submitSelector?: string;
 }
 
 /**
@@ -1172,6 +1192,15 @@ export async function crawlWithAuth(
     ...mergeCrawlResults(anonymous, authCrawl, 'authenticated'),
     authAttempted: true,
     authVerified: true,
+    verifiedLogin: attempt.selectors
+      ? {
+          pageUrl: candidate.url,
+          toggleSelector: candidate.loginToggleSelector,
+          identifierSelector: attempt.selectors.identifier,
+          passwordSelector: attempt.selectors.password,
+          submitSelector: attempt.selectors.submit,
+        }
+      : undefined,
   };
 }
 

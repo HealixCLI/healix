@@ -223,6 +223,100 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/login');
   });
 
+  it('prefers a PROVEN verifiedLogin over the independently-scored loginCandidates, and sets grounded selector env vars', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: true,
+            authVerified: true,
+            verifiedLogin: {
+              pageUrl: 'http://localhost:3000/#/SK/register',
+              toggleSelector: '#toggle-login-btn',
+              identifierSelector: '#login-email',
+              passwordSelector: '#login-password',
+              submitSelector: '#login-submit',
+            },
+          },
+          routing: { hashRouted: true, invariantPrefix: '#/SK' },
+          // Deliberately a DIFFERENT (wrong) URL than verifiedLogin.pageUrl — scoreLoginCandidates
+          // doesn't know which route crawlWithAuth actually authenticated through, so its top
+          // pick must lose to the proven one.
+          loginCandidates: [{ url: 'http://localhost:3000/#/SK/login', score: 5, source: 'crawled' }],
+          useful: true,
+          observedEndpoints: [],
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/register');
+    expect(env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR).toBe('#login-email');
+    expect(env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR).toBe('#login-password');
+    expect(env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR).toBe('#login-submit');
+    expect(env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR).toBe('#toggle-login-btn');
+  });
+
+  it('omits the grounded selector env vars when no verifiedLogin is present', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: false,
+            authVerified: false,
+          },
+          routing: { hashRouted: true, invariantPrefix: '#/SK' },
+          loginCandidates: [{ url: 'http://localhost:3000/#/SK/login', score: 5, source: 'crawled' }],
+          useful: true,
+          observedEndpoints: [],
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/login');
+    expect(env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR).toBeUndefined();
+  });
+
   it('falls back to the naive /login default when EXPLORE found no login candidates', () => {
     const env = suiteEnv(
       makeCtx({

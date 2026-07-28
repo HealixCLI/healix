@@ -1237,6 +1237,13 @@ describe('crawlWithAuth()', () => {
 
     expect(result.authAttempted).toBe(true);
     expect(result.authVerified).toBe(true);
+    expect(result.verifiedLogin).toEqual({
+      pageUrl: 'https://a.test/login',
+      toggleSelector: undefined,
+      identifierSelector: EMAIL_FIELD.selector,
+      passwordSelector: PASSWORD_FIELD.selector,
+      submitSelector: SUBMIT_BUTTON.selector,
+    });
 
     const anonymousUrls = result.routes.filter((r) => r.role === 'anonymous').map((r) => r.url);
     expect(anonymousUrls.sort()).toEqual(['https://a.test/', 'https://a.test/login']);
@@ -1318,6 +1325,18 @@ describe('crawlWithAuth()', () => {
     expect(result.authReason).toBeUndefined();
     const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
     expect(authUrls).toEqual(['https://a.test/dashboard']);
+
+    // This is the crux of the login-selector-grounding fix: the proven-working page URL and
+    // toggle selector must be the REGISTER page's toggle, not re-derived from scratch — a
+    // route with no password field until the toggle fires would otherwise be invisible to
+    // scoreLoginCandidates(), which never sees loginToggleSelector at all.
+    expect(result.verifiedLogin).toEqual({
+      pageUrl: 'https://a.test/register',
+      toggleSelector: '#toggle-login-btn',
+      identifierSelector: '#login-email',
+      passwordSelector: '#login-password',
+      submitSelector: '#login-submit',
+    });
   });
 
   // Runs ~10s on purpose: a submit that never leaves the login page is only CONFIRMED failed

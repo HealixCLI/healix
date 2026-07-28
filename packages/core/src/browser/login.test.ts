@@ -54,7 +54,12 @@ function makeFakeBrowser(config: {
     },
     async clickAt(_point: Point): Promise<void> {},
     async type(_selector: string, _text: string): Promise<void> {},
-    async pressKey(_key: string): Promise<void> {},
+    // Mirrors click()'s onSubmitGoTo fallback — models a form submitted by pressing Enter
+    // (the no-submit-button fallback path) rather than clicking a button.
+    async pressKey(_key: string): Promise<void> {
+      const next = config.onSubmitGoTo?.[currentUrl];
+      if (next) currentUrl = next;
+    },
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
     },
@@ -96,6 +101,22 @@ describe('attemptLogin()', () => {
 
     expect(result.ok).toBe(true);
     expect(result.landingUrl).toBe('https://a.test/dashboard');
+    expect(result.selectors).toEqual({ identifier: '#email', password: '#password', submit: '#submit' });
+  });
+
+  it('omits `selectors.submit` when submission falls back to pressing Enter (no submit button found)', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD] },
+        'https://a.test/dashboard': { elements: [] },
+      },
+      onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+    });
+
+    const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+    expect(result.ok).toBe(true);
+    expect(result.selectors).toEqual({ identifier: '#email', password: '#password', submit: undefined });
   });
 
   it('fails when the login page re-renders with the password field still present (wrong credentials)', async () => {
@@ -200,6 +221,68 @@ describe('attemptLogin()', () => {
     expect(result.landingUrl).toBe('https://a.test/#/SK/dashboard');
   });
 
+  it('re-fills the replacement form when a toggle swaps fields mid-fill, and reports the NEW selectors', async () => {
+    // Models the swap landing BETWEEN the two type() calls (see submitLoginAttempt's
+    // stillSameForm check) — the elements typed into become stale, so the reported
+    // `selectors` must reflect the REPLACEMENT elements, not the original ones.
+    const OLD_EMAIL: InteractiveElement = {
+      role: 'textbox',
+      name: 'Email',
+      selector: '#old-email',
+      inputType: 'email',
+    };
+    const OLD_PASSWORD: InteractiveElement = {
+      role: 'textbox',
+      name: 'Password',
+      selector: '#old-password',
+      inputType: 'password',
+    };
+    const NEW_EMAIL: InteractiveElement = {
+      role: 'textbox',
+      name: 'Email',
+      selector: '#new-email',
+      inputType: 'email',
+    };
+    const NEW_PASSWORD: InteractiveElement = {
+      role: 'textbox',
+      name: 'Password',
+      selector: '#new-password',
+      inputType: 'password',
+    };
+    const NEW_SUBMIT: InteractiveElement = { role: 'button', name: 'Sign in', selector: '#new-submit' };
+
+    const pages: Record<string, { elements: InteractiveElement[] }> = {
+      'https://a.test/login': { elements: [OLD_EMAIL, OLD_PASSWORD] },
+      'https://a.test/dashboard': { elements: [] },
+    };
+    const browser = makeFakeBrowser({
+      pages,
+      onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+    });
+    const typed: Array<{ selector: string; text: string }> = [];
+    const originalType = browser.type.bind(browser);
+    let swapped = false;
+    browser.type = async (selector: string, text: string) => {
+      typed.push({ selector, text });
+      if (!swapped) {
+        pages['https://a.test/login'].elements = [NEW_EMAIL, NEW_PASSWORD, NEW_SUBMIT];
+        swapped = true;
+      }
+      return originalType(selector, text);
+    };
+
+    const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+    expect(result.ok).toBe(true);
+    expect(typed).toContainEqual({ selector: '#new-email', text: 'user@a.test' });
+    expect(typed).toContainEqual({ selector: '#new-password', text: 'pw' });
+    expect(result.selectors).toEqual({
+      identifier: '#new-email',
+      password: '#new-password',
+      submit: '#new-submit',
+    });
+  });
+
   it('refuses to submit a registration form as a login', async () => {
     const REGISTER_SUBMIT: InteractiveElement = {
       role: 'button',
@@ -297,6 +380,7 @@ describe('attemptLogin()', () => {
       expect(result.ok).toBe(true);
       expect(typed).toContainEqual({ selector: '#real-email', text: 'user@a.test' });
       expect(typed).not.toContainEqual({ selector: '#search', text: 'user@a.test' });
+      expect(result.selectors?.identifier).toBe('#real-email');
     });
 
     it('prefers a textbox that comes AFTER the password field when it is strictly nearer than one before it', async () => {
@@ -331,6 +415,7 @@ describe('attemptLogin()', () => {
 
       expect(result.ok).toBe(true);
       expect(typed).toContainEqual({ selector: '#near-username', text: 'user@a.test' });
+      expect(result.selectors?.identifier).toBe('#near-username');
     });
   });
 
@@ -371,6 +456,7 @@ describe('attemptLogin()', () => {
 
       expect(result.ok).toBe(true);
       expect(clicked).toEqual(['#real-submit']);
+      expect(result.selectors?.submit).toBe('#real-submit');
     });
 
     it('falls back to selector/testid keyword matching when there is no <form> wrapper', async () => {
@@ -400,6 +486,7 @@ describe('attemptLogin()', () => {
 
       expect(result.ok).toBe(true);
       expect(clicked).toEqual(['button[data-testid="login-submit"]']);
+      expect(result.selectors?.submit).toBe('button[data-testid="login-submit"]');
     });
 
     it('falls back to the visible-name regex only when neither structural signal is present (backward compat)', async () => {
@@ -429,6 +516,7 @@ describe('attemptLogin()', () => {
 
       expect(result.ok).toBe(true);
       expect(clicked).toEqual(['#action-button']);
+      expect(result.selectors?.submit).toBe('#action-button');
     });
 
     it('never picks a disabled button at any tier', async () => {
@@ -465,6 +553,7 @@ describe('attemptLogin()', () => {
 
       expect(result.ok).toBe(true);
       expect(clicked).toEqual(['#enabled-fallback']);
+      expect(result.selectors?.submit).toBe('#enabled-fallback');
     });
   });
 });

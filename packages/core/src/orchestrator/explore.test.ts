@@ -419,6 +419,8 @@ describe('runExplorePhase()', () => {
     expect(browser.stopped).toBe(true);
   });
 
+  // Runs ~10s on purpose: login is only CONFIRMED failed once login.ts's
+  // LOGIN_SETTLE_TIMEOUT_MS has elapsed. Fits this package's 15s testTimeout (vitest.config.ts).
   it('emits a warn breadcrumb (never throws) when credentials are present but login cannot be verified', async () => {
     const browser = makeFakeBrowser({
       pages: {

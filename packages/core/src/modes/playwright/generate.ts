@@ -20,7 +20,10 @@ function emit(ctx: TestModeContext, message: string, data?: unknown): void {
 }
 
 const MAX_MOCK_CONTENT_LINES = 20;
-const MAX_MOCK_BODY_CHARS = 400;
+// The 'auth' category's static mock body (mock-responses.ts) serializes to ~550 chars —
+// 400 would mid-JSON-truncate it in this prompt, which invites the model to invent the
+// rest of the shape rather than see the real one.
+const MAX_MOCK_BODY_CHARS = 800;
 
 /**
  * Ground assertions in the ACTUAL resolved mock content, not a guess. Without
@@ -417,6 +420,32 @@ const ESCAPE_HATCH_MARKER = '// TODO: unobserved element';
 /** Matches a test-block opening call (`test(`, `test.only(`, `test.skip(`) at an exact source offset — used to rewrite it to `test.fixme(` in place without disturbing anything else in the block. */
 const TEST_OPEN_AT_RE = /test(?:\.(?:only|skip|fixme))?\(/y;
 
+/** Captures the model's own explanation trailing its ESCAPE_HATCH_MARKER comment — the
+ * genuinely useful half ("the login form fields were not captured in the inventory for the
+ * login route itself") rather than just the fact that something was unobserved. */
+// Every gap is [ \t] rather than \s so the capture can never cross the newline and pick up the
+// following line of test code as if it were the explanation.
+const ESCAPE_HATCH_REASON_RE = /\/\/[ \t]*TODO:[ \t]*unobserved element[ \t]*[-–—:]?[ \t]*([^\r\n]*)/;
+/** Keeps one long model comment from dominating a report cell. */
+const SKIP_REASON_MAX_LENGTH = 300;
+
+/**
+ * Builds the `TestDetails` argument carrying the skip reason as a real Playwright annotation.
+ *
+ * The reason has to reach Playwright's ANNOTATIONS, not just a source comment: execute.ts's
+ * extractSkipReason and report.ts's skip-reason cell both read annotations, so a comment-only
+ * marker leaves the report's "why was this skipped" column blank — for what is, in practice,
+ * the most common skip cause there is. `JSON.stringify` does the embedding because the text is
+ * model-authored and can hold quotes, backslashes, or newlines.
+ */
+function escapeHatchDetails(body: string): string {
+  const detail = ESCAPE_HATCH_REASON_RE.exec(body)?.[1]?.trim() ?? '';
+  const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
+  const description =
+    full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
+  return `, { annotation: { type: 'fixme', description: ${JSON.stringify(description)} } }`;
+}
+
 /**
  * A test the model itself flagged as built on a guess (the escape-hatch marker anywhere in
  * its body) still passes every other gate and, until now, shipped to execute as an ordinary
@@ -426,6 +455,9 @@ const TEST_OPEN_AT_RE = /test(?:\.(?:only|skip|fixme))?\(/y;
  * Downgrade just that block to `test.fixme(...)` so Playwright reports it as
  * needs-review/skipped rather than a hard failure, while every other test in the same spec
  * (with no marker) ships and runs normally.
+ *
+ * Also attaches the reason as a Playwright annotation (see escapeHatchDetails) so it survives
+ * into the report instead of living only in a source comment no reader of the results ever sees.
  */
 export function demoteEscapeHatchBlocks(source: string): string {
   const targets = splitTestBlocks(source).filter((b) => b.body.includes(ESCAPE_HATCH_MARKER));
@@ -436,6 +468,16 @@ export function demoteEscapeHatchBlocks(source: string): string {
     TEST_OPEN_AT_RE.lastIndex = block.start;
     const m = TEST_OPEN_AT_RE.exec(result);
     if (!m || m.index !== block.start) continue;
+
+    // Insert the details argument BEFORE rewriting the opening call: titleEnd sits after
+    // block.start, so splicing at the later offset first leaves the earlier one valid. Skipped
+    // when the block's first argument isn't a string literal — there's no title to insert after,
+    // and the fixme downgrade below still matters more than the annotation.
+    if (block.titleEnd !== undefined) {
+      result =
+        result.slice(0, block.titleEnd) + escapeHatchDetails(block.body) + result.slice(block.titleEnd);
+    }
+
     result =
       result.slice(0, block.start) +
       '/* healix: unobserved element — needs review */ test.fixme(' +

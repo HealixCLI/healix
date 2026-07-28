@@ -24,6 +24,15 @@ export interface TestBlock {
   start: number;
   /** End offset (exclusive), just past the block's closing `)` (and a trailing `;` / blank line if present). */
   end: number;
+  /**
+   * End offset (exclusive) just past the closing quote of the block's title literal — i.e. the
+   * insertion point for a second argument. Absent when the block's first argument isn't a
+   * string literal at all. Exposed so a caller can splice a `TestDetails` object in after the
+   * title without re-parsing: the title may contain escaped quotes (real generated titles do,
+   * e.g. `'... the user\'s email ...'`), which TITLE_RE already handles correctly and a naive
+   * regex in the caller would not.
+   */
+  titleEnd?: number;
   body: string;
 }
 
@@ -179,6 +188,9 @@ export function splitTestBlocks(source: string): TestBlock[] {
       title: titleMatch ? titleMatch[2] : '',
       start: m.index,
       end: realEnd,
+      // TITLE_RE is `^`-anchored, so titleMatch[0] spans from argsText's start (including any
+      // leading whitespace) through the closing quote.
+      titleEnd: titleMatch ? openParenIndex + 1 + titleMatch[0].length : undefined,
       body: source.slice(m.index, end),
     });
     TEST_CALL_OPEN_RE.lastIndex = end;

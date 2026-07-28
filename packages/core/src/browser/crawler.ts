@@ -44,6 +44,21 @@ export interface CrawlResult {
   visitedCount: number;
   /** True when the route/wall-clock budget was hit before the queue drained. */
   budgetExhausted: boolean;
+  /**
+   * How many discovered-but-never-visited routes were still queued when the crawl stopped.
+   * `budgetExhausted` alone can't distinguish "ran out of time with nothing left to do"
+   * (harmless) from "ran out of time holding routes we already knew about" — the latter
+   * silently truncates the inventory GENERATE grounds against, and produced a real run whose
+   * every Tier B spec shipped as `test.fixme` with no signal that discovery had been cut
+   * short. Callers surface this as a warning; see explore.ts.
+   *
+   * Optional (rather than a required number matching the other counters) purely so every
+   * pre-existing CrawlResult literal across the codebase/tests doesn't need a mechanical
+   * touch just to keep compiling — the same tradeoff, for the same reason, as
+   * `ExecOutcome.skipped` in modes/types.ts. Always populated by `crawl()`; treat an absent
+   * value as 0.
+   */
+  unvisitedQueuedCount?: number;
   /** Human-readable `a <-> b` pairs for detected two-node redirect ping-pongs. */
   redirectLoopsDetected: string[];
   /** True when most visited routes render near-identical DOM (a single-shell SPA). */
@@ -67,7 +82,19 @@ const DEFAULT_MAX_ROUTES = 60;
 // real navigations than before this budget was last tuned — raised alongside
 // MAX_CLICKS_PER_PAGE/MAX_CLICK_PROBES_PER_CRAWL so the larger candidate pool has
 // room to actually run instead of hitting budgetExhausted mid-page.
-const DEFAULT_BUDGET_MS = 120_000;
+const DEFAULT_BUDGET_MS = 240_000;
+/**
+ * Fraction of the wall-clock budget after which a deep probe will no longer be STARTED while
+ * unvisited routes are still queued. Deep-probe is enrichment (it re-discovers a state that
+ * only exists behind a click); ordinary route discovery is a prerequisite for everything
+ * downstream, so when the two compete for the tail of the budget, discovery has to win —
+ * otherwise budget exhaustion costs whole routes instead of merely costing detail. Note this
+ * gates on the BUDGET, not on the route's own element count: GAP-056's finding that every
+ * route deserves deep-probe eligibility (a well-populated page can still hide an ungrounded
+ * same-URL form) is untouched — probes still run on every route, just not once they'd be
+ * spending time the queue still needs.
+ */
+const DEEP_PROBE_BUDGET_FRACTION = 0.5;
 /** Once a DOM fingerprint has repeated this many times, stop following that page's links. */
 const SHELL_REPEAT_THRESHOLD = 3;
 /** Share of visited routes sharing the dominant fingerprint that counts as "collapsed". */
@@ -76,6 +103,35 @@ const SHELL_COLLAPSE_RATIO = 0.8;
 interface QueueItem {
   url: string;
   depth: number;
+}
+
+/**
+ * Push `item` onto the BFS queue, but jump a login-looking URL ahead of every non-login
+ * URL already waiting.
+ *
+ * The login route is the single highest-value route in the whole crawl: it's what
+ * `scoreLoginCandidates` ranks, what `crawlWithAuth` logs in through, and therefore the
+ * gate on the ENTIRE authenticated half of the inventory. Plain FIFO order gives it no
+ * such standing — a real run discovered `#/SK/login` from the home page's sign-in button,
+ * queued it behind `#/SK/register`, and then spent the whole wall-clock budget
+ * click-probing the register page's date-picker, so login was never dequeued at all. Every
+ * Tier B spec was then generated ungrounded (`test.fixme`) for want of one route that had
+ * been sitting in the queue the entire time.
+ *
+ * Deliberately a reordering, not a budget change: it costs nothing, and unlike a bigger
+ * budget it doesn't merely make the starvation less likely — the login route can no longer
+ * be behind anything that could starve it. Relative order WITHIN each class is preserved
+ * (login URLs stay FIFO among themselves, as do the rest), so this is BFS with one
+ * priority tier rather than a different traversal.
+ */
+function enqueue(queue: QueueItem[], item: QueueItem): void {
+  if (!LOGIN_URL_HINT_RE.test(item.url)) {
+    queue.push(item);
+    return;
+  }
+  const firstOrdinary = queue.findIndex((q) => !LOGIN_URL_HINT_RE.test(q.url));
+  if (firstOrdinary === -1) queue.push(item);
+  else queue.splice(firstOrdinary, 0, item);
 }
 
 /** Strip a trailing slash from the path (but keep a bare "/") while preserving hash/query. */
@@ -149,7 +205,16 @@ const UNSAFE_CLICK_TEXT_RE =
 /** An accessible name that reads as a login/sign-in action — used both to score crawled login
  * candidates (see `scoreLoginCandidates`) and, during click-probing, to recognize a same-URL
  * toggle that reveals a login view (see `discoverClickRoutes`). */
-const LOGIN_TEXT_RE = /log[- ]?in|sign[- ]?in|prihl[aá]si/i;
+export const LOGIN_TEXT_RE = /log[- ]?in|sign[- ]?in|prihl[aá]si/i;
+/** Matches a URL that reads as a login page — checked before the signup/register hint so a
+ * route matching both (unlikely, but possible on an odd path) is still treated as login.
+ * Also drives `enqueue`'s discovery priority below, not just candidate ranking. */
+export const LOGIN_URL_HINT_RE = /\blogin\b|\bsign-?in\b/i;
+/** Matches a URL that reads as registration — many apps expose a password field on both a
+ * signup and a login page, so a route hinting at signup is a weaker login candidate than one
+ * with no hint either way. Also matches a submit control's own identifier (a
+ * `register-submit` testid), which login.ts uses to refuse to submit a signup form. */
+export const SIGNUP_URL_HINT_RE = /\bregister\b|\bsign-?up\b/i;
 /** Cap on click candidates considered per page, before the per-visit MAX_CLICKS_PER_PAGE slice. */
 const CLICK_CANDIDATES_PER_PAGE = 8;
 /**
@@ -262,8 +327,12 @@ interface DeepProbeOpts {
  * pure `<a href>` scan can't see — common in SPAs that route their primary
  * navigation via button/onClick handlers rather than real anchors (this is
  * why a link-only crawl can stall at a single thin route on such an app; see
- * GAP-042). Never clicks anything inside a form, disabled, a submit control,
- * or with a name matching UNSAFE_CLICK_TEXT_RE. After each click, resets to
+ * GAP-042). Never clicks anything disabled, a submit control, or with a name
+ * matching UNSAFE_CLICK_TEXT_RE. In-form controls ARE clicked (as long as they
+ * aren't the submit): excluding them, as this did until e0fcac6, hid any login
+ * view reachable only through a toggle inside the register form — the submit
+ * filter is what keeps an in-form click from actually submitting anything.
+ * After each click, resets to
  * `originalUrl` (if the click navigated) or presses Escape (if it likely just
  * opened a menu/dropdown in place) before trying the next candidate, so the
  * page is always back in a known state for the caller. A same-URL click whose
@@ -485,11 +554,16 @@ export async function crawl(
   const maxRoutes = opts.maxRoutes ?? DEFAULT_MAX_ROUTES;
   const budgetMs = opts.wallClockBudgetMs ?? DEFAULT_BUDGET_MS;
   const deadline = Date.now() + budgetMs;
+  // See DEEP_PROBE_BUDGET_FRACTION: past this point, enrichment yields to discovery.
+  const deepProbeCutoff = Date.now() + budgetMs * DEEP_PROBE_BUDGET_FRACTION;
 
-  const queue: QueueItem[] = [
-    { url: baseUrl, depth: 0 },
-    ...(opts.seedRoutes ?? []).map((url) => ({ url, depth: 0 })),
-  ];
+  // baseUrl stays unconditionally first — it's the crawl root, and visiting it first is what
+  // seeds link discovery and the route-prefix detection every later URL is reconciled
+  // against. Only the seeds (and, below, click/link-discovered URLs) are priority-ordered.
+  const queue: QueueItem[] = [{ url: baseUrl, depth: 0 }];
+  for (const url of opts.seedRoutes ?? []) {
+    enqueue(queue, { url, depth: 0 });
+  }
   const queued = new Set<string>(queue.map((q) => normalizeUrl(q.url)));
   const requested = new Set<string>();
   const visitedResolved = new Set<string>();
@@ -586,7 +660,7 @@ export async function crawl(
         // Queue the link as discovered, not its normalized form — see the
         // goto() comment above (GAP-052) for why navigating to a
         // trailing-slash-stripped URL can be wrong.
-        queue.push({ url: link, depth: item.depth + 1 });
+        enqueue(queue, { url: link, depth: item.depth + 1 });
       }
     }
 
@@ -601,7 +675,9 @@ export async function crawl(
     // route-thinness would keep missing exactly that shape. STATE_REVEAL_MIN_NEW_ELEMENTS (only a
     // click that reveals a real, materially larger state ever gets recorded) and the separate
     // MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
-    const wantsStateProbe = remainingStateProbes > 0;
+    // ...but past DEEP_PROBE_BUDGET_FRACTION of the budget, only when nothing is left to
+    // discover — see that constant for why enrichment yields to discovery at the tail.
+    const wantsStateProbe = remainingStateProbes > 0 && (queue.length === 0 || Date.now() < deepProbeCutoff);
     if (wantsClickProbe || wantsStateProbe) {
       const maxClicks = wantsClickProbe
         ? Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes)
@@ -631,7 +707,7 @@ export async function crawl(
         const norm = normalizeUrl(discovered);
         if (!requested.has(norm) && !queued.has(norm)) {
           queued.add(norm);
-          queue.push({ url: discovered, depth: item.depth + 1 });
+          enqueue(queue, { url: discovered, depth: item.depth + 1 });
         }
       }
     }
@@ -644,6 +720,9 @@ export async function crawl(
     routes,
     visitedCount: routes.length,
     budgetExhausted,
+    // Counts only URLs never requested at all — the loop `shift()`s before it can break, and
+    // skips already-requested entries, so queue length on its own would over-report.
+    unvisitedQueuedCount: queue.filter((q) => !requested.has(normalizeUrl(q.url))).length,
     redirectLoopsDetected,
     shellCollapsed,
     degenerateRedirectsSkipped,
@@ -662,14 +741,6 @@ export interface CrawlWithAuthResult extends CrawlResult {
   /** Set whenever auth wasn't attempted or wasn't verified — never blocks the crawl. */
   authReason?: string;
 }
-
-/** Matches a URL that reads as a login page — checked before the signup/register hint so a
- * route matching both (unlikely, but possible on an odd path) is still treated as login. */
-const LOGIN_URL_HINT_RE = /\blogin\b|\bsign-?in\b/i;
-/** Matches a URL that reads as registration — many apps expose a password field on both a
- * signup and a login page, so a route hinting at signup is a weaker login candidate than one
- * with no hint either way. */
-const SIGNUP_URL_HINT_RE = /\bregister\b|\bsign-?up\b/i;
 
 /**
  * Picks the best login candidate among password-bearing routes: a route whose
@@ -750,6 +821,7 @@ export async function crawlWithAuth(
     routes: [...anonymous.routes, ...authenticatedRoutes],
     visitedCount: anonymous.visitedCount + authenticatedRoutes.length,
     budgetExhausted: anonymous.budgetExhausted || authCrawl.budgetExhausted,
+    unvisitedQueuedCount: (anonymous.unvisitedQueuedCount ?? 0) + (authCrawl.unvisitedQueuedCount ?? 0),
     redirectLoopsDetected: [...anonymous.redirectLoopsDetected, ...authCrawl.redirectLoopsDetected],
     shellCollapsed: anonymous.shellCollapsed || authCrawl.shellCollapsed,
     degenerateRedirectsSkipped: [
@@ -835,38 +907,106 @@ function joinHashPath(prefix: string, path: string): string {
 const COMMON_LOGIN_PATHS = ['/login', '/signin', '/auth/login'];
 /** Minimum score treated as "confident" (crawled candidates only — see scoreLoginCandidates). */
 const CONFIDENT_SCORE = 3;
+/**
+ * Score given to a COMMON_LOGIN_PATHS guess. Deliberately BELOW what a signup-penalized crawled
+ * route reaches (3 for its password field, less SIGNUP_URL_PENALTY), and below CONFIDENT_SCORE so
+ * a guess never counts as confidence in its own right.
+ *
+ * A crawled register page outranking a guessed `/login` is the point, not an oversight: we have
+ * positive evidence the register page exists and carries a password field, and none whatsoever
+ * that `/login` resolves to anything. On an app whose login view is only a toggle inside the
+ * register form — with no `/login` route at all — preferring the guess would send the auth
+ * fixture to a URL that renders the SPA's fallback, losing a login that otherwise works (the
+ * fixture reveal-clicks the toggle). Since `enqueue` now guarantees a real login route is
+ * visited when one is reachable, the case this ordering decides is precisely the one where the
+ * guess is wrong.
+ */
+const COMMON_PATH_SCORE = 1;
+
+/**
+ * Penalty applied to a route whose URL reads as registration/signup. Sized to sit in the gap
+ * between the two thresholds either side of it: enough that a signup route's password field
+ * alone (+3) can no longer reach CONFIDENT_SCORE (so the common-path fallback still gets
+ * emitted), but not so much that it drops to or below COMMON_PATH_SCORE (so a page we actually
+ * crawled still outranks a URL we only guessed at). See scoreLoginCandidates.
+ *
+ * Concretely, with a password field's +3: 3 - 1 = 2, which is below CONFIDENT_SCORE (3) and
+ * above COMMON_PATH_SCORE (1). A penalty of 2 would instead land exactly ON
+ * COMMON_PATH_SCORE, leaving the register page ahead of the guess only by tie-break order —
+ * true today, but by accident rather than by intent.
+ */
+const SIGNUP_URL_PENALTY = 1;
 
 /**
  * Ranks crawled routes as login candidates: highest for an actual password
- * field, plus points for URL/title text matches. Falls back to a small
- * common-paths list — reconciled against any detected hash/region prefix
- * instead of a naive path join — only when nothing crawled scores
- * confidently.
+ * field, plus points for URL/title text matches, minus a penalty for a URL that
+ * reads as registration. Falls back to a small common-paths list — reconciled
+ * against any detected hash/region prefix instead of a naive path join — only
+ * when nothing crawled scores confidently.
+ *
+ * The signup penalty is the whole reason this isn't just "has a password field". Registration
+ * and login pages both carry one, so `hasPasswordField` alone can't tell them apart — and
+ * scoring a register page +3 did two kinds of damage at once: it made the register page the
+ * top candidate (this feeds HEALIX_TIERB_LOGIN_URL, see modes/playwright/execute.ts), AND,
+ * because +3 is exactly CONFIDENT_SCORE, it suppressed the `/login` common-path fallback that
+ * would otherwise have rescued the run. A real crawl that never reached `#/SK/login` therefore
+ * reported `#/SK/register` as a CONFIDENT login candidate and offered no alternative. Netting
+ * the signup hint out fixes both halves: the register page stays a candidate (it may genuinely
+ * be the only way in, e.g. an in-form login toggle) but ranks below any real login route and no
+ * longer claims a confidence that silently disables the fallback.
+ *
+ * Mirrors `pickLoginCandidate`'s preference order, which already used these same two regexes —
+ * the two had drifted apart, and it was this one, the one feeding the generated auth fixture,
+ * that lacked the logic.
  */
 export function scoreLoginCandidates(
   routes: CrawledRoute[],
   routing: RoutePrefixInfo,
   baseUrl: string,
 ): LoginCandidate[] {
-  const candidates: LoginCandidate[] = [];
+  const best = new Map<string, LoginCandidate>();
   for (const route of routes) {
     let score = 0;
     if (route.hasPasswordField) score += 3;
     if (LOGIN_TEXT_RE.test(route.url)) score += 2;
     if (LOGIN_TEXT_RE.test(route.title)) score += 1;
-    if (score > 0) candidates.push({ url: route.url, score, source: 'crawled' });
+    // Checked after the login hints so a route reading as BOTH (an odd path like
+    // "/register-or-login") keeps its login credit — same precedence as pickLoginCandidate.
+    if (!LOGIN_URL_HINT_RE.test(route.url) && SIGNUP_URL_HINT_RE.test(route.url)) {
+      score -= SIGNUP_URL_PENALTY;
+    }
+    if (score <= 0) continue;
+    // Deduped by normalized URL, keeping the HIGHEST score: a route and its deep-probe states
+    // (see CrawledRoute.stateKey) share one URL, so without this the same page appeared two or
+    // three times in a row — pure noise for a caller that only ever reads candidates[0]. Keeping
+    // the max rather than the first matters because a probed state can carry signals its base
+    // route didn't (a click that reveals the password field).
+    const key = normalizeUrl(route.url);
+    const existing = best.get(key);
+    if (!existing || score > existing.score) {
+      best.set(key, { url: existing?.url ?? route.url, score, source: 'crawled' });
+    }
   }
-  candidates.sort((a, b) => b.score - a.score);
+  const candidates = [...best.values()].sort((a, b) => b.score - a.score);
 
   if (!candidates.some((c) => c.score >= CONFIDENT_SCORE)) {
     for (const path of COMMON_LOGIN_PATHS) {
       const relative = routing.hashRouted ? joinHashPath(routing.invariantPrefix ?? '#', path) : path;
       try {
-        candidates.push({ url: new URL(relative, baseUrl).toString(), score: 1, source: 'common-path' });
+        candidates.push({
+          url: new URL(relative, baseUrl).toString(),
+          score: COMMON_PATH_SCORE,
+          source: 'common-path',
+        });
       } catch {
         // Malformed baseUrl — skip this fallback candidate rather than throw.
       }
     }
+    // Re-sorted because a common-path guess deliberately outranks a signup-penalized crawled
+    // route: a guessed `/login` is a better bet than a register page we know is a register page.
+    // Without this the two tie in insertion order and the register page wins by being first,
+    // which is the exact failure the penalty above exists to prevent.
+    candidates.sort((a, b) => b.score - a.score);
   }
 
   return candidates;

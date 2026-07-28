@@ -134,6 +134,14 @@ export interface ExternalDependency {
 export interface EndpointMock {
   method: string;
   pathPattern: string;
+  /**
+   * Overrides the parent dependency's category for THIS endpoint's mock response only.
+   * Set when the PATH itself identifies the endpoint regardless of its host — an
+   * `/auth/token/generate` login handshake on an otherwise generic 'backend'/'other'
+   * host must still get a token/session body, not the dependency-wide `{}`. See
+   * target/auth-endpoints.ts.
+   */
+  category?: ExternalDependencyCategory;
   response?: MockResponse;
 }
 

@@ -103,6 +103,38 @@ describe('scaffold — mock fixture generation', () => {
     expect(contents).not.toContain('pkg:nodemailer');
   });
 
+  it('emits an auth-tagged endpoint\'s own (token-bearing) response, not the flat dependency-level body, for a "backend"-category host (Fix 1 end-to-end)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_API_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example-partner.test'],
+        endpoints: [
+          {
+            method: 'POST',
+            pathPattern: '/auth/token/generate',
+            category: 'auth',
+            response: {
+              status: 200,
+              body: { token: 'healix-mock-jwt-token', access_token: 'healix-mock-jwt-token' },
+            },
+          },
+        ],
+      },
+    ];
+    const mockResponses: Record<string, MockResponse> = {
+      'env:VITE_API_URL': { status: 200, body: {} },
+    };
+
+    await scaffold(makeCtx({ mockExternalDependencies: true, externalDependencies: deps, mockResponses }));
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    expect(contents).toContain('/auth/token/generate');
+    expect(contents).toContain('healix-mock-jwt-token');
+  });
+
   it('attributes real EXPLORE-observed endpoints to the dependency whose hostname they were seen on, even with no static endpoint detection (GAP-046 + multi-dependency case)', async () => {
     const deps: ExternalDependency[] = [
       {

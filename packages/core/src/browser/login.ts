@@ -1,4 +1,4 @@
-import { normalizeUrl } from './crawler.js';
+import { LOGIN_TEXT_RE, LOGIN_URL_HINT_RE, SIGNUP_URL_HINT_RE, normalizeUrl } from './crawler.js';
 import type { BrowserSurface, DomSnapshot, InteractiveElement } from './types.js';
 
 export interface LoginAttemptResult {
@@ -69,6 +69,99 @@ function findNearestUsernameField(
 const LOGIN_SETTLE_TIMEOUT_MS = 10_000;
 const LOGIN_SETTLE_POLL_MS = 250;
 
+/** Upper bound on how long to wait for the credential fields to MOUNT before concluding a
+ * candidate page has no login form. See `waitForCredentialForm`. */
+const FORM_MOUNT_TIMEOUT_MS = 5_000;
+const FORM_MOUNT_POLL_MS = 250;
+
+function passwordFieldOf(snapshot: DomSnapshot): InteractiveElement | undefined {
+  return snapshot.interactiveElements.find((el) => el.inputType === 'password');
+}
+
+/**
+ * Polls until a password field is present, clicking a login-reveal control if one turns up
+ * along the way, or gives up after `FORM_MOUNT_TIMEOUT_MS`.
+ *
+ * A single snapshot taken straight after `goto()` is not evidence that a page has no login
+ * form — on a client-side-routed app the route component may not have mounted yet, and the
+ * frame can still hold the PREVIOUS route's elements or none at all. Concluding "no password
+ * field found on candidate login page" from that one look is how a real run reported exactly
+ * that about a page which, navigated to by hand, renders its password field perfectly well —
+ * and because that reason aborts the login, the entire authenticated half of the crawl never
+ * ran and every Tier B spec shipped ungrounded.
+ *
+ * The reveal click is folded into this loop rather than tried after it, so a toggle-gated form
+ * is revealed on the first iteration (immediately) instead of after the mount timeout has
+ * already elapsed — waiting 5s for a form that was only ever going to appear on a click is
+ * pure latency, paid on every login attempt against such an app. Returns the last snapshot
+ * either way, so the caller reports a genuine absence after a real wait, not after one frame.
+ */
+async function waitForCredentialForm(browser: BrowserSurface): Promise<DomSnapshot> {
+  const deadline = Date.now() + FORM_MOUNT_TIMEOUT_MS;
+  let snapshot = await browser.snapshot();
+  let revealAttempted = false;
+  for (;;) {
+    if (passwordFieldOf(snapshot)) return snapshot;
+
+    if (!revealAttempted) {
+      const reveal = findLoginRevealControl(snapshot.interactiveElements);
+      if (reveal) {
+        // Only ever one attempt: if clicking it didn't produce a form, clicking again won't,
+        // and a toggle clicked twice can just as easily switch the login view back off.
+        revealAttempted = true;
+        try {
+          await browser.click(reveal.selector);
+          snapshot = await browser.snapshot();
+          continue;
+        } catch {
+          // Reveal click failed — keep polling. A genuine absence is the caller's diagnosis to
+          // report, and it's more useful than "a click we guessed at didn't work".
+        }
+      }
+    }
+
+    if (Date.now() >= deadline) return snapshot;
+    await new Promise((resolve) => setTimeout(resolve, FORM_MOUNT_POLL_MS));
+    snapshot = await browser.snapshot();
+  }
+}
+
+/**
+ * A control that reveals a login form hidden behind a click — the register/login switch some
+ * SPAs use instead of two routes. Unlike crawler.ts's click-probing (which must never touch
+ * in-form controls, since a stray click could submit something), this runs on a page we are
+ * deliberately trying to log in through, so an in-form "Prihlásiť sa"/"Sign in" button is
+ * exactly the control we want. Submit-typed buttons are still excluded: those submit the form
+ * we're trying to get AWAY from.
+ */
+function findLoginRevealControl(elements: InteractiveElement[]): InteractiveElement | undefined {
+  return elements.find(
+    (el) =>
+      !el.disabled &&
+      (el.role === 'button' || el.role === 'link') &&
+      el.buttonType !== 'submit' &&
+      LOGIN_TEXT_RE.test(el.name),
+  );
+}
+
+/**
+ * True when submitting would register a new account rather than log in: the resolved submit
+ * control identifies itself as a signup control AND the page's own URL reads as signup, with
+ * no login hint anywhere to contradict either.
+ *
+ * `findLoginSubmitButton`'s strongest tier is "the `type="submit"` button inside the same
+ * form", which on a registration page is the REGISTRATION submit — so a login attempt pointed
+ * at a register page (which is what an unfixed login-candidate ranking produces) would fill a
+ * real signup form with the test account's credentials and submit it. Requiring BOTH signals
+ * keeps this from misfiring on a legitimate login form that merely lives at a shared
+ * `/account` route or carries an unlucky testid.
+ */
+function looksLikeSignupSubmission(url: string, submit: InteractiveElement | undefined): boolean {
+  if (!submit) return false;
+  if (LOGIN_URL_HINT_RE.test(url) || LOGIN_TEXT_RE.test(submit.name)) return false;
+  return SIGNUP_URL_HINT_RE.test(url) && SIGNUP_URL_HINT_RE.test(submit.selector);
+}
+
 /**
  * Polls until the page navigates away from the login URL or the password
  * field disappears, or `LOGIN_SETTLE_TIMEOUT_MS` elapses. A real login is
@@ -111,7 +204,9 @@ async function submitLoginAttempt(
   username: string,
   password: string,
 ): Promise<LoginAttemptResult> {
-  const before = await browser.snapshot();
+  // Waits for the credential form to mount, revealing it behind a login toggle if that's what
+  // this app needs — see waitForCredentialForm.
+  let before = await waitForCredentialForm(browser);
 
   const passwordIndex = before.interactiveElements.findIndex((el) => el.inputType === 'password');
   const passwordEl = before.interactiveElements[passwordIndex];
@@ -123,12 +218,43 @@ async function submitLoginAttempt(
     return { ok: false, reason: 'no username/email field found alongside the password field' };
   }
   const submitEl = findLoginSubmitButton(before.interactiveElements);
+  if (looksLikeSignupSubmission(before.url, submitEl)) {
+    return {
+      ok: false,
+      reason: `candidate login page at ${before.url} is a registration form (its only submit control is ${submitEl?.selector}) — refusing to submit it as a login`,
+    };
+  }
 
   try {
     await browser.type(usernameEl.selector, username);
     await browser.type(passwordEl.selector, password);
-    if (submitEl) {
-      await browser.click(submitEl.selector);
+
+    // Re-check that we're still filling the form we started on. The same click-to-reveal apps
+    // that hide a login form behind a toggle swap it in ASYNCHRONOUSLY, so the swap can land
+    // BETWEEN the two type() calls above — the username goes into the outgoing form's field,
+    // the password into the incoming one's, and the login then fails with a wrong-looking
+    // "credentials rejected" that no amount of credential-checking explains. Detected by
+    // element identity rather than by reading back the values (BrowserSurface exposes no
+    // value read, and a swapped-in field is empty either way): if the password field we typed
+    // into is gone, the form was replaced, so re-fill the replacement once.
+    const after = await browser.snapshot();
+    const stillSameForm = after.interactiveElements.some(
+      (el) => el.inputType === 'password' && el.selector === passwordEl.selector,
+    );
+    if (!stillSameForm) {
+      const newPasswordIndex = after.interactiveElements.findIndex((el) => el.inputType === 'password');
+      const newPasswordEl = after.interactiveElements[newPasswordIndex];
+      const newUsernameEl = findNearestUsernameField(after.interactiveElements, newPasswordIndex);
+      if (newPasswordEl && newUsernameEl) {
+        await browser.type(newUsernameEl.selector, username);
+        await browser.type(newPasswordEl.selector, password);
+        before = after;
+      }
+    }
+
+    const submit = findLoginSubmitButton(before.interactiveElements);
+    if (submit) {
+      await browser.click(submit.selector);
     } else {
       await browser.pressKey('Enter');
     }

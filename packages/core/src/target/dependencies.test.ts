@@ -245,4 +245,115 @@ describe('detectExternalDependencies', () => {
     const deps = await detectExternalDependencies(dir);
     expect(deps).toEqual([]);
   });
+
+  it('attaches an auth-shaped call-site endpoint across multiple mockable dependencies, scoped to the auth-looking one (Fix 1 repro)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({ dependencies: { react: '^18.0.0' } }));
+    write(
+      dir,
+      'src/api.ts',
+      'const backend = import.meta.env.VITE_API_URL;\nconst authBase = import.meta.env.VITE_AUTH_URL;\n' +
+        "apiClient.get('/customer/get');\nauthClient.post('/auth/token/generate');\n",
+    );
+    write(
+      dir,
+      '.env',
+      'VITE_API_URL=https://eu.api.example-partner.test\nVITE_AUTH_URL=https://auth.example-idp.test\n',
+    );
+
+    const deps = await detectExternalDependencies(dir);
+    const backendDep = deps.find((d) => d.envVar === 'VITE_API_URL');
+    const authDep = deps.find((d) => d.envVar === 'VITE_AUTH_URL');
+    expect(backendDep).toBeDefined();
+    expect(authDep).toBeDefined();
+    expect(authDep?.category).toBe('auth');
+
+    expect(
+      authDep?.endpoints?.some((e) => e.method === 'POST' && e.pathPattern === '/auth/token/generate'),
+    ).toBe(true);
+    // The gate is relaxed for AUTH endpoints only — an ordinary endpoint must not get
+    // per-endpoint attribution on ANY dependency just because an auth endpoint elsewhere did.
+    expect(backendDep?.endpoints?.some((e) => e.pathPattern === '/customer/get')).toBeFalsy();
+    expect(backendDep?.endpoints?.some((e) => e.pathPattern.includes('auth'))).toBeFalsy();
+  });
+
+  it('tags an auth-shaped endpoint distinctly from an ordinary one on a single mockable dependency', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({ dependencies: { react: '^18.0.0' } }));
+    write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+    write(dir, 'src/api.ts', "apiClient.post('/auth/login');\napiClient.get('/orders');\n");
+    write(dir, '.env', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+    expect(dep).toBeDefined();
+    const auth = dep?.endpoints?.find((e) => e.pathPattern === '/auth/login');
+    const orders = dep?.endpoints?.find((e) => e.pathPattern === '/orders');
+    expect(auth?.category).toBe('auth');
+    expect(orders?.category).toBeUndefined();
+  });
+
+  it('still attaches an auth endpoint when a hardcoded host is seen twice — once as a bare base literal, once with the auth path (repeat-literal regression)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(
+      dir,
+      'src/api.ts',
+      "fetch('https://eu.api.example-partner.test/health');\nfetch('https://eu.api.example-partner.test/auth/token/generate');\n",
+    );
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.hostnames?.includes('eu.api.example-partner.test'));
+    expect(dep).toBeDefined();
+    expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
+  });
+
+  it('detects an auth path expressed as a template-literal interpolation the call-site regexes miss (fetch(`${base}/auth/token/generate`))', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(
+      dir,
+      'src/api.ts',
+      'const base = process.env.API_BASE_URL;\nfetch(`${base}/auth/token/generate`);\n',
+    );
+    write(dir, '.env', 'API_BASE_URL=https://eu.api.example-partner.test\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'API_BASE_URL');
+    expect(dep).toBeDefined();
+    expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
+  });
+
+  it('does not attribute an auth path to a non-network-call plain string constant', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(
+      dir,
+      'src/docs.ts',
+      "export const authDocsLink = 'https://docs.example.test/auth/token/generate';\n",
+    );
+
+    const deps = await detectExternalDependencies(dir);
+    expect(deps.find((d) => d.hostnames?.includes('docs.example.test'))).toBeUndefined();
+  });
+
+  it('still detects an auth endpoint even when scanned after 40+ other call sites hit the ordinary endpoint cap (cap-immunity)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({ dependencies: { react: '^18.0.0' } }));
+    write(dir, '.env', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+
+    let bulk = '';
+    for (let i = 0; i < 45; i++) {
+      bulk += `apiClient.get('/bulk-endpoint-${i}');\n`;
+    }
+    write(dir, 'src/calls/aaa-bulk.ts', bulk);
+    write(dir, 'src/calls/zzz-auth.ts', "apiClient.post('/auth/token/generate');\n");
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+    expect(dep).toBeDefined();
+    expect(dep?.endpoints?.length ?? 0).toBeGreaterThanOrEqual(40);
+    expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
+  });
 });

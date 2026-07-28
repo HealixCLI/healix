@@ -600,6 +600,32 @@ function isAuthSetup(projectName: string | undefined, file: string | undefined):
 }
 
 /**
+ * Prefix stamped onto the auth-setup row's OWN error text. Triage's
+ * RE_BLOCKED_TIERB matches it (see triage/rules.ts) so this row classifies as the
+ * run-configuration problem it is.
+ *
+ * Stamped HERE, where `isAuthSetup` has already established the row's identity
+ * structurally, precisely so that triage never has to guess it back out of error text.
+ * Triage sees only a title and an error string — and a bare Playwright timeout from the
+ * fixture ("Test timeout of 60000ms exceeded.") carries no auth signal whatsoever, so it
+ * used to land on the generic timeout rule as `environment` @0.55 with the rationale "a
+ * timeout fired with no selector or assertion context", burying the actual cause of 45
+ * blocked tests. Guessing instead from the row's title (`authenticate`) or from auth-ish
+ * words in the error would reintroduce exactly the defect-leakage bug AuthSignals documents
+ * below — Playwright embeds the failing source snippet in its errors, so any generated spec
+ * quoting an auth word could match. A marker Healix writes itself has no such ambiguity.
+ */
+const AUTH_SETUP_FAILURE_MARKER = 'Tier B auth setup failed';
+
+/** Stamp the marker onto the auth-setup row's own error, tolerating an empty/absent error
+ * (a timeout with no message still needs to classify correctly). */
+function withAuthSetupMarker(error: string): string {
+  const text = error.trim();
+  if (text.startsWith(AUTH_SETUP_FAILURE_MARKER)) return text;
+  return text ? `${AUTH_SETUP_FAILURE_MARKER}.\n${text}` : `${AUTH_SETUP_FAILURE_MARKER}.`;
+}
+
+/**
  * Structural signals for classifying Tier B outcomes. Derived from the run
  * itself (the auth-setup project's result + the setup's sidecar meta file),
  * NEVER from matching error text: Playwright errors embed the failing source
@@ -700,9 +726,17 @@ function errorText(result: PwResult | undefined): string {
  * description (a bare `test.skip()` with no reason given).
  */
 function extractSkipReason(test: PwTest): string | undefined {
-  const annotation = (test.annotations ?? []).find((a) => a.type === 'skip' || a.type === 'fixme');
-  const description = annotation?.description?.trim();
-  return description && description.length > 0 ? description : undefined;
+  // Picks the first skip/fixme annotation that actually HAS a description, not simply the first
+  // one: a declaration-form `test.fixme(title, ...)` gets a description-less `fixme` annotation
+  // from Playwright itself, which would otherwise shadow the described annotation the generator
+  // attaches alongside it (see generate.ts's escapeHatchDetails) and leave every escape-hatch
+  // skip reporting no reason at all.
+  for (const annotation of test.annotations ?? []) {
+    if (annotation.type !== 'skip' && annotation.type !== 'fixme') continue;
+    const description = annotation.description?.trim();
+    if (description) return description;
+  }
+  return undefined;
 }
 
 const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
@@ -890,9 +924,12 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
     let status = normalizeStatus(entry.status);
     // Suppress only a passing setup phantom — a failing one stays visible as
     // the root cause (mirrors parseReport's isSetupSpec handling).
-    if (isAuthSetup(entry.project, entry.specFile) && status !== 'failed') continue;
+    const isSetupEntry = isAuthSetup(entry.project, entry.specFile);
+    if (isSetupEntry && status !== 'failed') continue;
 
-    let errText = entry.error ?? '';
+    // Same marker parseReport stamps, so a resumed run classifies this row identically to a
+    // fresh one rather than falling back to the generic timeout rule.
+    let errText = isSetupEntry ? withAuthSetupMarker(entry.error ?? '') : (entry.error ?? '');
     if (projectIsTierB(entry.project)) {
       if (auth.setupFailed && (status === 'failed' || status === 'skipped')) {
         status = 'blocked';
@@ -1049,7 +1086,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       title,
       status: worst,
       durationMs: totalDuration || undefined,
-      error: worstError || undefined,
+      error: isSetupSpec ? withAuthSetupMarker(worstError) : worstError || undefined,
       artifacts: artifacts.length > 0 ? artifacts : undefined,
       specFile: spec.file ?? suiteFile,
       skipReason: worstSkipReason,

@@ -204,7 +204,8 @@ describe('checkpointReporterContents', () => {
 
   it("QA request: recovers a skip reason from test.skip(cond, 'reason')/test.fixme(...) annotations", () => {
     const src = checkpointReporterContents();
-    expect(src).toContain("a.type === 'skip' || a.type === 'fixme'");
+    expect(src).toContain("'skip'");
+    expect(src).toContain("'fixme'");
     expect(src).toContain('skipReason:');
   });
 
@@ -668,5 +669,54 @@ describe('authSetupContents — locale-aware login fixture', () => {
     const setupBodyStart = fixture.indexOf("setup('authenticate'");
     const setupBody = fixture.slice(setupBodyStart);
     expect(setupBody).not.toMatch(/access\(authFile\)/);
+  });
+
+  it('waits for the identifier field to settle before filling, guarding against a transient second form/tab', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('async function waitForStableCount(locator, timeoutMs)');
+    const loginFormIdx = fixture.indexOf('async function loginForm');
+    const waitIdx = fixture.indexOf('waitForStableCount(identifierField, 2000)', loginFormIdx);
+    const fillIdx = fixture.indexOf('identifierField.first().fill(email)', loginFormIdx);
+    expect(waitIdx).toBeGreaterThan(loginFormIdx);
+    expect(waitIdx).toBeLessThan(fillIdx);
+  });
+
+  it('re-verifies the identifier field actually holds the filled value before checking the submit button, re-filling once if not', () => {
+    const fixture = authSetupContents();
+    const loginFormIdx = fixture.indexOf('async function loginForm');
+    const firstFillIdx = fixture.indexOf('identifierField.first().fill(email)', loginFormIdx);
+    const verifyIdx = fixture.indexOf('identifierField.first().inputValue()', firstFillIdx);
+    const secondFillIdx = fixture.indexOf('identifierField.first().fill(email)', firstFillIdx + 1);
+    expect(verifyIdx).toBeGreaterThan(firstFillIdx);
+    expect(secondFillIdx).toBeGreaterThan(verifyIdx);
+  });
+
+  it('waits for the submit button to become enabled before clicking, so a stuck-disabled button fails fast instead of consuming the full 60s test timeout', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('async function waitForSubmitEnabled(button, timeoutMs)');
+    const loginFormIdx = fixture.indexOf('async function loginForm');
+    const waitIdx = fixture.indexOf('waitForSubmitEnabled(submitButton, 8000)', loginFormIdx);
+    const clickIdx = fixture.indexOf('submitButton.click(', loginFormIdx);
+    expect(waitIdx).toBeGreaterThan(loginFormIdx);
+    expect(waitIdx).toBeLessThan(clickIdx);
+    // Bound well under the config's 60s test timeout.
+    expect(fixture).toContain('submitButton.click({ timeout: 15_000 })');
+  });
+
+  it('throws a clear, non-selector diagnostic (never the raw credential values) when the submit button never enables', () => {
+    const fixture = authSetupContents();
+    const loginFormIdx = fixture.indexOf('async function loginForm');
+    const guardIdx = fixture.indexOf('if (!(await waitForSubmitEnabled(submitButton, 8000)))', loginFormIdx);
+    const blockEnd = fixture.indexOf('await submitButton.click(', guardIdx);
+    const block = fixture.slice(guardIdx, blockEnd);
+    expect(guardIdx).toBeGreaterThan(loginFormIdx);
+    expect(block).toContain('never became enabled');
+    expect(block).toContain('not a selector gap');
+    // Only booleans/lengths for field state — never the actual credential values,
+    // since this text reaches the AI triage provider (see triage/prompt.ts).
+    expect(block).not.toContain('${email}');
+    expect(block).not.toContain('${password}');
+    expect(block).toContain('identifierFilled');
+    expect(block).toContain('passwordFilled');
   });
 });

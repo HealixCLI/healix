@@ -51,6 +51,51 @@ describe('classifyByRules / engine.classify', () => {
       });
       expect(result.rationale).toContain('BLOCKED, not failed');
     });
+
+    it('classifies the auth-setup fixture\'s OWN "no credentials configured" message as environment (on the setup row itself, not just its cascaded dependants)', () => {
+      const result = engine.classify({
+        title: 'authenticate',
+        error:
+          'Tier B auth setup skipped: no test credentials configured for this project ' +
+          '(and no HEALIX_TIERB_EMAIL/PASSWORD/LOGIN_URL env vars set). Set testUsername/testPassword on the project.',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('classifies the auth-setup fixture\'s "submit button never became enabled" message as environment, not test_is_wrong', () => {
+      const result = engine.classify({
+        title: 'authenticate',
+        error:
+          'Login submit button never became enabled within 8s of filling both credential fields ' +
+          '(still on http://localhost:4202/#/SK/login). Both fields were located (identifier field ' +
+          'non-empty: true, password field non-empty: true), so this is not a selector gap — the ' +
+          "app's own client-side validation is still refusing to enable submit.",
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it("classifies a BARE auth-setup timeout as environment via execute.ts's own marker", () => {
+      // The residual case the fixture's own messages can't cover: a fixture that times out
+      // without emitting anything of its own. Before the marker this landed on the generic
+      // timeout rule as environment @0.55 ("no selector or assertion context"), burying the
+      // real cause of 45 blocked tests behind a low-confidence shrug.
+      const result = engine.classify({
+        title: 'authenticate',
+        error: 'Tier B auth setup failed.\nTest timeout of 60000ms exceeded.',
+      });
+      expect(result.verdict).toBe('environment');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.9);
+    });
+
+    it('does NOT over-match a plain, unrelated 60s timeout that lacks any Tier B phrase (regression guard)', () => {
+      const result = engine.classify({
+        title: 'some other test',
+        error: 'Test timeout of 60000ms exceeded.\nwaiting for locator(\'button[type="submit"]\')',
+      });
+      expect(result.verdict).not.toBe('environment');
+    });
   });
 
   describe('missing local dependency (browser binary / Node package never installed)', () => {

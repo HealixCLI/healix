@@ -360,6 +360,48 @@ test.only('[REQ:REQ-1] guessed', async ({ page }) => {
 `;
     expect(demoteEscapeHatchBlocks(source)).toContain("test.fixme('[REQ:REQ-1] guessed'");
   });
+
+  it("carries the model's own reason through as a Playwright annotation, not just a comment", () => {
+    // Without the annotation, execute.ts's extractSkipReason and report.ts's skip-reason cell
+    // have nothing to read and the report shows a skip with no explanation.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-AUTH-01] positive: logs in', async ({ page }) => {
+  // TODO: unobserved element - the login form fields were not captured in the inventory.
+  await expect(page).not.toHaveURL(/home/);
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain("type: 'fixme'");
+    expect(result).toContain('the login form fields were not captured in the inventory.');
+    // The details object goes between the title and the body callback.
+    expect(result).toMatch(/test\.fixme\('\[REQ:FR-AUTH-01\] positive: logs in', \{ annotation:/);
+  });
+
+  it('falls back to a generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(demoteEscapeHatchBlocks(source)).toContain('"unobserved element — needs review"');
+  });
+
+  it('safely embeds a title containing an escaped quote', () => {
+    // Real generated titles do this, and a naive scan for the title's closing quote would cut
+    // the details object into the middle of the string literal.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] shows the user\\'s current email', async ({ page }) => {
+  // TODO: unobserved element - no subscription toggle observed.
+  await page.locator('button').click();
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain("test.fixme('[REQ:REQ-1] shows the user\\'s current email', { annotation:");
+  });
 });
 
 describe('collectGroundTruth — mirrors selectInventoryElements so the gate never rejects a selector the model was never shown', () => {

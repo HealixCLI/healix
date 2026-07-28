@@ -33,6 +33,15 @@ export interface ExplorationGap {
   parentRouteUrl?: string;
   targetSelectorGuess?: string;
   targetName?: string;
+  /** Role of `parentRouteUrl` at crawl time — drives gap-fill's priority tiering (see
+   * `gapPriorityTier`) so authenticated-surface gaps (the usual high-value target) are attempted
+   * before anonymous-page ones within the shared gap-fill budget. */
+  parentRouteRole?: CrawledRoute['role'];
+  /** Set when the candidate's accessible name reads as page furniture (logo/nav) or a
+   * third-party social/OAuth entry point on an anonymous page — see `isLowValueAffordance`.
+   * Such gaps skip LLM micro-agent escalation entirely (see `runGapFillingPass`) so the shared
+   * budget isn't spent confirming a Facebook button reveals nothing. */
+  lowValueAffordance?: boolean;
 }
 
 export interface GapFillAttempt {
@@ -59,6 +68,102 @@ function normalizePathForMatch(path: string): string {
   return path.replace(/\/+$/, '') || '/';
 }
 
+/** Page furniture — logo, hamburger/nav menu — essentially never the thing a test scenario
+ * actually needs, regardless of which route it lives on. */
+const DECORATIVE_AFFORDANCE_NAME_RE = /\blogo\b|\bhamburger\b|^home$|^menu$/i;
+
+/**
+ * Third-party social/OAuth entry point. Deliberately gated to anonymous-role parent routes only
+ * at the call site below (not baked into this regex) — the same brand tokens can legitimately
+ * appear on an AUTHENTICATED feature (e.g. this app's own "Apple Wallet"/"Google Wallet" barcode
+ * reveal on the dashboard), so matching brand name alone without the anonymous-page context would
+ * misclassify exactly the high-value gaps this heuristic must not catch.
+ */
+const SOCIAL_LOGIN_AFFORDANCE_NAME_RE =
+  /facebook|twitter|\bx\.com\b|linkedin|instagram|github|\bgoogle\b|\bapple\b|microsoft|\bsso\b|oauth/i;
+
+function isLowValueAffordance(name: string, parentRole: CrawledRoute['role'] | undefined): boolean {
+  if (DECORATIVE_AFFORDANCE_NAME_RE.test(name)) return true;
+  return parentRole === 'anonymous' && SOCIAL_LOGIN_AFFORDANCE_NAME_RE.test(name);
+}
+
+const CORRELATION_STOPWORDS = new Set([
+  'this',
+  'that',
+  'with',
+  'your',
+  'page',
+  'view',
+  'flow',
+  'test',
+  'check',
+  'verify',
+  'confirm',
+  'ensure',
+  'screen',
+  'click',
+  'button',
+]);
+
+function significantWords(text: string): Set<string> {
+  return new Set(
+    text
+      .toLowerCase()
+      .split(/[^a-z0-9]+/)
+      .filter((w) => w.length >= 5 && !CORRELATION_STOPWORDS.has(w)),
+  );
+}
+
+/**
+ * Best-effort correlation between an affordance candidate's accessible name and the approved
+ * plan's own item titles — e.g. a "wallet"/"voucher" candidate name against a plan item literally
+ * mentioning "wallet". Deliberately simple substring/word overlap, matching this codebase's
+ * existing text-heuristic style (see `deriveRegionCodesFromText` in orchestrator/index.ts,
+ * `LOGIN_TEXT_RE`/`SIGNUP_URL_HINT_RE` in browser/crawler.ts). Language-dependent: a candidate
+ * name captured in the target app's own locale (e.g. Slovak "zmeniť") won't correlate against an
+ * English plan title, so this is a secondary signal — `parentRouteRole` tiering below is the
+ * primary, language-agnostic lever for prioritizing gaps that matter.
+ */
+function correlatePlanItem(
+  targetName: string,
+  planItems: IdentifyGapsInput['planItems'],
+): string | undefined {
+  const nameWords = significantWords(targetName);
+  if (nameWords.size === 0) return undefined;
+  for (const item of planItems) {
+    const itemWords = significantWords(item.title);
+    for (const w of nameWords) {
+      if (itemWords.has(w)) return item.id;
+    }
+  }
+  return undefined;
+}
+
+/**
+ * Priority tier for gap-fill ordering (lower = attempted first). Plan-linked gaps (route and
+ * affordance alike) lead, since a real test scenario needs them; among affordance gaps, an
+ * authenticated-surface candidate outranks an anonymous one (the dashboard-behind-login surface
+ * is consistently the higher-value target — see GAP-060's measured evidence), and a
+ * decorative/social-nav candidate sinks to the bottom regardless of role. `unvisited-observed-
+ * endpoint` gaps keep their historical position (just behind plan-linked) since they're already a
+ * concrete, named signal of a real missed flow.
+ */
+function gapPriorityTier(gap: ExplorationGap): number {
+  // Checked BEFORE relatedPlanItemId for affordance gaps deliberately: `correlatePlanItem`'s
+  // word-overlap heuristic can spuriously match a decorative/social candidate against an
+  // UNRELATED plan item that happens to mention the same brand/word (confirmed live — a
+  // "Facebook" OAuth-button gap correlated against a plan item titled "...Google, Facebook via
+  // Cognito" that's actually about a completely different scenario). `lowValueAffordance`'s
+  // curated classification is a stronger, more deliberate signal than that loose overlap, so it
+  // must win the tie rather than let a coincidental keyword match promote a decorative gap to
+  // the front of the queue.
+  if (gap.kind === 'unclicked-affordance' && gap.lowValueAffordance) return 4;
+  if (gap.relatedPlanItemId) return 0;
+  if (gap.kind !== 'unclicked-affordance') return 1;
+  if (gap.parentRouteRole === 'authenticated') return 2;
+  return 3;
+}
+
 /**
  * Diffs the (already multi-seed-enriched) crawl inventory against two independent sources of
  * truth the explore call site already has — the approved plan's own required routes, and network
@@ -71,6 +176,8 @@ function normalizePathForMatch(path: string): string {
 export function identifyExplorationGaps(input: IdentifyGapsInput): ExplorationGap[] {
   const gaps: ExplorationGap[] = [];
   const visitedUrls = new Set(input.crawlResult.routes.map((r) => normalizeUrl(r.url)));
+  const routeRoleByUrl = new Map<string, CrawledRoute['role']>();
+  for (const route of input.crawlResult.routes) routeRoleByUrl.set(normalizeUrl(route.url), route.role);
 
   for (const item of input.planItems) {
     if (!item.unitKey?.startsWith('route:')) continue;
@@ -110,6 +217,7 @@ export function identifyExplorationGaps(input: IdentifyGapsInput): ExplorationGa
 
   for (const route of input.crawlResult.routes) {
     for (const candidate of route.unattemptedClickCandidates ?? []) {
+      const parentRouteRole = routeRoleByUrl.get(normalizeUrl(route.url)) ?? route.role;
       gaps.push({
         id: `click:${route.url}>>${candidate.selector}`,
         kind: 'unclicked-affordance',
@@ -117,13 +225,16 @@ export function identifyExplorationGaps(input: IdentifyGapsInput): ExplorationGa
         parentRouteUrl: route.url,
         targetSelectorGuess: candidate.selector,
         targetName: candidate.name,
+        parentRouteRole,
+        lowValueAffordance: isLowValueAffordance(candidate.name, parentRouteRole),
+        relatedPlanItemId: correlatePlanItem(candidate.name, input.planItems),
       });
     }
   }
 
-  // Plan-linked gaps first — Array.prototype.sort is stable, so relative order within each
-  // group (plan-linked vs. not) is otherwise preserved.
-  gaps.sort((a, b) => (a.relatedPlanItemId ? -1 : 0) - (b.relatedPlanItemId ? -1 : 0));
+  // Priority-tiered, not just plan-linked-first — see `gapPriorityTier`'s doc comment.
+  // Array.prototype.sort is stable, so relative order within each tier is otherwise preserved.
+  gaps.sort((a, b) => gapPriorityTier(a) - gapPriorityTier(b));
 
   const deduped: ExplorationGap[] = [];
   const seenIds = new Set<string>();
@@ -149,6 +260,8 @@ export interface RunGapFillInput {
    * own (e.g. a click-and-diff that reveals nothing). Absent simply means such gaps stay open. */
   gapFillProvider?: GapFillProvider;
   perGapBudgetMs?: number;
+  /** Defaults to `perGapBudgetMs * gaps.length` when unset — see `DEFAULT_PER_GAP_BUDGET_MS`'s
+   * doc comment for why the total scales with gap count rather than being a fixed pool. */
   totalBudgetMs?: number;
 }
 
@@ -157,23 +270,47 @@ export interface GapFillResult {
   newRoutes: CrawledRoute[];
 }
 
-const DEFAULT_TOTAL_GAP_FILL_BUDGET_MS = 45_000;
+/**
+ * Ceiling on a SINGLE gap's micro-agent escalation. Measured live against the real Claude CLI
+ * (not a mocked provider): a single micro-agent turn — subprocess spin-up + a cheap/low-effort
+ * completion — took ~8-9s round-trip, so this leaves room for ~5 real turns per gap (enough for
+ * a full click/confirm/adjust cycle, not just one shot).
+ *
+ * This used to be clamped against a FIXED shared total budget (45s), which meant this floor
+ * wasn't actually guaranteed: measured live, two 20s-capped wallet gaps alone consumed nearly
+ * the whole fixed total, pushing a THIRD, equally-important gap (the dashboard's change-password
+ * trigger) to `skipped-budget` with zero attempt — a higher per-gap floor was making things worse
+ * for gaps queued behind the first couple, not better. `runGapFillingPass`'s total budget now
+ * scales with the number of gaps (`perGapBudgetMs * gaps.length`, see there) specifically so this
+ * floor is a real per-gap guarantee, not a best-effort share of a pool sized independently of how
+ * many gaps exist. Trade-off: total gap-fill wall-clock now scales with gap count too (bounded by
+ * `MAX_GAPS_PER_RUN` in `identifyExplorationGaps`, so worst case is 10 * this value).
+ */
+const DEFAULT_PER_GAP_BUDGET_MS = 50_000;
 /** Cheap-model, bounded ReAct loop — not a free-form agent. See providers/model-config.ts's
  * 'explore-gapfill' entry. */
-const MICRO_AGENT_MAX_ACTIONS = 4;
+const MICRO_AGENT_MAX_ACTIONS = 5;
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-function newAnonymousRoute(url: string, snapshot: Awaited<ReturnType<typeof snapshotClean>>): CrawledRoute {
+/** Named for the common case (a freshly-discovered URL has no prior role to inherit), but a gap
+ * closed against an EXISTING route (e.g. an affordance revealed on an already-crawled
+ * authenticated dashboard page) should carry that route's real role through instead of always
+ * mislabeling the new state as anonymous — see the `role` param's call sites below. */
+function newAnonymousRoute(
+  url: string,
+  snapshot: Awaited<ReturnType<typeof snapshotClean>>,
+  role: CrawledRoute['role'] = 'anonymous',
+): CrawledRoute {
   return {
     url,
     title: snapshot.title,
     snapshot,
     depth: 0,
     hasPasswordField: snapshot.interactiveElements.some((el) => el.inputType === 'password'),
-    role: 'anonymous',
+    role,
     networkEvents: [],
     crashed: looksCrashed(snapshot),
   };
@@ -234,7 +371,7 @@ async function closeAffordanceGapDeterministic(
 
     if (!revealed) return null;
     const route: CrawledRoute = {
-      ...newAnonymousRoute(gap.parentRouteUrl, after),
+      ...newAnonymousRoute(gap.parentRouteUrl, after, gap.parentRouteRole ?? 'anonymous'),
       stateKey: `${gap.parentRouteUrl}>>${gap.targetSelectorGuess}`,
     };
     return { attempt: { gap, outcome: 'closed', newRoutesCaptured: 1 }, route };
@@ -341,12 +478,21 @@ async function runMicroAgent(
   origin: string,
   gapFillProvider: GapFillProvider,
   emit: RunGapFillInput['emit'],
+  perGapDeadline: number,
+  /** Role to label a newly-revealed state with — see `newAnonymousRoute`'s doc comment. Defaults
+   * to 'anonymous', correct for the endpoint-gap call site where there's no existing route to
+   * inherit a role from; the affordance-gap call site passes the parent route's real role. */
+  role: CrawledRoute['role'] = 'anonymous',
 ): Promise<{ newRoute?: CrawledRoute }> {
   const history: string[] = [];
   let before = await snapshotClean(browser);
   const beforeCount = before.interactiveElements.length;
 
   for (let turn = 0; turn < MICRO_AGENT_MAX_ACTIONS; turn += 1) {
+    if (Date.now() >= perGapDeadline) {
+      emit('explore', 'debug', 'Gap-fill micro-agent per-gap budget elapsed — stopping this gap early.');
+      break;
+    }
     const prompt = buildMicroAgentPrompt(goalDescription, before, history);
     let completion: Awaited<ReturnType<GapFillProvider['provider']['complete']>>;
     try {
@@ -405,7 +551,7 @@ async function runMicroAgent(
     ) {
       return {
         newRoute: {
-          ...newAnonymousRoute(after.url, after),
+          ...newAnonymousRoute(after.url, after, role),
           stateKey: `gapfill>>${history.join('>>')}`,
         },
       };
@@ -417,15 +563,19 @@ async function runMicroAgent(
 }
 
 /**
- * Attempts to close every identified gap, in order, within a shared total time budget — a single
- * failing gap never aborts the rest. Deterministic paths (a direct `goto`, or a click-and-diff)
- * are always tried first; the bounded LLM micro-agent only runs for a gap they couldn't close AND
- * when `gapFillProvider` is configured.
+ * Attempts to close every identified gap, in order, within a total time budget that scales with
+ * how many gaps there are (`perGapBudgetMs * gaps.length` by default) — a single failing gap
+ * never aborts the rest, and (unlike a fixed-size pool) a gap sorted further down the
+ * priority-ordered list is still guaranteed its own `perGapBudgetMs` rather than whatever happens
+ * to be left over after the gaps ahead of it. Deterministic paths (a direct `goto`, or a
+ * click-and-diff) are always tried first; the bounded LLM micro-agent only runs for a gap they
+ * couldn't close AND when `gapFillProvider` is configured.
  */
 export async function runGapFillingPass(input: RunGapFillInput): Promise<GapFillResult> {
   const attempts: GapFillAttempt[] = [];
   const newRoutes: CrawledRoute[] = [];
-  const deadline = Date.now() + (input.totalBudgetMs ?? DEFAULT_TOTAL_GAP_FILL_BUDGET_MS);
+  const perGapBudgetMs = input.perGapBudgetMs ?? DEFAULT_PER_GAP_BUDGET_MS;
+  const deadline = Date.now() + (input.totalBudgetMs ?? perGapBudgetMs * input.gaps.length);
   let origin: string;
   try {
     origin = new URL(input.baseUrl).origin;
@@ -438,6 +588,9 @@ export async function runGapFillingPass(input: RunGapFillInput): Promise<GapFill
       attempts.push({ gap, outcome: 'skipped-budget', newRoutesCaptured: 0 });
       continue;
     }
+    // Clamped against the total deadline so a gap late in the list never gets MORE runway than
+    // what's actually left — this only ever shortens, never extends, a gap's effective budget.
+    const perGapDeadline = Math.min(deadline, Date.now() + perGapBudgetMs);
 
     try {
       if (gap.kind === 'unvisited-plan-route' && gap.targetUrlGuess) {
@@ -468,6 +621,7 @@ export async function runGapFillingPass(input: RunGapFillInput): Promise<GapFill
             origin,
             input.gapFillProvider,
             input.emit,
+            perGapDeadline,
           );
           attempts.push({
             gap,
@@ -494,6 +648,19 @@ export async function runGapFillingPass(input: RunGapFillInput): Promise<GapFill
         if (deterministic.route) newRoutes.push(deterministic.route);
         continue;
       }
+      if (gap.lowValueAffordance) {
+        // Decorative/social-nav affordance that already failed the cheap deterministic
+        // click-and-diff above — not worth a full multi-turn LLM escalation. Conserves the
+        // shared budget for gaps further down the (now value-ordered) list.
+        attempts.push({
+          gap,
+          outcome: 'partial',
+          newRoutesCaptured: 0,
+          detail:
+            'decorative/social-nav affordance — skipped LLM escalation to conserve shared gap-fill budget',
+        });
+        continue;
+      }
       if (input.gapFillProvider && gap.parentRouteUrl) {
         await input.browser.goto(gap.parentRouteUrl).catch(() => undefined);
         const micro = await runMicroAgent(
@@ -502,6 +669,8 @@ export async function runGapFillingPass(input: RunGapFillInput): Promise<GapFill
           origin,
           input.gapFillProvider,
           input.emit,
+          perGapDeadline,
+          gap.parentRouteRole ?? 'anonymous',
         );
         attempts.push({
           gap,

@@ -111,6 +111,12 @@ export interface CrawlOptions {
   wallClockBudgetMs?: number;
   /** Extra URLs to seed the BFS queue alongside `baseUrl` (e.g. known routes from static analysis). */
   seedRoutes?: string[];
+  /** Overrides MAX_STATE_PROBES_PER_CRAWL for this call only. Defaults to it when unset, a no-op
+   * for every existing caller. Lets `crawlWithAuth` give its anonymous and authenticated passes
+   * different-sized deep-probe pools — each `crawl()` call already gets its own independent
+   * budget (see GAP-060), so this is purely an allocation knob between the two calls, not a
+   * change to how a single call spends its own budget. */
+  stateProbeBudget?: number;
 }
 
 const DEFAULT_MAX_ROUTES = 60;
@@ -803,7 +809,7 @@ export async function crawl(
   const routes: CrawledRoute[] = [];
   let budgetExhausted = false;
   let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
-  let remainingStateProbes = MAX_STATE_PROBES_PER_CRAWL;
+  let remainingStateProbes = opts.stateProbeBudget ?? MAX_STATE_PROBES_PER_CRAWL;
 
   // Discard anything buffered before this crawl started so it doesn't leak into route 0.
   browser.drainNetworkEvents();
@@ -1083,7 +1089,17 @@ export async function crawlManySeeds(
 
 export interface CrawlWithAuthOptions extends CrawlOptions {
   credentials?: { username: string; password: string };
+  /** Overrides the anonymous pass's own `stateProbeBudget` (see GAP-060). Defaults to
+   * ANONYMOUS_STATE_PROBE_RESERVE — small on purpose: the authenticated, behind-login surface is
+   * consistently the higher-value deep-probe target (measured evidence in GAP-060's gap-tracker
+   * entry), so the anonymous pass gets just enough reserve to still catch an anonymous-page state
+   * (e.g. a date-picker) without crowding out the budget the authenticated pass gets via its own,
+   * independent `crawl()` call (`opts.stateProbeBudget` below, unaffected by this field). */
+  anonymousStateProbeBudget?: number;
 }
+
+/** See `CrawlWithAuthOptions.anonymousStateProbeBudget`'s doc comment. */
+const ANONYMOUS_STATE_PROBE_RESERVE = 5;
 
 export interface CrawlWithAuthResult extends CrawlResult {
   /** Whether a login candidate was found and a login was actually attempted. */
@@ -1151,7 +1167,10 @@ export async function crawlWithAuth(
   baseUrl: string,
   opts: CrawlWithAuthOptions = {},
 ): Promise<CrawlWithAuthResult> {
-  const anonymous = await crawl(browser, baseUrl, opts);
+  const anonymous = await crawl(browser, baseUrl, {
+    ...opts,
+    stateProbeBudget: opts.anonymousStateProbeBudget ?? ANONYMOUS_STATE_PROBE_RESERVE,
+  });
 
   const creds = opts.credentials;
   if (!creds || !creds.username || !creds.password) {

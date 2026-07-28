@@ -122,6 +122,79 @@ describe('identifyExplorationGaps()', () => {
     expect(gaps.length).toBeLessThanOrEqual(10);
     expect(gaps[0].relatedPlanItemId).toBe('p1');
   });
+
+  it('sorts an authenticated-route affordance gap ahead of an anonymous-route one when neither correlates to a plan item', () => {
+    // Anonymous route listed FIRST in the crawl result — if tiering didn't override crawl order,
+    // its gap would sort first too.
+    const anonymousRoute = route('https://a.test/#/SK/register', {
+      role: 'anonymous',
+      unattemptedClickCandidates: [{ selector: '[data-testid=some-toggle]', name: 'Some toggle' }],
+    });
+    const authenticatedRoute = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      unattemptedClickCandidates: [{ selector: '[data-testid=change-btn]', name: 'Change' }],
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([anonymousRoute, authenticatedRoute]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [],
+      observedEndpoints: [],
+    });
+
+    expect(gaps.map((g) => g.parentRouteUrl)).toEqual([
+      'https://a.test/#/SK/dashboard',
+      'https://a.test/#/SK/register',
+    ]);
+  });
+
+  it('correlates an affordance gap against a plan item title and sorts it into the top tier', () => {
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      unattemptedClickCandidates: [
+        { selector: '[data-testid=unrelated-btn]', name: 'Unrelated' },
+        { selector: '[data-testid=voucher-btn]', name: 'Voucher barcode' },
+      ],
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [{ id: 'p1', title: 'Voucher listing with barcode' }],
+      observedEndpoints: [],
+    });
+
+    expect(gaps[0]).toMatchObject({ targetName: 'Voucher barcode', relatedPlanItemId: 'p1' });
+  });
+
+  it('does not misclassify a brand-named affordance on an AUTHENTICATED route as low-value, even though the same brand name is a social/OAuth signal on an anonymous route', () => {
+    // Regression guard: a naive brand-name regex would catch "Apple Wallet"/"Google Wallet" the
+    // same way it (correctly) catches an anonymous-page Facebook/Google OAuth button.
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      unattemptedClickCandidates: [
+        { selector: '[data-testid=apple-wallet]', name: 'apple wallet' },
+        { selector: '[data-testid=other-btn]', name: 'Some other feature' },
+      ],
+    });
+    const register = route('https://a.test/#/SK/register', {
+      role: 'anonymous',
+      unattemptedClickCandidates: [{ selector: '[data-testid=facebook-btn]', name: 'Facebook' }],
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([register, dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [],
+      observedEndpoints: [],
+    });
+
+    const appleWalletGap = gaps.find((g) => g.targetName === 'apple wallet');
+    const facebookGap = gaps.find((g) => g.targetName === 'Facebook');
+    expect(appleWalletGap?.lowValueAffordance).not.toBe(true);
+    expect(facebookGap?.lowValueAffordance).toBe(true);
+    expect(gaps.indexOf(appleWalletGap!)).toBeLessThan(gaps.indexOf(facebookGap!));
+  });
 });
 
 function makeFakeBrowser(config: {
@@ -490,6 +563,134 @@ describe('runGapFillingPass()', () => {
 
     expect(result.attempts[0].usedMicroAgent).toBe(true);
     expect(result.attempts[0].outcome).toBe('closed');
+    expect(result.newRoutes).toHaveLength(1);
+  });
+
+  it('skips LLM escalation entirely for a gap already classified low-value, once its deterministic click reveals nothing', async () => {
+    const facebookBtn = button('Facebook', '[data-testid=facebook-btn]');
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/#/SK/register': [facebookBtn] },
+      // No onClickSelectorReveal -> deterministic click-and-diff reveals nothing.
+    });
+    let providerCalls = 0;
+    const countingProvider: ProviderAdapter = {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      detect: async () => ({ installed: true, binPath: null, version: null }),
+      health: async () => {
+        throw new Error('unused');
+      },
+      plan: async () => {
+        throw new Error('unused');
+      },
+      complete: async (): Promise<CompletionResult> => {
+        providerCalls += 1;
+        return { provider: 'claude', ok: true, text: 'done()', raw: null, detail: '' };
+      },
+    };
+    const gaps = [
+      {
+        id: 'click:https://a.test/#/SK/register>>[data-testid=facebook-btn]',
+        kind: 'unclicked-affordance' as const,
+        description: 'test',
+        parentRouteUrl: 'https://a.test/#/SK/register',
+        targetSelectorGuess: '[data-testid=facebook-btn]',
+        targetName: 'Facebook',
+        parentRouteRole: 'anonymous' as const,
+        lowValueAffordance: true,
+      },
+    ];
+
+    const result = await runGapFillingPass({
+      browser,
+      baseUrl: 'https://a.test/',
+      gaps,
+      emit: () => {},
+      gapFillProvider: { provider: countingProvider },
+    });
+
+    expect(providerCalls).toBe(0);
+    expect(result.attempts[0].outcome).toBe('partial');
+    expect(result.attempts[0].usedMicroAgent).toBeUndefined();
+    expect(result.attempts[0].detail).toMatch(/skipped LLM escalation/);
+  });
+
+  it("bounds a single gap's micro-agent turns to its own per-gap budget, so an overrunning gap does not starve the shared budget for the gap behind it", async () => {
+    const slowSelector = '[data-testid=slow-btn]';
+    const voucherSelector = '[data-testid=voucher-btn]';
+    const revealed = [
+      button('A'),
+      button('B'),
+      button('C'),
+      button('D'),
+      button('E'),
+      button('F'),
+      button('G'),
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/#/SK/dashboard': [button('Slow', slowSelector)],
+        'https://a.test/#/SK/vouchers': [button('Voucher', voucherSelector)],
+      },
+      onClickSelectorReveal: { [voucherSelector]: revealed },
+    });
+
+    let slowGapCompletions = 0;
+    const slowProvider: ProviderAdapter = {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      detect: async () => ({ installed: true, binPath: null, version: null }),
+      health: async () => {
+        throw new Error('unused');
+      },
+      plan: async () => {
+        throw new Error('unused');
+      },
+      // Never reveals anything (targets the same dead-end selector every turn) and takes real
+      // wall-clock time per turn, simulating a slow/looping micro-agent call.
+      complete: async (): Promise<CompletionResult> => {
+        slowGapCompletions += 1;
+        await new Promise((resolve) => setTimeout(resolve, 30));
+        return { provider: 'claude', ok: true, text: `click(${slowSelector})`, raw: null, detail: '' };
+      },
+    };
+
+    const gaps = [
+      {
+        id: 'click:dashboard>>slow',
+        kind: 'unclicked-affordance' as const,
+        description: 'slow gap',
+        parentRouteUrl: 'https://a.test/#/SK/dashboard',
+        targetSelectorGuess: slowSelector,
+        targetName: 'Slow',
+      },
+      {
+        id: 'click:vouchers>>voucher',
+        kind: 'unclicked-affordance' as const,
+        description: 'voucher gap',
+        parentRouteUrl: 'https://a.test/#/SK/vouchers',
+        targetSelectorGuess: voucherSelector,
+        targetName: 'Voucher',
+      },
+    ];
+
+    const result = await runGapFillingPass({
+      browser,
+      baseUrl: 'https://a.test/',
+      gaps,
+      emit: () => {},
+      gapFillProvider: { provider: slowProvider },
+      totalBudgetMs: 5_000,
+      perGapBudgetMs: 20,
+    });
+
+    // Cut short by its own per-gap budget well before MICRO_AGENT_MAX_ACTIONS (4) turns.
+    expect(slowGapCompletions).toBeLessThan(4);
+    expect(result.attempts[0].outcome).toBe('partial');
+    // The gap behind it must still be genuinely attempted, not starved into skipped-budget.
+    expect(result.attempts[1].outcome).toBe('closed');
     expect(result.newRoutes).toHaveLength(1);
   });
 });

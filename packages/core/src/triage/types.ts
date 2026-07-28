@@ -13,6 +13,16 @@ export interface TriageInput {
   sourceFile?: string;
   /** That file's content (or a leading slice of it) — first-party repo code, cited normally rather than fenced as untrusted. */
   sourceExcerpt?: string;
+  /**
+   * Compact summary of the actual HTTP call(s) this test made via the
+   * `request` fixture (see modes/types.ts's ExecOutcome.apiEvidence) — which
+   * backend actually answered (Healix's own mock, or the real one), the
+   * status, and a truncated body. App-derived (captured from the app/mock
+   * under test), so treated as untrusted data in the prompt, same as `error`.
+   * Absent when the failing test never called `request`, or predates this
+   * feature.
+   */
+  apiEvidence?: string;
 }
 
 export interface TriageResult {

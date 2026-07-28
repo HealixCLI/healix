@@ -52,9 +52,11 @@ import {
   clearExecCheckpoint,
   playwrightProjectArgs,
   readMockRequestCounts,
+  readApiEvidence,
   type AuthSignals,
 } from './execute.js';
 import {
+  API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
@@ -1044,6 +1046,74 @@ describe("readMockRequestCounts — F-15: tallies the mock fixture's write-throu
       `${JSON.stringify({ id: 'pkg:twilio' })}\nnot valid json\n\n`,
     );
     expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 1 });
+  });
+});
+
+describe('readApiEvidence — per-test summary of actual request-fixture calls', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-api-evidence-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (no tierC-api tests ran, or nothing called request)', async () => {
+    expect(await readApiEvidence(dir)).toEqual({});
+  });
+
+  it('groups calls by key and formats a compact, mock-vs-real-labeled summary', async () => {
+    const lines = [
+      { key: 'tests/tierC-api/x.spec.ts#a', method: 'GET', url: '/lookup', status: 500, mocked: false, body: '{}' },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, API_EVIDENCE_LOG_FILENAME), `${lines}\n`);
+    const out = await readApiEvidence(dir);
+    const summary = out['tests/tierC-api/x.spec.ts#a'];
+    expect(summary).toContain('[REAL BACKEND]');
+    expect(summary).toContain('GET /lookup -> status 500');
+    expect(summary).toContain('Body: {}');
+  });
+
+  it('labels a mocked call [HEALIX MOCK]', async () => {
+    writeFileSync(
+      join(dir, API_EVIDENCE_LOG_FILENAME),
+      `${JSON.stringify({ key: 'f#t', method: 'POST', url: '/pay', status: 200, mocked: true, body: '{"ok":true}' })}\n`,
+    );
+    const out = await readApiEvidence(dir);
+    expect(out['f#t']).toContain('[HEALIX MOCK]');
+    expect(out['f#t']).toContain('POST /pay -> status 200');
+  });
+
+  it('keeps only the LAST few calls per key (bounded, so a chatty test cannot blow up the prompt)', async () => {
+    const many = Array.from({ length: 6 }, (_, i) =>
+      JSON.stringify({ key: 'f#t', method: 'GET', url: `/call-${i}`, status: 200, mocked: false, body: '' }),
+    ).join('\n');
+    writeFileSync(join(dir, API_EVIDENCE_LOG_FILENAME), `${many}\n`);
+    const summary = (await readApiEvidence(dir))['f#t'];
+    // Bounded to the last 3 (API_EVIDENCE_MAX_CALLS_PER_TEST) — the earliest calls are dropped.
+    expect(summary).not.toContain('/call-0');
+    expect(summary).not.toContain('/call-2');
+    expect(summary).toContain('/call-3');
+    expect(summary).toContain('/call-5');
+  });
+
+  it('skips a malformed line instead of losing every other entry, and drops lines with no key', async () => {
+    writeFileSync(
+      join(dir, API_EVIDENCE_LOG_FILENAME),
+      [
+        JSON.stringify({ key: 'f#t', method: 'GET', url: '/ok', status: 200, mocked: false, body: '' }),
+        'not valid json',
+        JSON.stringify({ method: 'GET', url: '/nokey', status: 200, mocked: false, body: '' }),
+        '',
+      ].join('\n') + '\n',
+    );
+    const out = await readApiEvidence(dir);
+    expect(Object.keys(out)).toEqual(['f#t']);
+    expect(out['f#t']).toContain('/ok');
   });
 });
 

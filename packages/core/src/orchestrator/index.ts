@@ -2046,7 +2046,12 @@ async function runPipeline(
     if (checkCancelled()) return await pauseOrCancel('triage', executeComplete);
     setStatus('triaging');
     try {
-      const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
+      // Stable non-null reference: `outcome` is a mutable `let`, so its
+      // non-null narrowing here doesn't survive into the .map() closure below
+      // (TS conservatively assumes a closure could run after a reassignment).
+      // Captured once so the closure can read outcome.apiEvidence directly.
+      const execOutcome = outcome;
+      const failed = execOutcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
         const engine = createTriageEngine();
 
@@ -2121,6 +2126,12 @@ async function runPipeline(
             // but never threaded through before, so triage only ever "knew" a
             // trace existed by chance, never which file.
             const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+            // Same identity execute.ts's own dedup keyOf()/readApiEvidence() use
+            // (`${specFile}#${title}`) — lets triage see the ACTUAL response this
+            // test's own API call(s) received, not just the one field its failing
+            // assertion happened to print.
+            const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
+            const apiEvidence = execOutcome.apiEvidence?.[apiEvidenceKey];
             // Recover the plan item this spec was generated from, to find the source-context unit
             // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
             // candidates below, since most failures never reach that stage.
@@ -2136,6 +2147,7 @@ async function runPipeline(
               ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
+              ...(apiEvidence ? { apiEvidence } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;
             try {

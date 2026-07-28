@@ -68,6 +68,31 @@ const RE_BLOCKED_TIERB =
 const RE_MISSING_DEPENDENCY =
   /(Executable doesn't exist|browserType\.launch:|please run the following command to download new browsers|npx playwright install|pnpm (?:exec )?playwright install|yarn playwright install|Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND)/i;
 
+// A Node-side JavaScript runtime error thrown by the GENERATED TEST SCRIPT
+// itself (not a DOM/browser-side symptom like a stale selector or a slow
+// assertion) — a hallucinated/wrong Playwright API call, an undeclared
+// reference, or an unguarded null/undefined access in the test's own code.
+// Distinct from every other rule here in that it's never a signal ABOUT the
+// app under test at all; it's the test script failing to even run correctly.
+// Previously uncovered by any rule, so these fell through to the generic
+// low-confidence ambiguous default despite being about as unambiguous as a
+// failure signature gets. Must run before the generic assertion/selector/
+// timeout rules since none of those phrases are expected to co-occur here,
+// but ordering wouldn't matter much either way — this is a narrow, specific
+// signature with essentially no overlap risk.
+const RE_CODEGEN_DEFECT =
+  /(is not a function\b|is not a constructor\b|ReferenceError:|is not defined\b|Cannot read propert(?:y|ies) of (?:null|undefined))/i;
+
+// input.apiEvidence markers (see ExecOutcome.apiEvidence / execute.ts's
+// readApiEvidence): which side actually answered this test's own `request`-
+// fixture call(s) — Healix's mock, or the real backend — and, for the real
+// backend, whether it came back with a 4xx/5xx. Real, captured evidence
+// rather than something inferred from the failing assertion's own text, so
+// rules keyed on these run BEFORE the generic assertion/status rules below —
+// they're corroborated, not guessed.
+const RE_MOCK_ANSWERED = /\[HEALIX MOCK\]/;
+const RE_REAL_ERROR_STATUS = /\[REAL BACKEND\][^\n]*-> status ([45]\d{2})\b/;
+
 // A bare Timeout (action/wait level) that is not already a navigation or
 // selector timeout — treated as environment/slowness.
 const RE_TIMEOUT = /\bTimeout(?:Error)?\b|timed out/i;
@@ -93,6 +118,21 @@ const RE_CONTENT_ASSERTION =
 // never stopped to look at the intermediate response.
 const RE_REDIRECT_NOT_FOLLOWED = /Expected:?\s*"?3\d{2}"?[\s\S]{0,120}?Received:?\s*"?200"?\b/i;
 
+// A generic expect(received).toBe/toEqual(expected) mismatch where BOTH sides
+// look like a plausible HTTP status code (100-599) — the signature of an
+// API-level status assertion (e.g. expect(response.status()).toBe(200))
+// receiving a different code than expected, distinct from a DOM content/count
+// check. The literal "expect(received).toBe/toEqual(expected)" prefix is what
+// naturally excludes toHaveCount/toHaveValue mismatches (those use a
+// different matcher name in that same position, e.g.
+// "expect(locator).toHaveCount(expected)"), so no separate exclusion regex is
+// needed. Must run AFTER redirect_not_followed (below) so a genuine
+// 3xx-expected/200-received case is still claimed by that more specific,
+// higher-confidence rule first — this one is the catch-all for every OTHER
+// status mismatch (a 500 where 200 was expected, a 404, a 401, ...).
+const RE_STATUS_CODE_ASSERTION =
+  /expect\(received\)\.(?:toBe|toEqual)\(expected\)[\s\S]{0,80}?Expected:?\s*"?[1-5]\d{2}"?\b[\s\S]{0,80}?Received:?\s*"?[1-5]\d{2}"?\b/i;
+
 // Signals that an error is fundamentally an assertion failure, even though it
 // may also mention a locator (Playwright includes "waiting for locator" /
 // getBy* text inside expect() timeout output). When any of these are present we
@@ -113,25 +153,68 @@ function mk(verdict: Verdict, confidence: number, rationale: string): TriageResu
  *     installed; carries no navigation/connection signal of its own, so it
  *     must run before the generic environment/selector/assertion rules or it
  *     falls through to the low-confidence ambiguous default.
- *  3. environment   — a down server makes every selector lookup "fail", so it
+ *  3. codegen_defect — the generated TEST SCRIPT itself threw a Node-side
+ *     runtime error (hallucinated API call, undeclared reference, unguarded
+ *     null access) — not a signal about the app at all. Runs early since
+ *     these phrases don't overlap with any other rule's signals.
+ *  4. mock_response_incomplete — the test's own captured apiEvidence (see
+ *     ExecOutcome.apiEvidence) shows Healix's OWN mock answered its API
+ *     call(s), combined with a generic assertion-mismatch signature — real,
+ *     captured corroboration (not a guess) that this run's mock config is
+ *     what's incomplete, not the app. Must run before the generic
+ *     assertion/status rules so this corroborated signal isn't swallowed by
+ *     their uncorroborated, lower-confidence verdicts.
+ *  5. real_api_error_evidence — apiEvidence shows the REAL backend answered
+ *     with a captured 4xx/5xx, combined with the same assertion signature —
+ *     concrete, observed proof of a server error, not an inference. Same
+ *     ordering rationale as #4.
+ *  6. environment   — a down server makes every selector lookup "fail", so it
  *     must pre-empt the selector rule.
- *  4. redirect_not_followed — expected a 3xx, observed the followed
+ *  7. redirect_not_followed — expected a 3xx, observed the followed
  *     redirect's terminal 200 → the test's own request is missing
  *     `maxRedirects: 0`. Runs BEFORE the generic assertion rule so this
  *     specific, high-confidence test_is_wrong signal isn't swallowed by the
  *     lower-confidence default-ambiguous/app_is_wrong assertion bucket
  *     first (first-match wins).
- *  5. assertion     — expect() mismatch; content checks lean app_is_wrong,
+ *  8. status_code_assertion — a plain toBe/toEqual mismatch where both sides
+ *     look like an HTTP status code (any OTHER status mismatch besides the
+ *     3xx-vs-200 case redirect_not_followed already claimed above) — leans
+ *     app_is_wrong, since the app returned a status the test didn't expect.
+ *  9. assertion     — expect() mismatch; content checks lean app_is_wrong,
  *     everything else is genuinely ambiguous. Runs BEFORE the selector rule
  *     because Playwright assertion-timeout output embeds locator phrases
  *     ("waiting for locator", getBy*) that would otherwise be misclassified as
  *     test_is_wrong.
- *  6. selector      — locator not found / strict-mode → the test is wrong.
+ * 10. selector      — locator not found / strict-mode → the test is wrong.
  *     Suppressed when assertion signals (expect(), Expected/Received,
  *     toHaveText/toBeVisible …) are present.
- *  7. flaky         — visibility/detached/instability.
- *  8. timeout       — residual bare timeouts → environment/slowness.
+ * 11. flaky         — visibility/detached/instability.
+ * 12. timeout       — residual bare timeouts → environment/slowness.
  */
+// Runs FIRST on a "blocked" test's error text — before it even asks "did the
+// setup fixture fail, or were credentials missing" — because execute.ts's own
+// checkpointEntriesToOutcome/findAuthSetupOutcome ALREADY appends the
+// auth-setup fixture's own raw error (auth.setupError) after the generic
+// "Tier B prerequisite not met" line. That real reason is sitting right there
+// in the error text; a rule that ignores it and always presents "either X or
+// Y" as equally likely is strictly less precise than the evidence it already
+// has. Checked in the same specificity order the top-level rule chain itself
+// uses (missing dependency, then generic environment), so a downstream
+// blocked row's rationale matches what the auth-setup row's OWN triage entry
+// already says instead of hedging between possibilities it could resolve.
+function describeBlockedTierbCause(error: string): string {
+  if (/no test credentials configured|Tier B ran without credentials/i.test(error)) {
+    return 'the project has no test credentials configured, so the session ran anonymously';
+  }
+  if (RE_MISSING_DEPENDENCY.test(error)) {
+    return "the auth setup fixture itself failed because a required local dependency (a Playwright browser binary, or a Node package) was missing in this execution environment — not a credentials gap";
+  }
+  if (RE_ENVIRONMENT.test(error)) {
+    return 'the auth setup fixture itself failed because the app/server was unreachable (connection refused, DNS failure, or a navigation timeout) — not a credentials gap';
+  }
+  return 'either the auth setup fixture itself failed, or the project has no test credentials configured, so the session ran anonymously';
+}
+
 const RULES: readonly Rule[] = [
   {
     id: 'blocked_tierb_prerequisite',
@@ -140,7 +223,7 @@ const RULES: readonly Rule[] = [
       return mk(
         'environment',
         0.9,
-        'This test was BLOCKED, not failed: a Tier-B auth prerequisite was not met (either the auth setup fixture itself failed, or the project has no test credentials configured, so the session ran anonymously). Neither the app nor the test is defective — add test credentials (or fix the underlying auth setup failure) to unblock this coverage.',
+        `This test was BLOCKED, not failed: a Tier-B auth prerequisite was not met — ${describeBlockedTierbCause(error)}. Neither the app nor the test is defective.`,
       );
     },
   },
@@ -152,6 +235,49 @@ const RULES: readonly Rule[] = [
         'environment',
         0.85,
         'A required local dependency (a Playwright browser binary, or a Node package) was never installed in this execution environment — not an app or test defect. Install the missing dependency (e.g. `npx playwright install`, or a package install) and re-run.',
+      );
+    },
+  },
+  {
+    id: 'codegen_defect',
+    match(error) {
+      if (!RE_CODEGEN_DEFECT.test(error)) return null;
+      return mk(
+        'test_is_wrong',
+        0.8,
+        "The generated test script itself threw a runtime error (a nonexistent/mistyped API call, an undeclared reference, or an unguarded null/undefined access) — this is a defect in the test's own code, not a signal about the app under test.",
+      );
+    },
+  },
+  {
+    id: 'mock_response_incomplete',
+    match(error, _title, input) {
+      // Requires BOTH signals: apiEvidence alone doesn't prove the FAILING
+      // assertion was even about that call, and a generic assertion mismatch
+      // alone is the pre-existing (lower-confidence) case below. Together,
+      // they're real corroboration — the test's own captured evidence shows
+      // Healix's mock (not the real backend) answered, so a missing/wrong
+      // field is this run's mock configuration, not an app defect.
+      if (!RE_ASSERTION.test(error)) return null;
+      if (typeof input.apiEvidence !== 'string' || !RE_MOCK_ANSWERED.test(input.apiEvidence)) return null;
+      return mk(
+        'environment',
+        0.65,
+        "The captured evidence shows this test's own API call was answered by Healix's mock, not the real backend — the mocked response for this dependency is missing or doesn't include what this assertion needed. This is a gap in the run's mock configuration, not a defect in the app itself.",
+      );
+    },
+  },
+  {
+    id: 'real_api_error_evidence',
+    match(error, _title, input) {
+      if (!RE_ASSERTION.test(error)) return null;
+      if (typeof input.apiEvidence !== 'string') return null;
+      const m = RE_REAL_ERROR_STATUS.exec(input.apiEvidence);
+      if (!m) return null;
+      return mk(
+        'app_is_wrong',
+        0.8,
+        `The captured evidence shows the REAL backend answered this test's own API call with a ${m[1]} status — a concrete, observed server-side error, not an inference from the assertion text alone.`,
       );
     },
   },
@@ -174,6 +300,17 @@ const RULES: readonly Rule[] = [
         'test_is_wrong',
         0.7,
         "The test expected a redirect status (3xx) but observed 200 — the app almost certainly DID redirect, but the request auto-followed it and landed on the redirect target's own response instead. The test's own request is missing `maxRedirects: 0` (or an equivalent no-follow option), not an app defect.",
+      );
+    },
+  },
+  {
+    id: 'status_code_assertion',
+    match(error) {
+      if (!RE_STATUS_CODE_ASSERTION.test(error)) return null;
+      return mk(
+        'app_is_wrong',
+        0.6,
+        'The test asserted a specific HTTP status code and received a different one — the API/app responded with an unexpected status, which is normally a real defect rather than a stale test expectation. (If the test itself is hitting the wrong endpoint or method, this may instead be a test defect — review the request setup.)',
       );
     },
   },

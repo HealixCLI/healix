@@ -52,6 +52,41 @@ describe('classifyByRules / engine.classify', () => {
       expect(result.rationale).toContain('BLOCKED, not failed');
     });
 
+    it('cites the ACTUAL cause (server unreachable) instead of hedging between "setup failed OR no credentials" when the wrapped error shows a real connection failure', () => {
+      // The blocked test's error already carries the auth-setup fixture's own
+      // real reason (execute.ts appends auth.setupError after the generic
+      // prefix) — the rationale must say THAT, not a vague "could be either".
+      const result = engine.classify({
+        title: '[REQ:REQ-1] authenticated flow',
+        error:
+          'Auth setup failed — Tier B prerequisite not met.\n' +
+          'net::ERR_CONNECTION_REFUSED at http://localhost:4202/login',
+      });
+      expect(result.rationale).toContain('unreachable');
+      expect(result.rationale).not.toContain('either the auth setup fixture itself failed, or the project has no test credentials configured');
+    });
+
+    it('cites a genuine missing-credentials cause specifically when that really is what the wrapped error says', () => {
+      const result = engine.classify({
+        title: '[REQ:REQ-1] authenticated flow',
+        error:
+          'Auth setup failed — Tier B prerequisite not met.\n' +
+          'Tier B auth setup skipped: no test credentials configured for this project.',
+      });
+      expect(result.rationale).toContain('no test credentials configured');
+      expect(result.rationale).not.toContain('unreachable');
+    });
+
+    it('falls back to the generic "either X or Y" phrasing only when the wrapped error gives no specific reason at all', () => {
+      const result = engine.classify({
+        title: '[REQ:REQ-1] authenticated flow',
+        error: 'Auth setup failed — Tier B prerequisite not met.',
+      });
+      expect(result.rationale).toContain(
+        'either the auth setup fixture itself failed, or the project has no test credentials configured',
+      );
+    });
+
     it('classifies the auth-setup fixture\'s OWN "no credentials configured" message as environment (on the setup row itself, not just its cascaded dependants)', () => {
       const result = engine.classify({
         title: 'authenticate',
@@ -152,6 +187,44 @@ describe('classifyByRules / engine.classify', () => {
           "locator.click: Error: locator not found for getByRole('button', { name: 'Submit module' })",
         ),
       ).toBe('test_is_wrong');
+    });
+  });
+
+  describe('codegen defect (the generated test script itself threw a runtime error)', () => {
+    it('classifies "is not a function" (a hallucinated Playwright API call) as test_is_wrong', () => {
+      const result = engine.classify({
+        title: 'some test',
+        error: 'TypeError: page.getByRoleX is not a function',
+      });
+      expect(result.verdict).toBe('test_is_wrong');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.75);
+    });
+
+    it('classifies a ReferenceError (undeclared variable in generated code) as test_is_wrong', () => {
+      expect(verdictFor('ReferenceError: expectedTitle is not defined')).toBe('test_is_wrong');
+    });
+
+    it('classifies "is not defined" as test_is_wrong', () => {
+      expect(verdictFor('Error: someHelper is not defined')).toBe('test_is_wrong');
+    });
+
+    it('classifies an unguarded null/undefined property access as test_is_wrong', () => {
+      expect(
+        verdictFor("TypeError: Cannot read properties of null (reading 'textContent')"),
+      ).toBe('test_is_wrong');
+    });
+
+    it('classifies "is not a constructor" as test_is_wrong', () => {
+      expect(verdictFor('TypeError: SomeHelper is not a constructor')).toBe('test_is_wrong');
+    });
+
+    it('does not fire on an ordinary environment or assertion failure (no false positives)', () => {
+      expect(verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000')).toBe('environment');
+      expect(
+        verdictFor(
+          ['Error: expect(received).toHaveText(expected)', 'Expected string: "Welcome"'].join('\n'),
+        ),
+      ).not.toBe('test_is_wrong');
     });
   });
 
@@ -280,6 +353,140 @@ describe('classifyByRules / engine.classify', () => {
 
     it('does not fire when the received status is not 200 (a genuinely different mismatch)', () => {
       expect(verdictFor('Expected: 302\nReceived: 500')).not.toBe('test_is_wrong');
+    });
+  });
+
+  describe('status code assertion (a non-redirect HTTP status mismatch) → app_is_wrong, not ambiguous', () => {
+    it('classifies "expected 200, got 500" as app_is_wrong', () => {
+      const error = [
+        'Error: expect(received).toBe(expected) // Object.is equality',
+        '',
+        'Expected: 200',
+        'Received: 500',
+        '',
+        '    at status-codes-api-responses.spec.ts:22:38',
+      ].join('\n');
+      const result = engine.classify({ title: '[REQ:REQ-43] returns 200 for a valid request', error });
+      expect(result.verdict).toBe('app_is_wrong');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.55);
+    });
+
+    it('classifies "expected 200, got 404" as app_is_wrong', () => {
+      const error = [
+        'Error: expect(received).toBe(expected) // Object.is equality',
+        '',
+        'Expected: 200',
+        'Received: 404',
+      ].join('\n');
+      expect(verdictFor(error)).toBe('app_is_wrong');
+    });
+
+    it('classifies a toEqual status mismatch the same way', () => {
+      const error = [
+        'Error: expect(received).toEqual(expected) // deep equality',
+        '',
+        'Expected: 401',
+        'Received: 403',
+      ].join('\n');
+      expect(verdictFor(error)).toBe('app_is_wrong');
+    });
+
+    it('still lets redirect_not_followed claim a genuine 3xx-expected/200-received case (no regression)', () => {
+      const error = [
+        'Error: expect(received).toBe(expected) // Object.is equality',
+        '',
+        'Expected: 302',
+        'Received: 200',
+      ].join('\n');
+      expect(verdictFor(error)).toBe('test_is_wrong');
+    });
+
+    it('does NOT fire on a toHaveCount mismatch, even with small numbers that could look status-code-ish (no regression)', () => {
+      const error = ['Error: expect(locator).toHaveCount(expected)', 'Expected: 3', 'Received: 2'].join('\n');
+      expect(verdictFor(error)).toBe('ambiguous');
+    });
+
+    it('does not fire without the toBe/toEqual(expected) prefix (plain numbers alone are not enough)', () => {
+      expect(verdictFor('Expected: 200\nReceived: 500')).not.toBe('app_is_wrong');
+    });
+  });
+
+  describe('apiEvidence-corroborated rules (real captured API responses, not a guess)', () => {
+    const ASSERTION_ERROR = "Error: expect(received).toBeTruthy() failed\nReceived: undefined";
+
+    describe('mock_response_incomplete', () => {
+      it('classifies as environment when apiEvidence shows Healix\'s OWN mock answered', () => {
+        const result = engine.classify({
+          title: 'customer_lookup API',
+          error: ASSERTION_ERROR,
+          apiEvidence: '[HEALIX MOCK] GET /customer_lookup -> status 200\nBody: {}',
+        });
+        expect(result.verdict).toBe('environment');
+        expect(result.confidence).toBeGreaterThanOrEqual(0.6);
+        expect(result.rationale).toMatch(/mock/i);
+      });
+
+      it('does NOT fire when apiEvidence is absent (falls through to the generic ambiguous default)', () => {
+        expect(verdictFor(ASSERTION_ERROR)).toBe('ambiguous');
+      });
+
+      it('does NOT fire when apiEvidence shows the REAL backend answered', () => {
+        const result = engine.classify({
+          title: 't',
+          error: ASSERTION_ERROR,
+          apiEvidence: '[REAL BACKEND] GET /customer_lookup -> status 200\nBody: {}',
+        });
+        expect(result.verdict).not.toBe('environment');
+      });
+
+      it('does NOT fire when the error itself has no expect()-style signature at all (apiEvidence alone is not enough)', () => {
+        const result = engine.classify({
+          title: 't',
+          error: 'some unrelated crash with no matcher signature',
+          apiEvidence: '[HEALIX MOCK] GET /customer_lookup -> status 200\nBody: {}',
+        });
+        expect(result.verdict).not.toBe('environment');
+      });
+    });
+
+    describe('real_api_error_evidence', () => {
+      it('classifies as app_is_wrong (high confidence) when apiEvidence shows a REAL 500', () => {
+        const result = engine.classify({
+          title: 't',
+          error: ASSERTION_ERROR,
+          apiEvidence: '[REAL BACKEND] GET /customer_lookup -> status 500\nBody: {}',
+        });
+        expect(result.verdict).toBe('app_is_wrong');
+        expect(result.confidence).toBeGreaterThanOrEqual(0.75);
+        expect(result.rationale).toContain('500');
+      });
+
+      it('classifies as app_is_wrong for a REAL 404 too', () => {
+        const result = engine.classify({
+          title: 't',
+          error: ASSERTION_ERROR,
+          apiEvidence: '[REAL BACKEND] GET /x -> status 404\nBody: {}',
+        });
+        expect(result.verdict).toBe('app_is_wrong');
+      });
+
+      it('does NOT fire on a REAL 2xx status (no error to corroborate)', () => {
+        const result = engine.classify({
+          title: 't',
+          error: ASSERTION_ERROR,
+          apiEvidence: '[REAL BACKEND] GET /x -> status 200\nBody: {}',
+        });
+        expect(result.verdict).not.toBe('app_is_wrong');
+      });
+
+      it('does NOT fire on a MOCKED 500 (that path belongs to mock_response_incomplete, not this rule)', () => {
+        const result = engine.classify({
+          title: 't',
+          error: ASSERTION_ERROR,
+          apiEvidence: '[HEALIX MOCK] GET /x -> status 500\nBody: {}',
+        });
+        expect(result.verdict).not.toBe('app_is_wrong');
+      });
     });
   });
 

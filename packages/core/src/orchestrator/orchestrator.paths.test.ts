@@ -215,6 +215,9 @@ const fakeBrowser: BrowserSurface = {
   drainNetworkEvents() {
     return [];
   },
+  async exportStorageState() {
+    return {};
+  },
   async stop(): Promise<void> {},
 };
 
@@ -946,6 +949,9 @@ describe('orchestrator paths (offline DI seam)', () => {
       drainNetworkEvents() {
         return [];
       },
+      async exportStorageState() {
+        return {};
+      },
       async stop(): Promise<void> {
         stopCalled = true;
       },
@@ -1007,6 +1013,9 @@ describe('orchestrator paths (offline DI seam)', () => {
       },
       drainNetworkEvents() {
         return [];
+      },
+      async exportStorageState() {
+        return {};
       },
       async stop(): Promise<void> {},
     };

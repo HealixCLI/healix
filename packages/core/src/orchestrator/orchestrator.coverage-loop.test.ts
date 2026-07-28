@@ -182,6 +182,9 @@ const fakeBrowser: BrowserSurface = {
   drainNetworkEvents() {
     return [];
   },
+  async exportStorageState() {
+    return {};
+  },
   async stop(): Promise<void> {},
 };
 

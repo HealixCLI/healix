@@ -39,7 +39,10 @@ import { mockDependencyUrl, startMockServer } from '../target/mock-server.js';
 import type { ExternalDependency, MockResponse, MockServerHandle } from '../target/types.js';
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
-import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
+import { runExplorePhase, splitStaticUnitsForExplore, assessExplorationUsefulness } from './explore.js';
+import { deriveRegionCodesFromText } from '../browser/seed-discovery.js';
+import { identifyExplorationGaps, runGapFillingPass } from './gap-fill.js';
+import { mergeCrawlResults } from '../browser/crawler.js';
 import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
@@ -1458,6 +1461,13 @@ async function runPipeline(
             cachedExploration.useful &&
             !cachedExploration.crawl.budgetExhausted;
           let exploration: ExplorationArtifact;
+          // Captured only on a fresh (non-cache-hit) crawl, in memory only — see
+          // ExploreInput.onBeforeStop's doc comment for why this never touches the persisted
+          // exploration cache. Lets the gap-fill pass below (which necessarily starts a NEW
+          // browser, since this phase's own `finally` already tore the session down) resume
+          // whatever authenticated session crawlWithAuth established, instead of running
+          // anonymous-only.
+          let explorationSessionStorageState: unknown;
           if (cachedExploration && cachedExplorationIsTrustworthy) {
             exploration = cachedExploration;
             emit(
@@ -1481,6 +1491,14 @@ async function runPipeline(
             // form — not every role. Prefer a roleless credential (the "default"
             // session Tier B also falls back to) over a role-tagged one.
             const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            // No structured project-config field for supported regions/locales exists yet (see
+            // the enrichment plan's "region-code sourcing is a design TBD") — this scans the
+            // approved plan's own item text as a last-resort heuristic (e.g. a requirement that
+            // literally names "CZ/HU-specific home page copy"). Prefer a real project-config
+            // field or static analysis of the target's i18n/locale config once either exists.
+            const knownRegionCodes = deriveRegionCodesFromText(
+              planForGeneration.items.flatMap((it) => [it.title, it.intent, it.reqTag ?? '']),
+            );
             exploration = await runExplorePhase({
               browser,
               baseUrl: effectiveBaseUrl,
@@ -1489,12 +1507,95 @@ async function runPipeline(
                 : undefined,
               crawlOptions: opts.crawlBudget,
               staticRoutePaths,
+              knownRegionCodes,
+              browserFactory: makeBrowser,
+              onBeforeStop: async (b) => {
+                explorationSessionStorageState = await b.exportStorageState().catch(() => undefined);
+              },
               emit,
               onFrame: hooks?.onFrame,
             });
             persistExplorationCache(project.id, effectiveBaseUrl, exploration);
           }
           ctx.exploration = exploration;
+
+          // Gap-fill runs HERE, unconditionally — not inside runExplorePhase — because a cache
+          // hit skips the crawl entirely (see the trust-gate comment above), but the approved
+          // plan's required routes differ run to run regardless of whether the crawl itself is
+          // fresh or reused. Gap-fill is inherently plan-shaped, not crawl-shaped, so it must
+          // re-run against the CURRENT plan even on a cache hit.
+          try {
+            let explorationArtifact = ctx.exploration;
+            const gaps = identifyExplorationGaps({
+              crawlResult: explorationArtifact.crawl,
+              routing: explorationArtifact.routing,
+              baseUrl: effectiveBaseUrl,
+              planItems: planForGeneration.items.map((it) => ({
+                id: it.id,
+                title: it.title,
+                unitKey: it.unitKey,
+              })),
+              observedEndpoints: explorationArtifact.observedEndpoints,
+            });
+            if (gaps.length > 0) {
+              emit(
+                'explore',
+                'info',
+                `Gap-fill: attempting to close ${gaps.length} identified exploration gap(s).`,
+              );
+              await browser.start({
+                headless: true,
+                baseUrl: effectiveBaseUrl,
+                storageState: explorationSessionStorageState,
+              });
+              try {
+                const gapFill = await runGapFillingPass({
+                  browser,
+                  baseUrl: effectiveBaseUrl,
+                  gaps,
+                  emit,
+                  gapFillProvider: provider ? { provider, onUsage: recordUsage } : undefined,
+                });
+                if (gapFill.newRoutes.length > 0) {
+                  const mergedCrawl = {
+                    ...mergeCrawlResults(explorationArtifact.crawl, {
+                      routes: gapFill.newRoutes,
+                      visitedCount: gapFill.newRoutes.length,
+                      budgetExhausted: false,
+                      unvisitedQueuedCount: 0,
+                      redirectLoopsDetected: [],
+                      shellCollapsed: false,
+                      degenerateRedirectsSkipped: [],
+                    }),
+                    authAttempted: explorationArtifact.crawl.authAttempted,
+                    authVerified: explorationArtifact.crawl.authVerified,
+                    authReason: explorationArtifact.crawl.authReason,
+                  };
+                  const quality = assessExplorationUsefulness(mergedCrawl);
+                  explorationArtifact = {
+                    ...explorationArtifact,
+                    crawl: mergedCrawl,
+                    useful: quality.useful,
+                    uselessReason: quality.reason,
+                    thinRouteRatio: quality.thinRouteRatio,
+                  };
+                }
+                explorationArtifact = { ...explorationArtifact, gapFillAttempts: gapFill.attempts };
+                ctx.exploration = explorationArtifact;
+                const closedCount = gapFill.attempts.filter((a) => a.outcome === 'closed').length;
+                emit(
+                  'explore',
+                  'info',
+                  `Gap-fill: closed ${closedCount}/${gaps.length} gap(s), capturing ${gapFill.newRoutes.length} new route(s).`,
+                );
+                persistExplorationCache(project.id, effectiveBaseUrl, explorationArtifact);
+              } finally {
+                await browser.stop().catch(() => undefined);
+              }
+            }
+          } catch (err) {
+            emit('explore', 'debug', `Gap-fill pass failed (continuing): ${errMsg(err)}`);
+          }
 
           // Auth-pattern-aware breadcrumb: a recognized auth library was detected in source but
           // the crawl found no REAL login form — only the always-present common-path fallback

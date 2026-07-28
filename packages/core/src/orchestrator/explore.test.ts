@@ -74,6 +74,9 @@ function makeFakeBrowser(config: {
     drainNetworkEvents() {
       return [];
     },
+    async exportStorageState() {
+      return {};
+    },
     async stop(): Promise<void> {
       state.stopped = true;
     },
@@ -537,6 +540,94 @@ describe('runExplorePhase()', () => {
       );
       expect(warn).toBeDefined();
       expect(warn?.data).toEqual({ skipped: ['https://a.test/broken'] });
+    });
+  });
+
+  describe('knownRegionCodes (same-context region-seed injection)', () => {
+    it('derives and crawls a sibling-region route not linked from the primary crawl, reusing the same session', async () => {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/': { elements: [link('https://a.test/#/SK/home')] },
+          'https://a.test/#/SK/home': { elements: [heading('Vitajte')] },
+          // Never linked from anywhere in the SK subtree — only reachable by substituting the
+          // region prefix, exactly the scenario found in the real C&A app.
+          'https://a.test/#/CZ/home': { elements: [heading('Vítejte'), heading('Extra')] },
+        },
+      });
+      const { emit, events } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        knownRegionCodes: ['SK', 'CZ'],
+        emit,
+      });
+
+      const czRoute = artifact.crawl.routes.find((r) => r.url === 'https://a.test/#/CZ/home');
+      expect(czRoute).toBeDefined();
+      expect(czRoute?.seedLabel).toBe('CZ');
+      expect(artifact.seedsCrawled).toEqual([{ url: '#/SK/CZ', label: 'CZ', routeCount: 1 }]);
+      expect(events.some((e) => /region-seed fan-out found/i.test(e.message))).toBe(true);
+    });
+
+    it('does nothing when knownRegionCodes is empty', async () => {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/': { elements: [link('https://a.test/#/SK/home')] },
+          'https://a.test/#/SK/home': { elements: [heading('Vitajte')] },
+        },
+      });
+      const { emit, events } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        emit,
+      });
+
+      expect(artifact.seedsCrawled).toBeUndefined();
+      expect(events.some((e) => /region-seed fan-out/i.test(e.message))).toBe(false);
+    });
+  });
+
+  describe('onBeforeStop hook', () => {
+    it('calls onBeforeStop with the still-live browser before stop() tears it down', async () => {
+      const browser = makeFakeBrowser({
+        pages: { 'https://a.test/': { elements: [] } },
+      });
+      const { emit } = makeEmit();
+      let sawStoppedAtHookTime: boolean | undefined;
+
+      await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        onBeforeStop: (b) => {
+          sawStoppedAtHookTime = (b as typeof browser).stopped;
+        },
+        emit,
+      });
+
+      expect(sawStoppedAtHookTime).toBe(false);
+      expect(browser.stopped).toBe(true);
+    });
+
+    it('never lets a failing onBeforeStop hook abort the run', async () => {
+      const browser = makeFakeBrowser({
+        pages: { 'https://a.test/': { elements: [] } },
+      });
+      const { emit } = makeEmit();
+
+      const artifact = await runExplorePhase({
+        browser,
+        baseUrl: 'https://a.test/',
+        onBeforeStop: () => {
+          throw new Error('boom');
+        },
+        emit,
+      });
+
+      expect(artifact).toBeDefined();
+      expect(browser.stopped).toBe(true);
     });
   });
 });

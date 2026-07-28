@@ -1,7 +1,9 @@
 import {
   crawl,
+  crawlManySeeds,
   crawlWithAuth,
   detectRoutePrefix,
+  mergeCrawlResults,
   normalizeUrl,
   reconcileStaticRoutePaths,
   scoreLoginCandidates,
@@ -10,6 +12,7 @@ import {
 } from '../browser/crawler.js';
 import type { BrowserSurface } from '../browser/types.js';
 import { collectObservedEndpoints } from '../browser/network-capture.js';
+import { deriveRegionSeeds, regionCodeOf } from '../browser/seed-discovery.js';
 import type { ExplorationArtifact } from '../modes/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 import type { OrchestratorEvent } from './types.js';
@@ -21,6 +24,38 @@ export interface ExploreInput {
   crawlOptions?: CrawlOptions;
   /** Static-analysis route paths (e.g. functionality-index.ts units) to seed as a follow-up crawl once the hash/region prefix is known — see reconcileStaticRoutePaths. */
   staticRoutePaths?: string[];
+  /**
+   * Sibling region/locale codes (e.g. `["CZ", "HU", "SI"]`) known to exist for this target,
+   * beyond whichever one the primary crawl happened to land in. Used to derive same-origin
+   * sibling-region seed URLs (see `browser/seed-discovery.ts`'s `deriveRegionSeeds`) which reuse
+   * the already-authenticated session for free — no separate browser process or login needed.
+   * Absent/empty simply skips this enrichment step.
+   */
+  knownRegionCodes?: string[];
+  /**
+   * Extra config-driven seed URLs to union in alongside any derived region seeds (e.g. a project
+   * setting listing known deep-link routes with no in-app link at all). A seed sharing the
+   * primary crawl's origin joins the same-context injection above; a seed on a DIFFERENT origin
+   * (a genuinely separate deployment per region/section, unlike this app) instead goes through
+   * the `crawlManySeeds` fallback below — which needs `browserFactory` to spin up its own
+   * independent sessions, since separate origins can't share one `BrowserContext`.
+   */
+  extraSeedUrls?: string[];
+  /** Factory for a fresh `BrowserSurface` (own Chromium process), used only by the separate-
+   * origin seed fan-out fallback. Absent simply skips that fallback (the common same-origin
+   * case above doesn't need it at all). */
+  browserFactory?: () => BrowserSurface;
+  /**
+   * Called with `browser` right before this phase tears it down (its `finally` always calls
+   * `browser.stop()`, which destroys the session). A caller that wants to reuse the just-
+   * established authenticated session afterwards — e.g. the gap-fill pass, which runs in
+   * `orchestrator/index.ts` AFTER this phase returns and therefore starts a brand-new browser —
+   * should export `browser.exportStorageState()` here and hold onto it in memory. Deliberately
+   * NOT threaded through the returned `ExplorationArtifact`: that gets persisted to the on-disk
+   * exploration cache for up to 24h, and a live session's cookies have no business sitting in a
+   * cache file on the caller's behalf.
+   */
+  onBeforeStop?: (browser: BrowserSurface) => Promise<void> | void;
   emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void;
   onFrame?: (png: Buffer) => void;
 }
@@ -28,6 +63,22 @@ export interface ExploreInput {
 /** Bounds for the small follow-up crawl seeded from static-analysis routes. */
 const STATIC_SEED_MAX_ROUTES = 15;
 const STATIC_SEED_BUDGET_MS = 20_000;
+
+/**
+ * Multiplier applied to the calibrated `avgMsPerRoute` when sizing the region-seed fan-out's
+ * per-region time budget — a fresh region has cold caches and no warm auth-session shortcuts, so
+ * its first visits typically run slower than the primary crawl's steady-state average.
+ */
+const REGION_SEED_SAFETY_FACTOR = 1.5;
+/** Absolute floor so a primary crawl with very few routes (a tiny/fast target) still gets a
+ * workable region-seed budget rather than one rounded down to near-zero. */
+const REGION_SEED_MIN_BUDGET_MS = 5_000;
+/** Absolute ceiling regardless of the dynamic calculation — "dynamic" means computed from the
+ * target's measured behavior within a bounded envelope, never literally unbounded. */
+const REGION_SEED_MAX_TOTAL_BUDGET_MS = 180_000;
+/** Per-seed route cap for the separate-origin fallback fan-out — deliberately small; this is
+ * enrichment on top of an already-complete primary crawl, not a full crawl of another site. */
+const DEFAULT_CROSS_ORIGIN_SEED_MAX_ROUTES = 8;
 
 /** Bounded best-effort wait for the frame mirror's first capture before teardown. */
 const FIRST_FRAME_WAIT_MS = 600;
@@ -174,12 +225,151 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       }
     }
 
+    const primaryStart = Date.now();
     let crawlResult = await crawlWithAuth(browser, baseUrl, {
       ...input.crawlOptions,
       credentials: input.credentials,
     });
+    // Calibration signal for every dynamically-sized budget below: this target's own measured
+    // per-route cost (network speed, render cost, auth flow cost) predicts its future behavior
+    // far better than any fixed constant could.
+    const avgMsPerRoute = (Date.now() - primaryStart) / Math.max(1, crawlResult.visitedCount);
 
     const routing = detectRoutePrefix(baseUrl, crawlResult.routes);
+
+    const seedsCrawled: { url: string; label?: string; routeCount: number }[] = [];
+
+    const baseOrigin = (() => {
+      try {
+        return new URL(baseUrl).origin;
+      } catch {
+        return undefined;
+      }
+    })();
+    const isSameOrigin = (url: string): boolean => {
+      try {
+        return new URL(url).origin === baseOrigin;
+      } catch {
+        return false;
+      }
+    };
+    const sameOriginExtraSeeds = (input.extraSeedUrls ?? []).filter(isSameOrigin);
+    const crossOriginExtraSeeds = (input.extraSeedUrls ?? []).filter((url) => !isSameOrigin(url));
+
+    if ((input.knownRegionCodes && input.knownRegionCodes.length > 0) || sameOriginExtraSeeds.length > 0) {
+      try {
+        const derived = deriveRegionSeeds(routing, crawlResult, input.knownRegionCodes ?? []);
+        const alreadyVisited = new Set(crawlResult.routes.map((r) => normalizeUrl(r.url)));
+        const candidateSeeds = [...new Set([...derived, ...sameOriginExtraSeeds])].filter(
+          (url) => !alreadyVisited.has(normalizeUrl(url)),
+        );
+
+        if (candidateSeeds.length > 0) {
+          // perRegionMaxRoutes approximates "how many pages exist per locale" from how many
+          // primary-region routes were actually crawled — an i18n SPA's route tree normally
+          // mirrors 1:1 across regions, so this is a much better predictor than a flat constant.
+          const primaryPrefixRouteCount = routing.invariantPrefix
+            ? crawlResult.routes.filter((r) => r.url.includes(routing.invariantPrefix as string)).length
+            : crawlResult.routes.length;
+          const perRegionMaxRoutes = Math.max(1, primaryPrefixRouteCount);
+          const perRegionBudgetMs = Math.max(
+            REGION_SEED_MIN_BUDGET_MS,
+            perRegionMaxRoutes * avgMsPerRoute * REGION_SEED_SAFETY_FACTOR,
+          );
+          const regionLabels = new Set(candidateSeeds.map((s) => regionCodeOf(s)).filter(Boolean));
+          const regionCount = Math.max(1, regionLabels.size);
+          const totalBudgetMs = Math.min(perRegionBudgetMs * regionCount, REGION_SEED_MAX_TOTAL_BUDGET_MS);
+
+          const [firstSeed, ...restSeeds] = candidateSeeds;
+          const regionCrawl = await crawl(browser, firstSeed, {
+            seedRoutes: restSeeds,
+            maxRoutes: perRegionMaxRoutes * regionCount + 1,
+            wallClockBudgetMs: totalBudgetMs,
+          });
+          const role: 'anonymous' | 'authenticated' = crawlResult.authVerified
+            ? 'authenticated'
+            : 'anonymous';
+          const labeledRoutes = regionCrawl.routes.map((r) => ({ ...r, seedLabel: regionCodeOf(r.url) }));
+          crawlResult = {
+            ...mergeCrawlResults(crawlResult, { ...regionCrawl, routes: labeledRoutes }, role),
+            authAttempted: crawlResult.authAttempted,
+            authVerified: crawlResult.authVerified,
+            authReason: crawlResult.authReason,
+          };
+
+          const routeCountByLabel = new Map<string, number>();
+          for (const r of labeledRoutes) {
+            const label = r.seedLabel ?? 'unknown';
+            routeCountByLabel.set(label, (routeCountByLabel.get(label) ?? 0) + 1);
+          }
+          for (const [label, routeCount] of routeCountByLabel) {
+            seedsCrawled.push({ url: `${routing.invariantPrefix ?? ''}/${label}`, label, routeCount });
+          }
+          if (labeledRoutes.length > 0) {
+            emit(
+              'explore',
+              'debug',
+              `Region-seed fan-out found ${labeledRoutes.length} additional route(s) across ${routeCountByLabel.size} region(s) not reachable by link-following.`,
+              {
+                regions: [...routeCountByLabel.keys()],
+                totalBudgetMs,
+                budgetExhausted: regionCrawl.budgetExhausted,
+              },
+            );
+          }
+        }
+      } catch (err) {
+        emit('explore', 'debug', `Region-seed fan-out failed (continuing): ${errMsg(err)}`);
+      }
+    }
+
+    if (crossOriginExtraSeeds.length > 0 && input.browserFactory) {
+      try {
+        const alreadyVisited = new Set(crawlResult.routes.map((r) => normalizeUrl(r.url)));
+        const unvisited = crossOriginExtraSeeds.filter((url) => !alreadyVisited.has(normalizeUrl(url)));
+        if (unvisited.length > 0) {
+          // Pre-authenticates every fan-out seed from THIS session's cookies/localStorage
+          // (Playwright's own recommended pattern for parallel-authenticated sessions) rather
+          // than each seed running its own anonymous crawl and login attempt.
+          const storageState = await browser.exportStorageState().catch(() => undefined);
+          const fanOut = await crawlManySeeds(unvisited, input.browserFactory, storageState, {
+            perSeedBudgetMs: Math.max(
+              REGION_SEED_MIN_BUDGET_MS,
+              DEFAULT_CROSS_ORIGIN_SEED_MAX_ROUTES * avgMsPerRoute * REGION_SEED_SAFETY_FACTOR,
+            ),
+            perSeedMaxRoutes: DEFAULT_CROSS_ORIGIN_SEED_MAX_ROUTES,
+          });
+          const role: 'anonymous' | 'authenticated' = crawlResult.authVerified
+            ? 'authenticated'
+            : 'anonymous';
+          crawlResult = {
+            ...mergeCrawlResults(crawlResult, fanOut, role),
+            authAttempted: crawlResult.authAttempted,
+            authVerified: crawlResult.authVerified,
+            authReason: crawlResult.authReason,
+          };
+
+          const routeCountByOrigin = new Map<string, number>();
+          for (const r of fanOut.routes) {
+            const label = r.seedLabel ?? 'unknown';
+            routeCountByOrigin.set(label, (routeCountByOrigin.get(label) ?? 0) + 1);
+          }
+          for (const [label, routeCount] of routeCountByOrigin) {
+            seedsCrawled.push({ url: label, label, routeCount });
+          }
+          if (fanOut.routes.length > 0) {
+            emit(
+              'explore',
+              'debug',
+              `Separate-origin seed fan-out found ${fanOut.routes.length} additional route(s) across ${routeCountByOrigin.size} origin(s).`,
+              { origins: [...routeCountByOrigin.keys()], budgetExhausted: fanOut.budgetExhausted },
+            );
+          }
+        }
+      } catch (err) {
+        emit('explore', 'debug', `Separate-origin seed fan-out failed (continuing): ${errMsg(err)}`);
+      }
+    }
 
     if (input.staticRoutePaths && input.staticRoutePaths.length > 0) {
       try {
@@ -198,29 +388,18 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
           const role: 'anonymous' | 'authenticated' = crawlResult.authVerified
             ? 'authenticated'
             : 'anonymous';
-          const staticRoutes = staticCrawl.routes.map((r) => ({ ...r, role }));
+          const staticRouteCount = staticCrawl.routes.length;
           crawlResult = {
-            ...crawlResult,
-            routes: [...crawlResult.routes, ...staticRoutes],
-            visitedCount: crawlResult.visitedCount + staticRoutes.length,
-            budgetExhausted: crawlResult.budgetExhausted || staticCrawl.budgetExhausted,
-            unvisitedQueuedCount:
-              (crawlResult.unvisitedQueuedCount ?? 0) + (staticCrawl.unvisitedQueuedCount ?? 0),
-            redirectLoopsDetected: [
-              ...crawlResult.redirectLoopsDetected,
-              ...staticCrawl.redirectLoopsDetected,
-            ],
-            shellCollapsed: crawlResult.shellCollapsed || staticCrawl.shellCollapsed,
-            degenerateRedirectsSkipped: [
-              ...crawlResult.degenerateRedirectsSkipped,
-              ...staticCrawl.degenerateRedirectsSkipped,
-            ],
+            ...mergeCrawlResults(crawlResult, staticCrawl, role),
+            authAttempted: crawlResult.authAttempted,
+            authVerified: crawlResult.authVerified,
+            authReason: crawlResult.authReason,
           };
-          if (staticRoutes.length > 0) {
+          if (staticRouteCount > 0) {
             emit(
               'explore',
               'debug',
-              `Static-analysis route seeding found ${staticRoutes.length} additional route(s) not reachable by link-following.`,
+              `Static-analysis route seeding found ${staticRouteCount} additional route(s) not reachable by link-following.`,
             );
           }
         }
@@ -332,6 +511,7 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       uselessReason: quality.reason,
       thinRouteRatio: quality.thinRouteRatio,
       observedEndpoints: collectObservedEndpoints(crawlResult),
+      seedsCrawled: seedsCrawled.length > 0 ? seedsCrawled : undefined,
     };
   } finally {
     if (unsubFrames) {
@@ -339,6 +519,13 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
         unsubFrames();
       } catch {
         /* never let unsubscribe crash the run */
+      }
+    }
+    if (input.onBeforeStop) {
+      try {
+        await input.onBeforeStop(browser);
+      } catch (err) {
+        emit('explore', 'debug', `onBeforeStop hook failed (continuing): ${errMsg(err)}`);
       }
     }
     await browser.stop().catch(() => undefined);

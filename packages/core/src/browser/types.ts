@@ -7,6 +7,13 @@ export interface BrowserSurfaceOptions {
   headless?: boolean;
   viewport?: { width: number; height: number };
   baseUrl?: string;
+  /**
+   * Pre-seeds the new context's cookies/localStorage from a prior session's exported state (see
+   * `BrowserSurface.exportStorageState`) — lets a fresh browser process start already
+   * authenticated, without repeating a login. Used by the separate-origin seed fan-out path
+   * (multiple Chromium processes can't share one `BrowserContext`, but they can share one login).
+   */
+  storageState?: unknown;
 }
 
 export interface InteractiveElement {
@@ -60,6 +67,14 @@ export interface InteractiveElement {
    * raw index path, which breaks when the list/table reorders.
    */
   repeatedRowText?: string;
+  /**
+   * Set when this element represents a group of `repeatedGroupSize` near-identical siblings
+   * (same role, same selector shape ignoring the nth-of-type index — e.g. a date-picker's day
+   * cells, a table's rows) that were collapsed to this one representative — see
+   * `collapseRepeatedSiblings` in browser/crawler.ts. Absent for an ordinary, non-repeated
+   * element.
+   */
+  repeatedGroupSize?: number;
 }
 
 export interface DomSnapshot {
@@ -98,5 +113,8 @@ export interface BrowserSurface {
   onFrame(cb: (png: Buffer) => void): () => void;
   /** Return and clear the XHR/fetch traffic observed since the last drain (or since start()). */
   drainNetworkEvents(): CapturedNetworkEvent[];
+  /** Snapshot this session's cookies/localStorage so a separate `BrowserSurface` can start
+   * pre-authenticated from it via `BrowserSurfaceOptions.storageState` — see there for why. */
+  exportStorageState(): Promise<unknown>;
   stop(): Promise<void>;
 }

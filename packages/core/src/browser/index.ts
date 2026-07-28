@@ -1,4 +1,8 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Response } from 'playwright';
+
+/** Playwright has no standalone exported name for this shape — derived from the method itself
+ * so this stays in sync with whatever version of Playwright is installed. */
+export type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
 import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
 import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
 import { FrameMirror } from './mirror.js';
@@ -193,7 +197,10 @@ export function createBrowserSurface(): BrowserSurface {
           browser = await chromium.launch({ headless });
         }
         try {
-          context = await browser.newContext({ viewport });
+          context = await browser.newContext({
+            viewport,
+            storageState: opts.storageState as StorageState | undefined,
+          });
           page = await context.newPage();
           page.on('response', onResponse);
         } catch (err) {
@@ -327,6 +334,11 @@ export function createBrowserSurface(): BrowserSurface {
       const drained = networkBuffer;
       networkBuffer = [];
       return drained;
+    },
+
+    async exportStorageState(): Promise<StorageState> {
+      const ctx = requireStarted(context, 'exportStorageState');
+      return ctx.storageState();
     },
 
     async stop(): Promise<void> {

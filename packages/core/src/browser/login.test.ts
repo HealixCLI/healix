@@ -61,6 +61,9 @@ function makeFakeBrowser(config: {
     drainNetworkEvents() {
       return [];
     },
+    async exportStorageState() {
+      return {};
+    },
     async stop(): Promise<void> {},
   };
 }

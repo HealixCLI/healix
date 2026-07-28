@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   crawl,
+  crawlManySeeds,
   crawlWithAuth,
   reconcileStaticRoutePaths,
   scoreLoginCandidates,
@@ -127,6 +128,9 @@ function makeFakeBrowser(config: {
       const drained = networkBuffer;
       networkBuffer = [];
       return drained;
+    },
+    async exportStorageState() {
+      return {};
     },
     async stop(): Promise<void> {},
   };
@@ -847,9 +851,14 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     // hop1 (level1) and hop2 (level2) are recorded (MAX_STATE_DEPTH=2); level3 would be hop3 and
     // must never even be attempted — nothing ever clicks INSIDE a hop2 state's own candidates.
     const stateRoutes = result.routes.filter((r) => r.stateKey);
-    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level1)).toBe(true);
-    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level2)).toBe(true);
-    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level3)).toBe(false);
+    // Compared by content, not reference: snapshotClean() (repeated-sibling collapse) now
+    // returns a fresh array even when nothing actually collapses, so the raw fixture array is
+    // never literally the same object as what gets stored on the route.
+    const sameElements = (a: InteractiveElement[], b: InteractiveElement[]): boolean =>
+      JSON.stringify(a) === JSON.stringify(b);
+    expect(stateRoutes.some((r) => sameElements(r.snapshot.interactiveElements, level1))).toBe(true);
+    expect(stateRoutes.some((r) => sameElements(r.snapshot.interactiveElements, level2))).toBe(true);
+    expect(stateRoutes.some((r) => sameElements(r.snapshot.interactiveElements, level3))).toBe(false);
     // Safety: card number/nickname get filled, password and OTP-shaped fields never do.
     expect(recordTypes).toContain('#card-number');
     expect(recordTypes).toContain('#nick');
@@ -1089,6 +1098,89 @@ const SUBMIT_BUTTON: InteractiveElement = {
   inForm: true,
   buttonType: 'submit',
 };
+
+describe('crawl() repeated-sibling collapse (state-dedup)', () => {
+  it("collapses a run of near-identical siblings (e.g. a date-picker's day cells) into one representative + repeatedGroupSize", async () => {
+    const dayCells: InteractiveElement[] = Array.from({ length: 27 }, (_, i) => ({
+      role: 'button',
+      name: `Choose ${i + 1}, 2008`,
+      selector: `div:nth-of-type(${i + 1}) > span`,
+    }));
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: dayCells } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(1);
+    expect(result.routes[0].snapshot.interactiveElements[0].repeatedGroupSize).toBe(27);
+  });
+
+  it('leaves a small group of same-shaped elements (2-3 real, distinct nav items) uncollapsed', async () => {
+    const navItems: InteractiveElement[] = [
+      { role: 'link', name: 'Home', selector: 'nav > a:nth-of-type(1)' },
+      { role: 'link', name: 'About', selector: 'nav > a:nth-of-type(2)' },
+      { role: 'link', name: 'Contact', selector: 'nav > a:nth-of-type(3)' },
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: navItems } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(3);
+    expect(
+      result.routes[0].snapshot.interactiveElements.every((el) => el.repeatedGroupSize === undefined),
+    ).toBe(true);
+  });
+
+  it('stops recursing into a deep-probe reveal once its (route, fingerprint) pair has recurred, but still records it', async () => {
+    const openA = button('Open A');
+    const openB = button('Open B');
+    const openC = button('Open C');
+    const deeper = button('Deeper');
+    // 3 base elements; a reveal needs >= 3+5=8 elements to count as a real state (see
+    // STATE_REVEAL_MIN_NEW_ELEMENTS). The exact same array is revealed by all three buttons —
+    // same underlying shared component (e.g. a cookie-consent-style modal).
+    const sharedModal: InteractiveElement[] = [
+      deeper,
+      button('M1'),
+      button('M2'),
+      button('M3'),
+      button('M4'),
+      button('M5'),
+      button('M6'),
+      button('M7'),
+    ];
+    // sharedModal has 8 elements; a second-hop reveal needs >= 8+5=13 to register.
+    const deeperReveal: InteractiveElement[] = Array.from({ length: 13 }, (_, i) => button(`D${i}`));
+
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dash': { elements: [openA, openB, openC] } },
+      onClickSelectorReveal: {
+        [openA.selector]: sharedModal,
+        [openB.selector]: sharedModal,
+        [openC.selector]: sharedModal,
+        [deeper.selector]: deeperReveal,
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/dash');
+
+    const stateRoutes = result.routes.filter((r) => r.stateKey);
+    const sharedModalHits = stateRoutes.filter(
+      (r) => r.snapshot.interactiveElements.length === sharedModal.length,
+    );
+    const deeperRevealHits = stateRoutes.filter(
+      (r) => r.snapshot.interactiveElements.length === deeperReveal.length,
+    );
+    // All three reveals of the identical shared modal are still recorded...
+    expect(sharedModalHits).toHaveLength(3);
+    // ...but only the first two (below STATE_REPEAT_THRESHOLD) were recursed into far enough to
+    // reach and record the second-hop reveal — the third recognized the repeat and stopped short.
+    expect(deeperRevealHits).toHaveLength(2);
+  });
+});
 
 describe('crawlWithAuth()', () => {
   it('returns anonymous-only routes and skips auth when no credentials are supplied', async () => {
@@ -1715,5 +1807,112 @@ describe('crawl() login-route discovery priority', () => {
 
     expect(result.budgetExhausted).toBe(false);
     expect(result.unvisitedQueuedCount).toBe(0);
+  });
+});
+
+describe('crawlManySeeds() (separate-origin fallback fan-out)', () => {
+  /** A fresh fake BrowserSurface per call, one page per seed's own origin, recording every
+   * `start()` call's opts so a test can verify storageState propagation. */
+  function makeSeedBrowserFactory(config: {
+    pagesByOrigin: Record<string, InteractiveElement[]>;
+    delayMs?: Record<string, number>;
+    throwOnStartFor?: Set<string>;
+    startCalls: BrowserSurfaceOptions[];
+  }): () => BrowserSurface {
+    return () => {
+      let currentUrl = '';
+      return {
+        async start(opts: BrowserSurfaceOptions = {}): Promise<void> {
+          if (opts.baseUrl && config.throwOnStartFor?.has(opts.baseUrl)) {
+            throw new Error(`fake start failure for ${opts.baseUrl}`);
+          }
+          config.startCalls.push(opts);
+        },
+        async goto(url: string): Promise<void> {
+          currentUrl = url;
+          const delay = config.delayMs?.[url];
+          if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        },
+        async screenshot(): Promise<Buffer> {
+          return Buffer.alloc(0);
+        },
+        async snapshot(): Promise<DomSnapshot> {
+          const origin = new URL(currentUrl).origin;
+          return {
+            url: currentUrl,
+            title: currentUrl,
+            interactiveElements: config.pagesByOrigin[origin] ?? [],
+          };
+        },
+        async click(): Promise<void> {},
+        async clickAt(): Promise<void> {},
+        async type(): Promise<void> {},
+        async pressKey(): Promise<void> {},
+        onFrame(): () => void {
+          return () => {};
+        },
+        drainNetworkEvents(): CapturedNetworkEvent[] {
+          return [];
+        },
+        async exportStorageState() {
+          return {};
+        },
+        async stop(): Promise<void> {},
+      };
+    };
+  }
+
+  it('crawls each seed in its own browser, pre-authenticated from the given storageState', async () => {
+    const startCalls: BrowserSurfaceOptions[] = [];
+    const sharedStorageState = { cookies: [{ name: 'session', value: 'abc' }] };
+    const factory = makeSeedBrowserFactory({
+      pagesByOrigin: {
+        'https://a.test': [button('A')],
+        'https://b.test': [button('B')],
+      },
+      startCalls,
+    });
+
+    const result = await crawlManySeeds(['https://a.test/', 'https://b.test/'], factory, sharedStorageState);
+
+    expect(result.routes.map((r) => r.seedLabel).sort()).toEqual(['https://a.test', 'https://b.test']);
+    expect(startCalls.every((opts) => opts.storageState === sharedStorageState)).toBe(true);
+  });
+
+  it('never lets one seed whose browser fails to start abort the rest of the fan-out', async () => {
+    const factory = makeSeedBrowserFactory({
+      pagesByOrigin: { 'https://b.test': [button('B')] },
+      throwOnStartFor: new Set(['https://a.test/']),
+      startCalls: [],
+    });
+
+    const result = await crawlManySeeds(['https://a.test/', 'https://b.test/'], factory, undefined);
+
+    expect(result.routes.some((r) => r.seedLabel === 'https://b.test')).toBe(true);
+    expect(result.routes.some((r) => r.seedLabel === 'https://a.test')).toBe(false);
+  });
+
+  it('never crawls more seeds than fit in the total budget ceiling', async () => {
+    const seeds = ['https://a.test/', 'https://b.test/', 'https://c.test/'];
+    const delayMs: Record<string, number> = {};
+    for (const s of seeds) delayMs[s] = 40;
+    const factory = makeSeedBrowserFactory({
+      pagesByOrigin: {
+        'https://a.test': [button('A')],
+        'https://b.test': [button('B')],
+        'https://c.test': [button('C')],
+      },
+      delayMs,
+      startCalls: [],
+    });
+
+    const result = await crawlManySeeds(seeds, factory, undefined, {
+      perSeedBudgetMs: 5_000,
+      totalBudgetMs: 30, // shorter than even one seed's own navigation delay
+    });
+
+    // The calibration probe (first seed) always runs, but the deadline check before starting
+    // subsequent seeds means the fan-out can't run away past its total budget.
+    expect(result.routes.length).toBeLessThan(seeds.length);
   });
 });

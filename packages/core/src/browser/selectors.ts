@@ -27,6 +27,7 @@ interface DomElement {
   getAttribute(name: string): string | null;
   hasAttribute(name: string): boolean;
   getClientRects(): ArrayLike<unknown>;
+  querySelector(selector: string): DomElement | null;
 }
 
 interface DomDocument {
@@ -45,16 +46,92 @@ interface DomWindow {
 export const INTERACTIVE_ELEMENT_SELECTOR = 'button, a[href], input, select, textarea, [role="button"]';
 
 /**
- * Non-semantic wrapper tags commonly used as click targets in real apps (a
- * `<div>`/`<span>` with an `onClick` handler and `cursor: pointer` styling,
- * but no button/link/role semantics) — confirmed live across every app in
- * `docs/exploration-quality-audit.md`'s GAP-053, including a
- * security-relevant case (an account page's password-change/delete-account
- * controls were entirely invisible to the pipeline). `[onclick]` catches any
- * tag with a literal inline handler; the listed tags cover the common
- * wrapper shapes seen in practice without scanning every element on the page.
+ * GAP-053 originally scoped the second pass to a fixed tag allowlist
+ * (`div, span, li, td, tr, [onclick]`) for non-semantic click targets — a
+ * `<div>`/`<span>` with an `onClick` handler and `cursor: pointer` styling
+ * but no button/link/role semantics. GAP-057 replaced that with `'*'`: a
+ * fixed tag list is inherently whack-a-mole (confirmed live: a real app's
+ * account-settings panel used `<p>` tags for its password-change/delete-
+ * account controls, invisible to the old allowlist) and can never cover a
+ * custom element (`<cx-tile>`) or a bare `<a>` with no `href` (invisible to
+ * `INTERACTIVE_ELEMENT_SELECTOR` too). `cursor: pointer` is the signal this
+ * code already treats as authoritative (see the pass-2 loop below) — `'*'`
+ * plus `NON_CLICKABLE_TAGS` pruning first keeps that signal load-bearing
+ * without an incomplete tag list standing in front of it.
  */
-const GENERIC_CLICK_CANDIDATE_SELECTOR = 'div, span, li, td, tr, [onclick]';
+const GENERIC_CLICK_CANDIDATE_SELECTOR = '*';
+
+/**
+ * Structural tags pruned BEFORE any DOM read in the pass-2 loop (GAP-057) —
+ * pure string/hash checks, no `getComputedStyle`/`textContent` cost. Grouped
+ * by why each is excluded:
+ * - metadata/non-rendered: never visible, never a click target.
+ * - void/no-text: cannot carry an accessible name via textContent, and none
+ *   realistically carries `cursor: pointer` as a genuine click affordance.
+ * - replaced/opaque: browser-native embeds; a real click target inside one
+ *   (e.g. a video's own controls) isn't something Playwright drives anyway.
+ * - SVG internals: an icon's own vector fragments; the semantically
+ *   meaningful click target is the enclosing element, not `<path>`/`<g>`.
+ * Deliberately NOT denylisted: `a` (a bare `<a onClick>` with no `href` is a
+ * new capability this fix adds — invisible to both `INTERACTIVE_ELEMENT_SELECTOR`
+ * and `extractLinks()`), `form`, `table`/`tbody`, `nav`/`header`/`footer`, and
+ * any custom element — all can legitimately be a real app's click target and
+ * are cheaply eliminated by the `cursor: pointer` gate if they aren't.
+ */
+const NON_CLICKABLE_TAGS = [
+  // Metadata / non-rendered
+  'html',
+  'head',
+  'body',
+  'script',
+  'style',
+  'link',
+  'meta',
+  'title',
+  'base',
+  'noscript',
+  'template',
+  // Void / no-text
+  'br',
+  'hr',
+  'source',
+  'track',
+  'param',
+  'col',
+  'wbr',
+  // Replaced / opaque
+  'iframe',
+  'canvas',
+  'video',
+  'audio',
+  'object',
+  'embed',
+  'map',
+  'area',
+  // SVG internals
+  'svg',
+  'path',
+  'g',
+  'defs',
+  'use',
+  'circle',
+  'rect',
+  'line',
+  'polyline',
+  'polygon',
+  'ellipse',
+  'tspan',
+  'lineargradient',
+  'radialgradient',
+  'stop',
+  'clippath',
+  'mask',
+  'filter',
+  'symbol',
+  'marker',
+  'desc',
+  'foreignobject',
+];
 
 /**
  * Extract interactive elements (buttons, links, inputs, selects, textareas and
@@ -63,8 +140,16 @@ const GENERIC_CLICK_CANDIDATE_SELECTOR = 'div, span, li, td, tr, [onclick]';
  * per-element round-trips.
  */
 export async function collectInteractiveElements(page: Page): Promise<InteractiveElement[]> {
-  return page.evaluate<InteractiveElement[], { selector: string; genericSelector: string }>(
-    ({ selector: SELECTOR, genericSelector: GENERIC_CLICK_CANDIDATE_SELECTOR }) => {
+  return page.evaluate<
+    InteractiveElement[],
+    { selector: string; genericSelector: string; nonClickableTags: string[] }
+  >(
+    ({
+      selector: SELECTOR,
+      genericSelector: GENERIC_CLICK_CANDIDATE_SELECTOR,
+      nonClickableTags: NON_CLICKABLE_TAGS_ARG,
+    }) => {
+      const nonClickableTags = new Set(NON_CLICKABLE_TAGS_ARG);
       // Inside the browser these globals exist; we narrow them to our local view.
       const win = globalThis as unknown as DomWindow;
       const doc = win.document;
@@ -322,15 +407,23 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         return el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
       }
 
-      function isVisible(el: DomElement): boolean {
+      type ComputedStyleLike = { visibility: string; display: string; cursor: string };
+
+      /** Shared by both passes so a node's `getComputedStyle()` is fetched at most once — pass 2
+       * (GAP-057) already needs the style object for its `cursor` check, so it passes that same
+       * object here instead of triggering a second style read for the identical element. */
+      function isVisibleWithStyle(el: DomElement, style: ComputedStyleLike): boolean {
         if (el.hidden) {
           return false;
         }
         if (el.getClientRects().length === 0) {
           return false;
         }
-        const style = win.getComputedStyle(el);
         return style.visibility !== 'hidden' && style.display !== 'none';
+      }
+
+      function isVisible(el: DomElement): boolean {
+        return isVisibleWithStyle(el, win.getComputedStyle(el));
       }
 
       /** True when `el` is itself a semantic interactive element by the same shape INTERACTIVE_ELEMENT_SELECTOR matches. */
@@ -417,25 +510,46 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         outElements.push(el);
       }
 
-      // Second pass: non-semantic clickable wrappers (a <div>/<span> with an
-      // onClick handler and cursor:pointer styling, no button/link/role
-      // semantics) — see GAP-053. Cheap checks first (seen/visible, then
-      // non-empty text, then the ancestor walk) so the costlier
-      // getComputedStyle() call only runs for candidates that already passed
-      // everything else.
+      // Second pass: non-semantic clickable elements — anything styled cursor:pointer (or
+      // carrying a literal onclick attribute) with no button/link/role semantics — see GAP-053
+      // (originally a fixed tag allowlist) and GAP-057 (replaced with '*' + NON_CLICKABLE_TAGS,
+      // since a fixed tag list is inherently incomplete). Ordered strictly cheapest-first so the
+      // expensive per-node work never runs on the vast majority of nodes a '*' scan visits:
+      //   1. seen — O(1) hash, already-collected in pass 1.
+      //   2. non-clickable tag — O(1) hash, no DOM read at all.
+      //   3. cursor:pointer OR a literal onclick attribute — ONE getComputedStyle() call, shared
+      //      with the visibility check below instead of fetching style twice (as the old code did).
+      //   4. visibility — reuses the style object just fetched.
+      //   5. non-empty text (falling back to accessibleName for a text-less element like <img>) —
+      //      textContent is an O(subtree) read; gating it behind the cursor check means it only
+      //      ever runs on the handful of nodes that already passed, not every node in the walk.
+      //   6. ancestor walk — is this INSIDE an already-collected/semantic element.
+      //   7. descendant check (GAP-057) — does this WRAP a real interactive element (e.g. a
+      //      <label> around a checkbox, or a cursor-pointer <div> around a <button>) — the
+      //      ancestor walk alone misses this direction, producing a duplicate entry for one
+      //      click target.
       const genericNodes = Array.prototype.slice.call(
         doc.querySelectorAll(GENERIC_CLICK_CANDIDATE_SELECTOR),
       ) as DomElement[];
       for (const el of genericNodes) {
-        if (seen.has(el) || !isVisible(el)) continue;
-        const text = (el.textContent ?? '').trim();
+        if (seen.has(el)) continue;
+        if (nonClickableTags.has(el.tagName.toLowerCase())) continue;
+        const style = win.getComputedStyle(el);
+        if (style.cursor !== 'pointer' && !el.hasAttribute('onclick')) continue;
+        if (!isVisibleWithStyle(el, style)) continue;
+        const text = (el.textContent ?? '').trim() || accessibleName(el);
         if (!text) continue;
         if (hasInteractiveAncestor(el)) continue;
-        const style = win.getComputedStyle(el);
-        if (style.cursor !== 'pointer') continue;
+        if (el.querySelector(SELECTOR)) continue;
         seen.add(el);
         const { selector, tier, repeatedRowText } = selectorFor(el);
         out.push({
+          // Always 'generic', never roleFor(el)'s tag-based fallback (e.g. 'p'/'div'/a custom
+          // element's own tag name) — crawler.ts's extractClickCandidates and generate.ts's
+          // NON_SEMANTIC_ROLES both key off role === 'generic' specifically, regardless of which
+          // tag produced the candidate (see GAP-057). The one exception `roleFor` already
+          // encodes correctly — a bare <a> with no href reading as 'generic' — is consistent
+          // with this, so hardcoding here changes nothing for that case either.
           role: 'generic',
           name: accessibleName(el),
           selector,
@@ -465,6 +579,10 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
 
       return out;
     },
-    { selector: INTERACTIVE_ELEMENT_SELECTOR, genericSelector: GENERIC_CLICK_CANDIDATE_SELECTOR },
+    {
+      selector: INTERACTIVE_ELEMENT_SELECTOR,
+      genericSelector: GENERIC_CLICK_CANDIDATE_SELECTOR,
+      nonClickableTags: NON_CLICKABLE_TAGS,
+    },
   );
 }

@@ -120,17 +120,103 @@ describe('attemptLogin()', () => {
     }
   });
 
-  it('fails fast when the candidate page has no password field at all', async () => {
+  it('reports no password field only after waiting for one to mount', async () => {
+    // Deliberately NOT fast: a client-side-routed page can hold the previous route's elements
+    // (or none) for a moment after goto(), so absence is only real after a bounded wait —
+    // see waitForCredentialForm. Driven by fake timers rather than a real 5-second sleep.
+    vi.useFakeTimers();
+    try {
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/not-a-login-page': {
+            elements: [{ role: 'heading', name: 'Home', selector: 'h1' }],
+          },
+        },
+      });
+
+      const resultPromise = attemptLogin(browser, 'https://a.test/not-a-login-page', 'user@a.test', 'pw');
+      await vi.advanceTimersByTimeAsync(5_000);
+      const result = await resultPromise;
+
+      expect(result.ok).toBe(false);
+      expect(result.reason).toMatch(/no password field/i);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('waits out a late-mounting credential form instead of declaring the page has none', async () => {
+    vi.useFakeTimers();
+    try {
+      const pages: Record<string, { elements: InteractiveElement[] }> = {
+        // Mounts empty, exactly as a hash-routed SPA does between goto() and hydration.
+        'https://a.test/login': { elements: [] },
+      };
+      const browser = makeFakeBrowser({
+        pages,
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/home' },
+      });
+      pages['https://a.test/home'] = { elements: [] };
+
+      const resultPromise = attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+      // Hydrate the form one poll interval in.
+      await vi.advanceTimersByTimeAsync(300);
+      pages['https://a.test/login'].elements = [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON];
+      await vi.advanceTimersByTimeAsync(5_000);
+
+      const result = await resultPromise;
+      expect(result.ok).toBe(true);
+      expect(result.landingUrl).toBe('https://a.test/home');
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it('clicks a login-named control to reveal a form hidden behind a register/login toggle', async () => {
+    const TOGGLE: InteractiveElement = {
+      role: 'button',
+      name: 'Prihlásiť sa',
+      selector: 'form > div > button',
+      buttonType: 'button',
+      inForm: true,
+    };
     const browser = makeFakeBrowser({
       pages: {
-        'https://a.test/not-a-login-page': { elements: [{ role: 'heading', name: 'Home', selector: 'h1' }] },
+        // The register view: no password field is reachable until the toggle is clicked.
+        'https://a.test/#/SK/register': { elements: [TOGGLE] },
+        'https://a.test/#/SK/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/#/SK/dashboard': { elements: [] },
+      },
+      onClickSelectorGoTo: { 'form > div > button': 'https://a.test/#/SK/login' },
+      onSubmitGoTo: { 'https://a.test/#/SK/login': 'https://a.test/#/SK/dashboard' },
+    });
+
+    const result = await attemptLogin(browser, 'https://a.test/#/SK/register', 'user@a.test', 'pw');
+
+    expect(result.ok).toBe(true);
+    expect(result.landingUrl).toBe('https://a.test/#/SK/dashboard');
+  });
+
+  it('refuses to submit a registration form as a login', async () => {
+    const REGISTER_SUBMIT: InteractiveElement = {
+      role: 'button',
+      name: 'Pokračovať',
+      selector: 'button[data-testid="register-submit"]',
+      buttonType: 'submit',
+      inForm: true,
+    };
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/#/SK/register': {
+          elements: [EMAIL_FIELD, PASSWORD_FIELD, REGISTER_SUBMIT],
+        },
       },
     });
 
-    const result = await attemptLogin(browser, 'https://a.test/not-a-login-page', 'user@a.test', 'pw');
+    const result = await attemptLogin(browser, 'https://a.test/#/SK/register', 'user@a.test', 'pw');
 
     expect(result.ok).toBe(false);
-    expect(result.reason).toMatch(/no password field/i);
+    expect(result.reason).toMatch(/registration form/i);
   });
 
   it('fails when there is a password field but no separate username/email field', async () => {

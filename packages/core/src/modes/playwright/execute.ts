@@ -14,7 +14,11 @@ import type {
   TestModeContext,
 } from '../types.js';
 import { tiersForScope } from '../types.js';
-import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
+import {
+  EXEC_CHECKPOINT_FILENAME,
+  EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_REQUEST_LOG_FILENAME,
+} from './templates.js';
 
 const EXEC_TIMEOUT_MS = 30 * 60_000; // generous: full suite across three tiers
 const INSTALL_TIMEOUT_MS = 300_000; // generous: npm install for the scaffolded suite
@@ -460,7 +464,10 @@ export function runCommand(
 /**
  * Ensure the scaffolded suite has its node_modules. The Playwright browser
  * binaries live in the shared global cache, so only the npm deps need
- * installing here; browsers are handled lazily on a missing-browser failure.
+ * installing here; browsers are handled lazily on a missing-browser failure
+ * (see looksLikeMissingBrowser's retry below) rather than checked proactively
+ * on every call — the only local, network-free way to know a browser binary
+ * is missing is to actually try to launch it.
  *
  * Exported so validate.ts's parse-check gate can call it too — that gate runs
  * `npx playwright test --list` right after generation, before execute() ever
@@ -504,6 +511,19 @@ function looksLikeMissingBrowser(cmd: RawCommand): boolean {
   );
 }
 
+/** Heuristic: did the run fail because some OTHER npm package (not a browser
+ * binary) the scaffolded suite depends on was never installed, or a prior
+ * `npm install` here silently failed partway (ensureSuiteDeps logs and
+ * continues rather than hard-failing on that, see above) — e.g. a corrupted
+ * node_modules, or a package that only resolves once install actually runs to
+ * completion. Same signatures orchestrator/index.ts's looksLikeMissingDeps
+ * uses for the TARGET app's own dependencies; not shared code because this
+ * one reads a RawCommand (stdout+stderr) instead of a plain error message. */
+function looksLikeMissingSuiteDeps(cmd: RawCommand): boolean {
+  const text = stripAnsi(`${cmd.stderr}\n${cmd.stdout}`);
+  return /Cannot find module|Cannot find package|ERR_MODULE_NOT_FOUND|MODULE_NOT_FOUND/i.test(text);
+}
+
 // ---- Playwright JSON report shapes (only the fields we read) ----------------
 
 interface PwAttachment {
@@ -523,10 +543,16 @@ interface PwResult {
   errors?: PwError[];
   attachments?: PwAttachment[];
 }
+interface PwAnnotation {
+  type?: string;
+  description?: string;
+}
 interface PwTest {
   status?: string;
   projectName?: string;
   results?: PwResult[];
+  /** Playwright's own `test.skip(condition, 'reason')`/`test.fixme(...)` annotations, when the test/suite provided one. */
+  annotations?: PwAnnotation[];
 }
 interface PwSpec {
   title?: string;
@@ -571,6 +597,32 @@ function isAuthSetup(projectName: string | undefined, file: string | undefined):
     /auth[-._ ]?setup/i.test(String(projectName ?? '')) ||
     /auth\.setup\.[cm]?[jt]sx?$/i.test(String(file ?? ''))
   );
+}
+
+/**
+ * Prefix stamped onto the auth-setup row's OWN error text. Triage's
+ * RE_BLOCKED_TIERB matches it (see triage/rules.ts) so this row classifies as the
+ * run-configuration problem it is.
+ *
+ * Stamped HERE, where `isAuthSetup` has already established the row's identity
+ * structurally, precisely so that triage never has to guess it back out of error text.
+ * Triage sees only a title and an error string — and a bare Playwright timeout from the
+ * fixture ("Test timeout of 60000ms exceeded.") carries no auth signal whatsoever, so it
+ * used to land on the generic timeout rule as `environment` @0.55 with the rationale "a
+ * timeout fired with no selector or assertion context", burying the actual cause of 45
+ * blocked tests. Guessing instead from the row's title (`authenticate`) or from auth-ish
+ * words in the error would reintroduce exactly the defect-leakage bug AuthSignals documents
+ * below — Playwright embeds the failing source snippet in its errors, so any generated spec
+ * quoting an auth word could match. A marker Healix writes itself has no such ambiguity.
+ */
+const AUTH_SETUP_FAILURE_MARKER = 'Tier B auth setup failed';
+
+/** Stamp the marker onto the auth-setup row's own error, tolerating an empty/absent error
+ * (a timeout with no message still needs to classify correctly). */
+function withAuthSetupMarker(error: string): string {
+  const text = error.trim();
+  if (text.startsWith(AUTH_SETUP_FAILURE_MARKER)) return text;
+  return text ? `${AUTH_SETUP_FAILURE_MARKER}.\n${text}` : `${AUTH_SETUP_FAILURE_MARKER}.`;
 }
 
 /**
@@ -665,6 +717,28 @@ function errorText(result: PwResult | undefined): string {
   return '';
 }
 
+/**
+ * Recovers WHY a test was skipped, from Playwright's own `test.skip(cond,
+ * 'reason')` / `test.fixme(cond, 'reason')` annotations — QA-requested
+ * visibility for a 'skipped' Results row, which otherwise shows no
+ * indication of why the test never actually ran. Returns undefined when the
+ * test carries no skip/fixme annotation, or the annotation has no
+ * description (a bare `test.skip()` with no reason given).
+ */
+function extractSkipReason(test: PwTest): string | undefined {
+  // Picks the first skip/fixme annotation that actually HAS a description, not simply the first
+  // one: a declaration-form `test.fixme(title, ...)` gets a description-less `fixme` annotation
+  // from Playwright itself, which would otherwise shadow the described annotation the generator
+  // attaches alongside it (see generate.ts's escapeHatchDetails) and leave every escape-hatch
+  // skip reporting no reason at all.
+  for (const annotation of test.annotations ?? []) {
+    if (annotation.type !== 'skip' && annotation.type !== 'fixme') continue;
+    const description = annotation.description?.trim();
+    if (description) return description;
+  }
+  return undefined;
+}
+
 const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
 // Playwright still writes a video file when the page never repainted before
 // the context closed (a very fast test, or one that only ever saw about:blank)
@@ -696,6 +770,7 @@ interface ParsedReport {
   failed: number;
   blocked: number;
   flaky: number;
+  skipped: number;
 }
 
 // ---- Write-through per-test checkpoint (see templates.ts's checkpointReporterContents()) ----
@@ -717,6 +792,8 @@ export interface CheckpointEntry {
   status: string;
   durationMs?: number;
   error?: string;
+  /** Why a 'skipped' entry was skipped (see ExecResultItem.skipReason's own doc comment). */
+  skipReason?: string;
 }
 
 function checkpointFilePath(projectDir: string): string {
@@ -724,6 +801,39 @@ function checkpointFilePath(projectDir: string): string {
 }
 function invertFilePath(projectDir: string): string {
   return join(projectDir, EXEC_CHECKPOINT_INVERT_FILENAME);
+}
+
+/**
+ * Best-effort read of the mock fixture's write-through request log (see
+ * MOCK_REQUEST_LOG_FILENAME's doc comment in templates.ts) — tallies hits by
+ * dependency id. A missing file (mocking disabled, or nothing was ever
+ * intercepted) just means "no browser-level mock hits" (`{}`), same
+ * "best-effort, never fail the run" contract as readCheckpointEntries above.
+ * See F-15: this is what lets the report's mockedRequestCounts reflect
+ * fixture-level (page.route()/`request` override) mocking, which the
+ * pre-existing counter — built only from the separate launch-time mock HTTP
+ * server — had no visibility into at all.
+ */
+export async function readMockRequestCounts(projectDir: string): Promise<Record<string, number>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_REQUEST_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const counts: Record<string, number> = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as { id?: unknown };
+      const id = typeof entry.id === 'string' && entry.id ? entry.id : 'override';
+      counts[id] = (counts[id] ?? 0) + 1;
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  return counts;
 }
 
 /** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
@@ -772,6 +882,13 @@ export async function clearExecCheckpoint(projectDir: string): Promise<void> {
   await Promise.all([
     unlink(checkpointFilePath(projectDir)).catch(() => {}),
     unlink(invertFilePath(projectDir)).catch(() => {}),
+    // See F-15: cleared here too (not at the start of execute()) for the SAME
+    // reason as the two files above — an interrupted attempt's mock hits must
+    // survive into the resumed attempt's count (readMockRequestCounts is read
+    // BEFORE this runs), but a genuinely later, unrelated execute() call
+    // reusing this projectDir (next coverage-loop gap-fill iteration) must
+    // start counting fresh rather than inheriting this phase's hits.
+    unlink(join(projectDir, MOCK_REQUEST_LOG_FILENAME)).catch(() => {}),
   ]);
 }
 
@@ -801,14 +918,18 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
   let failed = 0;
   let blocked = 0;
   let flaky = 0;
+  let skipped = 0;
 
   for (const entry of entries) {
     let status = normalizeStatus(entry.status);
     // Suppress only a passing setup phantom — a failing one stays visible as
     // the root cause (mirrors parseReport's isSetupSpec handling).
-    if (isAuthSetup(entry.project, entry.specFile) && status !== 'failed') continue;
+    const isSetupEntry = isAuthSetup(entry.project, entry.specFile);
+    if (isSetupEntry && status !== 'failed') continue;
 
-    let errText = entry.error ?? '';
+    // Same marker parseReport stamps, so a resumed run classifies this row identically to a
+    // fresh one rather than falling back to the generic timeout rule.
+    let errText = isSetupEntry ? withAuthSetupMarker(entry.error ?? '') : (entry.error ?? '');
     if (projectIsTierB(entry.project)) {
       if (auth.setupFailed && (status === 'failed' || status === 'skipped')) {
         status = 'blocked';
@@ -827,6 +948,7 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
       durationMs: entry.durationMs,
       error: errText || undefined,
       specFile: entry.specFile,
+      skipReason: status === 'skipped' ? entry.skipReason : undefined,
     });
     switch (status) {
       case 'passed':
@@ -842,12 +964,15 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
       case 'failed':
         failed += 1;
         break;
+      case 'skipped':
+        skipped += 1;
+        break;
       default:
         break;
     }
   }
 
-  return { results, passed, failed, blocked, flaky };
+  return { results, passed, failed, blocked, flaky, skipped };
 }
 
 /**
@@ -870,6 +995,7 @@ export function mergeParsedReports(a: ParsedReport, b: ParsedReport): ParsedRepo
     failed: results.filter((r) => r.status === 'failed').length,
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
+    skipped: results.filter((r) => r.status === 'skipped').length,
   };
 }
 
@@ -879,6 +1005,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let failed = 0;
   let blocked = 0;
   let flaky = 0;
+  let skipped = 0;
 
   const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
@@ -898,6 +1025,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
 
     let worst: TestStatus = 'pending';
     let worstError = '';
+    let worstSkipReason: string | undefined;
     let totalDuration = 0;
     let artifacts: string[] = [];
     let isFlaky = false;
@@ -940,6 +1068,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       if ((STATUS_PRIORITY[status] ?? 0) >= (STATUS_PRIORITY[worst] ?? 0)) {
         worst = status;
         if (status === 'failed' || status === 'blocked') worstError = errText;
+        worstSkipReason = status === 'skipped' ? extractSkipReason(test) : undefined;
         const a = collectArtifactPaths(last?.attachments);
         if (a.length > 0) artifacts = a;
       }
@@ -957,9 +1086,10 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       title,
       status: worst,
       durationMs: totalDuration || undefined,
-      error: worstError || undefined,
+      error: isSetupSpec ? withAuthSetupMarker(worstError) : worstError || undefined,
       artifacts: artifacts.length > 0 ? artifacts : undefined,
       specFile: spec.file ?? suiteFile,
+      skipReason: worstSkipReason,
     };
     results.push(item);
 
@@ -977,8 +1107,11 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       case 'failed':
         failed += 1;
         break;
+      case 'skipped':
+        skipped += 1;
+        break;
       default:
-        // skipped/pending do not move pass/fail headline counters
+        // pending does not move any headline counter
         break;
     }
   };
@@ -997,7 +1130,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   };
 
   for (const suite of report.suites ?? []) walk(suite, '', undefined);
-  return { results, passed, failed, blocked, flaky };
+  return { results, passed, failed, blocked, flaky, skipped };
 }
 
 /** Read results.json if present and newer than the run start. */
@@ -1107,12 +1240,21 @@ function parseSummaryText(combined: string): ParsedReport {
   const passed = num(/(\d+)\s+passed/i);
   const failed = num(/(\d+)\s+failed/i);
   const flaky = num(/(\d+)\s+flaky/i);
-  return { results: [], passed, failed, blocked: 0, flaky };
+  const skipped = num(/(\d+)\s+skipped/i);
+  return { results: [], passed, failed, blocked: 0, flaky, skipped };
 }
 
 /** Outcome returned when the caller cancelled the run — never a throw. */
 function abortedOutcome(exitCode: number | null = null): ExecOutcome {
-  return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [], raw: { aborted: true, exitCode } };
+  return {
+    passed: 0,
+    failed: 0,
+    blocked: 0,
+    flaky: 0,
+    skipped: 0,
+    results: [],
+    raw: { aborted: true, exitCode },
+  };
 }
 
 /**
@@ -1128,7 +1270,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
 
   if (specs.length === 0) {
     emit(ctx, 'No specs to execute; returning empty outcome');
-    return { passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] };
+    return { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] };
   }
 
   // Already cancelled? Return before ANY subprocess (npm install / npx) spawns.
@@ -1169,21 +1311,39 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     return abortedOutcome(cmd.code);
   }
 
-  // The browser binaries normally come from the shared global cache; if a run
-  // fails because one is missing, install chromium into the cache and retry once.
-  if (cmd.code !== 0 && looksLikeMissingBrowser(cmd)) {
-    emit(ctx, '[execute] missing browser binary; running npx playwright install chromium…');
-    const browserInstall = await runCommand(
-      ctx,
-      'npx',
-      ['playwright', 'install', 'chromium'],
-      INSTALL_TIMEOUT_MS,
-    );
-    emit(ctx, '[execute] browser install complete; re-running suite', { code: browserInstall.code });
+  // Self-heal missing dependencies and retry ONCE, rather than surfacing a raw
+  // "module not found" / "browser not found" crash as if it were a real test
+  // failure. Two independent kinds, each gets its own install command:
+  //  - a Playwright browser binary (shared global cache, outside node_modules)
+  //  - any OTHER npm package the scaffolded suite depends on (node_modules) —
+  //    covers a prior ensureSuiteDeps() install that exited non-zero but was
+  //    allowed to continue (see its own comment), or a corrupted node_modules.
+  if (cmd.code !== 0 && (looksLikeMissingBrowser(cmd) || looksLikeMissingSuiteDeps(cmd))) {
+    if (looksLikeMissingBrowser(cmd)) {
+      // No browser name is passed: newer Playwright versions can fail on a
+      // binary (e.g. the separately-downloaded chrome-headless-shell) that a
+      // targeted `install chromium` does not cover, so this runs the same
+      // bare `playwright install` the tool's own error message recommends,
+      // which installs whatever the project's config actually needs.
+      emit(ctx, '[execute] missing browser binary; running npx playwright install…');
+      const browserInstall = await runCommand(ctx, 'npx', ['playwright', 'install'], INSTALL_TIMEOUT_MS);
+      emit(ctx, '[execute] browser install complete', { code: browserInstall.code });
+    }
+    if (looksLikeMissingSuiteDeps(cmd)) {
+      emit(ctx, '[execute] missing suite dependency; re-running npm install…');
+      const depsInstall = await runCommand(
+        ctx,
+        'npm',
+        ['install', '--no-audit', '--no-fund', '--silent'],
+        INSTALL_TIMEOUT_MS,
+      );
+      emit(ctx, '[execute] npm install complete', { code: depsInstall.code });
+    }
+    emit(ctx, '[execute] re-running suite after dependency install');
     startedAt = Date.now();
     cmd = await runPlaywright(ctx, invertFile);
 
-    // The retry run can be cancelled too (as can the install before it).
+    // The retry run can be cancelled too (as can the install(s) before it).
     if (cmd.aborted || ctx.signal?.aborted) {
       emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
       return abortedOutcome(cmd.code);
@@ -1259,12 +1419,19 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     }
   }
 
+  // See F-15: tallies the mock fixture's OWN write-through log, independent
+  // of results.json/steps.json — present regardless of whether the report
+  // parsed, since the fixture logs a hit the moment it fulfills a request.
+  const mockedRequestCounts = await readMockRequestCounts(ctx.projectDir);
+
   const outcome: ExecOutcome = {
     passed: parsed.passed,
     failed: parsed.failed,
     blocked: parsed.blocked,
     flaky: parsed.flaky,
+    skipped: parsed.skipped,
     results: parsed.results,
+    ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
     raw: {
       exitCode: cmd.code,
       signal: cmd.signal,
@@ -1285,6 +1452,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     failed: outcome.failed,
     blocked: outcome.blocked,
     flaky: outcome.flaky,
+    skipped: outcome.skipped,
   });
   return outcome;
 }

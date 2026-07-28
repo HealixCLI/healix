@@ -1,5 +1,6 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Response } from 'playwright';
 import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
+import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
 import { FrameMirror } from './mirror.js';
 import type {
   BrowserSurface,
@@ -179,7 +180,18 @@ export function createBrowserSurface(): BrowserSurface {
         const viewport = opts.viewport ?? { ...DEFAULT_VIEWPORT };
         baseUrl = opts.baseUrl;
 
-        browser = await chromium.launch({ headless });
+        try {
+          browser = await chromium.launch({ headless });
+        } catch (err) {
+          // The browser binary comes from a shared global cache Playwright manages
+          // itself; a first-ever run (or one after a Playwright upgrade) can find it
+          // empty. Install once and retry rather than failing every exploration until
+          // someone runs the command by hand.
+          if (!looksLikeMissingBrowser(err)) throw err;
+          const installed = await ensurePlaywrightBrowsersInstalled();
+          if (!installed) throw err;
+          browser = await chromium.launch({ headless });
+        }
         try {
           context = await browser.newContext({ viewport });
           page = await context.newPage();
@@ -208,7 +220,7 @@ export function createBrowserSurface(): BrowserSurface {
         before = await contentSignature(p).catch(() => undefined);
       }
 
-      await p.goto(target, { waitUntil: 'domcontentloaded' });
+      const response = await p.goto(target, { waitUntil: 'domcontentloaded' });
       // SPAs (esp. hash-routed) often finish DOMContentLoaded before client-side
       // hydration renders real content, so a snapshot taken immediately after
       // goto() can see 0 interactive elements on an otherwise content-rich page.
@@ -237,7 +249,18 @@ export function createBrowserSurface(): BrowserSurface {
       // route component to actually mount. Poll until the page's content signature changes from
       // its pre-nav value, bounded by the same settle timeout, so a snapshot taken right after
       // goto() reflects the destination route instead of a stale or momentarily-empty frame.
-      if (sameDocument && before !== undefined) {
+      //
+      // Skipped when goto() returned a response: Playwright returns null ONLY for a genuine
+      // same-document navigation (same URL, different hash) and a real Response whenever the
+      // document actually loaded — including a navigation to the URL we're already on, which
+      // reloads. That reload case is where waiting for the signature to CHANGE is not just
+      // useless but actively harmful: the destination content is identical by definition, so
+      // the poll can only ever run out the full SETTLE_TIMEOUT_MS. crawler.ts's
+      // discoverClickRoutes issues exactly that goto after every click probe to reset the page,
+      // so on a click-heavy route this dominated the entire crawl budget. When the document did
+      // load, it was torn down and rebuilt, so the stale-element problem this poll exists for
+      // cannot apply and the load/interactive-element race above is already sufficient.
+      if (sameDocument && before !== undefined && response === null) {
         const deadline = Date.now() + SETTLE_TIMEOUT_MS;
         for (;;) {
           const after: string = await contentSignature(p).catch(() => before as string);

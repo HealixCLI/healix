@@ -137,7 +137,16 @@ export async function scaffold(ctx: TestModeContext): Promise<void> {
   // Project files.
   const files: Array<[string, string]> = [
     [join(projectDir, 'package.json'), packageJsonContents({ name: suiteName(projectDir) })],
-    [join(projectDir, 'playwright.config.ts'), playwrightConfigContents({ baseUrl: ctx.baseUrl })],
+    [
+      join(projectDir, 'playwright.config.ts'),
+      playwrightConfigContents({
+        baseUrl: ctx.baseUrl,
+        // See F-18: only skip auth-setup when the plan is KNOWN to have no
+        // tierB-auth items — undefined (not yet known) keeps today's
+        // always-scaffold behavior.
+        includeAuthSetup: ctx.hasTierBAuthPlanItems !== false,
+      }),
+    ],
     [join(fixturesDir, 'auth.setup.ts'), authSetupContents()],
     [join(fixturesDir, 'action-highlighter.ts'), actionHighlighterFixtureContents()],
     [join(fixturesDir, 'steps-reporter.cjs'), stepsReporterContents()],

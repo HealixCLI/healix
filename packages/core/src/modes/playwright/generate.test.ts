@@ -265,6 +265,57 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
     expect(hard.filter((h) => h.includes('reset-password-email'))).toHaveLength(1);
     expect(warn.filter((w) => w.includes('reset-password-email'))).toHaveLength(0);
   });
+
+  // F-07: text shared by two distinct roles (e.g. an <h1> and a <button> both saying
+  // "História bodov") guarantees a Playwright strict-mode violation unless narrowed.
+  const ambiguousGt = () =>
+    gt({
+      names: ['história bodov'],
+      roleByName: new Map([['história bodov', new Set(['heading', 'button'])]]),
+    });
+
+  it('hard-fails a BARE getByText whose text is shared by multiple distinct roles', () => {
+    const source = `await page.getByText('História bodov').click();`;
+    const { hard, warn } = findUngroundedReferences(source, ambiguousGt());
+    expect(hard.some((h) => h.toLowerCase().includes('história bodov') && h.includes('ambiguous'))).toBe(
+      true,
+    );
+    expect(warn).toEqual([]);
+  });
+
+  it('does not flag a getByText already narrowed with .filter(...).first()', () => {
+    const source = `await page.getByText('História bodov').filter({ hasText: 'História bodov' }).first().click();`;
+    const { hard, warn } = findUngroundedReferences(source, ambiguousGt());
+    expect(hard).toEqual([]);
+    expect(warn).toEqual([]);
+  });
+
+  it('does not flag a getByText already narrowed with .first()', () => {
+    const source = `await page.getByText('História bodov').first().click();`;
+    const { hard, warn } = findUngroundedReferences(source, ambiguousGt());
+    expect(hard).toEqual([]);
+    expect(warn).toEqual([]);
+  });
+
+  it('does not flag a getByText already narrowed with .nth(0)', () => {
+    const source = `await page.getByText('História bodov').nth(0).click();`;
+    const { hard, warn } = findUngroundedReferences(source, ambiguousGt());
+    expect(hard).toEqual([]);
+    expect(warn).toEqual([]);
+  });
+
+  it('downgrades an ambiguous getByText to a warning when the escape-hatch marker is present', () => {
+    const source = `// TODO: unobserved element\nawait page.getByText('História bodov').click();`;
+    const { hard, warn } = findUngroundedReferences(source, ambiguousGt());
+    expect(hard).toEqual([]);
+    expect(warn.some((w) => w.includes('ambiguous'))).toBe(true);
+  });
+
+  it('does not flag getByText for text that maps to only a single role', () => {
+    // The base gt() fixture's "moje kupóny" name has only one observed role ('generic').
+    const source = `await page.getByText('Moje kupóny').click();`;
+    expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
 });
 
 describe('demoteEscapeHatchBlocks — ships an admitted guess as needs-review, not a real failure', () => {
@@ -308,6 +359,48 @@ test.only('[REQ:REQ-1] guessed', async ({ page }) => {
 });
 `;
     expect(demoteEscapeHatchBlocks(source)).toContain("test.fixme('[REQ:REQ-1] guessed'");
+  });
+
+  it("carries the model's own reason through as a Playwright annotation, not just a comment", () => {
+    // Without the annotation, execute.ts's extractSkipReason and report.ts's skip-reason cell
+    // have nothing to read and the report shows a skip with no explanation.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-AUTH-01] positive: logs in', async ({ page }) => {
+  // TODO: unobserved element - the login form fields were not captured in the inventory.
+  await expect(page).not.toHaveURL(/home/);
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain("type: 'fixme'");
+    expect(result).toContain('the login form fields were not captured in the inventory.');
+    // The details object goes between the title and the body callback.
+    expect(result).toMatch(/test\.fixme\('\[REQ:FR-AUTH-01\] positive: logs in', \{ annotation:/);
+  });
+
+  it('falls back to a generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(demoteEscapeHatchBlocks(source)).toContain('"unobserved element — needs review"');
+  });
+
+  it('safely embeds a title containing an escaped quote', () => {
+    // Real generated titles do this, and a naive scan for the title's closing quote would cut
+    // the details object into the middle of the string literal.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] shows the user\\'s current email', async ({ page }) => {
+  // TODO: unobserved element - no subscription toggle observed.
+  await page.locator('button').click();
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain("test.fixme('[REQ:REQ-1] shows the user\\'s current email', { annotation:");
   });
 });
 
@@ -1927,8 +2020,7 @@ test('[REQ:REQ-1] positive: does the thing', async ({ page, mockOverride }) => {
     expect(specs).toHaveLength(1);
   });
 
-  it('does not widen the inventory on a retry triggered by a non-grounding rejection reason', async () => {
-    const FORBIDDEN_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
+  const FORBIDDEN_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
 import { execSync } from 'node:child_process';
 
 test('[REQ:REQ-1] positive: does the thing', async ({ page }) => {
@@ -1937,14 +2029,18 @@ test('[REQ:REQ-1] positive: does the thing', async ({ page }) => {
   await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
 });
 `;
+
+  // F-10: a non-grounding rejection (forbidden API here) with a TRUNCATED inventory (this
+  // describe block's fixture: 35 elements, over the default 30-per-route cap) now ALSO widens
+  // on retry — not just a hallucinated-selector rejection — since the truncated inventory is
+  // just as plausibly the real cause of the failure as any other rejection reason.
+  it('widens the inventory on a retry triggered by a non-grounding rejection reason, when the inventory was truncated (F-10)', async () => {
     const { ctx, calls: localCalls } = ctxWith([FORBIDDEN_SPEC, GROUNDED_MOCK_SPEC]);
     await generate(ctx, PLAN);
 
     expect(localCalls).toHaveLength(2);
-    // A forbidden-API rejection is not a grounding/hallucination rejection — the retry must NOT
-    // widen the inventory just because some other gate rejected the first attempt.
-    expect(localCalls[1].prompt).not.toContain('[data-testid="act-32"]');
-    expect(localCalls[1].prompt).toContain('PARTIAL inventory');
+    expect(localCalls[1].prompt).toContain('[data-testid="act-32"]');
+    expect(localCalls[1].prompt).toContain('AUTHORITATIVE, COMPLETE inventory');
   });
 });
 
@@ -2339,6 +2435,184 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     expect(calls).toHaveLength(2);
     expect(calls[1].prompt).toContain('[SRC:routes/userRoutes.js]');
     expect(specs[0].contents).toContain('[SRC:routes/userRoutes.js]');
+  });
+});
+
+describe('generate — F-08: local-backend dependency threaded into tierC-api guidance', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-localbackend-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  const TIER_C_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
+
+test('[REQ:REQ-1] positive: home page renders', async ({ request }) => {
+  const response = await request.get('http://localhost:5555/api/health');
+  expect(response.status()).toBe(200);
+});
+`;
+
+  function ctxWith(externalDependencies: TestModeContext['externalDependencies']): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([TIER_C_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      mockExternalDependencies: false,
+      externalDependencies,
+    } as unknown as TestModeContext;
+  }
+
+  const TIER_C_PLAN: TestPlan = {
+    summary: 'one item',
+    items: [{ ...PLAN.items[0], tier: 'tierC-api' }],
+  };
+
+  it('surfaces a reachable local-backend origin in tierC-api guidance even when NOT mocking', async () => {
+    await generate(
+      ctxWith([
+        {
+          id: 'env:REACT_APP_BACKEND_URL',
+          category: 'local-backend',
+          label: 'Local backend API (REACT_APP_BACKEND_URL)',
+          source: 'env-var',
+          mockStrategy: 'undeterminable',
+          hostnames: ['localhost:5555'],
+          reachable: true,
+        },
+      ]),
+      TIER_C_PLAN,
+    );
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('http://localhost:5555');
+    expect(prompt).toContain('SEPARATE origin');
+  });
+
+  it('does not add local-backend guidance when no such dependency is present', async () => {
+    await generate(ctxWith([]), TIER_C_PLAN);
+    expect(calls[0].prompt).not.toContain('SEPARATE origin');
+  });
+
+  it('does not add local-backend guidance for an unreachable local-backend dependency', async () => {
+    await generate(
+      ctxWith([
+        {
+          id: 'env:X',
+          category: 'local-backend',
+          label: 'Local backend API (X)',
+          source: 'env-var',
+          mockStrategy: 'undeterminable',
+          hostnames: ['localhost:5555'],
+          reachable: false,
+        },
+      ]),
+      TIER_C_PLAN,
+    );
+    expect(calls[0].prompt).not.toContain('SEPARATE origin');
+  });
+});
+
+describe('generate — F-09: mandatory maxRedirects:0 for a 3xx-asserting tierC-api spec', () => {
+  let projectDir: string;
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-maxredirects-'));
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWith(replies: string[]): { ctx: TestModeContext; calls: FakeCall[] } {
+    const localCalls: FakeCall[] = [];
+    const ctx = {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider(replies, localCalls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      mockExternalDependencies: false,
+      externalDependencies: [],
+    } as unknown as TestModeContext;
+    return { ctx, calls: localCalls };
+  }
+
+  const TIER_C_PLAN: TestPlan = {
+    summary: 'one item',
+    items: [{ ...PLAN.items[0], tier: 'tierC-api' }],
+  };
+
+  const MISSING_MAX_REDIRECTS_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
+
+test('[REQ:REQ-1] positive: rejects invalid login with a redirect', async ({ request }) => {
+  const response = await request.post('/api/login', { data: { bad: true } });
+  expect(response.status()).toBe(302);
+});
+`;
+
+  const WITH_MAX_REDIRECTS_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
+
+test('[REQ:REQ-1] positive: rejects invalid login with a redirect', async ({ request }) => {
+  const response = await request.post('/api/login', { data: { bad: true }, maxRedirects: 0 });
+  expect(response.status()).toBe(302);
+});
+`;
+
+  it('rejects and retries a 3xx status assertion whose request call is missing maxRedirects: 0', async () => {
+    const { ctx, calls: localCalls } = ctxWith([MISSING_MAX_REDIRECTS_SPEC, WITH_MAX_REDIRECTS_SPEC]);
+    const specs = await generate(ctx, TIER_C_PLAN);
+
+    expect(localCalls).toHaveLength(2);
+    expect(localCalls[1].prompt).toContain('maxRedirects: 0');
+    expect(specs).toHaveLength(1);
+    expect(specs[0].contents).toContain('maxRedirects: 0');
+  });
+
+  it('accepts a 3xx status assertion whose request call already includes maxRedirects: 0', async () => {
+    const { ctx, calls: localCalls } = ctxWith([WITH_MAX_REDIRECTS_SPEC]);
+    const specs = await generate(ctx, TIER_C_PLAN);
+
+    expect(localCalls).toHaveLength(1);
+    expect(specs).toHaveLength(1);
+  });
+
+  it('does not require maxRedirects: 0 when no 3xx status is asserted', async () => {
+    const NO_REDIRECT_SPEC = `import { test, expect } from '../../fixtures/action-highlighter';
+
+test('[REQ:REQ-1] positive: rejects invalid login', async ({ request }) => {
+  const response = await request.post('/api/login', { data: { bad: true } });
+  expect(response.status()).toBe(401);
+});
+`;
+    const { ctx, calls: localCalls } = ctxWith([NO_REDIRECT_SPEC]);
+    const specs = await generate(ctx, TIER_C_PLAN);
+
+    expect(localCalls).toHaveLength(1);
+    expect(specs).toHaveLength(1);
+  });
+
+  it('does not apply the maxRedirects rule to a non-tierC-api (UI) spec', async () => {
+    const UI_PLAN: TestPlan = { summary: 'one item', items: [{ ...PLAN.items[0], tier: 'tierA-public' }] };
+    const UI_SPEC_WITH_STATUS = `import { test, expect } from '../../fixtures/action-highlighter';
+
+test('[REQ:REQ-1] positive: home page renders', async ({ page }) => {
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const { ctx, calls: localCalls } = ctxWith([UI_SPEC_WITH_STATUS]);
+    const specs = await generate(ctx, UI_PLAN);
+
+    expect(localCalls).toHaveLength(1);
+    expect(specs).toHaveLength(1);
   });
 });
 

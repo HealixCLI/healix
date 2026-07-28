@@ -1,5 +1,6 @@
 import fs from 'node:fs';
 import path from 'node:path';
+import { AUTH_ENDPOINT_METHODS, isAuthEndpointPath, isAuthHostname } from './auth-endpoints.js';
 import { probeUrl } from './http-probe.js';
 import type { EndpointMock, ExternalDependency, ExternalDependencyCategory, MockStrategy } from './types.js';
 
@@ -286,8 +287,12 @@ function parseHttpUrl(value: string): URL | null {
  * SSO, OAuth) get 'auth'; everything else defaults to 'backend' (the app's
  * own or a partner API it depends on).
  */
-function classifyEnvUrlVar(varName: string): ExternalDependencyCategory {
-  return /AUTH|COGNITO|LOGIN|SSO|OAUTH|IDENTITY/i.test(varName) ? 'auth' : 'backend';
+function classifyEnvUrlVar(varName: string, url?: URL | null): ExternalDependencyCategory {
+  if (/AUTH|COGNITO|LOGIN|SSO|OAUTH|IDENTITY/i.test(varName)) return 'auth';
+  // A base URL whose PATH is an auth path means every call through this dependency is an
+  // auth call (e.g. API_BASE=https://host/auth/v1) — the var's NAME alone never sees this.
+  if (url && isAuthEndpointPath(url.pathname)) return 'auth';
+  return 'backend';
 }
 
 /** Find where a package is imported and infer how it could be mocked. */
@@ -335,6 +340,19 @@ function findKnownProviderForHost(host: string): KnownProvider | null {
 }
 
 /**
+ * Auth-category or auth-hostname-looking dependencies among the given list, for narrowing
+ * which dependency an auth path (found in a multi-dependency repo) is attributed to. Falls
+ * back to the full list when none look auth-specific, since a path-based attribution is
+ * inert if wrong — the generated fixture matches by exact (method, path).
+ */
+function authTargets(mockableDeps: ExternalDependency[]): ExternalDependency[] {
+  const narrowed = mockableDeps.filter(
+    (d) => d.category === 'auth' || (d.hostnames ?? []).some((h) => isAuthHostname(h)),
+  );
+  return narrowed.length > 0 ? narrowed : mockableDeps;
+}
+
+/**
  * `client.get('/path')` / `client.post(\`/path/${id}\`)` style call sites —
  * generic across any HTTP client (axios instance, fetch wrapper, custom
  * service class), not tied to any particular app. Only string/template-
@@ -363,6 +381,17 @@ const CONFIG_METHOD_RE = /\bmethod\s*:\s*['"](\w+)['"]/i;
 const CONFIG_URL_RE = /\burl\s*:\s*(?:`([^`]*)`|'([^']*)'|"([^"]*)")/i;
 
 const MAX_ENDPOINTS_PER_DEP = 40;
+const MAX_AUTH_ENDPOINTS_PER_DEP = 8;
+
+/**
+ * Any string/template literal that LOOKS like a path — needed because CALL_SITE_RE and
+ * CONFIG_CALL_RE miss the common `fetch(`${base}/auth/token/generate`)` shape (no
+ * `.post(`, no `{ url: ... }`). Deliberately feeds ONLY the auth-endpoint list further
+ * down: a broad path-literal scan would flood normal endpoint detection with unrelated
+ * string constants, but a spurious auth-looking match there is inert (mocks match by
+ * exact path, so an extra unused entry changes nothing).
+ */
+const PATH_LITERAL_RE = /[`'"](?:\$\{[^}]{0,80}\})?(\/[\w\-./:]{2,120})[`'"]/g;
 
 /** Collapse a template-literal interpolation (`${id}`) to a `:param` placeholder so
  * `/reward/${id}` and `/reward/${x}` collapse to the same pattern. Exported so other
@@ -373,21 +402,69 @@ export function normalizeEndpointPath(raw: string): string {
   return raw.replace(/\$\{[^}]*\}/g, ':param');
 }
 
-/** Best-effort (method, path) call-site scan across every source file. Capped and deduped. */
-function extractEndpointCallSites(files: WalkFile[]): { endpoints: EndpointMock[]; truncated: boolean } {
+/** Auth-tagged (method, pathPattern) entries for one path — one per AUTH_ENDPOINT_METHODS,
+ * since a login handshake's verb often isn't statically knowable. */
+function authEndpointEntries(pathPattern: string): EndpointMock[] {
+  return AUTH_ENDPOINT_METHODS.map((method) => ({ method, pathPattern, category: 'auth' as const }));
+}
+
+/** Append endpoints to a dependency, deduped on (method, pathPattern). */
+function addEndpoints(dep: ExternalDependency, entries: EndpointMock[]): void {
+  const existing = new Set((dep.endpoints ?? []).map((e) => `${e.method} ${e.pathPattern}`));
+  const toAdd = entries.filter((e) => !existing.has(`${e.method} ${e.pathPattern}`));
+  if (toAdd.length === 0) return;
+  dep.endpoints = [...(dep.endpoints ?? []), ...toAdd];
+}
+
+/**
+ * Best-effort (method, path) call-site scan across every source file. Ordinary endpoints
+ * are capped/deduped at MAX_ENDPOINTS_PER_DEP as before; auth-shaped paths are additionally
+ * collected into a separate, smaller-capped `authEndpoints` list that is NEVER cut short by
+ * the ordinary cap being hit — a chatty repo with 40+ unrelated call sites must not be able
+ * to make the one login endpoint invisible.
+ */
+function extractEndpointCallSites(files: WalkFile[]): {
+  endpoints: EndpointMock[];
+  authEndpoints: EndpointMock[];
+  truncated: boolean;
+} {
   const seen = new Set<string>();
+  const authSeen = new Set<string>();
   const endpoints: EndpointMock[] = [];
+  const authEndpoints: EndpointMock[] = [];
   let truncated = false;
 
-  const tryAdd = (method: string | undefined, raw: string | undefined): boolean => {
-    if (!method || raw === undefined || !raw.startsWith('/')) return false;
-    const pathPattern = normalizeEndpointPath(raw);
-    const key = `${method.toUpperCase()} ${pathPattern}`;
-    if (seen.has(key)) return false;
-    seen.add(key);
-    endpoints.push({ method: method.toUpperCase(), pathPattern });
-    return true;
+  const addAuthEndpoint = (pathPattern: string): void => {
+    for (const entry of authEndpointEntries(pathPattern)) {
+      const key = `${entry.method} ${entry.pathPattern}`;
+      if (authSeen.has(key) || authEndpoints.length >= MAX_AUTH_ENDPOINTS_PER_DEP) continue;
+      authSeen.add(key);
+      authEndpoints.push(entry);
+    }
   };
+
+  const tryAdd = (method: string | undefined, raw: string | undefined): void => {
+    if (!method || raw === undefined || !raw.startsWith('/')) return;
+    const pathPattern = normalizeEndpointPath(raw);
+    const isAuth = isAuthEndpointPath(pathPattern);
+    const key = `${method.toUpperCase()} ${pathPattern}`;
+    if (!seen.has(key)) {
+      seen.add(key);
+      if (endpoints.length < MAX_ENDPOINTS_PER_DEP) {
+        endpoints.push({
+          method: method.toUpperCase(),
+          pathPattern,
+          ...(isAuth ? { category: 'auth' as const } : {}),
+        });
+      } else {
+        truncated = true;
+      }
+    }
+    if (isAuth) addAuthEndpoint(pathPattern);
+  };
+
+  const capsReached = (): boolean =>
+    endpoints.length >= MAX_ENDPOINTS_PER_DEP && authEndpoints.length >= MAX_AUTH_ENDPOINTS_PER_DEP;
 
   outer: for (const f of files) {
     const source = readSafe(f.abs);
@@ -395,24 +472,26 @@ function extractEndpointCallSites(files: WalkFile[]): { endpoints: EndpointMock[
 
     for (const m of source.matchAll(CALL_SITE_RE)) {
       tryAdd(m[1], m[2] ?? m[3] ?? m[4]);
-      if (endpoints.length >= MAX_ENDPOINTS_PER_DEP) {
-        truncated = true;
-        break outer;
-      }
+      if (capsReached()) break outer;
     }
     for (const m of source.matchAll(CONFIG_CALL_RE)) {
       const inner = m[1] ?? '';
       const method = CONFIG_METHOD_RE.exec(inner)?.[1];
       const urlMatch = CONFIG_URL_RE.exec(inner);
       tryAdd(method, urlMatch?.[1] ?? urlMatch?.[2] ?? urlMatch?.[3]);
-      if (endpoints.length >= MAX_ENDPOINTS_PER_DEP) {
-        truncated = true;
-        break outer;
+      if (capsReached()) break outer;
+    }
+    if (authEndpoints.length < MAX_AUTH_ENDPOINTS_PER_DEP) {
+      for (const m of source.matchAll(PATH_LITERAL_RE)) {
+        const raw = m[1];
+        const pathPattern = raw ? normalizeEndpointPath(raw) : null;
+        if (pathPattern && isAuthEndpointPath(pathPattern)) addAuthEndpoint(pathPattern);
+        if (capsReached()) break outer;
       }
     }
   }
 
-  return { endpoints, truncated };
+  return { endpoints, authEndpoints, truncated };
 }
 
 /**
@@ -433,11 +512,17 @@ function extractEndpointCallSites(files: WalkFile[]): { endpoints: EndpointMock[
 export async function detectExternalDependencies(repoPath: string): Promise<ExternalDependency[]> {
   const root = path.resolve(repoPath);
   const deps: ExternalDependency[] = [];
-  const seenIds = new Set<string>();
+  // A Map (not a Set) so a REPEAT literal for an already-recorded host can still look up
+  // the existing dependency object and contribute an auth-path endpoint to it — see the
+  // URL-literal loop below, where this used to be an unconditional `continue`.
+  const depsById = new Map<string, ExternalDependency>();
+  // Env-var dependency id -> its base URL's path prefix (e.g. "/v2"), so a relative
+  // call-site auth path can also be registered in its real, prefixed form.
+  const basePathById = new Map<string, string>();
 
   const addDep = (dep: ExternalDependency): void => {
-    if (seenIds.has(dep.id)) return;
-    seenIds.add(dep.id);
+    if (depsById.has(dep.id)) return;
+    depsById.set(dep.id, dep);
     deps.push(dep);
   };
 
@@ -487,19 +572,70 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
 
     for (const m of source.matchAll(URL_LITERAL_RE)) {
       const host = m[1];
-      if (!host || LOCAL_HOSTS.has(host)) continue;
-      const known = findKnownProviderForHost(host);
+      if (!host) continue;
+      const isLocal = LOCAL_HOSTS.has(host);
+      const known = isLocal ? null : findKnownProviderForHost(host);
       const id = known ? `pkg:${known.packageNames[0]}` : `url:${host}`;
-      if (seenIds.has(id)) continue;
 
       const line = lineAround(source, m.index ?? 0);
       // A namespace attribute (xmlns="http://www.w3.org/2000/svg") is never a
       // network call — the single most common false positive in JSX/SVG code.
       if (/\bxmlns/i.test(line)) continue;
 
+      const isCall = !isLocal && (known !== null || NETWORK_CALL_MARKER_RE.test(line));
+      // The literal's own PATH — discarded until now, and the one place a custom auth
+      // host (with no matching env-var name or KNOWN_PROVIDERS entry) announces itself
+      // unambiguously.
+      const literalPath = isCall ? (parseHttpUrl(m[0])?.pathname ?? null) : null;
+      const authPath =
+        literalPath && isAuthEndpointPath(literalPath) ? normalizeEndpointPath(literalPath) : null;
+
+      const existingDep = depsById.get(id);
+      if (existingDep) {
+        // Was an unconditional `continue`: a repeat literal for an already-recorded host
+        // contributed nothing, so `fetch(BASE)` seen first and
+        // `fetch('https://host/auth/token/generate')` seen second meant the auth path
+        // was never recorded at all.
+        if (authPath && existingDep.mockStrategy !== 'undeterminable') {
+          addEndpoints(existingDep, authEndpointEntries(authPath));
+        }
+        continue;
+      }
+
+      if (isLocal) {
+        // A hardcoded local-host literal, same as the env-var pass, is the
+        // app's own dev backend — record it distinctly as 'local-backend'
+        // (with a reachability probe, unlike today which dropped it
+        // unconditionally) rather than suppressing it, so Generate (F-08) can
+        // route tierC-api requests to its real origin. Still gated on the
+        // network-call marker so a plain string constant isn't flagged.
+        if (!NETWORK_CALL_MARKER_RE.test(line)) continue;
+        const origin = parseHttpUrl(m[0])?.origin ?? `http://${host}`;
+        let reachable = false;
+        try {
+          reachable = (await probeUrl(origin, 2_000)).reachable;
+        } catch {
+          reachable = false;
+        }
+        addDep({
+          id,
+          category: 'local-backend',
+          label: 'Local backend API',
+          source: 'url-literal',
+          hostnames: [new URL(origin).host],
+          mockStrategy: 'undeterminable',
+          file: f.rel,
+          reachable,
+          note: reachable
+            ? `Hardcoded reference to ${origin} (currently reachable local dev backend).`
+            : `Hardcoded reference to ${origin}; not reachable at detection time.`,
+        });
+        continue;
+      }
+
       if (known) {
         if (!known.mockable) continue; // already recorded (or will be) via the package-based pass
-        addDep({
+        const dep: ExternalDependency = {
           id,
           category: known.category,
           label: known.label,
@@ -507,22 +643,26 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
           hostnames: known.hostnames,
           mockStrategy: 'route-intercept',
           file: f.rel,
-        });
+        };
+        addDep(dep);
+        if (authPath) addEndpoints(dep, authEndpointEntries(authPath));
       } else {
         // An unrecognized host is only worth flagging when it's plausibly a
         // network call (fetch/axios/etc. on the same line) — otherwise it's
         // just a string constant (a support link, an asset URL) that isn't a
         // dependency the app talks to over the network at runtime.
         if (!NETWORK_CALL_MARKER_RE.test(line)) continue;
-        addDep({
+        const dep: ExternalDependency = {
           id,
-          category: 'other',
-          label: `Third-party API at ${host}`,
+          category: authPath ? 'auth' : 'other',
+          label: authPath ? `Auth/identity endpoint at ${host}` : `Third-party API at ${host}`,
           source: 'url-literal',
           hostnames: [host],
           mockStrategy: 'route-intercept',
           file: f.rel,
-        });
+        };
+        addDep(dep);
+        if (authPath) addEndpoints(dep, authEndpointEntries(authPath));
       }
     }
 
@@ -530,7 +670,7 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
       const varName = m[1] ?? m[2];
       if (!varName) continue;
       const id = `env:${varName}`;
-      if (seenIds.has(id)) continue;
+      if (depsById.has(id)) continue;
       // A redirect/callback URL is the app's OWN endpoint that a provider (an
       // OAuth/SSO identity provider, typically) redirects the browser BACK
       // to — the app never calls out to it, so it isn't an outbound
@@ -549,19 +689,36 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
         reachable = false;
       }
 
-      // A LOCAL host (localhost/127.0.0.1) is almost certainly the app's OWN
-      // dev backend — only worth flagging when it's actually down right now
-      // (the classic "backend isn't running" case); a live local server has
-      // nothing to mock. A REAL external host (third-party or a remote/QA
-      // backend) is flagged regardless of current reachability: mocking it is
-      // about deterministic, offline test runs, not just "is it down".
-      if (LOCAL_HOSTS.has(parsed.hostname) && reachable) continue;
-
       // Capture the host (with port, when present) so scaffold.ts's page.route()
       // fixture can also intercept this same URL at the browser network layer —
       // 'both' means route-intercept AND env-override both apply.
       const host = parsed.host;
-      const category = classifyEnvUrlVar(varName);
+
+      // A LOCAL host (localhost/127.0.0.1) that's reachable right now is
+      // almost certainly the app's OWN live dev backend — nothing to mock
+      // (Mock/Set 2 doesn't need it), but Generate (F-08) still needs its
+      // real origin to route tierC-api requests correctly instead of
+      // assuming same-origin with the frontend, so it's recorded distinctly
+      // rather than suppressed. An unreachable local host (the classic
+      // "backend isn't running" case) falls through to the same handling as
+      // a real external host below, unchanged from today.
+      if (LOCAL_HOSTS.has(parsed.hostname) && reachable) {
+        addDep({
+          id,
+          category: 'local-backend',
+          label: `Local backend API (${varName})`,
+          source: 'env-var',
+          envVar: varName,
+          mockStrategy: 'undeterminable',
+          hostnames: [host],
+          file: f.rel,
+          reachable,
+          note: `Reads ${varName}=${value} (currently reachable local dev backend — route tierC-api requests here directly, no mock needed).`,
+        });
+        continue;
+      }
+
+      const category = classifyEnvUrlVar(varName, parsed);
 
       addDep({
         id,
@@ -577,24 +734,56 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
           ? `Reads ${varName}=${value} (currently reachable).`
           : `Reads ${varName}=${value}; not reachable at detection time.`,
       });
+      // A non-empty, non-root path prefix (e.g. "/v2") means a relative call-site path
+      // like "/auth/token/generate" won't equal the REAL request path
+      // ("/v2/auth/token/generate") — recorded so the endpoint-attribution step below can
+      // register both forms for this dependency.
+      if (parsed.pathname && parsed.pathname !== '/') {
+        basePathById.set(id, parsed.pathname.replace(/\/+$/, ''));
+      }
     }
   }
 
-  // Attach statically-detected (method, path) call sites to whichever single
-  // mockable dependency exists — the common shape for a frontend SPA (one
-  // backend, called from many service files). With MULTIPLE mockable
-  // dependencies there is no reliable static signal for which endpoint
-  // belongs to which host without deeper import-graph tracing, so endpoint-
-  // level detail is skipped rather than risk misattributing it — those
-  // dependencies still get the coarser dependency-level mock as before.
+  // Attach statically-detected (method, path) call sites. Ordinary endpoint-level detail
+  // is only attached when exactly one mockable dependency exists — the common shape for a
+  // frontend SPA (one backend, called from many service files). With MULTIPLE mockable
+  // dependencies there is no reliable static signal for which endpoint belongs to which
+  // host without deeper import-graph tracing, so ordinary endpoint-level detail is skipped
+  // rather than risk misattributing it — those dependencies still get the coarser
+  // dependency-level mock as before.
+  //
+  // Auth/login-shaped endpoints are the deliberate exception: they're few, highly
+  // distinctive, and a mis-attributed one is inert (the generated fixture matches by exact
+  // (method, path), so a token body registered on a host that never receives
+  // "/auth/token/generate" is simply never served) — so they get per-endpoint attribution
+  // regardless of how many mockable dependencies exist.
   const mockableDeps = deps.filter((d) => d.mockStrategy !== 'undeterminable');
-  if (mockableDeps.length === 1) {
-    const { endpoints, truncated } = extractEndpointCallSites(files);
-    if (endpoints.length > 0) {
+  if (mockableDeps.length > 0) {
+    const { endpoints, authEndpoints, truncated } = extractEndpointCallSites(files);
+
+    const withPrefix = (dep: ExternalDependency, entries: EndpointMock[]): void => {
+      addEndpoints(dep, entries);
+      const prefix = basePathById.get(dep.id);
+      if (prefix)
+        addEndpoints(
+          dep,
+          entries.map((e) => ({ ...e, pathPattern: `${prefix}${e.pathPattern}` })),
+        );
+    };
+
+    if (mockableDeps.length === 1) {
       const dep = mockableDeps[0];
-      dep.endpoints = endpoints;
+      if (endpoints.length > 0) addEndpoints(dep, endpoints);
+      withPrefix(dep, authEndpoints);
       if (truncated) {
         dep.note = `${dep.note ? `${dep.note} ` : ''}Endpoint list capped at ${MAX_ENDPOINTS_PER_DEP}; some call sites were not scanned.`;
+      }
+    } else if (authEndpoints.length > 0) {
+      for (const dep of authTargets(mockableDeps)) {
+        withPrefix(dep, authEndpoints);
+        dep.note = `${dep.note ? `${dep.note} ` : ''}Login/token endpoint(s) attributed by path (${authEndpoints
+          .map((e) => e.pathPattern)
+          .join(', ')}); a mocked auth response is registered so login-dependent tests can succeed.`;
       }
     }
   }

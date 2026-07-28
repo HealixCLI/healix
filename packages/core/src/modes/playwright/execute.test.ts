@@ -51,9 +51,14 @@ import {
   writeInvertFile,
   clearExecCheckpoint,
   playwrightProjectArgs,
+  readMockRequestCounts,
   type AuthSignals,
 } from './execute.js';
-import { EXEC_CHECKPOINT_FILENAME, EXEC_CHECKPOINT_INVERT_FILENAME } from './templates.js';
+import {
+  EXEC_CHECKPOINT_FILENAME,
+  EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_REQUEST_LOG_FILENAME,
+} from './templates.js';
 
 function makeCtx(overrides: Partial<TestModeContext> = {}): TestModeContext {
   return {
@@ -383,7 +388,7 @@ describe('execute — cooperative cancellation', () => {
     const controller = new AbortController();
     controller.abort();
     const outcome = await execute(makeCtx({ signal: controller.signal }), []);
-    expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, results: [] });
+    expect(outcome).toEqual({ passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] });
     expect(spawn).not.toHaveBeenCalled();
   });
 });
@@ -479,6 +484,52 @@ describe('parseReport — structural Tier B classification', () => {
     expect(byTitle['authenticate']?.status).toBe('failed');
   });
 
+  it("stamps the auth-setup row's own error with a marker triage can classify structurally", () => {
+    // A fixture that times out emits nothing of its own, so the row reaches triage as a bare
+    // "Test timeout of 60000ms exceeded." — no auth signal at all, previously classified as a
+    // low-confidence generic timeout. Triage sees only title+error, and matching auth-ish words
+    // in Playwright's text would resurrect the defect-leakage bug AuthSignals guards against,
+    // so the identity has to be stamped here, where isAuthSetup already established it.
+    const auth: AuthSignals = {
+      setupFailed: true,
+      setupError: 'Test timeout of 60000ms exceeded.',
+      performedLogin: false,
+    };
+    const r = report([
+      {
+        title: 'authenticate',
+        file: 'fixtures/auth.setup.ts',
+        projectName: 'auth-setup',
+        status: 'failed',
+        error: 'Test timeout of 60000ms exceeded.',
+      },
+    ]);
+    const parsed = parseReport(r, auth);
+    const row = parsed.results.find((x) => x.title === 'authenticate');
+    expect(row?.error).toContain('Tier B auth setup failed');
+    // The original Playwright text is preserved, not replaced — it's the actual diagnosis.
+    expect(row?.error).toContain('Test timeout of 60000ms exceeded.');
+  });
+
+  it('stamps the same marker on a checkpoint-restored auth-setup failure', () => {
+    const auth: AuthSignals = { setupFailed: true, setupError: 'boom', performedLogin: false };
+    const parsed = checkpointEntriesToOutcome(
+      [
+        {
+          key: 'k1',
+          title: 'authenticate',
+          project: 'auth-setup',
+          specFile: 'fixtures/auth.setup.ts',
+          status: 'failed',
+          error: 'Test timeout of 60000ms exceeded.',
+        },
+      ],
+      auth,
+    );
+    const row = parsed.results.find((x) => x.title === 'authenticate');
+    expect(row?.error).toContain('Tier B auth setup failed');
+  });
+
   it('excludes a PASSING auth-setup spec from results entirely (no phantom test row)', () => {
     // Regression: a passing auth-setup used to appear in `results` as a normal
     // "test" that can never be matched back to a generated spec — inflating
@@ -541,6 +592,107 @@ describe('parseReport — structural Tier B classification', () => {
     const parsed = parseReport(r, auth);
     expect(parsed.results[0]?.status).toBe('failed');
     expect(parsed.blocked).toBe(0);
+  });
+});
+
+describe('parseReport — QA request: skip reason from test.skip(cond, "reason") annotations', () => {
+  function skipReport(annotations: Array<{ type?: string; description?: string }> | undefined): PwReportArg {
+    return {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'staging-only check',
+              file: 'tests/tierA-public/staging-only-check.spec.ts',
+              tests: [
+                {
+                  status: 'skipped',
+                  projectName: 'tierA-public',
+                  results: [{ status: 'skipped', duration: 0 }],
+                  annotations,
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+  }
+
+  it('recovers the description from a real test.skip(cond, "reason") annotation', () => {
+    const r = skipReport([{ type: 'skip', description: 'staging-only feature not enabled here' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.status).toBe('skipped');
+    expect(parsed.results[0]?.skipReason).toBe('staging-only feature not enabled here');
+  });
+
+  it('also recognizes a test.fixme(cond, "reason") annotation', () => {
+    const r = skipReport([{ type: 'fixme', description: 'flaky pending investigation' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBe('flaky pending investigation');
+  });
+
+  it('leaves skipReason undefined for a bare skip with no description given', () => {
+    const r = skipReport([{ type: 'skip' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  // A declaration-form `test.fixme(title, { annotation: ... }, body)` — what generate.ts's
+  // demoteEscapeHatchBlocks emits — yields TWO fixme annotations from Playwright: the described
+  // one and its own bare one. Verified against Playwright 1.62's JSON reporter. Taking the first
+  // by type alone would return whichever the runner happened to list first, so both orders must
+  // resolve to the description.
+  it('finds the description when Playwright also emits its own bare fixme annotation', () => {
+    const described = { type: 'fixme', description: 'unobserved element — needs review' };
+    const bare = { type: 'fixme' };
+
+    expect(parseReport(skipReport([described, bare]), LOGGED_IN).results[0]?.skipReason).toBe(
+      'unobserved element — needs review',
+    );
+    expect(parseReport(skipReport([bare, described]), LOGGED_IN).results[0]?.skipReason).toBe(
+      'unobserved element — needs review',
+    );
+  });
+
+  it('leaves skipReason undefined when there are no annotations at all', () => {
+    const r = skipReport(undefined);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  it('ignores an unrelated annotation type (e.g. "slow")', () => {
+    const r = skipReport([{ type: 'slow', description: 'this suite is known to be slow' }]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
+
+  it('never attaches a skipReason to a non-skipped result, even if annotations are present', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'x',
+              file: 'tests/tierA-public/x.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierA-public',
+                  results: [{ status: 'passed', duration: 5 }],
+                  annotations: [{ type: 'skip', description: 'irrelevant leftover annotation' }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.status).toBe('passed');
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
   });
 });
 
@@ -713,6 +865,23 @@ describe('parseReport — error text stays simple, not a wall of duplicates', ()
   });
 });
 
+describe('parseReport — F-24: counts skipped tests instead of leaving them invisible', () => {
+  it('tallies a skipped test into outcome.skipped, distinct from passed/failed/blocked/flaky', () => {
+    const r = report([
+      { title: 'a', projectName: 'tierA-public', status: 'passed' },
+      { title: 'b', projectName: 'tierA-public', status: 'failed' },
+      { title: 'c', projectName: 'tierA-public', status: 'skipped' },
+      { title: 'd', projectName: 'tierA-public', status: 'skipped' },
+    ]);
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.passed).toBe(1);
+    expect(parsed.failed).toBe(1);
+    expect(parsed.skipped).toBe(2);
+    expect(parsed.blocked).toBe(0);
+    expect(parsed.results.filter((x) => x.status === 'skipped')).toHaveLength(2);
+  });
+});
+
 describe('parseReport — specFile inheritance through nested describe() suites', () => {
   it('inherits the file from an ancestor suite when the immediate (nested) suite and spec both lack one', () => {
     // Real shape: Playwright's JSON reporter sets `file` on the outermost
@@ -833,6 +1002,49 @@ describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / cl
     // Second call: both files are already gone — must stay a no-op, not throw.
     await expect(clearExecCheckpoint(dir)).resolves.toBeUndefined();
   });
+
+  it('F-15: clearExecCheckpoint also clears the mock-request log, so a later unrelated execute() call starts counting fresh', async () => {
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${JSON.stringify({ id: 'pkg:twilio' })}\n`);
+    await clearExecCheckpoint(dir);
+    expect(await readMockRequestCounts(dir)).toEqual({});
+  });
+});
+
+describe("readMockRequestCounts — F-15: tallies the mock fixture's write-through hit log", () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-request-log-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (mocking disabled, or nothing was ever intercepted)', async () => {
+    expect(await readMockRequestCounts(dir)).toEqual({});
+  });
+
+  it('tallies hits by dependency id across multiple lines', async () => {
+    const lines = [{ id: 'pkg:twilio' }, { id: 'pkg:twilio' }, { id: 'env:VITE_API_BASE_URL' }]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 2, 'env:VITE_API_BASE_URL': 1 });
+  });
+
+  it('attributes a hit with no resolvable dependency id to "override" instead of dropping it', async () => {
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), '{}\n{}\n');
+    expect(await readMockRequestCounts(dir)).toEqual({ override: 2 });
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio' })}\nnot valid json\n\n`,
+    );
+    expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 1 });
+  });
 });
 
 describe('findAuthSetupOutcomeFromEntries', () => {
@@ -911,6 +1123,29 @@ describe('checkpointEntriesToOutcome', () => {
     expect(parsed.blocked).toBe(1);
     expect(parsed.results[0].error).toContain('without credentials');
   });
+
+  it('QA request: carries a checkpoint-restored skip reason through to the resumed outcome', () => {
+    const parsed = checkpointEntriesToOutcome(
+      [
+        {
+          key: 'k1',
+          title: 'staging-only check',
+          status: 'skipped',
+          skipReason: 'staging-only, disabled here',
+        },
+      ],
+      LOGGED_IN,
+    );
+    expect(parsed.results[0]?.skipReason).toBe('staging-only, disabled here');
+  });
+
+  it('never attaches a skipReason to a non-skipped checkpoint entry', () => {
+    const parsed = checkpointEntriesToOutcome(
+      [{ key: 'k1', title: 'x', status: 'expected', skipReason: 'stale leftover value' }],
+      LOGGED_IN,
+    );
+    expect(parsed.results[0]?.skipReason).toBeUndefined();
+  });
 });
 
 describe('mergeParsedReports', () => {
@@ -921,6 +1156,7 @@ describe('mergeParsedReports', () => {
       failed: 0,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const b = {
       results: [{ title: 'b', status: 'failed' as const }],
@@ -928,6 +1164,7 @@ describe('mergeParsedReports', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
@@ -942,6 +1179,7 @@ describe('mergeParsedReports', () => {
       failed: 1,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const b = {
       results: [{ title: 'a', specFile: 'x.spec.ts', status: 'passed' as const }],
@@ -949,6 +1187,7 @@ describe('mergeParsedReports', () => {
       failed: 0,
       blocked: 0,
       flaky: 0,
+      skipped: 0,
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results).toHaveLength(1);
@@ -1121,6 +1360,172 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(outcome.failed).toBe(1);
     const row = outcome.results.find((r) => r.title === 'login works');
     expect(row?.error).toContain('Auth setup failed');
+  });
+
+  /** A child process that emits `stderrText` on stderr, then closes with `exitCode`. */
+  function fakeFailingProcess(exitCode: number, stderrText: string): ChildProcess {
+    const proc = new EventEmitter() as unknown as ChildProcess & {
+      stdout: EventEmitter;
+      stderr: EventEmitter;
+    };
+    proc.stdout = new EventEmitter() as never;
+    proc.stderr = new EventEmitter() as never;
+    (proc as unknown as { pid: number }).pid = 4242;
+    (proc as unknown as { kill: () => boolean }).kill = () => true;
+    queueMicrotask(() => {
+      proc.stderr.emit('data', Buffer.from(stderrText));
+      proc.emit('close', exitCode, null);
+    });
+    return proc;
+  }
+
+  /** A child process that writes a passing results.json then exits 0 — a successful (retried) Playwright run. */
+  function fakePassingRun(title: string): ChildProcess {
+    writeFileSync(
+      join(dir, 'results.json'),
+      JSON.stringify(report([{ title, projectName: 'tierA-public', status: 'passed' }])),
+      'utf-8',
+    );
+    return fakeChildProcess(0);
+  }
+
+  it('self-heals a missing Node module by re-running npm install and retrying once (not just missing browsers)', async () => {
+    const spawnedCommands: string[] = [];
+
+    // 1st spawn: `npx playwright test` fails with a "Cannot find module" signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module '@playwright/test'\n");
+    });
+    // 2nd spawn: the recovery `npm install`.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0);
+    });
+    // 3rd spawn: the retried `npx playwright test`, this time succeeding.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('self-heals a missing Playwright browser binary by running a bare `npx playwright install` (no npm install)', async () => {
+    const spawnedCommands: Array<{ cmd: string; args: unknown }> = [];
+
+    // 1st spawn: `npx playwright test` fails with the real chrome-headless-shell signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeFailingProcess(
+        1,
+        "browserType.launch: Executable doesn't exist at ...chrome-headless-shell.exe\n" +
+          'Please run the following command to download new browsers:\n\n    npx playwright install\n',
+      );
+    });
+    // 2nd spawn: the recovery browser install.
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeChildProcess(0);
+    });
+    // 3rd spawn: the retried `npx playwright test`, this time succeeding.
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands.map((c) => c.cmd)).toEqual(['npx', 'npx', 'npx']);
+    // No browser name filter — installs whatever the local Playwright version needs.
+    expect(spawnedCommands[1]?.args).toEqual(['playwright', 'install']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('runs BOTH recovery installs when a failure carries both a missing-browser and a missing-module signature', async () => {
+    const spawnedCommands: Array<{ cmd: string; args: unknown }> = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeFailingProcess(
+        1,
+        "browserType.launch: Executable doesn't exist at ...chrome-headless-shell.exe\n" +
+          "Error: Cannot find module 'some-helper-package'\n",
+      );
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeChildProcess(0);
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakeChildProcess(0);
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd, args) => {
+      spawnedCommands.push({ cmd: String(cmd), args });
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    // Order matches the source: browser install (if applicable) runs before the npm install.
+    expect(spawnedCommands.map((c) => c.cmd)).toEqual(['npx', 'npx', 'npm', 'npx']);
+    expect(spawnedCommands[1]?.args).toEqual(['playwright', 'install']);
+    expect(outcome.passed).toBe(1);
+  });
+
+  it('does NOT run any recovery install for a failure that matches neither signature (no spurious retry)', async () => {
+    const spawnedCommands: string[] = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, 'Error: expect(locator).toHaveText(expected) failed\n');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    // Exactly one spawn — the original run — no install, no retry.
+    expect(spawnedCommands).toEqual(['npx']);
+    expect(outcome.passed).toBe(0);
+  });
+
+  it('retries at most once: a still-failing retry does not loop or spawn a second recovery attempt', async () => {
+    const spawnedCommands: string[] = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module 'still-missing'\n");
+    });
+    // Recovery npm install "succeeds"...
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0);
+    });
+    // ...but the retried run fails with the SAME signature again.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module 'still-missing'\n");
+    });
+
+    await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    // Exactly 3 spawns total — original, one recovery install, one retry — never a second recovery round.
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
   });
 
   it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {

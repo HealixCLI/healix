@@ -1,5 +1,11 @@
 import { describe, expect, it } from 'vitest';
-import { crawl, crawlWithAuth, reconcileStaticRoutePaths } from './crawler.js';
+import {
+  crawl,
+  crawlWithAuth,
+  reconcileStaticRoutePaths,
+  scoreLoginCandidates,
+  type RoutePrefixInfo,
+} from './crawler.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
@@ -45,6 +51,9 @@ function makeFakeBrowser(config: {
   onClickSelectorGoTo?: Record<string, string>;
   onClickSelectorReveal?: Record<string, InteractiveElement[]>;
   recordClicks?: string[];
+  /** Records every selector passed to type(), in call order — used to assert fillSafeInputs'
+   * safety filters (never password/file/OTP-shaped fields). */
+  recordTypes?: string[];
   log?: string[];
 }): BrowserSurface {
   let currentUrl = '';
@@ -105,7 +114,9 @@ function makeFakeBrowser(config: {
       }
     },
     async clickAt(_point: Point): Promise<void> {},
-    async type(_selector: string, _text: string): Promise<void> {},
+    async type(selector: string, _text: string): Promise<void> {
+      config.recordTypes?.push(selector);
+    },
     async pressKey(key: string): Promise<void> {
       if (key === 'Escape') revealedElements = undefined;
     },
@@ -542,7 +553,12 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toEqual([]);
   });
 
-  it('does not click-probe a page while the link-following queue still has 5+ pending URLs', async () => {
+  it('does not spend route-discovery click budget on a page while the link-following queue still has 5+ pending URLs, but still deep-probes it (GAP-056)', async () => {
+    // The link-queue-thin gate exists to avoid GUESSING at a new route via a click when there
+    // are plenty of real links left to follow — a route-discovery-specific tradeoff. It does NOT
+    // apply to deep-probing (looking for a same-URL modal/panel behind a button on THIS page,
+    // see GAP-056): a live audit found exactly this shape on a page that had plenty of other
+    // content too, so gating deep-probing on "is the link queue idle" would keep missing it.
     const extraNav = button('Extra Nav');
     const recordClicks: string[] = [];
     const browser = makeFakeBrowser({
@@ -566,9 +582,12 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    const result = await crawl(browser, 'https://a.test/');
 
-    expect(recordClicks).toEqual([]);
+    // The click happens (deep-probing engaged), but reveals nothing meaningful on this fixture
+    // (no onClickSelectorReveal configured for extraNav), so it's harmless and no state is recorded.
+    expect(recordClicks).toEqual([extraNav.selector]);
+    expect(result.routes.some((r) => r.stateKey)).toBe(false);
   });
 
   it('caps click-probes at 8 candidates on a single page even with more safe candidates available', async () => {
@@ -648,6 +667,181 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     // Nowhere near all 10 button-only pages get reached before the
     // crawl-wide click-probe budget runs out.
     expect(result.visitedCount).toBeLessThan(pageCount);
+  });
+});
+
+describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
+  it('records a same-URL click that reveals a materially larger DOM as its own state, then reverts', async () => {
+    // A thin page (< 5 elements) whose "Manage wallet" button opens a modal with 6 real
+    // interactive elements — the exact wallet/subscription-panel shape the plain click-probing
+    // pass would otherwise harvest zero links from and immediately Escape-revert.
+    const walletButton = button('Manage wallet');
+    const thinPage = [walletButton];
+    const modalElements = [
+      button('Add card'),
+      button('Remove card'),
+      { role: 'textbox', name: 'Card nickname', selector: '#card-nickname' } as InteractiveElement,
+      link('https://a.test/wallet/history'),
+      button('Close'),
+      button('Something else'),
+    ];
+    const log: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/dashboard': { elements: thinPage },
+        'https://a.test/wallet/history': { elements: [] },
+      },
+      onClickSelectorReveal: { [walletButton.selector]: modalElements },
+      log,
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard');
+
+    const baseRoute = result.routes.find((r) => r.url === 'https://a.test/dashboard' && !r.stateKey);
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(baseRoute).toBeDefined();
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.stateKey).toBe(`https://a.test/dashboard>>${walletButton.selector}`);
+    expect(stateRoute?.snapshot.interactiveElements).toHaveLength(modalElements.length);
+    // The link inside the modal is still harvested for ordinary route discovery.
+    expect(result.routes.some((r) => r.url === 'https://a.test/wallet/history')).toBe(true);
+    // After recording the state (and probing whatever it reveals), the page must end up back at
+    // its original state — same revert guarantee the plain click-probing pass already gives
+    // every other candidate, so the next top-level BFS step starts from a known page.
+    const clickIdx = log.indexOf(`click:${walletButton.selector}`);
+    expect(log.slice(clickIdx)).toContain('goto:https://a.test/dashboard');
+  });
+
+  it('deep-probes a route that already has plenty of interactive elements too, when a candidate reveals a real modal', async () => {
+    // Real-world shape found via a live audit of the C&A app: a well-populated "My account" page
+    // (~15 elements, nowhere near thin) whose "change password" button reveals a same-URL form —
+    // gating deep-probing on the ROUTE's own element count would keep missing exactly this case,
+    // since the surrounding page being healthy says nothing about whether one specific button
+    // opens an ungrounded panel. STATE_REVEAL_MIN_NEW_ELEMENTS is what keeps this targeted instead.
+    const healthyPage = [
+      button('A'),
+      button('B'),
+      button('C'),
+      link('https://a.test/other'),
+      { role: 'textbox', name: 'Search', selector: '#search' } as InteractiveElement,
+    ];
+    // healthyPage has 5 elements; revealed must add >= STATE_REVEAL_MIN_NEW_ELEMENTS (5) to
+    // count as a real modal, not an ordinary dropdown — 10 total clears that.
+    const revealed = [
+      button('X'),
+      button('Y'),
+      button('Z'),
+      button('W'),
+      button('V'),
+      button('U'),
+      button('T'),
+      button('S'),
+      button('R'),
+      button('Q'),
+    ];
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: healthyPage },
+        'https://a.test/other': { elements: [] },
+      },
+      onClickSelectorReveal: { [healthyPage[0]!.selector]: revealed },
+      recordClicks,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.snapshot.interactiveElements).toHaveLength(revealed.length);
+  });
+
+  it('recurses into a revealed state up to the depth cap, filling safe inputs but never a password/OTP field', async () => {
+    const openWallet = button('Manage wallet');
+    const openAddCard = button('Add card');
+    // fillSafeInputs only ever runs on a state right before recursing INTO it (there'd be no
+    // point filling a form we're not going to progress past), so the fields under test live on
+    // level1 — the state depth0's call recurses into. Base page has 1 element; level1 must add
+    // >= STATE_REVEAL_MIN_NEW_ELEMENTS (5) to count as a real reveal, not a dropdown.
+    const level1 = [
+      openAddCard,
+      { role: 'textbox', name: 'Card number', selector: '#card-number' } as InteractiveElement,
+      { role: 'textbox', name: 'OTP code', selector: '#otp-code' } as InteractiveElement,
+      { role: 'textbox', name: 'Password', selector: '#pw', inputType: 'password' } as InteractiveElement,
+      { role: 'textbox', name: 'Nickname', selector: '#nick' } as InteractiveElement,
+      button('F'),
+    ];
+    const thirdLevelButton = button('Go deeper');
+    // level1 has 6 elements; level2 must add >= 5 more against THAT baseline, so needs >= 11 total.
+    const level2 = [
+      thirdLevelButton,
+      button('Z1'),
+      button('Z2'),
+      button('Z3'),
+      button('Z4'),
+      button('Z5'),
+      button('Z6'),
+      button('Z7'),
+      button('Z8'),
+      button('Z9'),
+      button('Z10'),
+    ];
+    const level3 = [
+      button('past-depth-cap-1'),
+      button('past-depth-cap-2'),
+      button('past-depth-cap-3'),
+      button('past-depth-cap-4'),
+      button('past-depth-cap-5'),
+    ];
+    const recordTypes: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [openWallet] } },
+      onClickSelectorReveal: {
+        [openWallet.selector]: level1,
+        [openAddCard.selector]: level2,
+        [thirdLevelButton.selector]: level3,
+      },
+      recordTypes,
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard');
+
+    // hop1 (level1) and hop2 (level2) are recorded (MAX_STATE_DEPTH=2); level3 would be hop3 and
+    // must never even be attempted — nothing ever clicks INSIDE a hop2 state's own candidates.
+    const stateRoutes = result.routes.filter((r) => r.stateKey);
+    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level1)).toBe(true);
+    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level2)).toBe(true);
+    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level3)).toBe(false);
+    // Safety: card number/nickname get filled, password and OTP-shaped fields never do.
+    expect(recordTypes).toContain('#card-number');
+    expect(recordTypes).toContain('#nick');
+    expect(recordTypes).not.toContain('#pw');
+    expect(recordTypes).not.toContain('#otp-code');
+  });
+
+  it('never exceeds the crawl-wide state-probe budget of 20', async () => {
+    // A thin base page (< 5 elements, so deep-probing engages at all) whose every safe candidate
+    // reveals a fresh, materially larger state one hop deep — without a shared budget this could
+    // spend far more than MAX_STATE_PROBES_PER_CRAWL clicks chasing all of them.
+    const candidates = Array.from({ length: 4 }, (_, i) => button(`Open ${i}`));
+    const reveal: Record<string, InteractiveElement[]> = {};
+    for (const c of candidates) {
+      // 10 elements against a 4-element base clears STATE_REVEAL_MIN_NEW_ELEMENTS (5).
+      reveal[c.selector] = Array.from({ length: 10 }, (_, j) => button(`${c.name} inner ${j}`));
+    }
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: candidates } },
+      onClickSelectorReveal: reveal,
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    // Only 4 top-level candidates exist, so ordinary click-probe/link-discovery budget (60) is
+    // nowhere near the limiting factor here — MAX_STATE_PROBES_PER_CRAWL (20) is what actually
+    // caps this run, well short of the 4 * (1 + 8) = 36 clicks unbounded recursion would spend.
+    expect(recordClicks.length).toBeLessThanOrEqual(20);
   });
 });
 
@@ -812,6 +1006,10 @@ describe('crawlWithAuth()', () => {
     expect(authUrls).toEqual(['https://a.test/dashboard']);
   });
 
+  // Runs ~10s on purpose: a submit that never leaves the login page is only CONFIRMED failed
+  // once login.ts's LOGIN_SETTLE_TIMEOUT_MS has elapsed, since a real login legitimately chains
+  // several requests before redirecting. Fits this package's 15s testTimeout (vitest.config.ts)
+  // without needing its own.
   it('degrades to anonymous-only when login cannot be verified (wrong credentials)', async () => {
     const browser = makeFakeBrowser({
       pages: {
@@ -1011,6 +1209,69 @@ describe('crawl() non-semantic clickable elements are click-probe eligible (GAP-
   });
 });
 
+describe('crawl() drops over-long generic candidate names to avoid crowding real targets out of the probe slice (GAP-057)', () => {
+  it('excludes a role: generic candidate whose name exceeds the length cap', async () => {
+    // A pointer-styled CONTAINER (widened discovery from GAP-057's '*' scan) whose textContent
+    // swept up a whole panel's text, not a real click target.
+    const container: InteractiveElement = {
+      role: 'generic',
+      name: 'x'.repeat(61),
+      selector: 'div.panel',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [container] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).not.toContain(container.selector);
+  });
+
+  it('keeps a role: generic candidate whose name is exactly at the length cap (boundary)', async () => {
+    const atLimit: InteractiveElement = {
+      role: 'generic',
+      name: 'x'.repeat(60),
+      selector: 'div.at-limit',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [atLimit] },
+        'https://a.test/modal': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/modal' },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(atLimit.selector);
+  });
+
+  it('never applies the length cap to a semantic button candidate, however long its name', async () => {
+    const longButton: InteractiveElement = {
+      role: 'button',
+      name: 'y'.repeat(300),
+      selector: 'button.long-name',
+    };
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [longButton] },
+        'https://a.test/modal': { elements: [] },
+      },
+      onClickGoTo: { 'https://a.test/': 'https://a.test/modal' },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(longButton.selector);
+  });
+});
+
 describe('crawl() per-route crash signal', () => {
   it('flags a route whose accessible tree reads as an unhandled app-side crash', async () => {
     const browser = makeFakeBrowser({
@@ -1089,5 +1350,148 @@ describe('crawl() network capture (GAP-046)', () => {
     expect(result.routes).toHaveLength(1);
     expect(result.routes[0]?.url).toBe('https://a.test/ok');
     expect(result.routes[0]?.networkEvents).toEqual([]);
+  });
+});
+
+describe('scoreLoginCandidates()', () => {
+  const NO_HASH: RoutePrefixInfo = { hashRouted: false };
+
+  function route(url: string, opts: { title?: string; hasPasswordField?: boolean } = {}) {
+    return {
+      url,
+      title: opts.title ?? '',
+      snapshot: { url, title: opts.title ?? '', interactiveElements: [] },
+      depth: 0,
+      hasPasswordField: opts.hasPasswordField ?? false,
+      role: 'anonymous' as const,
+      networkEvents: [],
+    };
+  }
+
+  it('ranks a real login route above a password-bearing register route', () => {
+    const candidates = scoreLoginCandidates(
+      [
+        route('https://a.test/#/SK/register', { title: 'Registrácia', hasPasswordField: true }),
+        route('https://a.test/#/SK/login', { title: 'Prihlásiť sa', hasPasswordField: true }),
+      ],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+
+    expect(candidates[0]?.url).toBe('https://a.test/#/SK/login');
+    expect(candidates[0]?.score).toBeGreaterThan(candidates[1]?.score ?? 0);
+  });
+
+  it('a register page is not confident on its password field alone, so the /login fallback still fires', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/#/SK/register', { title: 'Registrácia', hasPasswordField: true })],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+
+    // The whole bug: +3 for the password field used to equal CONFIDENT_SCORE, so the register
+    // page was reported as a CONFIDENT login candidate and the fallback was suppressed entirely,
+    // leaving the run with no alternative to a page that isn't a login form.
+    expect(candidates.some((c) => c.source === 'common-path')).toBe(true);
+    expect(candidates.find((c) => c.url.endsWith('/register'))?.score).toBeLessThan(3);
+  });
+
+  it('ranks a crawled register page ABOVE a merely guessed /login', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/#/SK/register', { title: 'Registrácia', hasPasswordField: true })],
+      { hashRouted: true, invariantPrefix: '#/SK' },
+      'https://a.test/',
+    );
+
+    // Deliberate: on an app whose login is only a toggle inside the register form, there is no
+    // /login route at all, so preferring the guess would send the auth fixture to a URL that
+    // renders the SPA's fallback and lose a login that otherwise works. We positively observed
+    // the register page and its password field; /login is only a guess.
+    expect(candidates[0]?.url).toBe('https://a.test/#/SK/register');
+    const guess = candidates.find((c) => c.source === 'common-path');
+    expect(candidates[0]?.score).toBeGreaterThan(guess?.score ?? 0);
+  });
+
+  it('keeps a login-hinted route confident so no fallback candidates are added', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/login', { hasPasswordField: true })],
+      NO_HASH,
+      'https://a.test/',
+    );
+
+    expect(candidates.every((c) => c.source === 'crawled')).toBe(true);
+  });
+
+  it('collapses a route and its deep-probe states into one candidate, keeping the highest score', () => {
+    const base = route('https://a.test/login');
+    const probed = { ...route('https://a.test/login', { hasPasswordField: true }), stateKey: 'x>>y' };
+
+    const candidates = scoreLoginCandidates([base, probed], NO_HASH, 'https://a.test/');
+
+    const forLogin = candidates.filter((c) => c.url === 'https://a.test/login');
+    expect(forLogin).toHaveLength(1);
+    // 3 (password field, contributed only by the probed state) + 2 (URL hint).
+    expect(forLogin[0]?.score).toBe(5);
+  });
+
+  it('still treats a route reading as both register and login as a login candidate', () => {
+    const candidates = scoreLoginCandidates(
+      [route('https://a.test/register-or-login', { hasPasswordField: true })],
+      NO_HASH,
+      'https://a.test/',
+    );
+
+    // No signup penalty applied, so the password field alone keeps it confident.
+    expect(candidates[0]?.url).toBe('https://a.test/register-or-login');
+    expect(candidates.every((c) => c.source === 'crawled')).toBe(true);
+  });
+});
+
+describe('crawl() login-route discovery priority', () => {
+  it('visits a login-looking route before other routes queued ahead of it', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          // Register is discovered FIRST, so plain FIFO order would visit it first.
+          elements: [link('https://a.test/register'), link('https://a.test/login')],
+        },
+        'https://a.test/register': { elements: [] },
+        'https://a.test/login': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/', { maxRoutes: 2 });
+
+    // maxRoutes: 2 means exactly one of the two gets visited — it must be login.
+    expect(result.routes.map((r) => r.url)).toEqual(['https://a.test/', 'https://a.test/login']);
+  });
+
+  it('reports discovered-but-unvisited routes so a truncated crawl is not silent', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/a'), link('https://a.test/b')] },
+        'https://a.test/a': { elements: [] },
+        'https://a.test/b': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/', { maxRoutes: 1 });
+
+    expect(result.budgetExhausted).toBe(true);
+    expect(result.unvisitedQueuedCount).toBe(2);
+  });
+
+  it('reports zero unvisited routes when the queue drained normally', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/a')] },
+        'https://a.test/a': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.budgetExhausted).toBe(false);
+    expect(result.unvisitedQueuedCount).toBe(0);
   });
 });

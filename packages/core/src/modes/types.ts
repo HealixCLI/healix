@@ -15,6 +15,10 @@ export interface ExplorationArtifact {
   /** False when the crawl produced too little real context to trust (see assessExplorationUsefulness). */
   useful: boolean;
   uselessReason?: string;
+  /** Fraction of routes with fewer than THIN_ROUTE_ELEMENT_THRESHOLD interactive elements — a
+   * degradation signal distinct from `useful` (see assessExplorationUsefulness, F-03/F-06). Present
+   * only when the crawl passed the hard useful/useless gate. */
+  thinRouteRatio?: number;
   /** Real endpoints observed on the wire during the crawl — see GAP-046 and
    * `browser/network-capture.ts`'s `collectObservedEndpoints()`. */
   observedEndpoints: ObservedEndpoint[];
@@ -237,6 +241,13 @@ export interface ExecResultItem {
    * real spec file.
    */
   specFile?: string;
+  /**
+   * Why a 'skipped' result was skipped — Playwright's own annotation
+   * description from `test.skip(condition, 'reason')` (or `test.fixme(...)`),
+   * when the test/suite provided one. Absent for a skip with no reason
+   * given, or for any non-skipped status.
+   */
+  skipReason?: string;
 }
 
 export interface ExecOutcome {
@@ -244,8 +255,34 @@ export interface ExecOutcome {
   failed: number;
   blocked: number;
   flaky: number;
+  /**
+   * Tests the runner recorded as `skipped` (TestStatus already had this
+   * value — see storage/types.ts — but nothing here previously counted it).
+   * See F-24 in the Set-2 fixtures/mock/auth-execution findings: a report
+   * that only shows total/passed/failed/blocked/flaky leaves the fraction of
+   * a suite that never actually ran invisible, since a reader has no
+   * `skipped` figure to subtract out of `total`. Optional (rather than
+   * matching the other counters' required-number style) purely so every
+   * pre-existing ExecOutcome literal elsewhere in the codebase/tests doesn't
+   * need a mechanical touch just to keep compiling; always populated by
+   * execute.ts/coverage.ts — treat an absent value as 0. report.ts's own
+   * "skipped" card recounts directly from `results` rather than trusting
+   * this field, so the two stay in sync even if a caller ever forgets to
+   * set it.
+   */
+  skipped?: number;
   results: ExecResultItem[];
   raw?: unknown;
+  /**
+   * Browser-level mock hits (page.route()/`request` fixture overrides — see
+   * F-15), keyed by dependency id, tallied from execute.ts's
+   * readMockRequestCounts(). Distinct from the orchestrator's separate,
+   * launch-time mock HTTP server counts — the two mocking mechanisms are
+   * unrelated, so the orchestrator merges both into one total for the report
+   * rather than either silently overwriting the other. Optional/mode-specific:
+   * a mode with no fixture-level mocking (or no mocking at all) simply omits it.
+   */
+  mockedRequestCounts?: Record<string, number>;
 }
 
 export interface SuiteBundle {
@@ -289,6 +326,17 @@ export interface TestModeContext {
   externalDependencies?: ExternalDependency[];
   /** Resolved canned response per dependency id (see externalDependencies), keyed by ExternalDependency.id. */
   mockResponses?: Record<string, MockResponse>;
+  /**
+   * Whether the approved plan contains at least one (non-rejected) tierB-auth
+   * item. Undefined (not yet known, e.g. in tests that build a bare context)
+   * is treated as true — the pre-existing "always scaffold auth-setup"
+   * behavior — so this only ever narrows behavior for callers that
+   * deliberately set it. See F-18: scaffold() uses this to skip registering
+   * the `auth-setup` Playwright project when the plan has no auth surface at
+   * all, instead of running it unconditionally and misreporting its
+   * "no credentials configured" throw as an ordinary test failure.
+   */
+  hasTierBAuthPlanItems?: boolean;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

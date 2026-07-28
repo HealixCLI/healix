@@ -1,7 +1,52 @@
+import { isAuthEndpointPath } from './auth-endpoints.js';
 import type { ProviderAdapter } from '../providers/types.js';
-import type { ExternalDependency, ExternalDependencyCategory, MockResponse } from './types.js';
+import type { EndpointMock, ExternalDependency, ExternalDependencyCategory, MockResponse } from './types.js';
 
 const MOCK_RESPONSE_TIMEOUT_MS = 60_000;
+
+function base64url(input: string): string {
+  return Buffer.from(input, 'utf-8')
+    .toString('base64')
+    .replace(/\+/g, '-')
+    .replace(/\//g, '_')
+    .replace(/=+$/, '');
+}
+
+/**
+ * Deterministic, structurally valid, far-future-expiry JWT. An opaque placeholder like
+ * 'healix-mock-token' throws in any app that runs jwtDecode()/parses the payload on login,
+ * which fails the login just as silently as a missing token. Computed once from a literal
+ * payload (no Date.now()) so the generated fixture is byte-stable run to run.
+ */
+const MOCK_JWT = [
+  base64url('{"alg":"HS256","typ":"JWT"}'),
+  base64url('{"sub":"healix-mock-user","exp":4102444800}'), // 2100-01-01, never expired
+  base64url('healix-mock-signature'),
+].join('.');
+
+/**
+ * A deliberate SUPERSET of the shapes real login APIs return, not one canonical shape: the
+ * mock can't know which field the app reads to decide "I am logged in", and a MISSING field
+ * breaks login silently (this is the exact bug this body exists to fix) while an extra
+ * field is inert. Covers the capillary-style `status.success` envelope (an app checking
+ * `!res.status?.success`), OAuth2/OIDC snake_case, and the camelCase twins SPA clients
+ * commonly read. No nested `data` wrapper: with axios `res.data` IS the body, so
+ * `res.data.token` already resolves.
+ */
+const AUTH_MOCK_BODY = {
+  status: { success: true, code: 200, message: 'Success' },
+  success: true,
+  token: MOCK_JWT,
+  access_token: MOCK_JWT,
+  accessToken: MOCK_JWT,
+  token_type: 'Bearer',
+  tokenType: 'Bearer',
+  expires_in: 3600,
+  expiresIn: 3600,
+  refresh_token: 'healix-mock-refresh-token',
+  refreshToken: 'healix-mock-refresh-token',
+  user: { id: 'healix-mock-user', email: 'healix.mock@example.test', name: 'Healix Mock User' },
+};
 
 /** Plausible canned success response per category — used until/unless the AI pass overrides it. */
 const STATIC_TEMPLATES: Record<ExternalDependencyCategory, MockResponse> = {
@@ -9,14 +54,47 @@ const STATIC_TEMPLATES: Record<ExternalDependencyCategory, MockResponse> = {
   otp: { status: 200, body: { status: 'pending', message: 'OTP sent (mocked by Healix)' } },
   email: { status: 202, body: { status: 'queued', id: 'healix-mock-email-000000' } },
   payment: { status: 200, body: { status: 'succeeded', id: 'healix_mock_pi_000000' } },
-  auth: { status: 200, body: { success: true, token: 'healix-mock-token' } },
+  auth: { status: 200, body: AUTH_MOCK_BODY },
   backend: { status: 200, body: {} },
+  // Never actually served — a 'local-backend' dependency's mockStrategy is always
+  // 'undeterminable' (F-04: it's routed to directly, not mocked), so this entry only
+  // exists to keep this Record exhaustive over ExternalDependencyCategory.
+  'local-backend': { status: 200, body: {} },
   other: { status: 200, body: {} },
 };
 
 /** The static, deterministic fallback response for a dependency's category. Never fails, never calls out. */
 export function staticMockResponse(category: ExternalDependencyCategory): MockResponse {
   return STATIC_TEMPLATES[category] ?? STATIC_TEMPLATES.other;
+}
+
+/**
+ * The category to mock an individual endpoint with: the endpoint's own tag wins (set by
+ * dependencies.ts when a path is statically recognized as auth-shaped), else a path sniff
+ * as a second line of defense for endpoints reaching here by any other route, else the
+ * parent dependency's own category.
+ */
+function endpointCategory(dep: ExternalDependency, endpoint: EndpointMock): ExternalDependencyCategory {
+  if (endpoint.category) return endpoint.category;
+  if (isAuthEndpointPath(endpoint.pathPattern)) return 'auth';
+  return dep.category;
+}
+
+/**
+ * For an auth-classified endpoint, layers a response ON TOP of the static auth floor
+ * rather than replacing it: a model reliably invents A plausible token response, but not
+ * necessarily the exact field this particular app reads — and a plausible-but-wrong auth
+ * body is the failure mode this whole module exists to prevent. Also clamps an error status
+ * on the login endpoint, since an AI-returned 401 there would fail every login-dependent test.
+ */
+function withAuthFloor(category: ExternalDependencyCategory, response: MockResponse): MockResponse {
+  if (category !== 'auth') return response;
+  const body = response.body;
+  const merged =
+    body && typeof body === 'object' && !Array.isArray(body)
+      ? { ...AUTH_MOCK_BODY, ...(body as Record<string, unknown>) }
+      : AUTH_MOCK_BODY;
+  return { ...response, status: response.status >= 400 ? 200 : response.status, body: merged };
 }
 
 /** Shape the model is asked to emit inside a fenced JSON block. */
@@ -52,8 +130,10 @@ function buildPrompt(deps: ExternalDependency[]): string {
         '  Known endpoints for this dependency (produce a distinct, endpoint-appropriate response for EACH):',
       );
       for (const e of d.endpoints) {
+        const cat = endpointCategory(d, e);
+        const tag = cat === 'auth' ? ' | category: auth (LOGIN HANDSHAKE)' : '';
         lines.push(
-          `    - key: "${endpointKey(d.id, e.method, e.pathPattern)}" | ${e.method} ${e.pathPattern}`,
+          `    - key: "${endpointKey(d.id, e.method, e.pathPattern)}" | ${e.method} ${e.pathPattern}${tag}`,
         );
       }
     }
@@ -75,6 +155,12 @@ function buildPrompt(deps: ExternalDependency[]): string {
       'appropriate to what that specific endpoint path suggests it does — e.g. a path containing "login"/"auth" ' +
       'returns a token; "list"/plural nouns return an array; "balance"/"points"/"ledger" return numeric fields; ' +
       'a POST "redeem"/"create" returns a confirmation id.',
+  );
+  lines.push(
+    'An endpoint marked "category: auth (LOGIN HANDSHAKE)" is the app\'s LOGIN/TOKEN handshake — return a ' +
+      'successful session response (a token plus whatever envelope the path suggests), never an error or a ' +
+      'health-check-style {status,service,version} body. Healix merges your body over a guaranteed baseline, so ' +
+      'ADD fields rather than replacing the shape.',
   );
   return lines.join('\n');
 }
@@ -173,10 +259,11 @@ export async function generateMockResponses(
   for (const d of mockable) {
     result.set(d.id, staticMockResponse(d.category));
     // Every detected endpoint gets a static fallback up front too, same as the
-    // dependency-level entry — an AI override below replaces it when usable,
-    // but a run with no ready provider still gets a (generic) response per
-    // endpoint instead of falling back to the coarser dependency-wide one.
-    for (const e of d.endpoints ?? []) e.response = staticMockResponse(d.category);
+    // dependency-level entry — an AI override below replaces it when usable, but a run
+    // with no ready provider still gets a (generic) response per endpoint instead of
+    // falling back to the coarser dependency-wide one. Uses the ENDPOINT's own category
+    // (endpointCategory), which wins over the dependency's when the path is auth-shaped.
+    for (const e of d.endpoints ?? []) e.response = staticMockResponse(endpointCategory(d, e));
   }
   if (mockable.length === 0 || !provider) return result;
 
@@ -197,10 +284,10 @@ export async function generateMockResponses(
       const parsed = parseMockResponses(completion.text, validKeys);
       for (const d of mockable) {
         const depLevel = parsed.get(d.id);
-        if (depLevel) result.set(d.id, depLevel);
+        if (depLevel) result.set(d.id, withAuthFloor(d.category, depLevel));
         for (const e of d.endpoints ?? []) {
           const perEndpoint = parsed.get(endpointKey(d.id, e.method, e.pathPattern));
-          if (perEndpoint) e.response = perEndpoint;
+          if (perEndpoint) e.response = withAuthFloor(endpointCategory(d, e), perEndpoint);
         }
       }
     }

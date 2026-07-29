@@ -63,7 +63,9 @@ describe('classifyByRules / engine.classify', () => {
           'net::ERR_CONNECTION_REFUSED at http://localhost:4202/login',
       });
       expect(result.rationale).toContain('unreachable');
-      expect(result.rationale).not.toContain('either the auth setup fixture itself failed, or the project has no test credentials configured');
+      expect(result.rationale).not.toContain(
+        'either the auth setup fixture itself failed, or the project has no test credentials configured',
+      );
     });
 
     it('cites a genuine missing-credentials cause specifically when that really is what the wrapped error says', () => {
@@ -209,9 +211,9 @@ describe('classifyByRules / engine.classify', () => {
     });
 
     it('classifies an unguarded null/undefined property access as test_is_wrong', () => {
-      expect(
-        verdictFor("TypeError: Cannot read properties of null (reading 'textContent')"),
-      ).toBe('test_is_wrong');
+      expect(verdictFor("TypeError: Cannot read properties of null (reading 'textContent')")).toBe(
+        'test_is_wrong',
+      );
     });
 
     it('classifies "is not a constructor" as test_is_wrong', () => {
@@ -221,9 +223,7 @@ describe('classifyByRules / engine.classify', () => {
     it('does not fire on an ordinary environment or assertion failure (no false positives)', () => {
       expect(verdictFor('Error: connect ECONNREFUSED 127.0.0.1:3000')).toBe('environment');
       expect(
-        verdictFor(
-          ['Error: expect(received).toHaveText(expected)', 'Expected string: "Welcome"'].join('\n'),
-        ),
+        verdictFor(['Error: expect(received).toHaveText(expected)', 'Expected string: "Welcome"'].join('\n')),
       ).not.toBe('test_is_wrong');
     });
   });
@@ -411,10 +411,10 @@ describe('classifyByRules / engine.classify', () => {
   });
 
   describe('apiEvidence-corroborated rules (real captured API responses, not a guess)', () => {
-    const ASSERTION_ERROR = "Error: expect(received).toBeTruthy() failed\nReceived: undefined";
+    const ASSERTION_ERROR = 'Error: expect(received).toBeTruthy() failed\nReceived: undefined';
 
     describe('mock_response_incomplete', () => {
-      it('classifies as environment when apiEvidence shows Healix\'s OWN mock answered', () => {
+      it("classifies as environment when apiEvidence shows Healix's OWN mock answered", () => {
         const result = engine.classify({
           title: 'customer_lookup API',
           error: ASSERTION_ERROR,

@@ -91,7 +91,11 @@ function buildEvidenceBlock(input: TriageInput): string[] {
   // configured this field" versus "the real API genuinely omitted it."
   const hasApiEvidence = typeof input.apiEvidence === 'string' && input.apiEvidence.trim().length > 0;
   const apiEvidenceBlock = hasApiEvidence
-    ? ['', '--- ACTUAL API RESPONSE(S) OBSERVED (untrusted) ---', fenceUntrusted(truncate(input.apiEvidence, MAX_SOURCE_CHARS))]
+    ? [
+        '',
+        '--- ACTUAL API RESPONSE(S) OBSERVED (untrusted) ---',
+        fenceUntrusted(truncate(input.apiEvidence, MAX_SOURCE_CHARS)),
+      ]
     : [];
 
   return [
@@ -133,7 +137,7 @@ const HYPOTHESIS_PREAMBLE = [
   'it to the NUMBER too. A bare assertion mismatch ("expected X, got',
   'undefined/missing") with NOTHING else corroborating it is genuinely weak',
   'evidence: it is equally consistent with a real app defect, a stale test',
-  "expectation, a misconfigured mock, or an API contract that changed out from",
+  'expectation, a misconfigured mock, or an API contract that changed out from',
   'under the test. Reserve confidence above ~0.7 for cases with CORROBORATING',
   'evidence, not just the bare mismatch itself — e.g.: an ACTUAL API RESPONSE',
   'block below marked [REAL BACKEND] showing a genuinely empty/malformed body',

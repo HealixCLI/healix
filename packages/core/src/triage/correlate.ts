@@ -73,7 +73,7 @@ export function correlateBySignature<T extends CorrelationEntry>(entries: readon
   const upgrades = new Map<T, TriageResult>();
   for (const group of groups.values()) {
     if (group.length < 2) continue;
-    const best = group.reduce((a, b) => ((b.triage!.confidence > a.triage!.confidence) ? b : a));
+    const best = group.reduce((a, b) => (b.triage!.confidence > a.triage!.confidence ? b : a));
     if (!CONFIDENT_VERDICTS.includes(best.triage!.verdict)) continue;
 
     const sig = extractFailureSignature(best.error ?? '');

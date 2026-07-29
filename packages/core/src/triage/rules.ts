@@ -235,7 +235,7 @@ function describeBlockedTierbCause(error: string): string {
     return 'the project has no test credentials configured, so the session ran anonymously';
   }
   if (RE_MISSING_DEPENDENCY.test(error)) {
-    return "the auth setup fixture itself failed because a required local dependency (a Playwright browser binary, or a Node package) was missing in this execution environment — not a credentials gap";
+    return 'the auth setup fixture itself failed because a required local dependency (a Playwright browser binary, or a Node package) was missing in this execution environment — not a credentials gap';
   }
   if (RE_ENVIRONMENT.test(error)) {
     return 'the auth setup fixture itself failed because the app/server was unreachable (connection refused, DNS failure, or a navigation timeout) — not a credentials gap';

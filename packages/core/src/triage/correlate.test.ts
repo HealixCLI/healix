@@ -89,7 +89,7 @@ describe('correlateBySignature', () => {
     expect(correlateBySignature(entries)[0]!.triage).toBeNull();
   });
 
-  it('carries the anchor verdict\'s own verdictSource forward onto upgraded members', () => {
+  it("carries the anchor verdict's own verdictSource forward onto upgraded members", () => {
     const entries = [
       { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'A', 'rule_fallback') },
       { error: testIdError(1), triage: mkTriage('ambiguous', 0.45, 'B') },

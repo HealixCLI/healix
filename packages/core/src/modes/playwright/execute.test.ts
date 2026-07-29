@@ -1066,7 +1066,14 @@ describe('readApiEvidence — per-test summary of actual request-fixture calls',
 
   it('groups calls by key and formats a compact, mock-vs-real-labeled summary', async () => {
     const lines = [
-      { key: 'tests/tierC-api/x.spec.ts#a', method: 'GET', url: '/lookup', status: 500, mocked: false, body: '{}' },
+      {
+        key: 'tests/tierC-api/x.spec.ts#a',
+        method: 'GET',
+        url: '/lookup',
+        status: 500,
+        mocked: false,
+        body: '{}',
+      },
     ]
       .map((e) => JSON.stringify(e))
       .join('\n');

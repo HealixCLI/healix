@@ -5,10 +5,11 @@
  * Neither classify() nor analyze()/analyzeBatch() ever sees more than one
  * failure's OWN evidence at a time, so two failures missing the exact same
  * element can end up with wildly different verdicts/confidence purely
- * because of which batch the AI happened to review them in (or whether they
- * were selected for AI review at all — see TRIAGE_AI_LIMIT in
- * orchestrator/index.ts). Identical evidence should never produce different
- * verdicts. This pass groups failures by a coarse, deterministic fingerprint
+ * because of which batch the AI happened to review them in, or because one
+ * hit a provider error/timeout (verdictSource: 'rule_fallback') while its
+ * twin got a real AI reply (verdictSource: 'ai_reviewed'). Identical evidence
+ * should never produce different verdicts. This pass groups failures by a
+ * coarse, deterministic fingerprint
  * of WHAT was missing (a locator description, a data-testid, or a getBy*
  * call), and when a group has a confident, non-ambiguous verdict on ANY
  * member, applies it consistently to every other member of that group that
@@ -88,6 +89,7 @@ export function correlateBySignature<T extends CorrelationEntry>(entries: readon
           `${best.triage!.rationale} ` +
           `(Corroborated: ${group.length} failures in this run share the identical failure signature ` +
           `"${sig}" — the same verdict applies consistently across all of them.)`,
+        verdictSource: best.triage!.verdictSource,
         ...(best.triage!.suggestedPatch ? { suggestedPatch: best.triage!.suggestedPatch } : {}),
       });
     }

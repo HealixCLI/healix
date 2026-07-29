@@ -158,7 +158,7 @@ const RE_ASSERTION_CONTEXT =
   /(expect\(|Expected:|Received:|Expected (?:string|substring|value|pattern)|Received string|toHaveText|toContainText|toBeVisible|toHaveURL|toHaveValue|toHaveCount|toHaveTitle|toMatchSnapshot)/i;
 
 function mk(verdict: Verdict, confidence: number, rationale: string): TriageResult {
-  return { verdict, confidence, rationale };
+  return { verdict, confidence, rationale, verdictSource: 'rule_fallback' };
 }
 
 /**
@@ -431,9 +431,12 @@ const RULES: readonly Rule[] = [
       return mk(
         'environment',
         // F-20: was 0.55 (same as flaky) — deliberately lowered so a bare
-        // timeout reliably lands in orchestrator/index.ts's AI-escalation
-        // candidate pool (aiCandidates sorts ascending by confidence, takes
-        // the lowest TRIAGE_AI_LIMIT). classifyByRules() only ever sees ONE
+        // timeout is escalated to AI review EARLY (orchestrator/index.ts's
+        // aiCandidates sorts ascending by confidence, so a low score here
+        // means this gets reviewed before higher-confidence rivals if a run
+        // is ever cancelled or budget-limited mid-triage — every failure is
+        // eventually escalated regardless, but order still matters for a
+        // partial run). classifyByRules() only ever sees ONE
         // failure at a time and has no way to notice that a bare timeout is
         // actually a downstream symptom of a DIFFERENT, already-diagnosed
         // app_is_wrong failure in the same run (e.g. a broken form submit

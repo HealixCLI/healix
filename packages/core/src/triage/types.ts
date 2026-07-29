@@ -49,6 +49,17 @@ export interface TriageResult {
    * environment/flaky/ambiguous, where there is no code-level fix.
    */
   suggestedPatch?: string;
+  /**
+   * Where this verdict actually came from — surfaced to users so a verdict
+   * can be told apart from a genuinely AI-reviewed judgment vs. one that
+   * fell back to the deterministic rule baseline because the AI call itself
+   * errored, timed out, or returned an unparseable reply (or simply because
+   * a rule matched with high enough confidence that classify() never needed
+   * to escalate). Always set — 'rule_fallback' by classifyByRules() itself,
+   * upgraded to 'ai_reviewed' only by reconcile() when a real AI reply was
+   * successfully parsed and used.
+   */
+  verdictSource: 'ai_reviewed' | 'rule_fallback';
 }
 
 /** One failure entered into a batched analyze() call, keyed by a caller-assigned id (stable across the batch/split-retry lifecycle — not the test's own reqTag/title, which may repeat or be absent). */

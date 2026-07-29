@@ -25,11 +25,18 @@ describe('correlateBySignature', () => {
   const testIdError = (n: number) =>
     `Error: expect(locator).toBeVisible() failed\nLocator: locator('img[data-testid="headerbl-logo${n === 0 ? '' : ''}"]')\nTimeout: 3000ms`;
 
+  const mkTriage = (
+    verdict: 'app_is_wrong' | 'test_is_wrong' | 'environment' | 'flaky' | 'ambiguous',
+    confidence: number,
+    rationale: string,
+    verdictSource: 'ai_reviewed' | 'rule_fallback' = 'ai_reviewed',
+  ) => ({ verdict, confidence, rationale, verdictSource });
+
   it('upgrades an ambiguous entry to match a confident sibling sharing the same signature', () => {
     const entries = [
-      { error: testIdError(1), triage: { verdict: 'app_is_wrong' as const, confidence: 0.7, rationale: 'A' } },
-      { error: testIdError(1), triage: { verdict: 'app_is_wrong' as const, confidence: 0.7, rationale: 'B' } },
-      { error: testIdError(1), triage: { verdict: 'ambiguous' as const, confidence: 0.45, rationale: 'C' } },
+      { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'A') },
+      { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'B') },
+      { error: testIdError(1), triage: mkTriage('ambiguous', 0.45, 'C') },
     ];
     const result = correlateBySignature(entries);
     expect(result[2]!.triage!.verdict).toBe('app_is_wrong');
@@ -40,15 +47,15 @@ describe('correlateBySignature', () => {
   });
 
   it('does NOT change anything when the group has fewer than 2 members', () => {
-    const entries = [{ error: testIdError(1), triage: { verdict: 'ambiguous' as const, confidence: 0.45, rationale: 'C' } }];
+    const entries = [{ error: testIdError(1), triage: mkTriage('ambiguous', 0.45, 'C') }];
     const result = correlateBySignature(entries);
     expect(result[0]).toBe(entries[0]);
   });
 
   it('does NOT change anything when the whole group is ambiguous (nothing confident to propagate)', () => {
     const entries = [
-      { error: testIdError(1), triage: { verdict: 'ambiguous' as const, confidence: 0.5, rationale: 'A' } },
-      { error: testIdError(1), triage: { verdict: 'ambiguous' as const, confidence: 0.45, rationale: 'B' } },
+      { error: testIdError(1), triage: mkTriage('ambiguous', 0.5, 'A') },
+      { error: testIdError(1), triage: mkTriage('ambiguous', 0.45, 'B') },
     ];
     const result = correlateBySignature(entries);
     expect(result[0]).toBe(entries[0]);
@@ -57,8 +64,8 @@ describe('correlateBySignature', () => {
 
   it('does NOT touch a member whose confidence already meets/exceeds the group best', () => {
     const entries = [
-      { error: testIdError(1), triage: { verdict: 'app_is_wrong' as const, confidence: 0.7, rationale: 'A' } },
-      { error: testIdError(1), triage: { verdict: 'app_is_wrong' as const, confidence: 0.7, rationale: 'B' } },
+      { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'A') },
+      { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'B') },
     ];
     const result = correlateBySignature(entries);
     expect(result[1]).toBe(entries[1]);
@@ -66,8 +73,8 @@ describe('correlateBySignature', () => {
 
   it('does NOT correlate failures with different signatures', () => {
     const entries = [
-      { error: "Locator: getByText('Not found')", triage: { verdict: 'app_is_wrong' as const, confidence: 0.7, rationale: 'A' } },
-      { error: "Locator: getByText('Spin')", triage: { verdict: 'ambiguous' as const, confidence: 0.45, rationale: 'B' } },
+      { error: "Locator: getByText('Not found')", triage: mkTriage('app_is_wrong', 0.7, 'A') },
+      { error: "Locator: getByText('Spin')", triage: mkTriage('ambiguous', 0.45, 'B') },
     ];
     const result = correlateBySignature(entries);
     expect(result[1]).toBe(entries[1]);
@@ -76,9 +83,18 @@ describe('correlateBySignature', () => {
   it('skips entries with no triage result', () => {
     const entries = [
       { error: testIdError(1), triage: null },
-      { error: testIdError(1), triage: { verdict: 'app_is_wrong' as const, confidence: 0.7, rationale: 'A' } },
+      { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'A') },
     ];
     expect(() => correlateBySignature(entries)).not.toThrow();
     expect(correlateBySignature(entries)[0]!.triage).toBeNull();
+  });
+
+  it('carries the anchor verdict\'s own verdictSource forward onto upgraded members', () => {
+    const entries = [
+      { error: testIdError(1), triage: mkTriage('app_is_wrong', 0.7, 'A', 'rule_fallback') },
+      { error: testIdError(1), triage: mkTriage('ambiguous', 0.45, 'B') },
+    ];
+    const result = correlateBySignature(entries);
+    expect(result[1]!.triage!.verdictSource).toBe('rule_fallback');
   });
 });

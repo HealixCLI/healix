@@ -550,6 +550,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
             confidence: 0.8,
             rationale: 'Assertion failed on a real element.',
             suggestedPatch: 'Fix the missing aria-label on the submit button.',
+            verdictSource: 'ai_reviewed',
           },
         },
       ],
@@ -585,6 +586,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
             confidence: 0.7,
             rationale: 'The selector no longer matches the live UI.',
             suggestedPatch: "await page.getByRole('button', { name: 'Submit' }).click();",
+            verdictSource: 'ai_reviewed',
           },
         },
       ],
@@ -660,7 +662,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         {
           title: '[REQ:REQ-1] positive: fails',
           error: 'boom',
-          triage: { verdict: 'app_is_wrong', confidence: 0.9, rationale: 'Real defect.' },
+          triage: { verdict: 'app_is_wrong', confidence: 0.9, rationale: 'Real defect.', verdictSource: 'ai_reviewed' },
         },
       ],
     });
@@ -995,12 +997,12 @@ describe('groupingSummary — round-trips through buildReport/renderReportHtml',
     {
       title: 'A',
       error: 'boom',
-      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x', verdictSource: 'ai_reviewed' as const },
     },
     {
       title: 'B',
       error: 'boom',
-      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x', verdictSource: 'ai_reviewed' as const },
     },
   ];
 

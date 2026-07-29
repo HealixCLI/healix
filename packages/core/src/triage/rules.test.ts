@@ -278,12 +278,12 @@ describe('classifyByRules / engine.classify', () => {
       expect(timeout.confidence).toBeLessThan(flaky.confidence);
     });
 
-    it("reliably wins an AI-escalation slot over tied-confidence flaky rivals (reproduces orchestrator/index.ts's ascending-sort + TRIAGE_AI_LIMIT slice)", () => {
+    it('sorts ahead of tied-confidence flaky rivals for AI-escalation ORDER (orchestrator/index.ts ascending-sorts by confidence; every failure is eventually escalated, but a cancelled/budget-limited run reviews lowest-confidence first)', () => {
       // Mirrors the Flask CRUD scenario: a bare-timeout failure (the real
       // root cause is a DIFFERENT, already-diagnosed app_is_wrong bug
       // earlier in the same test — e.g. a broken form submit that hangs a
-      // subsequent waitForURL) competing for a scarce AI-escalation slot
-      // against several flaky-confidence rivals.
+      // subsequent waitForURL) competing for EARLY review against several
+      // flaky-confidence rivals.
       const flakyInputs = Array.from({ length: 5 }, (_, i) => ({
         title: `flaky ${i}`,
         error: 'locator.click: Error: element is not visible',
@@ -292,17 +292,16 @@ describe('classifyByRules / engine.classify', () => {
 
       const all = [...flakyInputs, timeoutInput].map((input) => ({ input, triage: engine.classify(input) }));
 
-      // Same selection logic as orchestrator/index.ts's aiCandidates: sort
-      // ascending by confidence, cap to a limit (stand-in for TRIAGE_AI_LIMIT).
-      const LIMIT = 5;
-      const selected = [...all].sort((a, b) => a.triage.confidence - b.triage.confidence).slice(0, LIMIT);
-      const selectedTitles = new Set(selected.map((s) => s.input.title));
+      // Same ordering logic as orchestrator/index.ts's aiCandidates: sort
+      // ascending by confidence (no cap anymore — this is purely about which
+      // failure would be reviewed FIRST if a run stopped partway through).
+      const ordered = [...all].sort((a, b) => a.triage.confidence - b.triage.confidence);
+      const firstFive = new Set(ordered.slice(0, 5).map((s) => s.input.title));
 
-      expect(selectedTitles.has(timeoutInput.title)).toBe(true);
-      // Exactly one flaky candidate was bumped out to make room — proves the
-      // lowered confidence actually changed selection order, not just the
-      // number itself.
-      expect(flakyInputs.filter((f) => selectedTitles.has(f.title))).toHaveLength(4);
+      expect(firstFive.has(timeoutInput.title)).toBe(true);
+      // Exactly one flaky candidate was bumped later — proves the lowered
+      // confidence actually changed ordering, not just the number itself.
+      expect(flakyInputs.filter((f) => firstFive.has(f.title))).toHaveLength(4);
     });
   });
 

@@ -287,6 +287,8 @@ export interface TriageResultRow {
   confidence: number;
   rationale: string;
   suggestedPatch: string | null;
+  /** 'ai_reviewed' | 'rule_fallback' | null — null only for rows persisted before this column existed. */
+  verdictSource: string | null;
   createdAt: string;
 }
 
@@ -297,4 +299,5 @@ export interface NewTriageResult {
   confidence: number;
   rationale: string;
   suggestedPatch?: string | null;
+  verdictSource?: string | null;
 }

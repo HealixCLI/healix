@@ -451,6 +451,7 @@ function parseBatchEntry(obj: unknown): { id: string; result: TriageResult } | n
     verdict: rec.verdict,
     confidence: clampConfidence(rec.confidence),
     rationale,
+    verdictSource: 'ai_reviewed',
   };
   const patch = rec.suggestedPatch;
   if (typeof patch === 'string' && patch.trim().length > 0) {
@@ -498,6 +499,7 @@ export function parseTriageReply(text: string): TriageResult | null {
     verdict: obj.verdict,
     confidence: clampConfidence(obj.confidence),
     rationale,
+    verdictSource: 'ai_reviewed',
   };
 
   const patch = obj.suggestedPatch;

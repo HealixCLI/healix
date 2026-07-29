@@ -115,16 +115,22 @@ export type { ResumeCheckpoint } from './checkpoint.js';
  */
 const TRIAGE_ANALYZE_TIMEOUT_MS = ABSOLUTE_BACKSTOP_MS + 60_000;
 /**
- * How many failures (at most) get escalated to AI triage analysis. Raised from 3 to 8 to 20:
- * a real 21-failure run showed 8 still left 14 failures stuck at the generic low-confidence
- * baseline ('ambiguous', rationale "no more context available") — the un-escalated remainder is
- * exactly what was causing ambiguous-heavy reports. Grouped into TRIAGE_AI_BATCH_SIZE-sized
- * batches, each triaged with ONE provider call covering every item in the group (see
- * TriageEngine.analyzeBatch) instead of one call per item — every item still gets its own full
- * evidence block, only the fixed hypothesis/instructions preamble is paid once per batch instead
- * of once per item.
+ * Historical note: this used to cap how many failures (at most) got escalated
+ * to AI triage analysis (raised over time from 3 to 8 to 20). That cap is
+ * gone — EVERY failure with a rule baseline is now escalated to AI, so a run
+ * with more failures than any prior fixed limit no longer leaves the
+ * remainder stuck on the generic low-confidence baseline just because they
+ * didn't make the cut. If the AI call itself errors, times out, or returns an
+ * unparseable reply for a given item, that item simply keeps its
+ * classifyByRules() baseline — surfaced to the user via
+ * TriageResult.verdictSource ('rule_fallback' vs 'ai_reviewed') rather than
+ * silently looking identical to a reviewed-and-agreed verdict. Grouped into
+ * TRIAGE_AI_BATCH_SIZE-sized batches, each triaged with ONE provider call
+ * covering every item in the group (see TriageEngine.analyzeBatch) instead of
+ * one call per item — every item still gets its own full evidence block,
+ * only the fixed hypothesis/instructions preamble is paid once per batch
+ * instead of once per item.
  */
-const TRIAGE_AI_LIMIT = 20;
 /** How many failures share a single batched AI-triage call. */
 const TRIAGE_AI_BATCH_SIZE = 5;
 /**
@@ -2100,6 +2106,10 @@ async function runPipeline(
               confidence: row.confidence,
               rationale: row.rationale,
               ...(row.suggestedPatch ? { suggestedPatch: row.suggestedPatch } : {}),
+              // Legacy rows persisted before the verdict_source column existed
+              // have no way to know their real provenance — default to the
+              // conservative label rather than falsely claiming AI review.
+              verdictSource: row.verdictSource === 'ai_reviewed' ? 'ai_reviewed' : 'rule_fallback',
             },
           });
         }
@@ -2160,21 +2170,18 @@ async function runPipeline(
             return { r, input, triage, unit };
           });
 
-          // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
-          // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
-          // AbortController) rather than one at a time OR all at once — triage was previously
-          // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
-          // child process (providers/claude.ts's runCli), so an unbounded burst of
-          // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
-          // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
-          // failures that most need it (low-confidence/ambiguous baselines) rather than on
-          // whichever failures happen to execute first — a rule-confident test_is_wrong near
-          // the top of the results array was previously "spending" a slot that a genuinely
-          // ambiguous failure further down needed far more.
+          // AI enrichment for EVERY failure with a rule baseline — no cap. Run in
+          // TRIAGE_AI_BATCH_SIZE-sized batches (each call with its own bounded
+          // AbortController) rather than one at a time OR all at once — each call spawns a
+          // real CLI child process (providers/claude.ts's runCli), so an unbounded burst of
+          // simultaneous spawns is its own resource risk on a large run.
+          // Sorted ascending by baseline confidence so that if the run is cancelled or a
+          // budget ceiling hits mid-triage (see checkCancelled() in the batch loop below),
+          // whatever DID get reviewed was the failures that most needed it — not an
+          // ordering that limits which failures are eligible at all.
           const aiCandidates = baseline
             .filter((b) => b.triage !== null)
-            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
-            .slice(0, TRIAGE_AI_LIMIT);
+            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1));
           const aiCandidateSet = new Set(aiCandidates);
 
           /**
@@ -2194,6 +2201,7 @@ async function runPipeline(
                 confidence: b.triage.confidence,
                 rationale: b.triage.rationale,
                 suggestedPatch: b.triage.suggestedPatch ?? null,
+                verdictSource: b.triage.verdictSource,
               });
               noteStoreOk();
             } catch (err) {

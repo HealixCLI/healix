@@ -542,6 +542,7 @@ export class HealixStore {
       confidence: input.confidence,
       rationale: input.rationale,
       suggestedPatch: input.suggestedPatch ?? null,
+      verdictSource: input.verdictSource ?? null,
       createdAt: new Date().toISOString(),
     };
     this.db.exec('BEGIN IMMEDIATE');
@@ -549,7 +550,7 @@ export class HealixStore {
       this.db.prepare('DELETE FROM triage_results WHERE test_id = ?').run(row.testId);
       this.db
         .prepare(
-          'INSERT INTO triage_results (id, test_id, verdict, confidence, rationale, suggested_patch, created_at) VALUES (?, ?, ?, ?, ?, ?, ?)',
+          'INSERT INTO triage_results (id, test_id, verdict, confidence, rationale, suggested_patch, verdict_source, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
         )
         .run(
           row.id,
@@ -558,6 +559,7 @@ export class HealixStore {
           row.confidence,
           row.rationale,
           row.suggestedPatch,
+          row.verdictSource,
           row.createdAt,
         );
       this.db.exec('COMMIT');
@@ -904,6 +906,7 @@ function rowToTriageResult(r: Record<string, unknown>): TriageResultRow {
     confidence: Number(r.confidence),
     rationale: String(r.rationale),
     suggestedPatch: s(r.suggested_patch),
+    verdictSource: s(r.verdict_source),
     createdAt: String(r.created_at),
   };
 }

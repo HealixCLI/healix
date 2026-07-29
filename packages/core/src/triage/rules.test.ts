@@ -490,6 +490,83 @@ describe('classifyByRules / engine.classify', () => {
     });
   });
 
+  describe('suite_url_convention_mismatch', () => {
+    const BASE_URL = 'http://localhost:4202/#/SK/home';
+    const NOT_FOUND_ERROR = "Error: expect(locator).toBeVisible() failed\nLocator: getByText('Not found')";
+    const NULL_VALUE_ERROR = 'Expected: "T"\nReceived: null';
+
+    it("classifies as test_is_wrong when the test's own goto() omits the baseUrl's required path segment", () => {
+      const result = engine.classify({
+        title: 't',
+        error: NULL_VALUE_ERROR,
+        baseUrl: BASE_URL,
+        specSource: "await page.goto('/#/?token=T&mobile=M&lang=ar-sa');",
+      });
+      expect(result.verdict).toBe('test_is_wrong');
+      expect(result.confidence).toBeGreaterThanOrEqual(0.5);
+      expect(result.rationale).toContain('/#/?token=T&mobile=M&lang=ar-sa');
+      expect(result.rationale).toMatch(/suite|codegen/i);
+    });
+
+    it('fires the same way for a "Not found" gate test using the same shallow convention', () => {
+      const result = engine.classify({
+        title: 't',
+        error: NOT_FOUND_ERROR,
+        baseUrl: BASE_URL,
+        specSource: "await page.goto('/#/?token=abc123');",
+      });
+      expect(result.verdict).toBe('test_is_wrong');
+    });
+
+    it('does NOT fire when the goto target already matches the baseUrl convention (e.g. includes /SK/)', () => {
+      const result = engine.classify({
+        title: 't',
+        error: NULL_VALUE_ERROR,
+        baseUrl: BASE_URL,
+        specSource: "await page.goto('/#/SK/home?token=T&mobile=M');",
+      });
+      expect(result.verdict).not.toBe('test_is_wrong');
+    });
+
+    it('does NOT fire when baseUrl is absent', () => {
+      const result = engine.classify({
+        title: 't',
+        error: NULL_VALUE_ERROR,
+        specSource: "await page.goto('/#/?token=T&mobile=M&lang=ar-sa');",
+      });
+      expect(result.verdict).not.toBe('test_is_wrong');
+    });
+
+    it('does NOT fire when specSource is absent (nothing to compare)', () => {
+      const result = engine.classify({
+        title: 't',
+        error: NULL_VALUE_ERROR,
+        baseUrl: BASE_URL,
+      });
+      expect(result.verdict).not.toBe('test_is_wrong');
+    });
+
+    it("does NOT fire when the app's own baseUrl has no required path segment (bare hash root)", () => {
+      const result = engine.classify({
+        title: 't',
+        error: NULL_VALUE_ERROR,
+        baseUrl: 'http://localhost:4202/#/',
+        specSource: "await page.goto('/#/?token=T');",
+      });
+      expect(result.verdict).not.toBe('test_is_wrong');
+    });
+
+    it('does NOT fire when none of the goto() calls carry query params (nothing to compare)', () => {
+      const result = engine.classify({
+        title: 't',
+        error: NOT_FOUND_ERROR,
+        baseUrl: BASE_URL,
+        specSource: "await page.goto('/#/games');",
+      });
+      expect(result.verdict).not.toBe('test_is_wrong');
+    });
+  });
+
   describe('assertion failures', () => {
     it('classifies a content (text) assertion mismatch as app_is_wrong', () => {
       const verdict = verdictFor(

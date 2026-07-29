@@ -47,6 +47,7 @@ import { createTriageEngine } from '../triage/index.js';
 import type { TriageBatchItem, TriageInput, TriageResult } from '../triage/types.js';
 import { summarizeTriageGroups } from '../triage/grouping.js';
 import type { GroupingSummaryUnavailableReason } from '../triage/grouping.js';
+import { correlateBySignature } from '../triage/correlate.js';
 import {
   buildPlanPrompt,
   buildGapFillPlanPrompt,
@@ -2148,6 +2149,7 @@ async function runPipeline(
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
               ...(apiEvidence ? { apiEvidence } : {}),
+              ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;
             try {
@@ -2299,6 +2301,25 @@ async function runPipeline(
             // whole phase being all-or-nothing.
             for (const b of batch) persistTriageResult(b);
           }
+
+          // Deterministic corroboration pass: two failures missing the exact
+          // same element can otherwise land on different verdicts purely
+          // because of which AI batch (or whether any) reviewed them — see
+          // correlateBySignature's own doc comment. Runs once, after all AI
+          // enrichment above has settled, so it sees every failure's FINAL
+          // per-item verdict. Only entries whose verdict actually changed are
+          // re-persisted; everything else keeps the row persistTriageResult
+          // already wrote above.
+          const correlated = correlateBySignature(
+            baseline.map((b) => ({ error: b.r.error ?? '', triage: b.triage })),
+          );
+          baseline.forEach((b, i) => {
+            const next = correlated[i]!.triage;
+            if (next && next !== b.triage) {
+              b.triage = next;
+              persistTriageResult(b);
+            }
+          });
 
           for (const b of baseline) {
             if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });

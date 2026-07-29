@@ -23,6 +23,17 @@ export interface TriageInput {
    * feature.
    */
   apiEvidence?: string;
+  /**
+   * The project's configured/detected base URL (e.g.
+   * `http://localhost:4202/#/SK/home`) — project configuration, not
+   * app-rendered output, so it's cited normally rather than fenced as
+   * untrusted. Lets a rule compare a failing test's OWN `page.goto(...)`
+   * target against the app's real navigation convention (e.g. a required
+   * locale/route segment in the hash) to catch a generated test that never
+   * reaches a real route, rather than inferring an app defect from the
+   * resulting "content never appeared" symptom.
+   */
+  baseUrl?: string;
 }
 
 export interface TriageResult {

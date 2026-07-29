@@ -93,6 +93,23 @@ const RE_CODEGEN_DEFECT =
 const RE_MOCK_ANSWERED = /\[HEALIX MOCK\]/;
 const RE_REAL_ERROR_STATUS = /\[REAL BACKEND\][^\n]*-> status ([45]\d{2})\b/;
 
+// A test's own `page.goto('...')` call targets, read back out of specSource —
+// used to compare against the project's baseUrl navigation convention (see
+// suite_url_convention_mismatch below).
+const RE_GOTO_CALL = /page\.goto\(\s*['"`]([^'"`]+)['"`]/g;
+
+/** The hash-router path portion of a URL (everything between '#' and the first '?', if any), trailing slashes trimmed. Null when there's no '#' at all. */
+function extractHashPath(url: string): string | null {
+  const m = /#(\/[^?]*)/.exec(url);
+  if (!m) return null;
+  const trimmed = m[1].replace(/\/+$/, '');
+  return trimmed === '' ? '/' : trimmed;
+}
+
+function hashPathDepth(path: string): number {
+  return path.split('/').filter(Boolean).length;
+}
+
 // A bare Timeout (action/wait level) that is not already a navigation or
 // selector timeout — treated as environment/slowness.
 const RE_TIMEOUT = /\bTimeout(?:Error)?\b|timed out/i;
@@ -168,28 +185,39 @@ function mk(verdict: Verdict, confidence: number, rationale: string): TriageResu
  *     with a captured 4xx/5xx, combined with the same assertion signature —
  *     concrete, observed proof of a server error, not an inference. Same
  *     ordering rationale as #4.
- *  6. environment   — a down server makes every selector lookup "fail", so it
+ *  6. suite_url_convention_mismatch — the failing test's OWN page.goto(...)
+ *     target (read back from specSource) has a hash path shallower than the
+ *     project's baseUrl requires (e.g. baseUrl has "#/SK/home" but the test
+ *     visits bare "#/?token=..."), while the failure itself looks like
+ *     "content/route never appeared". Real, checkable evidence — a hash that
+ *     doesn't match a real route means the app may never even run its own
+ *     bootstrap logic for that visit — so this is treated as a suite/codegen
+ *     URL-construction defect rather than an app regression. Must run before
+ *     the generic environment/assertion/selector rules below so this more
+ *     specific, corroborated signal isn't swallowed by their generic,
+ *     uncorroborated verdicts.
+ *  7. environment   — a down server makes every selector lookup "fail", so it
  *     must pre-empt the selector rule.
- *  7. redirect_not_followed — expected a 3xx, observed the followed
+ *  8. redirect_not_followed — expected a 3xx, observed the followed
  *     redirect's terminal 200 → the test's own request is missing
  *     `maxRedirects: 0`. Runs BEFORE the generic assertion rule so this
  *     specific, high-confidence test_is_wrong signal isn't swallowed by the
  *     lower-confidence default-ambiguous/app_is_wrong assertion bucket
  *     first (first-match wins).
- *  8. status_code_assertion — a plain toBe/toEqual mismatch where both sides
+ *  9. status_code_assertion — a plain toBe/toEqual mismatch where both sides
  *     look like an HTTP status code (any OTHER status mismatch besides the
  *     3xx-vs-200 case redirect_not_followed already claimed above) — leans
  *     app_is_wrong, since the app returned a status the test didn't expect.
- *  9. assertion     — expect() mismatch; content checks lean app_is_wrong,
+ * 10. assertion     — expect() mismatch; content checks lean app_is_wrong,
  *     everything else is genuinely ambiguous. Runs BEFORE the selector rule
  *     because Playwright assertion-timeout output embeds locator phrases
  *     ("waiting for locator", getBy*) that would otherwise be misclassified as
  *     test_is_wrong.
- * 10. selector      — locator not found / strict-mode → the test is wrong.
+ * 11. selector      — locator not found / strict-mode → the test is wrong.
  *     Suppressed when assertion signals (expect(), Expected/Received,
  *     toHaveText/toBeVisible …) are present.
- * 11. flaky         — visibility/detached/instability.
- * 12. timeout       — residual bare timeouts → environment/slowness.
+ * 12. flaky         — visibility/detached/instability.
+ * 13. timeout       — residual bare timeouts → environment/slowness.
  */
 // Runs FIRST on a "blocked" test's error text — before it even asks "did the
 // setup fixture fail, or were credentials missing" — because execute.ts's own
@@ -278,6 +306,44 @@ const RULES: readonly Rule[] = [
         'app_is_wrong',
         0.8,
         `The captured evidence shows the REAL backend answered this test's own API call with a ${m[1]} status — a concrete, observed server-side error, not an inference from the assertion text alone.`,
+      );
+    },
+  },
+  {
+    id: 'suite_url_convention_mismatch',
+    match(error, _title, input) {
+      // Only worth checking when the failure itself looks like "content/route
+      // never appeared" (an assertion or unresolved-selector symptom) — not a
+      // connection/navigation-level failure, which environment_unreachable
+      // below already owns.
+      if (!RE_ASSERTION_CONTEXT.test(error) && !RE_SELECTOR_NOT_FOUND.test(error)) return null;
+      if (typeof input.baseUrl !== 'string' || typeof input.specSource !== 'string') return null;
+
+      const basePath = extractHashPath(input.baseUrl);
+      // Nothing to compare against unless the app's own baseUrl itself
+      // requires a real path beyond the hash root (e.g. a locale/route
+      // segment like "/SK/home") — a bare "#/" baseUrl has no convention a
+      // test could omit.
+      if (!basePath || hashPathDepth(basePath) < 2) return null;
+
+      const gotoUrls = [...input.specSource.matchAll(RE_GOTO_CALL)].map((m) => m[1]);
+      // Only goto calls that both use the hash router AND carry query params
+      // are relevant — those are the ones a bootstrap/deep-link test uses to
+      // pass token/mobile/lang/route-style params, and where a missing path
+      // segment silently sends the app to a URL its router won't recognize.
+      const withParams = gotoUrls.filter((u) => u.includes('#') && u.includes('?'));
+      if (withParams.length === 0) return null;
+
+      const shallow = withParams.find((u) => {
+        const p = extractHashPath(u);
+        return p !== null && hashPathDepth(p) < hashPathDepth(basePath);
+      });
+      if (!shallow) return null;
+
+      return mk(
+        'test_is_wrong',
+        0.6,
+        `This test navigates via page.goto('${shallow}'), whose hash path omits the route/locale segment(s) the app's own base URL requires (baseUrl "${input.baseUrl}" has hash path "${basePath}"). A hash that doesn't match a real route very plausibly means the app never even runs its param-bootstrap logic for this visit — the "params ignored"/"content never appeared" symptom this test observed is consistent with a suite/codegen URL-construction defect (the generated test omitted a required path segment), not necessarily an app regression. Recommended fix: rebuild this test's goto target to match the working convention used elsewhere in this suite (e.g. "#${basePath}?token=...") before concluding the app itself is broken.`,
       );
     },
   },

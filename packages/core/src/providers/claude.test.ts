@@ -29,7 +29,7 @@ vi.mock('./model-config.js', async (importOriginal) => {
 
 import { runCli, which } from '../exec/run-cli.js';
 import { readModelConfigOverrides } from './model-config.js';
-import { ClaudeProvider, parseClaudeJson } from './claude.js';
+import { ClaudeProvider, parseClaudeJson, parseClaudeStreamJson } from './claude.js';
 
 const readOverridesMock = vi.mocked(readModelConfigOverrides);
 
@@ -120,6 +120,70 @@ describe('parseClaudeJson (tolerant --output-format json parsing)', () => {
   });
 });
 
+describe('parseClaudeStreamJson (tolerant --output-format stream-json JSONL parsing)', () => {
+  const RESULT = {
+    type: 'result',
+    subtype: 'success',
+    is_error: false,
+    result: 'HEALIX_OK',
+    duration_ms: 1234,
+  };
+  const INIT_EVENT = { type: 'system', subtype: 'init', model: 'claude-sonnet-4-5', session_id: 'abc' };
+  const DELTA_EVENT = {
+    type: 'stream_event',
+    event: { type: 'content_block_delta', delta: { text: 'partial' } },
+  };
+
+  it('extracts the final result line, ignoring init/delta progress events before it', () => {
+    const stdout = [JSON.stringify(INIT_EVENT), JSON.stringify(DELTA_EVENT), JSON.stringify(RESULT)].join(
+      '\n',
+    );
+    const parsed = parseClaudeStreamJson(stdout);
+    expect(parsed).toMatchObject({ is_error: false, result: 'HEALIX_OK' });
+  });
+
+  it('parses a single-line result with no preceding stream events (back-compat with blob-shaped fixtures)', () => {
+    const parsed = parseClaudeStreamJson(`${JSON.stringify(RESULT)}\n`);
+    expect(parsed).toMatchObject({ is_error: false, result: 'HEALIX_OK' });
+  });
+
+  it('tolerates an update banner sharing a line with an early progress event', () => {
+    const stdout = [
+      `Update available! 2.1.6 → 2.2.0 ${JSON.stringify(INIT_EVENT)}`,
+      JSON.stringify(RESULT),
+    ].join('\n');
+    expect(parseClaudeStreamJson(stdout)?.result).toBe('HEALIX_OK');
+  });
+
+  it('picks the LAST is_error-carrying line if more than one appears', () => {
+    const stale = { ...RESULT, result: 'stale' };
+    const stdout = [JSON.stringify(stale), JSON.stringify(RESULT)].join('\n');
+    expect(parseClaudeStreamJson(stdout)?.result).toBe('HEALIX_OK');
+  });
+
+  it('handles braces inside string values on a single JSONL line', () => {
+    const tricky = { ...RESULT, result: 'literal } brace { inside a string' };
+    const stdout = [JSON.stringify(INIT_EVENT), JSON.stringify(tricky)].join('\n');
+    expect(parseClaudeStreamJson(stdout)?.result).toBe('literal } brace { inside a string');
+  });
+
+  it('returns null when the stream was cut off before a result event (killed by idle/hard timeout)', () => {
+    const stdout = [JSON.stringify(INIT_EVENT), JSON.stringify(DELTA_EVENT)].join('\n');
+    expect(parseClaudeStreamJson(stdout)).toBeNull();
+  });
+
+  it('falls back to the whole-blob parser for a pretty-printed multi-line JSON object (no JSONL result line)', () => {
+    const stdout = `${JSON.stringify(RESULT, null, 2)}\n`;
+    expect(parseClaudeStreamJson(stdout)?.result).toBe('HEALIX_OK');
+  });
+
+  it('returns null for garbage, empty and truncated output', () => {
+    expect(parseClaudeStreamJson('')).toBeNull();
+    expect(parseClaudeStreamJson('   \n  ')).toBeNull();
+    expect(parseClaudeStreamJson('complete garbage, no json anywhere')).toBeNull();
+  });
+});
+
 describe('ClaudeProvider static shape', () => {
   const provider = new ClaudeProvider();
 
@@ -166,7 +230,7 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
 
     expect(runCliMock).toHaveBeenCalledTimes(1);
     const [, args, callOpts] = runCliMock.mock.calls[0]!;
-    expect(args).toEqual(['-p', '--output-format', 'json']);
+    expect(args).toEqual(['-p', '--output-format', 'stream-json', '--verbose', '--include-partial-messages']);
     expect(args).not.toContain(prompt);
     expect(callOpts?.input).toBe(prompt);
   });
@@ -184,7 +248,15 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     await provider.complete(prompt, { mode: 'plan' });
 
     const [, args, callOpts] = runCliMock.mock.calls[0]!;
-    expect(args).toEqual(['-p', '--output-format', 'json', '--permission-mode', 'plan']);
+    expect(args).toEqual([
+      '-p',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+      '--permission-mode',
+      'plan',
+    ]);
     expect(args).not.toContain(prompt);
     expect(callOpts?.input).toBe(prompt);
   });
@@ -202,7 +274,15 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     await provider.plan(task);
 
     const [, args, callOpts] = runCliMock.mock.calls[0]!;
-    expect(args).toEqual(['-p', '--permission-mode', 'plan', '--output-format', 'json']);
+    expect(args).toEqual([
+      '-p',
+      '--permission-mode',
+      'plan',
+      '--output-format',
+      'stream-json',
+      '--verbose',
+      '--include-partial-messages',
+    ]);
     expect(args).not.toContain(task);
     expect(callOpts?.input).toBe(task);
   });
@@ -232,7 +312,7 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     expect(callOpts?.input).toBe(prompt);
   });
 
-  it('defaults to a 300s timeout when no timeoutMs override is given', async () => {
+  it('defaults to a 25-minute absolute-backstop timeout and a 60s idle timeout when no override is given', async () => {
     runCliMock.mockResolvedValueOnce({
       code: 0,
       stdout: okStdout,
@@ -243,10 +323,11 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     });
     await provider.complete('prompt');
     const [, , callOpts] = runCliMock.mock.calls[0]!;
-    expect(callOpts?.timeoutMs).toBe(300_000);
+    expect(callOpts?.timeoutMs).toBe(25 * 60_000);
+    expect(callOpts?.idleTimeoutMs).toBe(60_000);
   });
 
-  it('honours an explicit timeoutMs override instead of the default', async () => {
+  it('honours an explicit timeoutMs override for the hard backstop, leaving the idle timeout untouched', async () => {
     runCliMock.mockResolvedValueOnce({
       code: 0,
       stdout: okStdout,
@@ -258,6 +339,22 @@ describe('ClaudeProvider.complete / plan — prompt delivery (mocked runCli)', (
     await provider.complete('prompt', { timeoutMs: 42_000 });
     const [, , callOpts] = runCliMock.mock.calls[0]!;
     expect(callOpts?.timeoutMs).toBe(42_000);
+    expect(callOpts?.idleTimeoutMs).toBe(60_000);
+  });
+
+  it('a timed-out completion reports whether the idle or hard timer fired', async () => {
+    runCliMock.mockResolvedValueOnce({
+      code: null,
+      stdout: '',
+      stderr: '',
+      timedOut: true,
+      timeoutKind: 'idle',
+      aborted: false,
+      durationMs: 1,
+    });
+    const res = await provider.complete('prompt');
+    expect(res.ok).toBe(false);
+    expect(res.detail).toContain('no output for 60000ms');
   });
 });
 
@@ -313,6 +410,15 @@ describe('ClaudeProvider — per-task-type model/effort routing', () => {
     await provider.health();
     const [, args] = runCliMock.mock.calls.at(-1)!;
     expect(args).toEqual(expect.arrayContaining(['--model', 'haiku', '--effort', 'low']));
+  });
+
+  it('health() streams via stream-json and arms a 20s idle timeout', async () => {
+    await provider.health();
+    const [, args, callOpts] = runCliMock.mock.calls.at(-1)!;
+    expect(args).toEqual(
+      expect.arrayContaining(['--output-format', 'stream-json', '--verbose', '--include-partial-messages']),
+    );
+    expect(callOpts?.idleTimeoutMs).toBe(20_000);
   });
 
   it('a failed/timed-out completion still surfaces the resolved model/effort', async () => {

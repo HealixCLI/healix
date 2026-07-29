@@ -7,6 +7,13 @@ export interface RunResult {
   stdout: string;
   stderr: string;
   timedOut: boolean;
+  /**
+   * Which timer caused `timedOut`: 'idle' means no stdout/stderr activity
+   * arrived within `idleTimeoutMs`; 'hard' means the absolute `timeoutMs`
+   * ceiling was reached regardless of activity. Undefined when timedOut is
+   * false.
+   */
+  timeoutKind?: 'idle' | 'hard';
   /** True when the caller's AbortSignal fired before the process settled. */
   aborted: boolean;
   durationMs: number;
@@ -14,6 +21,17 @@ export interface RunResult {
 
 export interface RunOptions {
   timeoutMs?: number;
+  /**
+   * Sliding-window (idle) timeout, in ms: the kill timer resets on every
+   * stdout/stderr chunk received, so the process is only killed after this
+   * many ms pass with NO output activity — not after this much total time.
+   * `timeoutMs` still applies unconditionally as an absolute backstop
+   * ceiling (see killTree below), so a call that streams forever without
+   * ever going idle is still bounded. Omit to keep the pre-streaming
+   * behaviour of a single fixed `timeoutMs` timer (every non-streaming
+   * caller — `which`, `--version` probes, etc. — is unaffected by this).
+   */
+  idleTimeoutMs?: number;
   input?: string;
   cwd?: string;
   env?: NodeJS.ProcessEnv;
@@ -91,6 +109,7 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     let stdout = '';
     let stderr = '';
     let timedOut = false;
+    let timeoutKind: 'idle' | 'hard' | undefined;
     let aborted = false;
 
     /**
@@ -117,10 +136,31 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       }
     };
 
-    const timer = setTimeout(() => {
+    // Absolute backstop: fires regardless of activity. This is the ONLY timer
+    // when idleTimeoutMs is omitted, preserving today's fixed-timeout
+    // behaviour byte-for-byte for every non-streaming caller.
+    const hardTimer = setTimeout(() => {
       timedOut = true;
+      timeoutKind = 'hard';
       killTree();
     }, timeoutMs);
+
+    // Sliding-window idle timer: only armed when the caller opts in. Reset on
+    // every stdout/stderr chunk (see the 'data' handlers below) rather than on
+    // parsed JSONL lines — raw byte arrival is a strictly earlier and simpler
+    // liveness signal than "a full line parsed", and it still proves the
+    // process isn't hung even mid-line.
+    let idleTimer: NodeJS.Timeout | undefined;
+    const armIdleTimer = (): void => {
+      if (opts.idleTimeoutMs === undefined) return;
+      if (idleTimer) clearTimeout(idleTimer);
+      idleTimer = setTimeout(() => {
+        timedOut = true;
+        timeoutKind = 'idle';
+        killTree();
+      }, opts.idleTimeoutMs);
+    };
+    armIdleTimer();
 
     // Abort takes the same kill path as a timeout; the eventual 'close' event
     // settles the promise so partial stdout/stderr is still delivered.
@@ -130,10 +170,11 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     };
     opts.signal?.addEventListener('abort', onAbort, { once: true });
 
-    // Single settle point: clear the timer AND detach the abort listener so a
-    // long-lived caller signal doesn't accumulate listeners across runs.
+    // Single settle point: clear both timers AND detach the abort listener so
+    // a long-lived caller signal doesn't accumulate listeners across runs.
     const settle = (res: RunResult): void => {
-      clearTimeout(timer);
+      clearTimeout(hardTimer);
+      if (idleTimer) clearTimeout(idleTimer);
       opts.signal?.removeEventListener('abort', onAbort);
       resolve(res);
     };
@@ -146,9 +187,11 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     child.stderr!.setEncoding('utf8');
     child.stdout!.on('data', (d: string) => {
       stdout += d;
+      armIdleTimer();
     });
     child.stderr!.on('data', (d: string) => {
       stderr += d;
+      armIdleTimer();
     });
     child.on('error', (err) => {
       settle({
@@ -156,6 +199,7 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
         stdout,
         stderr: `${stderr}${String(err)}`,
         timedOut,
+        timeoutKind,
         aborted,
         durationMs: Date.now() - start,
       });
@@ -169,6 +213,7 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
         stdout,
         stderr: aborted ? `${stderr}[aborted]` : stderr,
         timedOut,
+        timeoutKind,
         aborted,
         durationMs: Date.now() - start,
       });

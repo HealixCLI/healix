@@ -10,6 +10,7 @@
  * prompt, parses the fenced-JSON reply robustly, and falls back to `classify`
  * whenever the provider errors, times out, or returns an unparseable reply.
  */
+import { ABSOLUTE_BACKSTOP_MS } from '../providers/types.js';
 import type { ProviderAdapter } from '../providers/types.js';
 import type { UsageRecorder } from '../providers/usage.js';
 import type { TriageBatchItem, TriageEngine, TriageInput, TriageResult } from './types.js';
@@ -24,8 +25,16 @@ import {
 
 export * from './types.js';
 
-/** Provider call budget for a single triage analysis. */
-const ANALYZE_TIMEOUT_MS = 120_000;
+/**
+ * Provider call budget for a single triage analysis — passed as the hard
+ * backstop `timeoutMs` to provider.complete() (the Claude adapter also arms
+ * its own much shorter sliding-window idle timeout on top of this, which is
+ * what actually governs day-to-day). The orchestrator wraps the whole
+ * analyzeBatch()/summarizeTriageGroups() call in its own outer safety net
+ * (TRIAGE_ANALYZE_TIMEOUT_MS in orchestrator/index.ts) which must stay
+ * greater than this value or it preempts this budget entirely.
+ */
+const ANALYZE_TIMEOUT_MS = ABSOLUTE_BACKSTOP_MS;
 
 /**
  * Blend an AI verdict with the deterministic baseline. The AI's verdict,

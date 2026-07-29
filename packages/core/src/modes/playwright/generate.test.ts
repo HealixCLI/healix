@@ -32,7 +32,6 @@ import {
   filterRoutesForItem,
   formatMockContent,
   generate,
-  genBatchTimeoutMs,
   GEN_CHECKPOINT_FILENAME,
   type GenCheckpointEntry,
   ProviderUnavailableError,
@@ -1212,13 +1211,14 @@ describe('generate — batched generation (multiple items per provider call)', (
     expect(specs.map((s) => s.reqTag).sort()).toEqual(['REQ-A', 'REQ-B', 'REQ-C']);
   });
 
-  it('scales the provider call timeout with expected test count instead of the flat single-item budget', async () => {
+  it('uses the same flat absolute-backstop timeout for every batch, regardless of expected test count', async () => {
+    // A hard-cap timeoutMs no longer needs to scale with batch size: the sliding-window idle
+    // timeout (armed inside the provider adapter) is what actually bounds a stalled call, so
+    // every batch — light or heavy — gets the same generous backstop instead of a size-derived one.
     const twoItemPlan: TestPlan = {
       summary: 'two items',
       items: [planItem('a', 'REQ-A'), planItem('b', 'REQ-B')],
     };
-    // Same item count (2) as the plan above, but with more scenarios per item — the timeout
-    // should scale with total expected tests (scenarios summed), not raw item count.
     const heavierPlan: TestPlan = {
       summary: 'two heavier items',
       items: [
@@ -1245,7 +1245,7 @@ describe('generate — batched generation (multiple items per provider call)', (
     const heavyBatchCall = heavierCalls.find((c) => c.prompt.includes('REQ-A') && c.prompt.includes('REQ-B'));
     expect(lightBatchCall?.opts?.timeoutMs).toBeDefined();
     expect(heavyBatchCall?.opts?.timeoutMs).toBeDefined();
-    expect(heavyBatchCall!.opts!.timeoutMs!).toBeGreaterThan(lightBatchCall!.opts!.timeoutMs!);
+    expect(heavyBatchCall!.opts!.timeoutMs!).toBe(lightBatchCall!.opts!.timeoutMs!);
   });
 
   it('never batches items from different tiers into the same provider call', async () => {
@@ -2858,46 +2858,6 @@ describe('generate — grounded against a real indexSource() result (isolated ch
       expect(specs[0].contents).toContain(`[SRC:${unit!.file}]`);
     },
   );
-});
-
-describe('genBatchTimeoutMs', () => {
-  it('scales with total expected tests (scenarios summed), not item count', () => {
-    const oneScenarioEach = [
-      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 1 }),
-      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 1 }),
-    ];
-    const fourScenariosEach = [
-      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 4 }),
-      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 4 }),
-    ];
-    expect(genBatchTimeoutMs(fourScenariosEach)).toBeGreaterThan(genBatchTimeoutMs(oneScenarioEach));
-  });
-
-  it('matches generateOne single-item budget for a lone item with one scenario', () => {
-    // GEN_TIMEOUT_MS (single-item budget) + (1 expected test + 1 buffer) * per-test increment,
-    // capped — for a single one-scenario item this must not silently drift from generateOne's
-    // own flat timeout used by generateBatch's n===1 bypass path.
-    const single = [planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 1 })];
-    const pair = [
-      planItem('a', 'REQ-A', 'tierA-public', { scenarioCount: 1 }),
-      planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 1 }),
-    ];
-    expect(genBatchTimeoutMs(pair)).toBeGreaterThan(genBatchTimeoutMs(single));
-  });
-
-  it('caps the timeout regardless of how many expected tests a batch has', () => {
-    const huge = Array.from({ length: 50 }, (_, i) =>
-      planItem(`id${i}`, `REQ-${i}`, 'tierA-public', { scenarioCount: 10 }),
-    );
-    // GEN_BATCH_TIMEOUT_CAP_MS = 480_000 — a batch this large must saturate the cap, not grow unbounded.
-    expect(genBatchTimeoutMs(huge)).toBe(480_000);
-  });
-
-  it('treats a missing/zero scenarios array as weight 1 per item, matching binPackByScenarioWeight', () => {
-    const zeroScenarioItem: TestPlanItem = { ...planItem('a', 'REQ-A'), scenarios: [] };
-    const oneScenarioItem = planItem('b', 'REQ-B', 'tierA-public', { scenarioCount: 1 });
-    expect(genBatchTimeoutMs([zeroScenarioItem])).toBe(genBatchTimeoutMs([oneScenarioItem]));
-  });
 });
 
 describe('routeClusterKey', () => {

@@ -134,6 +134,68 @@ describe('runCli stdin handling', () => {
   });
 });
 
+describe('runCli idle timeout (sliding window)', () => {
+  it('kills a process that goes quiet, even though it is far from the hard timeoutMs ceiling', async () => {
+    const start = Date.now();
+    // Writes once immediately, then sits doing nothing for 10s on its own —
+    // the idle timer (150ms) must fire long before either the child's own
+    // 10s no-op or the 5s hard backstop.
+    const r = await runCli(
+      process.execPath,
+      ['-e', 'process.stdout.write(String.fromCharCode(97));setTimeout(function(){},10000)'],
+      {
+        timeoutMs: 5_000,
+        idleTimeoutMs: 150,
+      },
+    );
+    expect(r.timedOut).toBe(true);
+    expect(r.timeoutKind).toBe('idle');
+    expect(r.stdout).toBe('a');
+    expect(Date.now() - start).toBeLessThan(4_000);
+  });
+
+  it('kills a continuously-active process once the absolute hard timeoutMs is reached', async () => {
+    const start = Date.now();
+    // Emits a byte every 50ms forever — never idle for longer than the 500ms
+    // idle window, so only the 300ms hard backstop can end this run.
+    const r = await runCli(
+      process.execPath,
+      ['-e', 'setInterval(function(){process.stdout.write(String.fromCharCode(98))},50)'],
+      {
+        timeoutMs: 300,
+        idleTimeoutMs: 500,
+      },
+    );
+    expect(r.timedOut).toBe(true);
+    expect(r.timeoutKind).toBe('hard');
+    expect(r.stdout.length).toBeGreaterThan(0);
+    expect(Date.now() - start).toBeLessThan(2_000);
+  });
+
+  it('lets a normal run complete when it never goes idle and stays under the hard cap', async () => {
+    const r = await runCli(
+      process.execPath,
+      [
+        '-e',
+        'process.stdout.write(String.fromCharCode(97));setTimeout(function(){process.stdout.write(String.fromCharCode(98));process.exit(0)},50)',
+      ],
+      { timeoutMs: 5_000, idleTimeoutMs: 1_000 },
+    );
+    expect(r.timedOut).toBe(false);
+    expect(r.timeoutKind).toBeUndefined();
+    expect(r.stdout).toBe('ab');
+    expect(r.code).toBe(0);
+  });
+
+  it('omitting idleTimeoutMs preserves the single fixed-timeout behaviour', async () => {
+    const r = await runCli(process.execPath, ['-e', 'setTimeout(function(){},10000)'], {
+      timeoutMs: 150,
+    });
+    expect(r.timedOut).toBe(true);
+    expect(r.timeoutKind).toBe('hard');
+  });
+});
+
 describe('extractSemver (--version output parsing)', () => {
   it('extracts from claude-style decorated output', () => {
     expect(extractSemver('2.1.6 (Claude Code)')).toBe('2.1.6');

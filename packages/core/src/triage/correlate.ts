@@ -2,18 +2,26 @@
  * Cross-failure signature correlation — a deterministic post-pass over a
  * run's ALREADY-triaged failures (rule-based + AI-enriched).
  *
- * Neither classify() nor analyze()/analyzeBatch() ever sees more than one
- * failure's OWN evidence at a time, so two failures missing the exact same
- * element can end up with wildly different verdicts/confidence purely
- * because of which batch the AI happened to review them in, or because one
- * hit a provider error/timeout (verdictSource: 'rule_fallback') while its
- * twin got a real AI reply (verdictSource: 'ai_reviewed'). Identical evidence
- * should never produce different verdicts. This pass groups failures by a
- * coarse, deterministic fingerprint
- * of WHAT was missing (a locator description, a data-testid, or a getBy*
- * call), and when a group has a confident, non-ambiguous verdict on ANY
- * member, applies it consistently to every other member of that group that
- * is currently ambiguous or less confident.
+ * Every failure is escalated to AI now (no cap), but two structural gaps
+ * remain: (1) a per-item AI call can still fail (provider error, timeout, an
+ * unparseable reply) and fall back to the rule baseline (verdictSource:
+ * 'rule_fallback'), leaving it under-evidenced even though a sibling with the
+ * IDENTICAL signature got a real, confident AI verdict; (2) batching gives
+ * the model zero visibility across batches, so two failures sharing a
+ * signature but landing in different 5-item batches have no structural
+ * guarantee of agreeing.
+ *
+ * This pass groups failures by a coarse, deterministic fingerprint of WHAT
+ * was missing (a locator description, a data-testid, or a getBy* call), and
+ * when a group has a confident, non-ambiguous verdict on ANY member, applies
+ * it to every OTHER member that is itself still on a rule_fallback verdict.
+ *
+ * Deliberately narrow: an 'ai_reviewed' member is NEVER overridden, even by a
+ * higher-confidence sibling in the same group — two independently-reached AI
+ * verdicts that disagree (e.g. one test_is_wrong @0.6, another app_is_wrong
+ * @0.7) is a real disagreement worth surfacing as-is, not evidence the lower
+ * one was wrong. Only a rule_fallback verdict (which never got a genuine AI
+ * opinion at all) is fair game to rescue with a confident sibling's verdict.
  */
 import type { TriageResult, Verdict } from './types.js';
 
@@ -44,20 +52,26 @@ export interface CorrelationEntry {
   triage: TriageResult | null;
 }
 
-// Never propagate a group's confident verdict onto members whose verdict was
-// already something other than 'ambiguous' at a comparable confidence — this
-// pass is meant to rescue failures the per-item process left under-evidenced,
-// not to overwrite a different, independently-reached verdict.
+// Never propagate a group's confident verdict onto a member that already got
+// a genuine AI opinion — that's an independently-reached verdict, not
+// something under-evidenced, even if its confidence is lower than a
+// sibling's. Only a rule_fallback member (no real AI opinion at all, because
+// the call errored/timed out/returned an unparseable reply) is fair game to
+// rescue with a confident sibling's verdict.
 const CONFIDENT_VERDICTS: readonly Verdict[] = ['test_is_wrong', 'app_is_wrong', 'environment', 'flaky'];
 
 /**
  * Returns a NEW array (input untouched) where any failure sharing a
  * 2+-member signature group with a confident verdict elsewhere in the group
  * has its own verdict/confidence/rationale upgraded to match — only when its
- * own current verdict is 'ambiguous' or strictly less confident than the
- * group's best. Entries with no extractable signature, or whose group has no
- * confident member, pass through with their triage unchanged (same object
- * reference, so callers can cheaply detect "did this one change").
+ * own current verdictSource is 'rule_fallback' (never got a genuine AI
+ * opinion). An 'ai_reviewed' member is NEVER overridden, regardless of how
+ * its confidence compares to the group's best — two independently-reached AI
+ * verdicts that disagree is a real disagreement worth surfacing as-is, not
+ * evidence the lower-confidence one was wrong. Entries with no extractable
+ * signature, or whose group has no confident member, pass through with their
+ * triage unchanged (same object reference, so callers can cheaply detect "did
+ * this one change").
  */
 export function correlateBySignature<T extends CorrelationEntry>(entries: readonly T[]): T[] {
   const groups = new Map<string, T[]>();
@@ -73,14 +87,20 @@ export function correlateBySignature<T extends CorrelationEntry>(entries: readon
   const upgrades = new Map<T, TriageResult>();
   for (const group of groups.values()) {
     if (group.length < 2) continue;
-    const best = group.reduce((a, b) => (b.triage!.confidence > a.triage!.confidence ? b : a));
-    if (!CONFIDENT_VERDICTS.includes(best.triage!.verdict)) continue;
+    // Pick the anchor ONLY among members with a confident verdict — an
+    // ambiguous rule_fallback member can carry a numerically high confidence
+    // score without ever having a real opinion, and must never "win" the
+    // anchor slot and block a group that DOES have a genuine confident
+    // sibling elsewhere.
+    const candidates = group.filter((m) => CONFIDENT_VERDICTS.includes(m.triage!.verdict));
+    if (candidates.length === 0) continue;
+    const best = candidates.reduce((a, b) => (b.triage!.confidence > a.triage!.confidence ? b : a));
 
     const sig = extractFailureSignature(best.error ?? '');
     for (const member of group) {
       if (member === best) continue;
       const current = member.triage!;
-      const isWeaker = current.verdict === 'ambiguous' || current.confidence < best.triage!.confidence;
+      const isWeaker = current.verdictSource === 'rule_fallback';
       if (!isWeaker) continue;
       upgrades.set(member, {
         verdict: best.triage!.verdict,

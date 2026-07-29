@@ -434,7 +434,7 @@ function parseSteps(json: string | null | undefined): StepItem[] {
   }
 }
 
-function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
+export function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow[] {
   const byTestId = new Map<string, TestResult>();
   for (const r of results) byTestId.set(r.testId, r);
   if (tests.length > 0) {
@@ -486,9 +486,9 @@ const STATUS_TILES: ReadonlyArray<{ status: TestStatus; label: string }> = [
   { status: 'skipped', label: 'Skipped' },
 ];
 
-type StatusCounts = Record<TestStatus, number>;
+export type StatusCounts = Record<TestStatus, number>;
 
-function summarizeStatuses(rows: JoinedRow[]): StatusCounts {
+export function summarizeStatuses(rows: JoinedRow[]): StatusCounts {
   const counts: StatusCounts = { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, pending: 0 };
   for (const r of rows) {
     const status = (r.status ?? 'pending') as TestStatus;

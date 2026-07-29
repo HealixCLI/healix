@@ -1,8 +1,7 @@
-import { Fragment, useEffect, useMemo, useRef, useState } from 'react';
+import { Fragment, useEffect, useMemo, useState } from 'react';
 import type { ReactNode } from 'react';
 import type { AgentEvent, TestCase, TestResult, TestStatus, UsageRow } from '@healix/core';
 import {
-  Camera,
   Check,
   ChevronDown,
   ChevronRight,
@@ -37,15 +36,13 @@ import {
   formatStageBreakdown,
   formatTime,
   formatTokens,
-  groupArtifacts,
   runStatusTone,
-  slugMatches,
   sumNullable,
   testStatusTone,
 } from '../lib/run-format';
 import type { StageDuration } from '../lib/run-format';
 
-type DetailTab = 'timeline' | 'results' | 'triage' | 'artifacts' | 'usage';
+type DetailTab = 'timeline' | 'results' | 'triage' | 'usage';
 
 const VERDICT_TONE: Record<string, 'ok' | 'warn' | 'err' | 'muted' | 'default'> = {
   app_is_wrong: 'err',
@@ -79,7 +76,7 @@ export function RunDetailPanel({
   const [note, setNote] = useState<string | null>(null);
   const [statusFilter, setStatusFilter] = useState<TestStatus | 'all'>('all');
   const [historyCaseKey, setHistoryCaseKey] = useState<{ reqTag: string | null; title: string } | null>(null);
-  // Shared across the Results (per-row) and Media tabs so a screenshot opens the same lightbox either way.
+  // Opened from a Results row's own inline evidence (screenshots/recordings).
   const [preview, setPreview] = useState<Preview | null>(null);
 
   const report = useMemo(() => asRunReport(detail?.report ?? null), [detail?.report]);
@@ -112,30 +109,6 @@ export function RunDetailPanel({
   };
 
   const suiteDir = detail?.suiteDir ?? null;
-  const artifacts = useMemo(() => detail?.artifacts ?? [], [detail?.artifacts]);
-  const groups = useMemo(() => groupArtifacts(artifacts), [artifacts]);
-  const mediaCount = useMemo(
-    () => groups.reduce((n, g) => n + g.images.length + g.videos.length, 0),
-    [groups],
-  );
-  // Folders (per-test) that actually contain screenshots/recordings — the
-  // targets a results row can jump to.
-  const mediaFolders = useMemo(
-    () => groups.filter((g) => g.images.length + g.videos.length > 0).map((g) => g.folder),
-    [groups],
-  );
-  // Media group the artifacts tab should scroll to (set by a results-row jump).
-  const [focusFolder, setFocusFolder] = useState<string | null>(null);
-
-  /**
-   * Jump from a results row to the Media tab. The row→folder match is a
-   * best-effort slug heuristic (Playwright slugifies test titles into folder
-   * names); when nothing matches we still switch tabs, landing at the top.
-   */
-  const showMedia = (title: string): void => {
-    setFocusFolder(mediaFolders.find((f) => slugMatches(title, f)) ?? null);
-    setTab('artifacts');
-  };
 
   const reveal = async (target: string): Promise<void> => {
     setBusy('reveal');
@@ -259,7 +232,6 @@ export function RunDetailPanel({
     { value: 'timeline', label: `Timeline · ${detail.events.length}` },
     { value: 'results', label: `Results · ${rows.length}` },
     { value: 'triage', label: `Triage · ${triage.length}` },
-    { value: 'artifacts', label: `Media · ${mediaCount}` },
     ...(SHOW_TOKEN_USAGE ? [{ value: 'usage' as const, label: `Usage · ${usage.length}` }] : []),
   ];
 
@@ -343,15 +315,7 @@ export function RunDetailPanel({
       )}
 
       <div className="mt-3">
-        <Tabs
-          items={TABS}
-          value={tab}
-          onChange={(t) => {
-            // A manual tab switch drops any pending row→media scroll target.
-            setFocusFolder(null);
-            setTab(t);
-          }}
-        />
+        <Tabs items={TABS} value={tab} onChange={setTab} />
       </div>
 
       <div className="mt-3 flex min-h-0 flex-1 flex-col">
@@ -372,8 +336,6 @@ export function RunDetailPanel({
             <div className="min-h-0 flex-1 overflow-auto">
               <ResultsTable
                 rows={filteredRows}
-                mediaFolders={mediaFolders}
-                onShowMedia={showMedia}
                 onShowHistory={(row) => setHistoryCaseKey({ reqTag: row.reqTag, title: row.title })}
                 setPreview={setPreview}
               />
@@ -388,17 +350,6 @@ export function RunDetailPanel({
               </p>
             )}
             <TriageList entries={triage} />
-          </div>
-        )}
-        {tab === 'artifacts' && (
-          <div className="min-h-0 flex-1 overflow-auto">
-            <ArtifactsGallery
-              artifacts={artifacts}
-              suiteDir={suiteDir}
-              runStatus={run.status}
-              focusFolder={focusFolder}
-              setPreview={setPreview}
-            />
           </div>
         )}
         {tab === 'usage' && SHOW_TOKEN_USAGE && (
@@ -613,15 +564,10 @@ function Timeline({ events }: { events: AgentEvent[] }) {
 
 function ResultsTable({
   rows,
-  mediaFolders,
-  onShowMedia,
   onShowHistory,
   setPreview,
 }: {
   rows: JoinedRow[];
-  /** Artifact folders that contain media; drives the per-row camera button. */
-  mediaFolders: string[];
-  onShowMedia: (title: string) => void;
   onShowHistory: (row: JoinedRow) => void;
   setPreview: (p: Preview | null) => void;
 }) {
@@ -649,14 +595,12 @@ function ResultsTable({
           <TableHead>Tier</TableHead>
           <TableHead className="text-right">Duration</TableHead>
           <TableHead className="text-right">Status</TableHead>
-          {/* Row → media jump / history columns (icon only). */}
+          {/* History column (icon only). */}
           <TableHead className="w-16" />
         </TableRow>
       </TableHeader>
       <TableBody>
         {rows.map((r) => {
-          // Best-effort: does any media folder look like this test's slug?
-          const hasMedia = mediaFolders.some((f) => slugMatches(r.title, f));
           const isOpen = expanded.has(r.key);
           return (
             <Fragment key={r.key}>
@@ -714,21 +658,6 @@ function ResultsTable({
                   >
                     <History className="h-3.5 w-3.5" />
                   </Button>
-                  {hasMedia && (
-                    <Button
-                      size="icon"
-                      variant="ghost"
-                      className="h-6 w-6"
-                      title="View screenshots / recordings"
-                      aria-label={`View media for ${r.title}`}
-                      onClick={(e) => {
-                        e.stopPropagation();
-                        onShowMedia(r.title);
-                      }}
-                    >
-                      <Camera className="h-3.5 w-3.5" />
-                    </Button>
-                  )}
                 </TableCell>
               </TableRow>
               {isOpen && (
@@ -845,13 +774,11 @@ function StepListItem({ step }: { step: StepItem }) {
 /**
  * Inline evidence for a single test row's own expanded detail — screenshots,
  * video, and any other captured artifact (trace.zip, error-context.md, …),
- * sourced from this test's own TestResult.artifactsJson rather than the
- * run-wide slug-matching heuristic the Media tab uses, so it's exact
- * regardless of outcome (passed, failed, blocked, or otherwise).
+ * sourced from this test's own TestResult.artifactsJson, present regardless
+ * of outcome (passed, failed, blocked, or otherwise).
  *
- * Unlike the Media tab's `artifacts: string[]` (paths relative to the suite's
- * test-results dir), these come straight from Playwright's own attachment
- * list — already ABSOLUTE paths — so they're used as-is, with no suiteDir join.
+ * These come straight from Playwright's own attachment list — already
+ * ABSOLUTE paths — so they're used as-is, with no suiteDir join.
  */
 function TestCaseEvidence({
   artifacts,
@@ -1071,173 +998,10 @@ function UsagePanel({ usage }: { usage: UsageRow[] }) {
   );
 }
 
-// ---- Artifacts gallery -------------------------------------------------------
-
 interface Preview {
   src: string;
   name: string;
   abs: string;
-}
-
-/**
- * Screenshots and recordings captured by the suite, grouped per test.
- * Images open in a lightbox; videos play inline; everything can be revealed
- * in the file manager. When `focusFolder` is set (a results-row jump), the
- * matching group is scrolled into view on mount.
- */
-function ArtifactsGallery({
-  artifacts,
-  suiteDir,
-  runStatus,
-  focusFolder = null,
-  setPreview,
-}: {
-  artifacts: string[];
-  suiteDir: string | null;
-  runStatus: string;
-  focusFolder?: string | null;
-  setPreview: (p: Preview | null) => void;
-}) {
-  const groups = useMemo(() => groupArtifacts(artifacts), [artifacts]);
-
-  // Scroll the focused group into view (once per focus change / mount).
-  const focusRef = useRef<HTMLElement | null>(null);
-  useEffect(() => {
-    focusRef.current?.scrollIntoView({ block: 'start', behavior: 'smooth' });
-  }, [focusFolder]);
-
-  if (artifacts.length === 0) {
-    const running = !['passed', 'failed', 'blocked', 'error', 'cancelled'].includes(runStatus);
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 py-10 text-center">
-        <Camera className="h-7 w-7 text-muted/50" />
-        <p className="text-sm text-muted">
-          {running
-            ? 'Screenshots and recordings will appear here once tests execute.'
-            : 'No screenshots or recordings were captured for this run.'}
-        </p>
-        {!running && (
-          <p className="max-w-sm text-xs text-muted/70">
-            Runs started before capture-on-success was enabled only kept media for failures. Start a new run
-            to record every test.
-          </p>
-        )}
-      </div>
-    );
-  }
-
-  const absOf = (rel: string): string | null => (suiteDir ? `${suiteDir}/test-results/${rel}` : null);
-
-  return (
-    <>
-      <div className="flex flex-col gap-4">
-        {groups.map((g) => {
-          const hasMedia = g.images.length + g.videos.length > 0;
-          const focused = focusFolder !== null && g.folder === focusFolder;
-          return (
-            <section
-              key={g.folder || '(root)'}
-              ref={
-                focused
-                  ? (el) => {
-                      focusRef.current = el;
-                    }
-                  : undefined
-              }
-              className={cn('rounded-lg border border-border bg-panel/40 p-3', focused && 'border-accent/50')}
-            >
-              <header className="mb-2 flex items-center justify-between gap-2">
-                <span
-                  className="min-w-0 truncate font-mono text-xs text-fg"
-                  title={g.folder || 'Suite output'}
-                >
-                  {g.folder || 'Suite output'}
-                </span>
-                {hasMedia && (
-                  <span className="shrink-0 text-[11px] text-muted">
-                    {g.images.length > 0 && `${g.images.length} screenshot${g.images.length > 1 ? 's' : ''}`}
-                    {g.images.length > 0 && g.videos.length > 0 && ' · '}
-                    {g.videos.length > 0 && `${g.videos.length} recording${g.videos.length > 1 ? 's' : ''}`}
-                  </span>
-                )}
-              </header>
-
-              {g.videos.length > 0 && (
-                <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
-                  {g.videos.map((rel) => {
-                    const abs = absOf(rel);
-                    return abs ? (
-                      <video
-                        key={rel}
-                        src={artifactUrl(abs)}
-                        controls
-                        preload="metadata"
-                        className="w-full rounded-md border border-border bg-black"
-                      />
-                    ) : null;
-                  })}
-                </div>
-              )}
-
-              {g.images.length > 0 && (
-                <div className={cn('grid grid-cols-2 gap-2 sm:grid-cols-3', g.videos.length > 0 && 'mt-2')}>
-                  {g.images.map((rel) => {
-                    const abs = absOf(rel);
-                    if (!abs) return null;
-                    const src = artifactUrl(abs);
-                    return (
-                      <button
-                        key={rel}
-                        type="button"
-                        onClick={() => setPreview({ src, name: artifactLeaf(rel), abs })}
-                        className="group relative overflow-hidden rounded-md border border-border bg-black transition-colors hover:border-accent/60 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-accent"
-                        title={rel}
-                      >
-                        <img
-                          src={src}
-                          alt={artifactLeaf(rel)}
-                          loading="lazy"
-                          className="aspect-video w-full object-cover object-top transition-transform duration-200 group-hover:scale-[1.02]"
-                        />
-                        <span className="absolute inset-x-0 bottom-0 truncate bg-gradient-to-t from-black/80 to-transparent px-2 pb-1 pt-4 text-left text-[10px] text-white/80">
-                          {artifactLeaf(rel)}
-                        </span>
-                      </button>
-                    );
-                  })}
-                </div>
-              )}
-
-              {g.other.length > 0 && (
-                <ul className={cn('flex flex-col', hasMedia && 'mt-2 border-t border-border/50 pt-1')}>
-                  {g.other.map((rel) => {
-                    const abs = absOf(rel);
-                    return (
-                      <li key={rel} className="flex items-center justify-between gap-3 py-1">
-                        <span className="min-w-0 truncate font-mono text-[11px] text-muted" title={rel}>
-                          {artifactLeaf(rel)}
-                        </span>
-                        <Button
-                          size="sm"
-                          variant="ghost"
-                          className="h-6 px-2 text-[11px]"
-                          onClick={() => abs && void window.healix.showItemInFolder(abs)}
-                          disabled={!abs}
-                        >
-                          <FolderOpen className="h-3 w-3" />
-                          Reveal
-                        </Button>
-                      </li>
-                    );
-                  })}
-                </ul>
-              )}
-            </section>
-          );
-        })}
-      </div>
-    </>
-  );
 }
 
 /** Full-screen image preview; closes on click, ✕, or Escape. */

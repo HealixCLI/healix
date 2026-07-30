@@ -270,6 +270,15 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
  */
 export const UNSAFE_CLICK_TEXT_RE =
   /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|add to cart|clear|cancel|odhl[aá]si|odstr[aá]ni|vymaza|zru[sš]i|ulo[zž]i|potvrdi|zaplati/i;
+/** A logo/brand element's accessible name — clicking one is almost always a "go home"
+ * navigation affordance, not a real feature, so it's low value to click-probe on its own.
+ * Worse, observed live (C&A app) to actively corrupt exploration: clicking it inside a
+ * deep-probed reveal resets the whole SPA view rather than undoing just that one click, which
+ * `resetAfterProbe` correctly detects as an unrecoverable mismatch and gives up on — discarding
+ * whatever real candidates were left in that reveal (see docs/click-probe-reset-corruption.md).
+ * Filtering it out here avoids ever paying that cost. Distinct from `UNSAFE_CLICK_TEXT_RE`
+ * above, which is about destructive/mutating actions, not low-value navigation chrome. */
+const LOGO_CLICK_TEXT_RE = /\blogo\b/i;
 /** An accessible name that reads as a login/sign-in action — used both to score crawled login
  * candidates (see `scoreLoginCandidates`) and, during click-probing, to recognize a same-URL
  * toggle that reveals a login view (see `discoverClickRoutes`). */
@@ -374,6 +383,7 @@ function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
       .filter((el) => !el.disabled)
       .filter((el) => el.buttonType !== 'submit')
       .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
+      .filter((el) => !LOGO_CLICK_TEXT_RE.test(el.name))
       .filter((el) => el.role !== 'generic' || el.name.length <= GENERIC_CANDIDATE_NAME_MAX_LENGTH)
       .slice(0, CLICK_CANDIDATES_PER_PAGE)
   );

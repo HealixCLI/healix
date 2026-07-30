@@ -458,6 +458,25 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toContain(safe.selector);
   });
 
+  it('never click-probes a logo/brand element — a "go home" affordance, not a real feature', async () => {
+    // Observed live (C&A app): clicking a "logo" candidate inside a deep-probed reveal resets
+    // the whole SPA view rather than undoing just that one click, which resetAfterProbe
+    // correctly detects as unrecoverable and gives up on — discarding whatever real candidates
+    // were left in that reveal. Filtering it out here avoids ever paying that cost.
+    const logo = button('logo');
+    const safe = button('Moje kupóny');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [logo, safe] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/dashboard');
+
+    expect(recordClicks).not.toContain(logo.selector);
+    expect(recordClicks).toContain(safe.selector);
+  });
+
   it('STILL click-probes "zmeniť" (change/edit) — it reveals a form rather than mutating anything', async () => {
     // The counterpart to the test above: over-blocking here would re-hide exactly the
     // profile-edit states GAP-060's reveal detection exists to capture. The form's own submit is

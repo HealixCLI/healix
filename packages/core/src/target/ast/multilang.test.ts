@@ -67,6 +67,54 @@ describe('extractMultiLangEndpoints', () => {
     expect(units.map((u) => u.key)).toContain('endpoint:GET /users');
   });
 
+  it('extracts Java Spring Boot REST controllers: class-level @RequestMapping + method-level mapping annotations', () => {
+    const source = `
+      @RestController
+      @RequestMapping("/api/todos")
+      public class TodoController {
+
+          @GetMapping
+          public List<TodoResponse> listTodos(Authentication authentication) { }
+
+          @PostMapping
+          public ResponseEntity<TodoResponse> createTodo(@RequestBody TodoRequest request) { }
+
+          @DeleteMapping("/{id}")
+          public ResponseEntity<Void> deleteTodo(@PathVariable Long id) { }
+      }
+    `;
+    const units = extractMultiLangEndpoints('TodoController.java', source);
+    const keys = units.map((u) => u.key);
+    // Bare @GetMapping/@PostMapping (no path) map to the class's own base path.
+    expect(keys).toContain('endpoint:GET /api/todos');
+    expect(keys).toContain('endpoint:POST /api/todos');
+    expect(keys).toContain('endpoint:DELETE /api/todos/{id}');
+  });
+
+  it('extracts Java Spring Boot method-level @RequestMapping(method = RequestMethod.X, ...)', () => {
+    const source = `
+      @RestController
+      @RequestMapping("/api/legacy")
+      public class LegacyController {
+
+          @RequestMapping(value = "/ping", method = RequestMethod.GET)
+          public String ping() { return "pong"; }
+      }
+    `;
+    const units = extractMultiLangEndpoints('LegacyController.java', source);
+    expect(units.map((u) => u.key)).toContain('endpoint:GET /api/legacy/ping');
+  });
+
+  it('returns an empty array for a Java file with no @RestController/@Controller (a DTO/model/repository)', () => {
+    const source = `
+      public class TodoRequest {
+          private String title;
+          public String getTitle() { return title; }
+      }
+    `;
+    expect(extractMultiLangEndpoints('TodoRequest.java', source)).toEqual([]);
+  });
+
   it('returns an empty array for an unrecognized extension', () => {
     expect(extractMultiLangEndpoints('README.md', '@app.route("/x")')).toEqual([]);
   });
@@ -114,6 +162,48 @@ describe.skipIf(!fs.existsSync(FLASK_APP_PY))(
       expect(keys).toContain('endpoint:GET /delete/<int:id>');
       expect(keys).toContain('endpoint:POST /update/<int:id>');
       expect(keys).toContain('endpoint:GET /update/<int:id>');
+    });
+  },
+);
+
+// Root-cause regression for a real gap found via manual coverage-loop testing: a Java/Spring Boot
+// backend (TODOAPP) produced ZERO functionality units, permanently disabling the coverage loop for
+// it regardless of the configured target — `.java` had no extractor at all until this fix.
+const TODOAPP_AUTH_CONTROLLER = path.join(
+  'C:',
+  'Users',
+  'GarimaKhatiyan',
+  'OneDrive - ZapCom Solutions Pvt. ltd',
+  'Desktop',
+  'TODOAPP',
+  'backend',
+  'src',
+  'main',
+  'java',
+  'com',
+  'healixtest',
+  'todoapp',
+  'controller',
+  'AuthController.java',
+);
+const TODOAPP_TODO_CONTROLLER = path.join(path.dirname(TODOAPP_AUTH_CONTROLLER), 'TodoController.java');
+
+describe.skipIf(!fs.existsSync(TODOAPP_AUTH_CONTROLLER))(
+  'extractMultiLangEndpoints against TODOAPP/backend (isolated check, real Spring Boot fixture)',
+  () => {
+    it('extracts every real endpoint from AuthController.java and TodoController.java', () => {
+      const authUnits = extractMultiLangEndpoints('AuthController.java', fs.readFileSync(TODOAPP_AUTH_CONTROLLER, 'utf-8'));
+      const todoUnits = extractMultiLangEndpoints(
+        'TodoController.java',
+        fs.readFileSync(TODOAPP_TODO_CONTROLLER, 'utf-8'),
+      );
+      const keys = [...authUnits, ...todoUnits].map((u) => u.key);
+
+      expect(keys).toContain('endpoint:POST /api/auth/register');
+      expect(keys).toContain('endpoint:POST /api/auth/login');
+      expect(keys).toContain('endpoint:GET /api/todos');
+      expect(keys).toContain('endpoint:POST /api/todos');
+      expect(keys).toContain('endpoint:DELETE /api/todos/{id}');
     });
   },
 );

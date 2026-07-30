@@ -34,11 +34,23 @@ import type {
 import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '../browser/types.js';
 
 /**
- * Retry-pass (results-page "regenerate only the gaps" action): RunOptions.retryItemIds
- * narrows planning to reuse ONLY the named ids from the base run's own plan.json,
- * skipping AI planning entirely — generation's existing base-run diff then
- * naturally regenerates just those items. Offline DI seam, same pattern as
- * orchestrator.topup.test.ts.
+ * This file covers two DISTINCT mechanisms, per the KB-driven redesign
+ * (docs/design/retry-pass-coverage-kb-redesign.md §3b):
+ *
+ * 1. Repair (RunOptions.retryItemIds): narrows planning to reuse ONLY the
+ *    named ids from the base run's own plan.json, skipping AI planning
+ *    entirely, via a NEW `suiteMode: 'topup'` run — generation's existing
+ *    base-run diff then naturally regenerates just those items. This is the
+ *    OLD Retry-pass mechanism, kept exactly as-is because Repair still
+ *    depends on it (`topup.ts`'s `forceRegenerate` — "the escape hatch
+ *    Repair (and, degenerately, Retry-pass) need") — zero code changes here,
+ *    only test relabeling for the tests that used to describe this as
+ *    "Retry-pass" before the redesign.
+ * 2. Retry-pass (orchestrator.retryPass(runId)): the NEW same-run Knowledge
+ *    Base mechanism — no new run row, no base_run_id. Its own describe block
+ *    is further down this file.
+ *
+ * Offline DI seam throughout, same pattern as orchestrator.topup.test.ts.
  */
 
 const SEED_ITEMS = [
@@ -102,7 +114,13 @@ function makeFakeMode(generateCalls: TestPlan[], dropReqTags: ReadonlySet<string
       generateCalls.push(plan);
       const specs: GeneratedSpec[] = [];
       for (const item of plan.items) {
-        if (item.reqTag && dropReqTags.has(item.reqTag)) continue;
+        if (item.reqTag && dropReqTags.has(item.reqTag)) {
+          // Mirrors real generate.ts's recordGenOutcome: this fake bypasses
+          // it entirely, so it has to fire the KB callback itself — the
+          // Knowledge Base's dropped/generated tracking depends on it.
+          ctx.onKbItemOutcome?.(item.id, 'dropped');
+          continue;
+        }
         // Mirrors generate.ts's real fallback (`item.reqTag ?? item.id`) — a
         // reqTag-less item still needs a stable, unique-per-item spec.reqTag
         // for this-run's own file naming/bookkeeping, even though it must
@@ -132,7 +150,9 @@ function makeFakeMode(generateCalls: TestPlan[], dropReqTags: ReadonlySet<string
           reqTag: specReqTag,
           tier: item.tier,
           contents,
+          planItemId: item.id,
         });
+        ctx.onKbItemOutcome?.(item.id, 'generated');
       }
       return specs;
     },
@@ -255,8 +275,8 @@ async function readPlan(projectId: string, runId: string): Promise<TestPlan> {
   return JSON.parse(raw) as TestPlan;
 }
 
-describe('retry-pass (RunOptions.retryItemIds)', () => {
-  it('regenerates exactly the requested gap item(s), with full AI planning NOT invoked', async () => {
+describe('Repair (RunOptions.retryItemIds — the OLD mechanism, unchanged; retry-pass no longer uses it)', () => {
+  it('regenerates exactly the requested gap item(s) via a new topup run, with full AI planning NOT invoked', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Retry Pass Demo',
@@ -450,8 +470,8 @@ describe('retry-pass (RunOptions.retryItemIds)', () => {
     expect(store.listTests(run2.runId)).toHaveLength(2);
   });
 
-  it('a run that errors out mid-EXECUTE leaves already-generated rows genuinely "pending" (precondition for retry-pass)', async () => {
-    // Retry-pass must catch not just plan items with NO test row at all, but
+  it('a run that errors out mid-EXECUTE leaves already-generated rows genuinely "pending" (precondition the new retry-pass KB relies on)', async () => {
+    // The KB must mirror not just plan items with NO test row at all, but
     // also ones that got a spec generated and registered, then never
     // actually executed because the run crashed during EXECUTE before
     // index.ts's deleteUnexecutedTests cleanup could run (that cleanup only
@@ -558,13 +578,13 @@ describe('retry-pass (RunOptions.retryItemIds)', () => {
     expect(new Set(run2Tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-A', 'REQ-B', 'REQ-C']));
   });
 
-  it('MULTI-SCENARIO CARRY-FORWARD, REQTAG-LESS: a reqTag-less item merely carried forward during Retry-pass keeps all its scenario rows (regression)', async () => {
-    // Retry-pass carries every NON-targeted item forward through the exact
+  it('MULTI-SCENARIO CARRY-FORWARD, REQTAG-LESS: a reqTag-less item merely carried forward during Repair keeps all its scenario rows (regression)', async () => {
+    // Repair carries every NON-targeted item forward through the exact
     // same hydrateCarriedSpecs/registerSpecRows path real Top-up uses (see
     // orchestrator.topup.test.ts's own REQTAG-LESS regression test for the
     // full mechanism). This locks down that a reqTag-less, multi-scenario item
     // NOT targeted by retryItemIds doesn't collapse to 1 row when a DIFFERENT
-    // item is the one actually being repaired/regenerated — Retry-pass is a
+    // item is the one actually being repaired/regenerated — Repair is a
     // distinct caller of the same carry-forward code, worth covering on its own.
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
@@ -661,5 +681,372 @@ describe('retry-pass (RunOptions.retryItemIds)', () => {
     } finally {
       rmSync(runDir, { recursive: true, force: true });
     }
+  });
+});
+
+describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowledge Base mechanism)', () => {
+  it('regenerates a dropped item on the SAME run — no new run row, KB flips dropped -> generated', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Same-run Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // ---- Initial run: generation silently drops REQ-B. ----
+    const run1GenerateCalls: TestPlan[] = [];
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run1GenerateCalls, new Set(['REQ-B'])),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+    expect(store.listTests(run1.runId)).toHaveLength(2);
+    expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(1);
+
+    // ---- Retry-pass on the SAME runId: no drops this time, REQ-B succeeds. ----
+    const run2GenerateCalls: TestPlan[] = [];
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.status).toBe('passed');
+    // Same runId — no new run row was ever created.
+    expect(summary.runId).toBe(run1.runId);
+    expect(store.listRuns(project.id)).toHaveLength(1);
+
+    // generate() was invoked with exactly the one previously-dropped item.
+    expect(run2GenerateCalls.flatMap((p) => p.items).map((i) => i.reqTag)).toEqual(['REQ-B']);
+
+    const tests = store.listTests(run1.runId);
+    expect(new Set(tests.map((t) => t.reqTag))).toEqual(new Set(['REQ-A', 'REQ-B', 'REQ-C']));
+    expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(0);
+  });
+
+  it('executes a pending (generated-but-never-run) scenario WITHOUT regenerating it', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Pending Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const CRASH_ITEMS = [
+      { title: 'Home loads', reqTag: 'REQ-A', tier: 'tierA-public', intent: 'Landing renders.' },
+    ];
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([], CRASH_ITEMS),
+      getMode: () => makeCrashingFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('error');
+    const beforeTests = store.listTests(run1.runId);
+    expect(beforeTests).toHaveLength(1);
+    expect(beforeTests[0].status).toBe('pending');
+    expect(store.listPendingPlanKbScenarios(run1.runId)).toHaveLength(1);
+    expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(0);
+
+    // ---- Retry-pass: the row is 'pending', not 'dropped' — generate() must NOT be called for it. ----
+    const run2GenerateCalls: TestPlan[] = [];
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.status).toBe('passed');
+    expect(run2GenerateCalls.flatMap((p) => p.items)).toHaveLength(0);
+
+    const afterTests = store.listTests(run1.runId);
+    expect(afterTests).toHaveLength(1);
+    expect(afterTests[0].status).toBe('passed');
+    expect(store.listPendingPlanKbScenarios(run1.runId)).toHaveLength(0);
+  });
+
+  it("returns retryPassResult: 'nothing-to-retry' and does no work when the KB has nothing outstanding", async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Nothing To Retry Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([]), // no drops
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    const run2GenerateCalls: TestPlan[] = [];
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.retryPassResult).toBe('nothing-to-retry');
+    expect(run2GenerateCalls).toHaveLength(0);
+    // Status is left exactly as it was — retryPass took no action at all.
+    expect(summary.status).toBe(run1.status);
+  });
+
+  it("reuses the original run's testingScope from run-config.json instead of defaulting it", async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Config Reuse Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([], new Set(['REQ-B'])), // drop REQ-B so there's something to retry
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true, testingScope: 'frontend' });
+    expect(run1.status).toBe('passed');
+
+    const seenScopes: Array<string | undefined> = [];
+    const captureMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        seenScopes.push(ctx.testingScope);
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(ctx, specs) {
+        return makeFakeMode([]).execute(ctx, specs);
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => captureMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.status).toBe('passed');
+    // Never defaulted to 'both' — the ORIGINAL run's 'frontend' scope survived.
+    expect(seenScopes).toEqual(['frontend']);
+  });
+
+  it('triages a NEWLY-failing regenerated item and includes the verdict in the refreshed report (old verdicts untouched)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Fresh Triage Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // ---- Initial run: REQ-B dropped, everything else passes. ----
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([], new Set(['REQ-B'])),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    expect(store.listTriageResults(run1.runId)).toHaveLength(0);
+
+    // ---- Retry-pass: REQ-B regenerates successfully but FAILS on execution — a genuinely new failure. ----
+    const failingMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = specs.map((s) => ({
+          title: s.title,
+          status: (s.reqTag === 'REQ-B' ? 'failed' : 'passed') as 'failed' | 'passed',
+          durationMs: 1,
+          ...(s.reqTag === 'REQ-B' ? { error: 'expect(locator).toBeVisible() failed' } : {}),
+        }));
+        return {
+          passed: results.filter((r) => r.status === 'passed').length,
+          failed: results.filter((r) => r.status === 'failed').length,
+          blocked: 0,
+          flaky: 0,
+          results,
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => failingMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.status).toBe('failed');
+    const triageRows = store.listTriageResults(run1.runId);
+    expect(triageRows).toHaveLength(1);
+    // No AI reply configured on this fake provider, so analyze() falls back
+    // to the deterministic rule baseline — still a real, persisted verdict,
+    // which is exactly what this test needs to prove the wiring works.
+    expect(triageRows[0]!.verdict).toBeTruthy();
+
+    const report = JSON.parse(
+      await readFile(join(dataDir, 'projects', project.id, 'runs', run1.runId, 'reports', 'report.json'), 'utf-8'),
+    ) as { triage: Array<{ title: string }> };
+    expect(report.triage).toHaveLength(1);
+  });
+
+  it('two items sharing the same reqTag (e.g. a UI-tier item and its tierC-api contract counterpart) both get KB-linked correctly, not just whichever comes first (regression)', async () => {
+    // Root-cause regression for a real bug found via manual testing: a real
+    // plan legitimately pairs a UI-tier item and a tierC-api item under the
+    // SAME functional reqTag. registerSpecRows used to resolve "which plan
+    // item does this spec belong to" purely by reqTag string, which silently
+    // picked whichever of the two items came first in the list — the other
+    // item's scenarios never got linkPlanKbScenarioTest called on them at all,
+    // leaving them stuck at KB status 'pending' with testId permanently null,
+    // even though their real Playwright tests executed fine. The fix threads
+    // GeneratedSpec.planItemId (set by generate.ts, which always knows exactly
+    // which item it's processing) through to registerSpecRows so it resolves
+    // the exact originating item instead of guessing.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'ReqTag Collision Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const COLLIDING_ITEMS = [
+      {
+        title: 'User registration via UI',
+        reqTag: 'REQ-001',
+        tier: 'tierA-public',
+        intent: 'UI registration flow.',
+        scenarios: [{ kind: 'positive', description: 'succeeds with valid input' }],
+      },
+      {
+        title: 'POST /api/auth/register API contract',
+        reqTag: 'REQ-001',
+        tier: 'tierC-api',
+        intent: 'API contract for registration.',
+        scenarios: [{ kind: 'positive', description: 'returns 200 with a token' }],
+      },
+    ];
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([], COLLIDING_ITEMS),
+      getMode: () => makeFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+
+    const kbItems = store.listPlanKbItems(run1.runId);
+    expect(kbItems).toHaveLength(2);
+    expect(kbItems.every((it) => it.status === 'generated')).toBe(true);
+
+    const kbScenarios = store.listPlanKbScenarios(run1.runId);
+    expect(kbScenarios).toHaveLength(2);
+    // BOTH items' scenarios got linked to a real test row and reflect their
+    // actual execution outcome — neither is silently stuck at 'pending'.
+    for (const kbItem of kbItems) {
+      const scenario = kbScenarios.find((s) => s.kbItemId === kbItem.id);
+      expect(scenario).toBeDefined();
+      expect(scenario!.testId).not.toBeNull();
+      expect(scenario!.status).toBe('passed');
+    }
+  });
+
+  it('a spec quarantined by the LATER validate() step (not generate.ts\'s own checks) gets the KB corrected to dropped, so retry-pass can regenerate it (regression)', async () => {
+    // Root-cause regression for a real bug found via manual testing on a real
+    // app: generate.ts's own per-item checks can accept a spec — recording the
+    // item 'generated' via ctx.onKbItemOutcome — that STILL fails the separate,
+    // LATER mode.validate() parse-check (a genuine codegen defect the
+    // regex/string gates can't catch; see index.ts's "Pre-execution validation
+    // gate" comment). Before this fix, the KB never learned about that later
+    // rejection: the item stayed stuck at 'generated'/'pending' forever, since
+    // registerSpecRows (and therefore linkPlanKbScenarioTest) is never called
+    // for a quarantined spec — retry-pass had no dropped item to regenerate,
+    // and no linked test row to execute either. A permanent, silent dead end.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Quarantine KB Correction Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    function quarantiningMode(generateCalls: TestPlan[]): TestMode {
+      const base = makeFakeMode(generateCalls);
+      return {
+        ...base,
+        async validate(_ctx, specs) {
+          const quarantined = specs.filter((s) => s.reqTag === 'REQ-B');
+          const ok = specs.filter((s) => s.reqTag !== 'REQ-B');
+          return {
+            ok,
+            repaired: [],
+            quarantined: quarantined.map((spec) => ({
+              spec,
+              reason: 'simulated codegen defect',
+              category: 'codegen-defect' as const,
+            })),
+            warnings: [],
+          };
+        },
+      };
+    }
+
+    // ---- Initial run: REQ-B's spec is "accepted" by generate() but quarantined by validate(). ----
+    const run1GenerateCalls: TestPlan[] = [];
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => quarantiningMode(run1GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+    // REQ-B never got a test row at all — registerSpecRows never ran for it.
+    const run1Tests = store.listTests(run1.runId);
+    expect(run1Tests.some((t) => t.reqTag === 'REQ-A')).toBe(true);
+    expect(run1Tests.some((t) => t.reqTag === 'REQ-B')).toBe(false);
+    // The KB correctly reflects the quarantine as a drop, not stuck at 'generated'/'pending'.
+    expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(1);
+    expect(store.listPendingPlanKbScenarios(run1.runId)).toHaveLength(0);
+
+    // ---- Retry-pass: REQ-B is now a real dropped item, so it actually gets regenerated. ----
+    const run2GenerateCalls: TestPlan[] = [];
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode(run2GenerateCalls),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.status).toBe('passed');
+    expect(run2GenerateCalls.flatMap((p) => p.items).map((i) => i.reqTag)).toEqual(['REQ-B']);
+    expect(store.listTests(run1.runId).some((t) => t.reqTag === 'REQ-B')).toBe(true);
+    expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(0);
   });
 });

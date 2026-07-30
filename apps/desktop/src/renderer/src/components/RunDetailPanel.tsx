@@ -58,18 +58,30 @@ export function RunDetailPanel({
   loading,
   onSelectRun,
   onRetryPass,
+  onRepair,
 }: {
   detail: RunDetail | null;
   loading: boolean;
   /** Jump to a different run (e.g. from the Test Case History drawer). Omit to disable those jumps. */
   onSelectRun?: (runId: string) => void;
   /**
-   * Start a targeted regeneration run (Retry-pass/Repair): given a ready
-   * StartRunArgs (suiteMode 'topup', baseRunId this run, retryItemIds set),
-   * the caller runs it through the same start-or-queue path as any other
-   * run. Omit to hide the Retry-pass/Repair buttons entirely.
+   * Trigger same-run Retry-pass for this run: regenerates whatever the
+   * Knowledge Base flags as dropped, executes everything still pending, and
+   * refreshes this run's report/coverage in place — no new run row (see
+   * docs/design/retry-pass-coverage-kb-redesign.md). The caller just needs
+   * to start tracking this SAME runId's live events; unlike onRepair below,
+   * there's no StartRunArgs to build anymore. Omit to hide the Retry-pass button.
    */
-  onRetryPass?: (args: StartRunArgs) => void;
+  onRetryPass?: (runId: string) => void;
+  /**
+   * Start a targeted regeneration run for Repair: given a ready StartRunArgs
+   * (suiteMode 'topup', baseRunId this run, retryItemIds set), the caller
+   * runs it through the same start-or-queue path as any other run. Repair is
+   * intentionally NOT migrated to the same-run Retry-pass mechanism (see
+   * docs/design/retry-pass-coverage-kb-redesign.md §3b) — it still mints a
+   * new topup run. Omit to hide the Repair button.
+   */
+  onRepair?: (args: StartRunArgs) => void;
 }) {
   const [tab, setTab] = useState<DetailTab>('timeline');
   const [busy, setBusy] = useState<'reveal' | 'export' | 'retry' | 'repair' | null>(null);
@@ -157,22 +169,12 @@ export function RunDetailPanel({
     setBusy('retry');
     setNote(null);
     try {
-      const gaps = await window.healix.generationGaps(detail.run.id);
-      if (gaps.length === 0) {
-        setNote('Nothing to retry — every planned item already has a generated, executed test.');
-        return;
-      }
-      onRetryPass({
-        projectId: detail.run.projectId,
-        testingScope: detail.runConfig?.testingScope,
-        provider: detail.runConfig?.provider,
-        suiteMode: 'topup',
-        baseRunId: detail.run.id,
-        autoApprove: true,
-        retryItemIds: gaps.map((g) => g.id),
-      });
-    } catch (err) {
-      setNote(err instanceof Error ? err.message : String(err));
+      // The "is there anything to retry" check is now server-side, inside
+      // retryPassPipeline itself (it has to be — it's the thing that knows
+      // whether the Knowledge Base has any dropped/pending rows) — this
+      // button just fires the request and lets onRetryPass start tracking
+      // this SAME runId's live events, same as a normal run.
+      onRetryPass(detail.run.id);
     } finally {
       setBusy(null);
     }
@@ -187,7 +189,7 @@ export function RunDetailPanel({
    * with triage verdicts as the candidate source instead of generation gaps.
    */
   const startRepair = async (): Promise<void> => {
-    if (!onRetryPass || !detail?.run) return;
+    if (!onRepair || !detail?.run) return;
     setBusy('repair');
     setNote(null);
     try {
@@ -196,7 +198,7 @@ export function RunDetailPanel({
         setNote('Nothing to repair — no tests were triaged "test is wrong" for this run.');
         return;
       }
-      onRetryPass({
+      onRepair({
         projectId: detail.run.projectId,
         testingScope: detail.runConfig?.testingScope,
         provider: detail.runConfig?.provider,
@@ -282,11 +284,11 @@ export function RunDetailPanel({
               title="Regenerate only the plan items from this run that never got a test, or never got executed"
             >
               <RotateCcw className="h-4 w-4" />
-              {busy === 'retry' ? 'Checking…' : 'Retry-pass'}
+              {busy === 'retry' ? 'Retrying…' : 'Retry-pass'}
             </Button>
           )}
           {/* Held back for a later release — see feature-flags.ts's SHOW_REPAIR_ACTION doc comment. */}
-          {onRetryPass && SHOW_REPAIR_ACTION && (
+          {onRepair && SHOW_REPAIR_ACTION && (
             <Button
               size="sm"
               variant="outline"
@@ -547,6 +549,12 @@ function TestSummary({
         value={formatDuration(totalTimeMs)}
         title={stageDurations.length > 0 ? formatStageBreakdown(stageDurations) : undefined}
       />
+      {/* Coverage-feedback loop has no UI entry point anymore (see RunsView.tsx)
+          — this tile is intentionally never rendered now, even for a
+          historical run that does carry real report.coverage data (from
+          before the toggle was removed, or a non-UI caller), so the Results
+          tab doesn't surface a concept the UI no longer lets the user
+          configure at all. */}
     </StatTileRow>
   );
 }

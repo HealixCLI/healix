@@ -160,6 +160,8 @@ export interface RunSummary {
   reportPath?: string;
   suite?: SuiteBundle;
   outcome?: ExecOutcome;
+  /** Set only by retryPass() when the Knowledge Base found nothing dropped/pending for this run — no work was done. */
+  retryPassResult?: 'nothing-to-retry';
 }
 
 /**
@@ -179,6 +181,15 @@ export interface Orchestrator {
    * has no checkpoint (nothing to resume from).
    */
   resume(runId: string, hooks?: OrchestratorHooks, signal?: AbortSignal): Promise<RunSummary>;
+  /**
+   * On-demand, same-run recovery: regenerate whatever the Knowledge Base
+   * flags as 'dropped', execute everything still 'pending', and refresh the
+   * run's report/coverage in place — no new run row is created, and the
+   * run's original testingScope/provider/PRD/coverage settings are reused
+   * from run-config.json rather than defaulted. See
+   * docs/design/retry-pass-coverage-kb-redesign.md.
+   */
+  retryPass(runId: string, hooks?: OrchestratorHooks, signal?: AbortSignal): Promise<RunSummary>;
 }
 
 /**

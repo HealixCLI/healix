@@ -139,6 +139,42 @@ export interface TestCase {
   specCode: string | null;
 }
 
+/** Item-level Knowledge Base status — whether GENERATE ever produced (and accepted) a spec for this plan item. */
+export type KbItemStatus = 'planned' | 'generated' | 'dropped';
+/** Scenario-level KB status — starts the same as its item, then tracks its own real execution outcome once one exists. */
+export type KbScenarioStatus = 'planned' | 'generated' | 'dropped' | TestStatus;
+
+/** One row per plan item, durably tracking whether GENERATE produced a spec for it — see docs/design/retry-pass-coverage-kb-redesign.md. */
+export interface PlanKbItem {
+  id: string;
+  runId: string;
+  /** TestPlanItem.id (pli_...) from this run's plan.json — the join key back to full plan-item content. */
+  planItemId: string;
+  title: string;
+  reqTag: string | null;
+  tier: Tier | null;
+  status: KbItemStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One child row per scenario of a PlanKbItem — see docs/design/retry-pass-coverage-kb-redesign.md. */
+export interface PlanKbScenario {
+  id: string;
+  kbItemId: string;
+  /** Denormalized from the parent item, for direct by-run queries without a join. */
+  runId: string;
+  /** Position within TestPlanItem.scenarios[] — matches registerSpecRows' own positional `${base}#${i}` keying. */
+  scenarioIndex: number;
+  kind: string;
+  description: string;
+  status: KbScenarioStatus;
+  /** Set once registerSpecRows creates the matching tests row; null until then, or for a still-dropped item. */
+  testId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TestResult {
   id: string;
   testId: string;

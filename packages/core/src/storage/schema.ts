@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 16;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -118,6 +118,7 @@ CREATE TABLE IF NOT EXISTS triage_results (
   confidence      REAL NOT NULL,
   rationale       TEXT NOT NULL,
   suggested_patch TEXT,
+  verdict_source  TEXT,
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
 );
 

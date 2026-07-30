@@ -581,14 +581,12 @@ async function discoverClickRoutes(
     }
   }
 
-  const unattemptedClickCandidates = candidates
-    .slice(attempted)
-    .map((c) => ({
-      selector: c.selector,
-      name: c.name,
-      selectorTier: c.selectorTier,
-      repeatedRowText: c.repeatedRowText,
-    }));
+  const unattemptedClickCandidates = candidates.slice(attempted).map((c) => ({
+    selector: c.selector,
+    name: c.name,
+    selectorTier: c.selectorTier,
+    repeatedRowText: c.repeatedRowText,
+  }));
 
   return {
     attempted,

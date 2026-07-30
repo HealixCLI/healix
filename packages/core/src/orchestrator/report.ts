@@ -267,6 +267,21 @@ const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
   ambiguous: 'Ambiguous',
 };
 
+const VERDICT_SOURCE_LABEL: Record<TriageResult['verdictSource'], string> = {
+  ai_reviewed: 'AI-reviewed',
+  rule_fallback: 'Rule-based',
+};
+
+/**
+ * Small badge distinguishing a genuinely AI-reviewed verdict from one that
+ * fell back to the deterministic rule baseline (AI call errored, timed out,
+ * or returned an unparseable reply) — without this, both looked identical to
+ * a reader even though their evidentiary basis is very different.
+ */
+function renderVerdictSourceBadge(source: TriageResult['verdictSource']): string {
+  return `<span class="tag verdict-source-${esc(source)}">${esc(VERDICT_SOURCE_LABEL[source] ?? source)}</span>`;
+}
+
 /**
  * Split a raw Playwright error blob into a one-line summary (for the row
  * itself) and the remaining call log / stack trace (tucked behind a
@@ -399,7 +414,7 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
   const triageBlock = triage
     ? `<div class="diagnosis"><span class="tag verdict-${esc(triage.triage.verdict)}">${esc(
         VERDICT_LABEL[triage.triage.verdict] ?? triage.triage.verdict,
-      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span>
+      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span> ${renderVerdictSourceBadge(triage.triage.verdictSource)}
       <div>${esc(triage.triage.rationale)}</div>
       ${triage.triage.suggestedPatch ? renderSuggestedFix(triage.triage.verdict, triage.triage.suggestedPatch) : ''}
     </div>`
@@ -528,7 +543,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
       (t) =>
         `<tr><td>${esc(t.title)}</td><td>${esc(t.triage.verdict)}</td><td>${esc(
           (t.triage.confidence * 100).toFixed(0),
-        )}%</td><td>${esc(t.triage.rationale)}${
+        )}%</td><td>${renderVerdictSourceBadge(t.triage.verdictSource)}</td><td>${esc(t.triage.rationale)}${
           t.triage.suggestedPatch ? renderSuggestedFix(t.triage.verdict, t.triage.suggestedPatch, 'hist') : ''
         }</td></tr>`,
     )
@@ -671,7 +686,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
           : ''
     }
     <table>
-      <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
+      <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Source</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>
     </table>
   </section>`

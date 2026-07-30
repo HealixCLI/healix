@@ -179,6 +179,8 @@ export interface ReportTriageEntryShape {
     confidence: number;
     rationale: string;
     suggestedPatch?: string;
+    /** 'ai_reviewed' | 'rule_fallback' — whether this verdict came from a genuine AI review or fell back to the deterministic rule baseline. */
+    verdictSource?: string;
   };
 }
 

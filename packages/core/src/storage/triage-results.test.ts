@@ -173,6 +173,7 @@ describe('HealixStore triage_results', () => {
       confidence: 0.85,
       rationale: '5xx is a real regression',
       suggestedPatch: 'Fix the /api/checkout handler.',
+      verdictSource: 'ai_reviewed',
     });
     s.recordTriageResult({
       testId: testB.id,
@@ -189,9 +190,10 @@ describe('HealixStore triage_results', () => {
       confidence: 0.85,
       rationale: '5xx is a real regression',
       suggestedPatch: 'Fix the /api/checkout handler.',
+      verdictSource: 'ai_reviewed',
     });
-    // suggestedPatch omitted for testB — must default to null, not undefined.
-    expect(rows[1]).toMatchObject({ verdict: 'flaky', suggestedPatch: null });
+    // suggestedPatch/verdictSource omitted for testB — must default to null, not undefined.
+    expect(rows[1]).toMatchObject({ verdict: 'flaky', suggestedPatch: null, verdictSource: null });
   });
 
   it('listTriageResults returns nothing for a run with no recorded triage results', async () => {
@@ -297,7 +299,7 @@ describe('HealixStore triage_results', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(15);
+    expect(info.version).toBe(16);
     expect(info.tables).toContain('triage_results');
 
     // The pre-existing row survived, untouched, with spec_code defaulting to null.

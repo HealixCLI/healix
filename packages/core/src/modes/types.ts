@@ -290,6 +290,18 @@ export interface ExecOutcome {
    * a mode with no fixture-level mocking (or no mocking at all) simply omits it.
    */
   mockedRequestCounts?: Record<string, number>;
+  /**
+   * Compact, prompt-ready summary of the actual HTTP call(s) a test made via
+   * the `request` fixture — keyed by `${specFile}#${title}` (the same
+   * identity execute.ts's own dedup keyOf() uses), from execute.ts's
+   * readApiEvidence(). Lets triage see the REAL response a failing API-tier
+   * assertion was checking against (which backend answered — Healix's own
+   * mock or the real one — the status, a truncated body), instead of only the
+   * one field Playwright's own error text happened to print. Optional: a test
+   * that never called `request` (or a run predating this feature) simply has
+   * no entry.
+   */
+  apiEvidence?: Record<string, string>;
 }
 
 export interface SuiteBundle {

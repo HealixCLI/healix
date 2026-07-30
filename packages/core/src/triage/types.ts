@@ -13,6 +13,27 @@ export interface TriageInput {
   sourceFile?: string;
   /** That file's content (or a leading slice of it) — first-party repo code, cited normally rather than fenced as untrusted. */
   sourceExcerpt?: string;
+  /**
+   * Compact summary of the actual HTTP call(s) this test made via the
+   * `request` fixture (see modes/types.ts's ExecOutcome.apiEvidence) — which
+   * backend actually answered (Healix's own mock, or the real one), the
+   * status, and a truncated body. App-derived (captured from the app/mock
+   * under test), so treated as untrusted data in the prompt, same as `error`.
+   * Absent when the failing test never called `request`, or predates this
+   * feature.
+   */
+  apiEvidence?: string;
+  /**
+   * The project's configured/detected base URL (e.g.
+   * `http://localhost:4202/#/SK/home`) — project configuration, not
+   * app-rendered output, so it's cited normally rather than fenced as
+   * untrusted. Lets a rule compare a failing test's OWN `page.goto(...)`
+   * target against the app's real navigation convention (e.g. a required
+   * locale/route segment in the hash) to catch a generated test that never
+   * reaches a real route, rather than inferring an app defect from the
+   * resulting "content never appeared" symptom.
+   */
+  baseUrl?: string;
 }
 
 export interface TriageResult {
@@ -28,6 +49,17 @@ export interface TriageResult {
    * environment/flaky/ambiguous, where there is no code-level fix.
    */
   suggestedPatch?: string;
+  /**
+   * Where this verdict actually came from — surfaced to users so a verdict
+   * can be told apart from a genuinely AI-reviewed judgment vs. one that
+   * fell back to the deterministic rule baseline because the AI call itself
+   * errored, timed out, or returned an unparseable reply (or simply because
+   * a rule matched with high enough confidence that classify() never needed
+   * to escalate). Always set — 'rule_fallback' by classifyByRules() itself,
+   * upgraded to 'ai_reviewed' only by reconcile() when a real AI reply was
+   * successfully parsed and used.
+   */
+  verdictSource: 'ai_reviewed' | 'rule_fallback';
 }
 
 /** One failure entered into a batched analyze() call, keyed by a caller-assigned id (stable across the batch/split-retry lifecycle — not the test's own reqTag/title, which may repeat or be absent). */

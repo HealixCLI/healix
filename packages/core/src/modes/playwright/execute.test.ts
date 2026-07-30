@@ -815,6 +815,160 @@ describe('parseReport — drops blank-recording videos, keeps everything else', 
   });
 });
 
+describe('parseReport — videoUnavailableReason: never a silent gap', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'healix-video-status-test-'));
+  const blankVideo = join(tmpDir, 'blank-video.webm');
+  const realVideo = join(tmpDir, 'real-video.webm');
+  writeFileSync(blankVideo, Buffer.alloc(1024));
+  writeFileSync(realVideo, Buffer.alloc(20 * 1024));
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('sets no reason when a real, non-blank video is present', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'real interaction',
+              file: 'tests/tierA-public/real2.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'passed',
+                      duration: 5000,
+                      attachments: [{ name: 'video', path: realVideo }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toBeUndefined();
+    expect(parsed.videoWarnings).toEqual([]);
+  });
+
+  it('explains a blank/discarded video with the blank-recording reason', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'fails fast, nothing ever painted, again',
+              file: 'tests/tierA-public/fast2.spec.ts',
+              tests: [
+                {
+                  status: 'failed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'failed',
+                      duration: 300,
+                      attachments: [{ name: 'video', path: blankVideo }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/no visible frames/);
+    expect(parsed.videoWarnings).toEqual([]); // expected/explained case, not an operational anomaly
+  });
+
+  it('explains a tierC-api test (no browser page) with the api-only reason, no operational warning', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'GET /api/x returns well-formed data',
+              file: 'tests/tierC-api/x.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierC-api',
+                  results: [{ status: 'passed', duration: 100, attachments: [] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/API request context/);
+    expect(parsed.videoWarnings).toEqual([]);
+  });
+
+  it('flags a browser-based test with NO video attachment at all as an anomaly, with an operational warning', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'no video attachment somehow',
+              file: 'tests/tierB-auth/gap.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierB-auth',
+                  results: [{ status: 'passed', duration: 100, attachments: [] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/artifact retention/);
+    expect(parsed.videoWarnings).toHaveLength(1);
+    expect(parsed.videoWarnings[0]).toContain('no video attachment somehow');
+  });
+
+  it('does not set a reason for a skipped result (never executed at all)', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'skipped test',
+              file: 'tests/tierA-public/skip.spec.ts',
+              tests: [
+                {
+                  status: 'skipped',
+                  projectName: 'tierA-public',
+                  results: [{ status: 'skipped', duration: 0, attachments: [] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toBeUndefined();
+  });
+});
+
 describe('parseReport — error text stays simple, not a wall of duplicates', () => {
   it('picks a single clear error instead of concatenating result.error and every result.errors[] entry', () => {
     const r: PwReportArg = {
@@ -1234,6 +1388,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const b = {
       results: [{ title: 'b', status: 'failed' as const }],
@@ -1242,6 +1397,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
@@ -1257,6 +1413,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const b = {
       results: [{ title: 'a', specFile: 'x.spec.ts', status: 'passed' as const }],
@@ -1265,6 +1422,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results).toHaveLength(1);

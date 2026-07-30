@@ -323,10 +323,27 @@ const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
  * callers, unit tests) we fall back to the original plain-basename listing,
  * since we have no safe path to link to.
  */
-function renderArtifacts(artifacts: string[] | undefined, reportDir: string | undefined): string {
-  if (!artifacts || artifacts.length === 0) return '';
+/**
+ * Explicit note rendered in place of a video player when one isn't present —
+ * see ExecResultItem.videoUnavailableReason's doc comment for the three
+ * distinct cases this covers. Never silently omitted: a missing video always
+ * shows either the player or this note, never neither.
+ */
+function renderVideoUnavailableNote(reason: string | undefined): string {
+  if (!reason) return '';
+  return `<div class="video-unavailable"><em>No video: ${esc(reason)}</em></div>`;
+}
+
+function renderArtifacts(
+  artifacts: string[] | undefined,
+  reportDir: string | undefined,
+  videoUnavailableReason?: string,
+): string {
+  if (!artifacts || artifacts.length === 0) {
+    return renderVideoUnavailableNote(videoUnavailableReason);
+  }
   if (!reportDir) {
-    return `<div class="hist">${artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`;
+    return `<div class="hist">${artifacts.map((a) => esc(baseName(a))).join(', ')}</div>${renderVideoUnavailableNote(videoUnavailableReason)}`;
   }
   const items = artifacts.map((abs) => ({
     href: relative(reportDir, abs).split(sep).join('/'),
@@ -346,8 +363,12 @@ function renderArtifacts(artifacts: string[] | undefined, reportDir: string | un
   const videoHtml = videos
     .map((i) => `<video controls preload="metadata" class="ev-video" src="${esc(i.href)}"></video>`)
     .join('');
+  // A video's own presence in `artifacts` means it's real (never blank —
+  // execute.ts already filtered those out), so the note only ever shows
+  // alongside images/other when there's genuinely no video among them.
+  const videoNote = videos.length === 0 ? renderVideoUnavailableNote(videoUnavailableReason) : '';
   const otherHtml = other.map((i) => `<a class="ev-file" href="${esc(i.href)}">${esc(i.name)}</a>`).join('');
-  return `<div class="evidence">${imgHtml}${videoHtml}${otherHtml}</div>`;
+  return `<div class="evidence">${imgHtml}${videoHtml}${videoNote}${otherHtml}</div>`;
 }
 
 /**
@@ -534,7 +555,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
         formatDuration(r.durationMs),
       )}</td><td>${descriptionCell}</td><td>${errorCell}</td><td>${renderSteps(
         r.steps,
-      )}</td><td>${renderArtifacts(r.artifacts, reportDir)}</td></tr>`;
+      )}</td><td>${renderArtifacts(r.artifacts, reportDir, r.status === 'skipped' ? undefined : r.videoUnavailableReason)}</td></tr>`;
     })
     .join('');
 

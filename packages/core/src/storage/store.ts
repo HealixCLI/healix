@@ -461,12 +461,16 @@ export class HealixStore {
    * joining through one-row-per-test.
    */
   insertResult(
-    result: Omit<TestResult, 'id' | 'description' | 'details' | 'stepsJson' | 'skipReason'> & {
+    result: Omit<
+      TestResult,
+      'id' | 'description' | 'details' | 'stepsJson' | 'skipReason' | 'videoUnavailableReason'
+    > & {
       id?: string;
       description?: string | null;
       details?: string | null;
       stepsJson?: string | null;
       skipReason?: string | null;
+      videoUnavailableReason?: string | null;
     },
   ): TestResult {
     const full: TestResult = {
@@ -476,11 +480,12 @@ export class HealixStore {
       details: result.details ?? null,
       stepsJson: result.stepsJson ?? null,
       skipReason: result.skipReason ?? null,
+      videoUnavailableReason: result.videoUnavailableReason ?? null,
     };
     this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
-        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details, steps_json, skip_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details, steps_json, skip_reason, video_unavailable_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         full.id,
@@ -493,6 +498,7 @@ export class HealixStore {
         full.details,
         full.stepsJson,
         full.skipReason,
+        full.videoUnavailableReason,
       );
     return full;
   }
@@ -895,6 +901,7 @@ function rowToResult(r: Record<string, unknown>): TestResult {
     details: s(r.details),
     stepsJson: s(r.steps_json),
     skipReason: s(r.skip_reason),
+    videoUnavailableReason: s(r.video_unavailable_reason),
   };
 }
 

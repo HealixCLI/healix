@@ -248,6 +248,17 @@ export interface ExecResultItem {
    * given, or for any non-skipped status.
    */
   skipReason?: string;
+  /**
+   * Why no usable video is present for this (executed, non-skipped) result —
+   * a human-readable explanation for one of three distinct cases, never a
+   * silent gap: (1) a tierC-api test never opened a browser page, so a video
+   * was structurally impossible; (2) Playwright recorded a video but it was
+   * blank (the test finished before anything rendered) and was discarded;
+   * (3) no video attachment at all for a browser-based test — a genuine,
+   * worth-investigating anomaly. Absent when a real, usable video IS present
+   * in `artifacts`, or for a 'skipped' result (which never executed at all).
+   */
+  videoUnavailableReason?: string;
 }
 
 export interface ExecOutcome {

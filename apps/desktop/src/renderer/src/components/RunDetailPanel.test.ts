@@ -30,6 +30,7 @@ function makeResult(overrides: Partial<TestResult> = {}): TestResult {
     details: null,
     stepsJson: null,
     skipReason: null,
+    videoUnavailableReason: null,
     ...overrides,
   };
 }
@@ -90,5 +91,40 @@ describe('summarizeStatuses — Results tab summary tile counts', () => {
     const results: TestResult[] = [makeResult({ id: 'r1', testId: 't1', status: 'passed' })];
     const summary = summarizeStatuses(joinResults(tests, results));
     expect(summary.skipped).toBe(0);
+  });
+});
+
+describe('joinResults — videoUnavailableReason', () => {
+  it('carries videoUnavailableReason through from the persisted result row', () => {
+    const tests: TestCase[] = [makeTest({ id: 't1' })];
+    const results: TestResult[] = [
+      makeResult({
+        id: 'r1',
+        testId: 't1',
+        status: 'passed',
+        videoUnavailableReason:
+          'This test only used the API request context — no browser page was opened, so no video could be recorded.',
+      }),
+    ];
+    const [row] = joinResults(tests, results);
+    expect(row.videoUnavailableReason).toBe(
+      'This test only used the API request context — no browser page was opened, so no video could be recorded.',
+    );
+  });
+
+  it('defaults to null when the result has none, or no result row exists yet', () => {
+    const tests: TestCase[] = [makeTest({ id: 't1' }), makeTest({ id: 't2' })];
+    const results: TestResult[] = [makeResult({ id: 'r1', testId: 't1', status: 'passed' })];
+    const rows = joinResults(tests, results);
+    expect(rows.find((r) => r.key === 't1')?.videoUnavailableReason).toBeNull();
+    expect(rows.find((r) => r.key === 't2')?.videoUnavailableReason).toBeNull();
+  });
+
+  it('carries videoUnavailableReason through the raw-results fallback path too', () => {
+    const results: TestResult[] = [
+      makeResult({ id: 'r1', testId: 't1', status: 'passed', videoUnavailableReason: 'blank recording' }),
+    ];
+    const [row] = joinResults([], results);
+    expect(row.videoUnavailableReason).toBe('blank recording');
   });
 });

@@ -592,6 +592,10 @@ function projectIsTierB(projectName: string | undefined): boolean {
   return /tierb/i.test(String(projectName ?? ''));
 }
 
+function projectIsTierC(projectName: string | undefined): boolean {
+  return /tierc/i.test(String(projectName ?? ''));
+}
+
 /** The auth-setup project/spec that produces the Tier B storageState. */
 function isAuthSetup(projectName: string | undefined, file: string | undefined): boolean {
   return (
@@ -765,6 +769,48 @@ function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[]
     .filter((p) => !isBlankVideo(p));
 }
 
+/** The raw video attachment (before blank-filtering), if Playwright reported one at all. */
+function findVideoAttachment(attachments: PwAttachment[] | undefined): PwAttachment | undefined {
+  return (attachments ?? []).find((a) => typeof a.path === 'string' && VIDEO_EXT.test(a.path));
+}
+
+/**
+ * Why no usable video is present for a result, when one isn't — three
+ * distinct, identifiable causes rather than a silent gap:
+ *  1. tierC-api tests never open a browser page (request-fixture only), so a
+ *     video is structurally impossible regardless of the `video: 'on'` config
+ *     — expected, not a defect.
+ *  2. A video attachment exists but is blank (see isBlankVideo) — the test
+ *     finished before anything rendered; the file is real but useless.
+ *  3. No video attachment at all for a browser-based (tierA/tierB) test —
+ *     genuinely anomalous; worth surfacing as a possible artifact-retention
+ *     gap rather than looking identical to case 1 or 2.
+ * Returns undefined when a real, non-blank video is present (nothing to explain).
+ */
+function computeVideoUnavailableReason(
+  attachments: PwAttachment[] | undefined,
+  projectName: string | undefined,
+): string | undefined {
+  const video = findVideoAttachment(attachments);
+  if (video?.path) {
+    if (!isBlankVideo(video.path)) return undefined;
+    return (
+      'Playwright recorded a video for this test, but it contained no visible frames ' +
+      '(the test likely finished before anything rendered) and was discarded as unusable.'
+    );
+  }
+  if (projectIsTierC(projectName)) {
+    return (
+      'This test only used the API request context — no browser page was opened, ' +
+      'so no video could be recorded.'
+    );
+  }
+  return (
+    'No video was found for this test even though it ran in a browser — ' +
+    'this may indicate a gap in artifact retention.'
+  );
+}
+
 interface ParsedReport {
   results: ExecResultItem[];
   passed: number;
@@ -772,6 +818,8 @@ interface ParsedReport {
   blocked: number;
   flaky: number;
   skipped: number;
+  /** Operational warnings surfaced by the caller (e.g. an anomalous missing-video case). */
+  videoWarnings: string[];
 }
 
 // ---- Write-through per-test checkpoint (see templates.ts's checkpointReporterContents()) ----
@@ -1043,7 +1091,7 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
     }
   }
 
-  return { results, passed, failed, blocked, flaky, skipped };
+  return { results, passed, failed, blocked, flaky, skipped, videoWarnings: [] };
 }
 
 /**
@@ -1067,6 +1115,7 @@ export function mergeParsedReports(a: ParsedReport, b: ParsedReport): ParsedRepo
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
     skipped: results.filter((r) => r.status === 'skipped').length,
+    videoWarnings: [...a.videoWarnings, ...b.videoWarnings],
   };
 }
 
@@ -1077,6 +1126,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let blocked = 0;
   let flaky = 0;
   let skipped = 0;
+  const videoWarnings: string[] = [];
 
   const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
@@ -1099,6 +1149,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
     let worstSkipReason: string | undefined;
     let totalDuration = 0;
     let artifacts: string[] = [];
+    let videoUnavailableReason: string | undefined;
     let isFlaky = false;
 
     for (const test of tests) {
@@ -1142,6 +1193,10 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
         worstSkipReason = status === 'skipped' ? extractSkipReason(test) : undefined;
         const a = collectArtifactPaths(last?.attachments);
         if (a.length > 0) artifacts = a;
+        videoUnavailableReason =
+          status === 'skipped'
+            ? undefined
+            : computeVideoUnavailableReason(last?.attachments, test.projectName);
       }
     }
 
@@ -1161,8 +1216,20 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       artifacts: artifacts.length > 0 ? artifacts : undefined,
       specFile: spec.file ?? suiteFile,
       skipReason: worstSkipReason,
+      videoUnavailableReason,
     };
     results.push(item);
+
+    // Only the genuinely-anomalous case (browser-based test, no video
+    // attachment at all — not the expected tierC-api/blank-recording cases)
+    // is worth an operational warning; distinguish it by message content
+    // rather than re-deriving the classification here.
+    if (
+      videoUnavailableReason &&
+      videoUnavailableReason.startsWith('No video was found for this test even though it ran in a browser')
+    ) {
+      videoWarnings.push(`No video captured for "${title}" — possible artifact retention gap.`);
+    }
 
     switch (worst) {
       case 'passed':
@@ -1201,7 +1268,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   };
 
   for (const suite of report.suites ?? []) walk(suite, '', undefined);
-  return { results, passed, failed, blocked, flaky, skipped };
+  return { results, passed, failed, blocked, flaky, skipped, videoWarnings };
 }
 
 /** Read results.json if present and newer than the run start. */
@@ -1312,7 +1379,7 @@ function parseSummaryText(combined: string): ParsedReport {
   const failed = num(/(\d+)\s+failed/i);
   const flaky = num(/(\d+)\s+flaky/i);
   const skipped = num(/(\d+)\s+skipped/i);
-  return { results: [], passed, failed, blocked: 0, flaky, skipped };
+  return { results: [], passed, failed, blocked: 0, flaky, skipped, videoWarnings: [] };
 }
 
 /** Outcome returned when the caller cancelled the run — never a throw. */
@@ -1474,6 +1541,13 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // execute phase, not just what this particular invocation ran.
   if (priorEntries.length > 0) {
     parsed = mergeParsedReports(parsed, checkpointEntriesToOutcome(priorEntries, auth));
+  }
+
+  // Surface the genuinely-anomalous missing-video case operationally (not
+  // just in the report) — a browser-based test with no video attachment at
+  // all may indicate a real artifact-retention gap worth investigating.
+  for (const warning of parsed.videoWarnings) {
+    emit(ctx, `[execute] ${warning}`);
   }
 
   // Best-effort: attach the step-by-step breakdown (see stepsReporterContents()

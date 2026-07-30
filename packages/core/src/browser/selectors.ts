@@ -249,11 +249,19 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           }
         }
 
-        // Build an nth-of-type path that uniquely identifies the node.
+        // Build an nth-of-type path that uniquely identifies the node. Capped generously (not at a
+        // small fixed depth): climbing to <body> is enough to guarantee uniqueness in practice, since
+        // nth-of-type at every level fixes exactly one path down from a singular root. A real run
+        // against a deeply-nested SPA (six wrapper divs before reaching anything distinguishing)
+        // found the OLD fixed 6-level cap returning a path that matched TWO different elements
+        // elsewhere on the page (two same-shaped subtrees six levels apart) — silently pointing a
+        // click at the wrong one, since every earlier tier already verifies uniqueness before
+        // accepting a candidate but this fallback never did.
+        const MAX_TIER4_ANCESTOR_LEVELS = 25;
         const parts: string[] = [];
         let repeatedRowText: string | undefined;
         let node: DomElement | null = el;
-        while (node && node.nodeType === 1 && parts.length < 6) {
+        while (node && node.nodeType === 1 && parts.length < MAX_TIER4_ANCESTOR_LEVELS) {
           const current: DomElement = node;
           let part = current.tagName.toLowerCase();
           const parent = current.parentElement;
@@ -284,6 +292,9 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
             parts[0] = `#${cssEscape(current.id)}`;
             break;
           }
+          // Stop climbing as soon as the path built so far is actually unique — mirrors the
+          // uniqueness check every earlier tier already performs before accepting a candidate.
+          if (doc.querySelectorAll(parts.join(' > ')).length === 1) break;
           node = parent;
         }
         return {

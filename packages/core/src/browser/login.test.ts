@@ -32,6 +32,7 @@ function makeFakeBrowser(config: {
     async goto(url: string): Promise<void> {
       currentUrl = url;
     },
+    async reload(): Promise<void> {},
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
     },

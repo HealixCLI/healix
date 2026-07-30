@@ -484,7 +484,39 @@ function appendChild(parent: FakeEl, child: FakeEl): void {
   parent.children.push(child);
 }
 
-/** A tiny querySelectorAll sufficient for selectorFor's uniqueness checks: #id and tag[attr="val"]. */
+/** Matches one `>`-joined segment of a combinator chain (`tag`, `tag:nth-of-type(n)`, or `#id`)
+ * against a single fake element — see `matchesChain` below. */
+function matchesSimpleSelector(el: FakeEl, simple: string): boolean {
+  const idMatch = /^#(.+)$/.exec(simple);
+  if (idMatch) return el.id === idMatch[1];
+  const nthMatch = /^([a-z0-9]+):nth-of-type\((\d+)\)$/i.exec(simple);
+  if (nthMatch) {
+    const [, tag, indexStr] = nthMatch;
+    if (el.tagName !== tag) return false;
+    if (!el.parentElement) return false;
+    const sameTag = el.parentElement.children.filter((c) => c.tagName === el.tagName);
+    return sameTag.indexOf(el) + 1 === Number(indexStr);
+  }
+  return el.tagName === simple;
+}
+
+/** Matches a full `>`-joined combinator chain (as `selectorFor`'s tier-4 path builder produces)
+ * against a candidate element: the LAST segment must match `el` itself, and each preceding
+ * segment must match `el`'s immediate ancestors in order — strict parent-child, since the real
+ * selector only ever joins with `>`, never a descendant-combinator space. */
+function matchesChain(el: FakeEl, simples: string[]): boolean {
+  let current: FakeEl | null = el;
+  for (let i = simples.length - 1; i >= 0; i -= 1) {
+    if (!current || !matchesSimpleSelector(current, simples[i]!)) return false;
+    current = current.parentElement;
+  }
+  return true;
+}
+
+/** A tiny querySelectorAll sufficient for selectorFor's uniqueness checks: #id, tag[attr="val"],
+ * and a `>`-joined nth-of-type combinator chain (the tier-4 path builder's own shape) — needed so
+ * the mirrored uniqueness check below behaves like the real `doc.querySelectorAll` instead of
+ * always seeing zero matches for any joined path. */
 function fakeQuerySelectorAll(root: FakeEl[], selector: string): FakeEl[] {
   const all: FakeEl[] = [];
   const visit = (el: FakeEl) => {
@@ -503,6 +535,10 @@ function fakeQuerySelectorAll(root: FakeEl[], selector: string): FakeEl[] {
   if (attrMatch) {
     const [, tag, attr, val] = attrMatch;
     return all.filter((el) => el.tagName === tag && el.attrs[attr!] === val);
+  }
+  if (selector.includes(' > ') || /^[a-z0-9]+(:nth-of-type\(\d+\))?$/i.test(selector)) {
+    const simples = selector.split(' > ');
+    return all.filter((el) => matchesChain(el, simples));
   }
   return [];
 }
@@ -551,10 +587,11 @@ function selectorForMirror(root: FakeEl[], el: FakeEl): SelectorResult {
     }
   }
 
+  const MAX_TIER4_ANCESTOR_LEVELS = 25;
   const parts: string[] = [];
   let repeatedRowText: string | undefined;
   let node: FakeEl | null = el;
-  while (node && node.nodeType === 1 && parts.length < 6) {
+  while (node && node.nodeType === 1 && parts.length < MAX_TIER4_ANCESTOR_LEVELS) {
     const current: FakeEl = node;
     let part = current.tagName.toLowerCase();
     const parent = current.parentElement;
@@ -576,6 +613,10 @@ function selectorForMirror(root: FakeEl[], el: FakeEl): SelectorResult {
       parts[0] = `#${current.id}`;
       break;
     }
+    // Stop climbing as soon as the path built so far is actually unique — mirrors the real
+    // selectorFor()'s fix for a tier-4 path that silently matched >1 element when capped at a
+    // small fixed depth.
+    if (qsa(parts.join(' > ')).length === 1) break;
     node = parent;
   }
   return { selector: parts.join(' > '), tier: 4, ...(repeatedRowText ? { repeatedRowText } : {}) };
@@ -615,6 +656,10 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
     const row2 = fakeEl('tr', { textContent: 'Bob   User' });
     appendChild(table, row1);
     appendChild(table, row2);
+    // A `td` sibling in row1 too — otherwise this fixture's single `td` would already be
+    // globally unique by tag alone, and the new uniqueness early-exit would stop the walk
+    // before ever climbing to the disambiguating `tr:nth-of-type(2)` level.
+    appendChild(row1, fakeEl('td'));
     const cell = fakeEl('td');
     appendChild(row2, cell);
 
@@ -634,6 +679,18 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
     const card2 = fakeEl('div', { textContent: 'id: 2 Title: Task Beta Update Delete' });
     appendChild(list, card1);
     appendChild(list, card2);
+
+    // card1 gets the same button-column/link shape as card2 — otherwise this fixture's single
+    // `<a>` (or single button-column div) would already be globally unique on its own, and the
+    // new uniqueness early-exit would stop the walk before ever climbing to the card level whose
+    // text this test exists to pin.
+    const infoCol1 = fakeEl('div');
+    const buttonCol1a = fakeEl('div', { textContent: 'Update' });
+    const buttonCol1b = fakeEl('div', { textContent: 'Delete' });
+    appendChild(card1, infoCol1);
+    appendChild(card1, buttonCol1a);
+    appendChild(card1, buttonCol1b);
+    appendChild(buttonCol1a, fakeEl('a', { textContent: 'Update' }));
 
     const infoCol = fakeEl('div');
     const buttonCol1 = fakeEl('div', { textContent: 'Update' });
@@ -697,6 +754,53 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
 
     const result = selectorForMirror([list], row1);
     expect(result.tier).toBe(4);
+  });
+
+  it('climbs past a coincidentally-matching shallow shape instead of returning a selector that matches >1 element', () => {
+    // Reproduces the exact live collision found against the C&A dashboard: two unrelated
+    // sections (a summary-tile row and a profile-edit row) happen to share the same LOCAL
+    // nth-of-type shape a couple of levels up ("div:nth-of-type(3) > p"), so a walk that stopped
+    // there (as the old fixed-depth cap could) would return a selector matching both — and
+    // Playwright's `.first()` would then click whichever came first in DOM order, not
+    // necessarily the intended one. The two branches only diverge one level further up (their
+    // own position under `root`), which is where uniqueness is actually reached.
+    const root = fakeEl('div');
+    const wrapperA = fakeEl('div'); // summary-tile section — 1st div child of root
+    const wrapperB = fakeEl('div'); // profile-edit section — 2nd div child of root
+    appendChild(root, wrapperA);
+    appendChild(root, wrapperB);
+
+    const midA = fakeEl('div');
+    appendChild(wrapperA, midA);
+    const rowA1 = fakeEl('div');
+    const rowA2 = fakeEl('div');
+    const rowA3 = fakeEl('div');
+    appendChild(midA, rowA1);
+    appendChild(midA, rowA2);
+    appendChild(midA, rowA3);
+    const decoy = fakeEl('p', { textContent: 'Môj účet' });
+    appendChild(rowA3, decoy);
+
+    const midB = fakeEl('div');
+    appendChild(wrapperB, midB);
+    const rowB1 = fakeEl('div');
+    const rowB2 = fakeEl('div');
+    const rowB3 = fakeEl('div');
+    appendChild(midB, rowB1);
+    appendChild(midB, rowB2);
+    appendChild(midB, rowB3);
+    const target = fakeEl('p', { textContent: 'zmeniť' });
+    appendChild(rowB3, target);
+
+    // Sanity-check the collision this test exists to pin: the shallow local shape alone really
+    // is ambiguous, so the fix has something real to climb past.
+    expect(fakeQuerySelectorAll([root], 'div:nth-of-type(3) > p')).toHaveLength(2);
+
+    const result = selectorForMirror([root], target);
+    expect(result.tier).toBe(4);
+    const matches = fakeQuerySelectorAll([root], result.selector);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toBe(target);
   });
 });
 

@@ -103,6 +103,10 @@ export interface CapturedNetworkEvent {
 export interface BrowserSurface {
   start(opts?: BrowserSurfaceOptions): Promise<void>;
   goto(url: string): Promise<void>;
+  /** Force a genuine reload of the current page — unlike `goto()`, this always re-fetches and
+   * re-parses the document from scratch, so it can't suffer `goto()`'s same-URL SPA no-op
+   * problem (see `browser/index.ts`'s `goto()` and `crawler.ts`'s `resetAfterProbe`). */
+  reload(): Promise<void>;
   screenshot(): Promise<Buffer>;
   snapshot(): Promise<DomSnapshot>;
   click(selector: string): Promise<void>;

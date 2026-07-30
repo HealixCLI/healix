@@ -48,6 +48,7 @@ function makeFakeBrowser(config: {
       }
       currentUrl = config.redirects?.[url] ?? url;
     },
+    async reload(): Promise<void> {},
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
     },

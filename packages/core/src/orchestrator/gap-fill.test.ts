@@ -407,6 +407,9 @@ function makeFakeBrowser(config: {
       currentUrl = url;
       revealed = undefined;
     },
+    async reload(): Promise<void> {
+      revealed = undefined;
+    },
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
     },

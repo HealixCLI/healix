@@ -447,6 +447,20 @@ export async function runExplorePhase(input: ExploreInput): Promise<ExplorationA
       );
     }
 
+    // A route that couldn't be reliably reset after a click (see resetAfterProbe in crawler.ts /
+    // docs/click-probe-reset-corruption.md) stops click-probing early on that route — distinct
+    // from budgetExhausted/unvisitedQueuedCount, this means candidates were left unattempted
+    // because the page got stuck, not because time ran out.
+    const resetFailures = crawlResult.resetFailures ?? 0;
+    if (resetFailures > 0) {
+      emit(
+        'explore',
+        'warn',
+        `Click-probing stopped early on ${resetFailures} route(s) because the page couldn't be reliably reset after a click — remaining candidates on those routes went unattempted.`,
+        { resetFailures },
+      );
+    }
+
     if (crawlResult.authAttempted && !crawlResult.authVerified) {
       emit(
         'explore',

@@ -39,9 +39,17 @@ interface FakePage {
  * register<->login switch that doesn't change the route); `pressKey('Escape')`
  * reverts back to the page's original elements, and any `goto()` also clears
  * the reveal (client-side toggle state doesn't survive a fresh navigation).
- * `log`, when provided, records every `goto`/`click` call (as `goto:<url>` /
- * `click:<selector>`) in order, so tests can assert reset-after-click
- * sequencing.
+ * `log`, when provided, records every `goto`/`click`/`reload` call (as `goto:<url>` /
+ * `click:<selector>` / `reload:<url>`) in order, so tests can assert reset-after-click
+ * sequencing. `escapeIneffective` names selectors whose reveal survives `pressKey('Escape')` —
+ * models a custom modal that doesn't listen for Escape, only a `reload()` (or a real cross-URL
+ * `goto()`) can clear it. `sameUrlGotoIneffective`, when true, makes `goto()` to the URL the fake
+ * is already on NOT clear a reveal — mirrors the real same-URL hash-routed-SPA no-op bug
+ * (goto() to a genuinely different URL still clears it). `reloadIneffective` names selectors whose
+ * reveal survives even a forced `reload()` too — models a truly unrecoverable page (should never
+ * happen for a genuine reload in real life, but lets a test exercise resetAfterProbe's own
+ * give-up path). All exist to reproduce docs/click-probe-reset-corruption.md in a test, where the
+ * default (everything reverts perfectly) can't.
  */
 function makeFakeBrowser(config: {
   pages: Record<string, FakePage>;
@@ -51,6 +59,9 @@ function makeFakeBrowser(config: {
   onClickGoTo?: Record<string, string>;
   onClickSelectorGoTo?: Record<string, string>;
   onClickSelectorReveal?: Record<string, InteractiveElement[]>;
+  escapeIneffective?: Set<string>;
+  sameUrlGotoIneffective?: boolean;
+  reloadIneffective?: Set<string>;
   recordClicks?: string[];
   /** Records every selector passed to type(), in call order — used to assert fillSafeInputs'
    * safety filters (never password/file/OTP-shaped fields). */
@@ -60,11 +71,16 @@ function makeFakeBrowser(config: {
   let currentUrl = '';
   let networkBuffer: CapturedNetworkEvent[] = [];
   let revealedElements: InteractiveElement[] | undefined;
+  let lastRevealSelector: string | undefined;
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
       config.log?.push(`goto:${url}`);
-      revealedElements = undefined;
+      const isSameUrl = url === currentUrl;
+      if (!(isSameUrl && config.sameUrlGotoIneffective)) {
+        revealedElements = undefined;
+        lastRevealSelector = undefined;
+      }
       if (config.throwFor?.has(url)) {
         // Model a request that actually fired (and would otherwise leak into the
         // next route's drain) even though this navigation ultimately fails.
@@ -78,6 +94,12 @@ function makeFakeBrowser(config: {
       currentUrl = config.redirects?.[url] ?? url;
       const events = config.pages[currentUrl]?.network;
       if (events) networkBuffer.push(...events);
+    },
+    async reload(): Promise<void> {
+      config.log?.push(`reload:${currentUrl}`);
+      if (lastRevealSelector && config.reloadIneffective?.has(lastRevealSelector)) return;
+      revealedElements = undefined;
+      lastRevealSelector = undefined;
     },
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
@@ -100,18 +122,21 @@ function makeFakeBrowser(config: {
       const reveal = config.onClickSelectorReveal?.[selector];
       if (reveal) {
         revealedElements = reveal;
+        lastRevealSelector = selector;
         return;
       }
       const bySelector = config.onClickSelectorGoTo?.[selector];
       if (bySelector) {
         currentUrl = bySelector;
         revealedElements = undefined;
+        lastRevealSelector = undefined;
         return;
       }
       const next = config.onClickGoTo?.[currentUrl];
       if (next) {
         currentUrl = next;
         revealedElements = undefined;
+        lastRevealSelector = undefined;
       }
     },
     async clickAt(_point: Point): Promise<void> {},
@@ -119,7 +144,10 @@ function makeFakeBrowser(config: {
       config.recordTypes?.push(selector);
     },
     async pressKey(key: string): Promise<void> {
-      if (key === 'Escape') revealedElements = undefined;
+      if (key !== 'Escape') return;
+      if (lastRevealSelector && config.escapeIneffective?.has(lastRevealSelector)) return;
+      revealedElements = undefined;
+      lastRevealSelector = undefined;
     },
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
@@ -757,9 +785,15 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     expect(result.routes.some((r) => r.url === 'https://a.test/wallet/history')).toBe(true);
     // After recording the state (and probing whatever it reveals), the page must end up back at
     // its original state — same revert guarantee the plain click-probing pass already gives
-    // every other candidate, so the next top-level BFS step starts from a known page.
-    const clickIdx = log.indexOf(`click:${walletButton.selector}`);
-    expect(log.slice(clickIdx)).toContain('goto:https://a.test/dashboard');
+    // every other candidate, so the next top-level BFS step starts from a known page. Checked by
+    // re-snapshotting the live browser rather than asserting a specific goto()/reload() call: a
+    // working Escape alone (this fake's default) is just as valid a recovery as a forced reload —
+    // what matters is the resulting state, not the mechanism (see resetAfterProbe in crawler.ts).
+    expect(log).toContain(`click:${walletButton.selector}`);
+    expect(await browser.snapshot()).toMatchObject({
+      url: 'https://a.test/dashboard',
+      interactiveElements: thinPage,
+    });
   });
 
   it('deep-probes a route that already has plenty of interactive elements too, when a candidate reveals a real modal', async () => {
@@ -1139,6 +1173,61 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     const visited = result.routes.filter((r) => !r.stateKey).map((r) => r.url);
     expect(visited).toContain('https://a.test/x');
     expect(visited).toContain('https://a.test/y');
+  });
+});
+
+describe('crawl() click-probe reset corruption (docs/click-probe-reset-corruption.md)', () => {
+  it('recovers via a forced reload() when Escape alone cannot close a stuck same-URL modal', async () => {
+    // Reproduces the live C&A bug directly: a custom modal that doesn't listen for Escape.
+    // stateProbeBudget: 0 isolates the plain click-probing pass's own reset (the branch the bug
+    // doc's root cause #1 is about — deep-probe was never involved in the original failure since
+    // it's off in pass 1) from the separate deep-probe pass this file already covers elsewhere.
+    const triggerA = button('Open stuck modal');
+    const triggerB = button('Other action');
+    const stuckModal = [button('Add card'), button('Close')];
+    const log: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [triggerA, triggerB] } },
+      onClickSelectorReveal: { [triggerA.selector]: stuckModal },
+      escapeIneffective: new Set([triggerA.selector]),
+      log,
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard', { stateProbeBudget: 0 });
+
+    // Escape couldn't close it, so resetAfterProbe had to escalate to a genuine reload() — and
+    // since the browser was already sitting on originalUrl, it skips the always-doomed
+    // goto(originalUrl) rather than wasting a call known to be a no-op for a same-URL SPA route.
+    const clickAIdx = log.indexOf(`click:${triggerA.selector}`);
+    expect(log.slice(clickAIdx)).toContain(`reload:https://a.test/dashboard`);
+    expect(log.slice(clickAIdx)).not.toContain(`goto:https://a.test/dashboard`);
+    // Recovery worked: the next candidate on the same page still got attempted, proving the
+    // stuck modal didn't poison the rest of this route's click-probing.
+    expect(log).toContain(`click:${triggerB.selector}`);
+    expect(result.resetFailures ?? 0).toBe(0);
+  });
+
+  it('gives up on remaining candidates when even a forced reload cannot recover a stuck page', async () => {
+    const triggerA = button('Open permanently stuck modal');
+    const triggerB = button('Never reached');
+    const stuckModal = [button('Add card'), button('Close')];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [triggerA, triggerB] } },
+      onClickSelectorReveal: { [triggerA.selector]: stuckModal },
+      escapeIneffective: new Set([triggerA.selector]),
+      reloadIneffective: new Set([triggerA.selector]),
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard', { stateProbeBudget: 0 });
+
+    // Neither Escape nor a forced reload could recover the page — click-probing must give up on
+    // this route's remaining candidates rather than burning a full actionability timeout hunting
+    // for each one behind the still-open modal (the exact failure mode the bug doc describes).
+    expect(result.resetFailures).toBe(1);
+    const dashboardRoute = result.routes.find((r) => r.url === 'https://a.test/dashboard');
+    expect(dashboardRoute?.unattemptedClickCandidates?.some((c) => c.selector === triggerB.selector)).toBe(
+      true,
+    );
   });
 });
 
@@ -1995,6 +2084,7 @@ describe('crawlManySeeds() (separate-origin fallback fan-out)', () => {
           const delay = config.delayMs?.[url];
           if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
         },
+        async reload(): Promise<void> {},
         async screenshot(): Promise<Buffer> {
           return Buffer.alloc(0);
         },

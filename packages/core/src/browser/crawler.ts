@@ -79,6 +79,18 @@ export interface CrawlResult {
   shellCollapsed: boolean;
   /** Requested URLs whose resolution was skipped as a runaway/degenerate redirect — see isDegenerateUrl. Likely an app-side routing defect, not a Healix bug; never a confirmed triage verdict. */
   degenerateRedirectsSkipped: string[];
+  /**
+   * How many times click-probing gave up on a route because the page couldn't be reliably reset
+   * after a click even after a forced reload — see `resetAfterProbe` and
+   * docs/click-probe-reset-corruption.md. Distinct from `budgetExhausted`/`unvisitedQueuedCount`:
+   * this means candidates were left unattempted because the page was stuck, not because time ran
+   * out. Callers surface this as a warning; see explore.ts.
+   *
+   * Optional for the same reason as `unvisitedQueuedCount` above — avoids a mechanical touch to
+   * every pre-existing `CrawlResult` literal. Always populated by `crawl()`; treat an absent value
+   * as 0.
+   */
+  resetFailures?: number;
 }
 
 /**
@@ -106,6 +118,7 @@ export function mergeCrawlResults(
     redirectLoopsDetected: [...base.redirectLoopsDetected, ...addition.redirectLoopsDetected],
     shellCollapsed: base.shellCollapsed || addition.shellCollapsed,
     degenerateRedirectsSkipped: [...base.degenerateRedirectsSkipped, ...addition.degenerateRedirectsSkipped],
+    resetFailures: (base.resetFailures ?? 0) + (addition.resetFailures ?? 0),
   };
 }
 
@@ -386,6 +399,10 @@ export interface ClickDiscoveryResult {
     selectorTier?: 1 | 2 | 3 | 4;
     repeatedRowText?: string;
   }[];
+  /** Number of times this call gave up on a page because `resetAfterProbe` couldn't reliably
+   * restore it even after a forced reload — distinct from ordinary budget exhaustion. See
+   * `CrawlResult.resetFailures`. */
+  resetFailures: number;
 }
 
 /** Enables the deep-probe behavior in `discoverClickRoutes` — engaged on every route (see
@@ -480,7 +497,41 @@ function emptyClickDiscoveryResult(): ClickDiscoveryResult {
     loginToggleSelectors: [],
     discoveredStates: [],
     unattemptedClickCandidates: [],
+    resetFailures: 0,
   };
+}
+
+/**
+ * Restore the page to `originalSnapshot`'s state after a click-probe, verifying the reset
+ * actually worked instead of trusting it blindly — see docs/click-probe-reset-corruption.md.
+ * `pressKey('Escape')` alone doesn't close every modal (custom in-app modals that don't listen
+ * for Escape), and `goto(originalUrl)` is a silent no-op for a same-URL hash-routed SPA (Playwright
+ * reports a real `Response` even though nothing actually reloaded). Left unrecovered, either
+ * failure poisons every click candidate that follows on the same page.
+ *
+ * Escalates only as far as needed: Escape + a cheap re-snapshot resolves the common real-dropdown
+ * case with no extra cost; `goto()` is skipped when we're already sitting on `originalUrl` (a
+ * known no-op there) and a genuine `reload()` — the one primitive that can't suffer the same-URL
+ * no-op problem — is used instead, but only when the cheaper steps didn't already succeed.
+ */
+async function resetAfterProbe(
+  browser: BrowserSurface,
+  originalSnapshot: DomSnapshot,
+  originalUrl: string,
+): Promise<boolean> {
+  await browser.pressKey('Escape').catch(() => undefined);
+  let current = await snapshotClean(browser).catch(() => undefined);
+  if (current && fingerprintOf(current) === fingerprintOf(originalSnapshot)) return true;
+
+  if (current && normalizeUrl(current.url) !== normalizeUrl(originalUrl)) {
+    await browser.goto(originalUrl).catch(() => undefined);
+    current = await snapshotClean(browser).catch(() => undefined);
+    if (current && fingerprintOf(current) === fingerprintOf(originalSnapshot)) return true;
+  }
+
+  await browser.reload().catch(() => undefined);
+  current = await snapshotClean(browser).catch(() => undefined);
+  return !!current && fingerprintOf(current) === fingerprintOf(originalSnapshot);
 }
 
 async function discoverClickRoutes(
@@ -497,6 +548,7 @@ async function discoverClickRoutes(
   const loginToggleSelectors: string[] = [];
   const discoveredStates: CrawledRoute[] = [];
   let attempted = 0;
+  let resetFailures = 0;
   const deepProbe = opts.deepProbe;
 
   for (const candidate of candidates) {
@@ -516,10 +568,16 @@ async function discoverClickRoutes(
       if (normalizeUrl(after.url) !== normalizeUrl(originalUrl)) {
         if (sameOrigin(after.url, origin)) discoveredUrls.push(after.url);
         discoveredUrls.push(...extractLinks(after, origin));
-        await browser.goto(originalUrl).catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       } else if (LOGIN_TEXT_RE.test(candidate.name) && hasPasswordField(after)) {
         loginToggleSelectors.push(candidate.selector);
-        await browser.pressKey('Escape').catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       } else if (
         deepProbe &&
         (after.interactiveElements.length - beforeCount >= STATE_REVEAL_MIN_NEW_ELEMENTS ||
@@ -566,19 +624,28 @@ async function discoverClickRoutes(
           discoveredUrls.push(...nested.discoveredUrls);
           loginToggleSelectors.push(...nested.loginToggleSelectors);
           discoveredStates.push(...nested.discoveredStates);
+          resetFailures += nested.resetFailures;
         }
 
-        await browser.pressKey('Escape').catch(() => undefined);
-        await browser.goto(originalUrl).catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       } else {
         // Click likely opened a menu/dropdown in place rather than navigating
         // — collect any newly revealed anchors, then close it.
         discoveredUrls.push(...extractLinks(after, origin));
-        await browser.pressKey('Escape').catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       }
     } catch {
       // Dead click target or click failed — best-effort reset, keep probing the rest.
-      await browser.goto(originalUrl).catch(() => undefined);
+      if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+        resetFailures += 1;
+        break;
+      }
     }
   }
 
@@ -595,6 +662,7 @@ async function discoverClickRoutes(
     loginToggleSelectors,
     discoveredStates,
     unattemptedClickCandidates,
+    resetFailures,
   };
 }
 
@@ -865,6 +933,7 @@ export async function crawl(
   let budgetExhausted = false;
   let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
   let remainingStateProbes = opts.stateProbeBudget ?? MAX_STATE_PROBES_PER_CRAWL;
+  let resetFailures = 0;
 
   // Discard anything buffered before this crawl started so it doesn't leak into route 0.
   browser.drainNetworkEvents();
@@ -963,6 +1032,7 @@ export async function crawl(
         emptyClickDiscoveryResult,
       );
       remainingClickProbes -= clickResult.attempted;
+      resetFailures += clickResult.resetFailures;
       if (clickResult.loginToggleSelectors.length > 0) {
         routes[routes.length - 1].loginToggleSelector = clickResult.loginToggleSelectors[0];
       }
@@ -993,19 +1063,31 @@ export async function crawl(
   if (remainingStateProbes > 0) {
     const stateBudget = { remaining: remainingStateProbes };
     const pass1Routes = [...routes];
+    // Tracks wherever the browser was actually left by the previous iteration (or, for the first
+    // iteration, by pass 1 itself — pass 2 visits in REVERSE of pass1Routes, so its first route is
+    // exactly the last route pass 1 visited). A route matching this is a same-URL no-op for
+    // goto() on a hash-routed SPA (see resetAfterProbe/docs/click-probe-reset-corruption.md) —
+    // force a genuine reload() instead so a stuck page can't poison this route's own
+    // discoverClickRoutes call from the very first snapshot it takes.
+    let lastVisitedUrl = pass1Routes[pass1Routes.length - 1]?.url;
     for (let i = pass1Routes.length - 1; i >= 0; i -= 1) {
       if (stateBudget.remaining <= 0 || Date.now() >= deadline) break;
       const route = pass1Routes[i];
 
       let snapshot: DomSnapshot;
       try {
-        await browser.goto(route.url);
+        if (lastVisitedUrl !== undefined && normalizeUrl(lastVisitedUrl) === normalizeUrl(route.url)) {
+          await browser.reload();
+        } else {
+          await browser.goto(route.url);
+        }
         snapshot = await snapshotClean(browser);
       } catch {
         browser.drainNetworkEvents();
         continue;
       }
       browser.drainNetworkEvents();
+      lastVisitedUrl = route.url;
 
       const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, MAX_CLICKS_PER_PAGE, {
         deepProbe: {
@@ -1016,6 +1098,7 @@ export async function crawl(
           stateFingerprints,
         },
       }).catch(emptyClickDiscoveryResult);
+      resetFailures += clickResult.resetFailures;
 
       if (clickResult.loginToggleSelectors.length > 0) {
         route.loginToggleSelector = clickResult.loginToggleSelectors[0];
@@ -1043,6 +1126,7 @@ export async function crawl(
     redirectLoopsDetected,
     shellCollapsed,
     degenerateRedirectsSkipped,
+    resetFailures,
   };
 }
 

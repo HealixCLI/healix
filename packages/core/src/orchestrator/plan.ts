@@ -162,6 +162,14 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
       'cases for a feature with no real boundary condition). Never pad the list to force a fixed count.',
   );
   lines.push(
+    'If a validation rule has multiple distinct concrete example inputs worth testing (e.g. several malformed ' +
+      'email formats), give each example its OWN scenario entry — do not bundle them into one description like ' +
+      "\"Malformed email formats ('abc', 'abc@', 'abc@.com') show 'Invalid email' error\". Exactly one test " +
+      'is generated per scenario, so a bundled description only ever gets ONE example actually executed while the ' +
+      "rest silently never run. Prefer: one scenario per example, e.g. \"Malformed email format 'abc' shows " +
+      "'Invalid email' error\", another for 'abc@', another for 'abc@.com'.",
+  );
+  lines.push(
     units.length > 0
       ? 'Produce one item per distinct route/endpoint listed above that is testable in scope — do not skip any without good reason. Every item needs at least one "positive" scenario; add "negative" and "edge" scenarios only where genuinely applicable to that feature (do not fabricate them for a feature that has none).'
       : 'Enumerate every distinct user-facing flow or API surface you can identify from the context above — do not artificially limit the number of items. Every item needs at least one "positive" scenario; add "negative" and "edge" scenarios only where genuinely applicable to that feature.',
@@ -485,6 +493,11 @@ export function buildReviseItemPrompt(
       'entries as the feature genuinely has; never pad it to force a fixed count.',
   );
   lines.push(
+    'If a validation rule has multiple distinct concrete example inputs worth testing, give each example its ' +
+      'OWN scenario entry rather than bundling them into one description — exactly one test is generated per ' +
+      'scenario, so a bundled description only ever gets one example actually executed.',
+  );
+  lines.push(
     'Include the full revised scenarios array (keep scenarios unaffected by the feedback as-is; revise only what the feedback requires).',
   );
   lines.push(tierGuidanceFor(tiers));
@@ -553,6 +566,82 @@ export async function reviseItem(
   return { ok: true, item: revised };
 }
 
+/**
+ * Matches ANY parenthesized, comma-separated list, e.g. `('abc', 'abc@')` or
+ * `(13, 15, 17)` — a CANDIDATE bundle. Whether it's actually treated as one
+ * (vs. an ordinary parenthetical aside) is decided by isVariantBundle below,
+ * not by this regex alone. No nested-parens support needed here: descriptions
+ * are short, flat sentences, not code.
+ */
+const PARENTHESIZED_LIST_RE = /\(([^()]+)\)/;
+
+/** Cap on how many variants get split out of one bundled description — a pathological huge list is left bundled rather than exploding into dozens of tests. */
+const MAX_SPLIT_VARIANTS = 8;
+
+function isQuotedLiteral(token: string): boolean {
+  return (
+    (token.startsWith("'") && token.endsWith("'") && token.length >= 2) ||
+    (token.startsWith('"') && token.endsWith('"') && token.length >= 2)
+  );
+}
+
+/**
+ * A bare (unquoted) token is treated as a literal data value only when it's a
+ * single word with no internal whitespace AND contains at least one
+ * non-letter character (a digit or symbol) — realistic malformed-format
+ * examples almost always do ('abc@', '000-000', '13/45/2020'), while an
+ * ordinary prose enumeration (field names, browser names, etc.) is almost
+ * always pure alphabetic words ('name', 'email', 'Chrome'). This is a
+ * deliberately conservative heuristic: it would rather miss an unquoted,
+ * all-letters variant list than mis-split a normal sentence like "(name,
+ * email, phone) fields are required".
+ */
+function looksLikeBareVariantToken(token: string): boolean {
+  return /^\S+$/.test(token) && /[^a-zA-Z]/.test(token);
+}
+
+/** Every item in the list is either a quoted literal or a bare "value-like" token (see looksLikeBareVariantToken) — a mix of the two is fine (e.g. one quoted, one bare-numeric). */
+function isVariantBundle(items: string[]): boolean {
+  return items.every((item) => isQuotedLiteral(item) || looksLikeBareVariantToken(item));
+}
+
+/**
+ * A scenario like "Malformed email formats ('abc', 'abc@', 'abc@.com') show
+ * 'Invalid email' error" describes ONE validation rule but bundles THREE
+ * concrete example inputs into its description — left as-is, GENERATE's own
+ * "exactly one test(...) per scenario" contract (see generate.ts's
+ * formatScenarios/count-mismatch retry) means only ONE test gets written for
+ * it, so the model picks a single example and the other two are silently
+ * never executed, never reported, and never recorded (the bug this fixes).
+ * The same happens for an unquoted bundle like "Invalid ages (13, 15, 17)
+ * are rejected".
+ *
+ * Splits such a description into one scenario per bundled example, each
+ * naming just that one value — so each becomes its own generated test with
+ * its own pass/fail/skip row and its own recording. A description with no
+ * bundled list, or a parenthetical that isn't a data-value list (e.g. "(name,
+ * email, phone) fields are required" — plain words, no digits/symbols), is
+ * left completely unchanged; see isVariantBundle's own doc comment for why
+ * that distinction matters.
+ */
+function splitBundledVariants(scenario: PlanScenario): PlanScenario[] {
+  const match = PARENTHESIZED_LIST_RE.exec(scenario.description);
+  if (!match) return [scenario];
+  const items = match[1]
+    .split(',')
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (items.length < 2 || items.length > MAX_SPLIT_VARIANTS) return [scenario];
+  if (!isVariantBundle(items)) return [scenario];
+  const [fullMatch] = match;
+  const start = match.index;
+  return items.map((item) => ({
+    kind: scenario.kind,
+    description:
+      scenario.description.slice(0, start) + item + scenario.description.slice(start + fullMatch.length),
+  }));
+}
+
 /** Parse and normalize a raw scenarios array; unknown/malformed entries are dropped, not coerced into noise. */
 function normalizeScenarios(raw: unknown): PlanScenario[] {
   if (!Array.isArray(raw)) return [];
@@ -563,7 +652,7 @@ function normalizeScenarios(raw: unknown): PlanScenario[] {
     if (description.length === 0) continue;
     const kindRaw = typeof entry.kind === 'string' ? entry.kind.trim().toLowerCase() : '';
     const kind = (KNOWN_SCENARIO_KINDS.find((k) => k === kindRaw) ?? 'positive') as PlanScenario['kind'];
-    out.push({ kind, description });
+    out.push(...splitBundledVariants({ kind, description }));
   }
   return out;
 }

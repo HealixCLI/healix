@@ -192,4 +192,28 @@ describe('mergeExecOutcomes', () => {
     const merged = mergeExecOutcomes(outcome([]), outcome([]));
     expect(merged.mockedRequestCounts).toBeUndefined();
   });
+
+  it('unions apiEvidence across a merge, with b (the later iteration) winning a key collision', () => {
+    const a: ExecOutcome = {
+      ...outcome([]),
+      apiEvidence: { 'f#a': 'A-only evidence', 'f#shared': 'stale evidence from iteration A' },
+    };
+    const b: ExecOutcome = {
+      ...outcome([]),
+      apiEvidence: { 'f#b': 'B-only evidence', 'f#shared': 'fresh evidence from iteration B' },
+    };
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.apiEvidence).toEqual({
+      'f#a': 'A-only evidence',
+      'f#b': 'B-only evidence',
+      'f#shared': 'fresh evidence from iteration B',
+    });
+  });
+
+  it('omits apiEvidence entirely when neither side has any (no empty-object noise)', () => {
+    const merged = mergeExecOutcomes(outcome([]), outcome([]));
+    expect(merged.apiEvidence).toBeUndefined();
+  });
 });

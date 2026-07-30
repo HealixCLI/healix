@@ -313,17 +313,6 @@ const IMG_EXT = /\.(png|jpe?g|gif|webp)$/i;
 const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
 
 /**
- * Evidence for one test row — screenshot(s), video, and anything else
- * captured (trace.zip, error-context.md, …). `reportDir` is the absolute
- * directory report.html itself is written to (runDir/reports); artifact
- * paths are absolute on disk, so we link to them relative to that directory
- * rather than embedding data (this stays a single file, but still resolves
- * correctly as long as the report is opened from alongside the run's suite/
- * folder — the same layout it was generated in). Without a reportDir (older
- * callers, unit tests) we fall back to the original plain-basename listing,
- * since we have no safe path to link to.
- */
-/**
  * Explicit note rendered in place of a video player when one isn't present —
  * see ExecResultItem.videoUnavailableReason's doc comment for the three
  * distinct cases this covers. Never silently omitted: a missing video always
@@ -334,6 +323,17 @@ function renderVideoUnavailableNote(reason: string | undefined): string {
   return `<div class="video-unavailable"><em>No video: ${esc(reason)}</em></div>`;
 }
 
+/**
+ * Evidence for one test row — screenshot(s), video, and anything else
+ * captured (trace.zip, error-context.md, …). `reportDir` is the absolute
+ * directory report.html itself is written to (runDir/reports); artifact
+ * paths are absolute on disk, so we link to them relative to that directory
+ * rather than embedding data (this stays a single file, but still resolves
+ * correctly as long as the report is opened from alongside the run's suite/
+ * folder — the same layout it was generated in). Without a reportDir (older
+ * callers, unit tests) we fall back to the original plain-basename listing,
+ * since we have no safe path to link to.
+ */
 function renderArtifacts(
   artifacts: string[] | undefined,
   reportDir: string | undefined,

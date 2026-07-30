@@ -1200,6 +1200,83 @@ describe('crawl() repeated-sibling collapse (state-dedup)', () => {
     ).toBe(true);
   });
 
+  it("does not erase a differently-named minority sibling into a same-shaped majority's collapsed representative (zmeniť/odstrániť)", async () => {
+    const editTriggers: InteractiveElement[] = [
+      { role: 'generic', name: 'zmeniť', selector: 'div:nth-of-type(1) > p', repeatedRowText: 'Meno zmeniť' },
+      {
+        role: 'generic',
+        name: 'zmeniť',
+        selector: 'div:nth-of-type(2) > p',
+        repeatedRowText: 'Dátum narodenia zmeniť',
+      },
+      {
+        role: 'generic',
+        name: 'zmeniť',
+        selector: 'div:nth-of-type(3) > p',
+        repeatedRowText: 'Email zmeniť',
+      },
+      {
+        role: 'generic',
+        name: 'zmeniť',
+        selector: 'div:nth-of-type(4) > p',
+        repeatedRowText: 'Heslo zmeniť',
+      },
+      {
+        role: 'generic',
+        name: 'odstrániť',
+        selector: 'div:nth-of-type(5) > p',
+        repeatedRowText: 'Odstrániť účet odstrániť',
+      },
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: editTriggers } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    const names = result.routes[0].snapshot.interactiveElements.map((el) => el.name).sort();
+    expect(names).toEqual(['odstrániť', 'zmeniť', 'zmeniť', 'zmeniť', 'zmeniť']);
+    expect(
+      result.routes[0].snapshot.interactiveElements.every((el) => el.repeatedGroupSize === undefined),
+    ).toBe(true);
+  });
+
+  it('still collapses a same-name subgroup that reaches the threshold when repeatedRowText is absent or repeats', async () => {
+    const deleteButtons: InteractiveElement[] = Array.from({ length: 5 }, (_, i) => ({
+      role: 'button',
+      name: 'Delete',
+      selector: `tr:nth-of-type(${i + 1}) > td > button`,
+    }));
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: deleteButtons } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(1);
+    expect(result.routes[0].snapshot.interactiveElements[0].repeatedGroupSize).toBe(5);
+  });
+
+  it('leaves a small mixed-name group uncollapsed when no single name reaches the threshold', async () => {
+    const mixed: InteractiveElement[] = [
+      { role: 'generic', name: 'A', selector: 'div:nth-of-type(1) > p' },
+      { role: 'generic', name: 'A', selector: 'div:nth-of-type(2) > p' },
+      { role: 'generic', name: 'A', selector: 'div:nth-of-type(3) > p' },
+      { role: 'generic', name: 'B', selector: 'div:nth-of-type(4) > p' },
+      { role: 'generic', name: 'B', selector: 'div:nth-of-type(5) > p' },
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: mixed } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(5);
+    expect(
+      result.routes[0].snapshot.interactiveElements.every((el) => el.repeatedGroupSize === undefined),
+    ).toBe(true);
+  });
+
   it('stops recursing into a deep-probe reveal once its (route, fingerprint) pair has recurred, but still records it', async () => {
     const openA = button('Open A');
     const openB = button('Open B');

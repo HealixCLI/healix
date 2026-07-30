@@ -670,22 +670,65 @@ function selectorShape(selector: string): string {
  * `snapshotClean`) so every downstream consumer — click-candidate extraction, deep-probe reveal
  * sizing, the recorded route itself — sees the collapsed view uniformly, rather than patching
  * each consumer separately.
+ *
+ * The shape key alone isn't enough: a live run against the same app found the account page's
+ * "zmeniť" (change name/DOB/email/password) x4 plus "odstrániť" (delete account) x1 — 5 `generic`
+ * `<p>` elements sharing one DOM shape — collapsing into ONE entry named "zmeniť", silently
+ * erasing the delete-account trigger rather than deduping it. So within a shape-group that meets
+ * the threshold, elements are also split by accessible NAME first: a minority name too small to
+ * be "real repetition" on its own (odstrániť x1) is never swallowed by a same-shaped majority.
+ * A same-name subgroup that itself meets the threshold (zmeniť x4) is then checked against
+ * `repeatedRowText` (the nearest repeated-DOM-ancestor's own text — see selectors.ts) before
+ * collapsing: each "zmeniť" trigger sits in its own profile section, so their surrounding row
+ * text differs even though their own name doesn't, distinguishing 4 functionally different
+ * triggers from a genuinely repeated list (e.g. 50 identically-labeled "Delete" row buttons,
+ * whose row text is far more likely to repeat, or not be tier-4/present at all).
  */
 function collapseRepeatedSiblings(snapshot: DomSnapshot): DomSnapshot {
-  const groups = new Map<string, InteractiveElement[]>();
+  const shapeGroups = new Map<string, InteractiveElement[]>();
   for (const el of snapshot.interactiveElements) {
     const key = `${el.role}:${selectorShape(el.selector)}`;
-    const group = groups.get(key);
+    const group = shapeGroups.get(key);
     if (group) group.push(el);
-    else groups.set(key, [el]);
+    else shapeGroups.set(key, [el]);
   }
 
   const collapsed: InteractiveElement[] = [];
-  for (const group of groups.values()) {
-    if (group.length >= REPEATED_GROUP_MIN_SIZE) {
-      collapsed.push({ ...group[0], repeatedGroupSize: group.length });
-    } else {
-      collapsed.push(...group);
+  for (const shapeGroup of shapeGroups.values()) {
+    if (shapeGroup.length < REPEATED_GROUP_MIN_SIZE) {
+      collapsed.push(...shapeGroup);
+      continue;
+    }
+
+    const distinctNames = new Set(shapeGroup.map((el) => el.name));
+    if (distinctNames.size >= REPEATED_GROUP_MIN_SIZE) {
+      // Mostly/all-unique names sharing one shape (a date-picker's day cells, an enumerated
+      // list) — the name carries no distinguishing signal here, collapse as one unit.
+      collapsed.push({ ...shapeGroup[0], repeatedGroupSize: shapeGroup.length });
+      continue;
+    }
+
+    const nameGroups = new Map<string, InteractiveElement[]>();
+    for (const el of shapeGroup) {
+      const group = nameGroups.get(el.name);
+      if (group) group.push(el);
+      else nameGroups.set(el.name, [el]);
+    }
+    for (const nameGroup of nameGroups.values()) {
+      if (nameGroup.length < REPEATED_GROUP_MIN_SIZE) {
+        collapsed.push(...nameGroup);
+        continue;
+      }
+
+      const rowTexts = nameGroup.map((el) => el.repeatedRowText);
+      const distinctRowTexts = new Set(rowTexts);
+      const allDistinct =
+        rowTexts.every((text) => text !== undefined) && distinctRowTexts.size === nameGroup.length;
+      if (allDistinct) {
+        collapsed.push(...nameGroup);
+      } else {
+        collapsed.push({ ...nameGroup[0], repeatedGroupSize: nameGroup.length });
+      }
     }
   }
 

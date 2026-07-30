@@ -1548,6 +1548,10 @@ async function runPipeline(
                 id: it.id,
                 title: it.title,
                 unitKey: it.unitKey,
+                intent: it.intent,
+                reqTag: it.reqTag,
+                scenarios: it.scenarios,
+                tier: it.tier,
               })),
               observedEndpoints: explorationArtifact.observedEndpoints,
             });

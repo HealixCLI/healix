@@ -18,11 +18,14 @@ import type { ObservedEndpoint } from '../browser/network-capture.js';
 import type { ProviderAdapter } from '../providers/types.js';
 import type { UsageRecorder } from '../providers/usage.js';
 import type { OrchestratorEvent } from './types.js';
+import type { TestPlanItem } from '../modes/types.js';
+import { buildRequirementTokens, hasRequirementCoverage } from '../util/requirement-tokens.js';
 
 export type ExplorationGapKind =
   | 'unvisited-plan-route'
   | 'unvisited-observed-endpoint'
-  | 'unclicked-affordance';
+  | 'unclicked-affordance'
+  | 'unmet-content-need';
 
 export interface ExplorationGap {
   id: string;
@@ -42,6 +45,21 @@ export interface ExplorationGap {
    * Such gaps skip LLM micro-agent escalation entirely (see `runGapFillingPass`) so the shared
    * budget isn't spent confirming a Facebook button reveals nothing. */
   lowValueAffordance?: boolean;
+  /** Confidence tier of `targetSelectorGuess`, copied from `InteractiveElement.selectorTier` —
+   * 4 means a positional nth-of-type fallback, which a fresh page reload can silently resolve to
+   * a different node than the one the crawl clicked (list reordering, conditional rendering,
+   * async-loaded content). Drives a text-anchored retry in `closeAffordanceGapDeterministic`. */
+  targetSelectorTier?: 1 | 2 | 3 | 4;
+  /** Nearest repeated ancestor's own text, copied from `InteractiveElement.repeatedRowText` —
+   * a stable `:text-is()` anchor to retry with when a tier-4 `targetSelectorGuess` reveals
+   * nothing on a fresh reload. */
+  targetRepeatedRowText?: string;
+  /** Only set for `'unmet-content-need'` gaps: the visited routes judged most likely to host this
+   * item's content (matched by the item's own `unitKey` route path, falling back to every visited
+   * route when that doesn't resolve to one) — seeds the micro-agent's starting point(s) so it can
+   * try more than one candidate route in sequence instead of guessing from wherever the browser
+   * currently sits. */
+  candidateRouteUrls?: string[];
 }
 
 export interface GapFillAttempt {
@@ -52,15 +70,29 @@ export interface GapFillAttempt {
   detail?: string;
 }
 
-/** Bounds even a huge plan/inventory to a fixed worst case per run. */
+/**
+ * Runaway backstop for gaps with NO plan correlation at all (decorative nav, untargeted leftover
+ * clicks on a page with dozens of unrelated buttons) — never a ceiling on real plan coverage.
+ * Every gap tied to an actual plan item (`relatedPlanItemId` set — this includes `unmet-content-
+ * need` gaps and any affordance/endpoint gap `correlatePlanItem` linked) gets a genuine attempt
+ * regardless of how many exist; there's no principled reason to drop a real, identified content
+ * need just because more than a handful happened to exist in one run. The total wall-clock cost is
+ * already self-scaling via `totalBudgetMs = perGapBudgetMs * gaps.length` (see there), so more
+ * real gaps just means a proportionally longer run, not a truncated one.
+ */
 const MAX_GAPS_PER_RUN = 10;
 
 export interface IdentifyGapsInput {
   crawlResult: CrawlWithAuthResult;
   routing: RoutePrefixInfo;
   baseUrl: string;
-  /** Narrow slice of the approved plan's items — only what's needed to spot an unvisited target. */
-  planItems: { id: string; title: string; unitKey?: string }[];
+  /** Narrow slice of the approved plan's items — only what's needed to spot an unvisited target
+   * and (when the richer fields are supplied) an unmet content need. `intent`/`reqTag`/
+   * `scenarios`/`tier` are optional so existing minimal callers/fixtures keep compiling
+   * unchanged; omitting them just means `identifyUnmetContentNeeds` has nothing to check for
+   * that item (see its doc comment). */
+  planItems: (Pick<TestPlanItem, 'id' | 'title' | 'unitKey'> &
+    Partial<Pick<TestPlanItem, 'intent' | 'reqTag' | 'scenarios' | 'tier'>>)[];
   observedEndpoints: ObservedEndpoint[];
 }
 
@@ -140,15 +172,92 @@ function correlatePlanItem(
 }
 
 /**
- * Priority tier for gap-fill ordering (lower = attempted first). Plan-linked gaps (route and
- * affordance alike) lead, since a real test scenario needs them; among affordance gaps, an
- * authenticated-surface candidate outranks an anonymous one (the dashboard-behind-login surface
- * is consistently the higher-value target — see GAP-060's measured evidence), and a
- * decorative/social-nav candidate sinks to the bottom regardless of role. `unvisited-observed-
- * endpoint` gaps keep their historical position (just behind plan-linked) since they're already a
- * concrete, named signal of a real missed flow.
+ * For each plan item (skipping `tierC-api`, which never drives a browser page), checks whether
+ * the CURRENT crawl inventory already has something relevant to that item's own requirement text
+ * (title/intent/scenarios — see `buildRequirementTokens`/`hasRequirementCoverage`), on whichever
+ * visited route its `unitKey` resolves to (falling back to every visited route when it doesn't).
+ * When nothing relevant is found anywhere, emits a gap whose `description` is the item's own
+ * scenario text verbatim — a concrete goal ("needs a form to enter current password, a new
+ * password, and submit"), not a generic template — so a downstream micro-agent escalation knows
+ * exactly what it's looking for instead of blindly retrying whatever affordance survived the
+ * crawl budget. This is what lets gap-fill disambiguate between several visually-identical
+ * triggers (e.g. this app's four "zmeniť" sections) by CONTENT rather than by a hardcoded name.
+ *
+ * Deliberately coarse (see `hasRequirementCoverage`'s doc comment): a false positive here just
+ * costs one extra bounded gap-fill attempt that reports `partial`, not a regression.
+ */
+function identifyUnmetContentNeeds(
+  crawlResult: CrawlWithAuthResult,
+  planItems: IdentifyGapsInput['planItems'],
+  routing: RoutePrefixInfo,
+  baseUrl: string,
+): ExplorationGap[] {
+  const gaps: ExplorationGap[] = [];
+  for (const item of planItems) {
+    if (item.tier === 'tierC-api') continue;
+    if (!item.intent && (!item.scenarios || item.scenarios.length === 0)) continue; // nothing to check against
+    const reqTokens = buildRequirementTokens(item);
+    if (reqTokens.size === 0) continue;
+
+    let candidates = crawlResult.routes;
+    if (item.unitKey?.startsWith('route:')) {
+      const path = item.unitKey.replace(/^route:/, '');
+      const [resolvedUrl] = reconcileStaticRoutePaths([path], routing, baseUrl);
+      const matched = resolvedUrl
+        ? crawlResult.routes.filter(
+            (r) => normalizeUrl(r.url) === normalizeUrl(resolvedUrl) || r.url.includes(path),
+          )
+        : crawlResult.routes.filter((r) => r.url.includes(path));
+      if (matched.length > 0) candidates = matched;
+    }
+    if (candidates.length === 0) continue; // nothing crawled at all yet — the unvisited-route gap already covers this
+
+    // Many real projects never populate unitKey at all (no functionality-index units to ground
+    // the plan on), leaving `candidates` as literally every visited route in crawl order —
+    // arbitrarily anonymous-first. Re-order (same convention as generate.ts's
+    // selectInventoryElements) so a tierB-auth item's candidates/parentRouteRole reflect the
+    // authenticated surface it actually needs, not whichever route the crawl happened to visit
+    // first.
+    const preferredRole = item.tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
+    candidates = [...candidates].sort(
+      (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
+    );
+
+    const covered = candidates.some((route) => hasRequirementCoverage(route, reqTokens));
+    if (covered) continue;
+
+    const scenarioText = (item.scenarios ?? []).map((s) => `- ${s.description}`).join('\n');
+    gaps.push({
+      id: `content:${item.id}`,
+      kind: 'unmet-content-need',
+      description: [
+        `Plan item "${item.title}"${item.intent ? ` (${item.intent})` : ''} needs content the exploration crawl never found:`,
+        scenarioText,
+      ]
+        .filter(Boolean)
+        .join('\n'),
+      relatedPlanItemId: item.id,
+      candidateRouteUrls: candidates.slice(0, 5).map((r) => r.url),
+      parentRouteRole: candidates[0]?.role,
+    });
+  }
+  return gaps;
+}
+
+/**
+ * Priority tier for gap-fill ordering (lower = attempted first). An `unmet-content-need` gap
+ * leads everything else: it's plan-linked BY CONSTRUCTION (derived directly from the item's own
+ * requirement text), not via `correlatePlanItem`'s looser word-overlap guess, so it's a stronger
+ * signal than any other tier here. Next, other plan-linked gaps (route and affordance alike) lead
+ * the rest, since a real test scenario needs them; among affordance gaps, an authenticated-surface
+ * candidate outranks an anonymous one (the dashboard-behind-login surface is consistently the
+ * higher-value target — see GAP-060's measured evidence), and a decorative/social-nav candidate
+ * sinks to the bottom regardless of role. `unvisited-observed-endpoint` gaps keep their historical
+ * position (just behind plan-linked) since they're already a concrete, named signal of a real
+ * missed flow.
  */
 function gapPriorityTier(gap: ExplorationGap): number {
+  if (gap.kind === 'unmet-content-need') return 0;
   // Checked BEFORE relatedPlanItemId for affordance gaps deliberately: `correlatePlanItem`'s
   // word-overlap heuristic can spuriously match a decorative/social candidate against an
   // UNRELATED plan item that happens to mention the same brand/word (confirmed live — a
@@ -157,11 +266,11 @@ function gapPriorityTier(gap: ExplorationGap): number {
   // curated classification is a stronger, more deliberate signal than that loose overlap, so it
   // must win the tie rather than let a coincidental keyword match promote a decorative gap to
   // the front of the queue.
-  if (gap.kind === 'unclicked-affordance' && gap.lowValueAffordance) return 4;
-  if (gap.relatedPlanItemId) return 0;
-  if (gap.kind !== 'unclicked-affordance') return 1;
-  if (gap.parentRouteRole === 'authenticated') return 2;
-  return 3;
+  if (gap.kind === 'unclicked-affordance' && gap.lowValueAffordance) return 5;
+  if (gap.relatedPlanItemId) return 1;
+  if (gap.kind !== 'unclicked-affordance') return 2;
+  if (gap.parentRouteRole === 'authenticated') return 3;
+  return 4;
 }
 
 /**
@@ -228,9 +337,13 @@ export function identifyExplorationGaps(input: IdentifyGapsInput): ExplorationGa
         parentRouteRole,
         lowValueAffordance: isLowValueAffordance(candidate.name, parentRouteRole),
         relatedPlanItemId: correlatePlanItem(candidate.name, input.planItems),
+        targetSelectorTier: candidate.selectorTier,
+        targetRepeatedRowText: candidate.repeatedRowText,
       });
     }
   }
+
+  gaps.push(...identifyUnmetContentNeeds(input.crawlResult, input.planItems, input.routing, input.baseUrl));
 
   // Priority-tiered, not just plan-linked-first — see `gapPriorityTier`'s doc comment.
   // Array.prototype.sort is stable, so relative order within each tier is otherwise preserved.
@@ -243,7 +356,12 @@ export function identifyExplorationGaps(input: IdentifyGapsInput): ExplorationGa
     seenIds.add(gap.id);
     deduped.push(gap);
   }
-  return deduped.slice(0, MAX_GAPS_PER_RUN);
+
+  // Plan-linked gaps (real, identified content needs) are never truncated — only gaps with no
+  // plan correlation at all compete for the fixed backstop. See MAX_GAPS_PER_RUN's doc comment.
+  const planLinked = deduped.filter((g) => g.relatedPlanItemId);
+  const unlinked = deduped.filter((g) => !g.relatedPlanItemId);
+  return [...planLinked, ...unlinked.slice(0, MAX_GAPS_PER_RUN)];
 }
 
 export interface GapFillProvider {
@@ -271,10 +389,21 @@ export interface GapFillResult {
 }
 
 /**
- * Ceiling on a SINGLE gap's micro-agent escalation. Measured live against the real Claude CLI
- * (not a mocked provider): a single micro-agent turn — subprocess spin-up + a cheap/low-effort
- * completion — took ~8-9s round-trip, so this leaves room for ~5 real turns per gap (enough for
- * a full click/confirm/adjust cycle, not just one shot).
+ * Cheap-model, bounded ReAct loop — not a free-form agent. See providers/model-config.ts's
+ * 'explore-gapfill' entry. Bumped from 5: the content-goal-driven path (`unmet-content-need`
+ * gaps, and multi-route chaining in `runGapFillingPass`) can genuinely need more turns than a
+ * simple affordance click-and-diff — navigate a candidate route, look around, then act — so it
+ * gets more room to actually converge on its goal before giving up.
+ */
+const MICRO_AGENT_MAX_ACTIONS = 10;
+/** Measured live against the real Claude CLI (not a mocked provider): a single micro-agent turn —
+ * subprocess spin-up + a cheap/low-effort completion — took ~8-9s round-trip, so 10s/turn is a
+ * realistic per-step allowance, not an arbitrary number. */
+const MICRO_AGENT_SECONDS_PER_ACTION = 10;
+/**
+ * Ceiling on a SINGLE gap's micro-agent escalation, derived from the two constants above rather
+ * than set independently — keeps "how many turns it gets" and "how long each turn is allotted"
+ * tied together by construction so they can't silently drift out of sync.
  *
  * This used to be clamped against a FIXED shared total budget (45s), which meant this floor
  * wasn't actually guaranteed: measured live, two 20s-capped wallet gaps alone consumed nearly
@@ -283,13 +412,11 @@ export interface GapFillResult {
  * for gaps queued behind the first couple, not better. `runGapFillingPass`'s total budget now
  * scales with the number of gaps (`perGapBudgetMs * gaps.length`, see there) specifically so this
  * floor is a real per-gap guarantee, not a best-effort share of a pool sized independently of how
- * many gaps exist. Trade-off: total gap-fill wall-clock now scales with gap count too (bounded by
- * `MAX_GAPS_PER_RUN` in `identifyExplorationGaps`, so worst case is 10 * this value).
+ * many gaps exist. Trade-off: total gap-fill wall-clock now scales with gap count too — and, since
+ * `MAX_GAPS_PER_RUN` no longer caps plan-linked gaps (see its own doc comment), a plan with many
+ * genuinely uncovered items can make a run take proportionally longer, by design.
  */
-const DEFAULT_PER_GAP_BUDGET_MS = 50_000;
-/** Cheap-model, bounded ReAct loop — not a free-form agent. See providers/model-config.ts's
- * 'explore-gapfill' entry. */
-const MICRO_AGENT_MAX_ACTIONS = 5;
+const DEFAULT_PER_GAP_BUDGET_MS = MICRO_AGENT_MAX_ACTIONS * MICRO_AGENT_SECONDS_PER_ACTION * 1000;
 
 function errMsg(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
@@ -353,6 +480,21 @@ async function closeUrlGap(
  * hard-failing the gap, since a selector this deterministic step can't drive is exactly the case
  * escalation exists for (the model can look at the CURRENT live snapshot and pick a still-valid
  * target instead of the one `identifyExplorationGaps` originally guessed at).
+ *
+ * A tier-4 (positional nth-of-type) `targetSelectorGuess` is exactly the kind that can silently
+ * resolve to a different node on a fresh reload than the one the crawl clicked — conditional
+ * rendering, async-loaded content, or list reordering all shift the index, and `.locator().first()`
+ * has no way to signal "this isn't the node you meant." When the primary selector reveals
+ * nothing, retry once with a stable text anchor before falling through to the micro-agent —
+ * preferring `targetRepeatedRowText` (the nearest repeated ancestor's own text, e.g. "Heslo
+ * ******** zmeniť") over the bare `targetName` (e.g. "zmeniť") when both are available: several
+ * distinct triggers can share an identical accessible name (this app has one "zmeniť" per
+ * profile-edit section — name, email, password, DOB), so anchoring on the name alone is exactly
+ * as ambiguous as the original positional selector — `:text-is(name).first()` just picks
+ * whichever same-named node happens to resolve first, arbitrarily (confirmed live: this
+ * previously closed the name-edit section while leaving change-password/email-change gaps
+ * unresolved). Scoping the click to the row identified by its own distinguishing text, THEN
+ * finding the actual clickable node inside it by name, disambiguates correctly.
  */
 async function closeAffordanceGapDeterministic(
   browser: BrowserSurface,
@@ -360,10 +502,31 @@ async function closeAffordanceGapDeterministic(
 ): Promise<{ attempt: GapFillAttempt; route?: CrawledRoute } | null> {
   if (!gap.parentRouteUrl || !gap.targetSelectorGuess) return null;
 
+  const primary = await attemptAffordanceClick(browser, gap, gap.targetSelectorGuess);
+  if (primary) return primary;
+
+  const textAnchor = gap.targetRepeatedRowText ?? gap.targetName;
+  if (gap.targetSelectorTier === 4 && textAnchor) {
+    const selector =
+      gap.targetRepeatedRowText && gap.targetName
+        ? `:has-text(${JSON.stringify(gap.targetRepeatedRowText)}) >> :text-is(${JSON.stringify(gap.targetName)})`
+        : `:text-is(${JSON.stringify(textAnchor)})`;
+    return attemptAffordanceClick(browser, gap, selector);
+  }
+  return null;
+}
+
+async function attemptAffordanceClick(
+  browser: BrowserSurface,
+  gap: ExplorationGap,
+  selector: string,
+): Promise<{ attempt: GapFillAttempt; route?: CrawledRoute } | null> {
+  if (!gap.parentRouteUrl) return null;
+
   try {
     await browser.goto(gap.parentRouteUrl);
     const before = await snapshotClean(browser);
-    await browser.click(gap.targetSelectorGuess);
+    await browser.click(selector);
     const after = await snapshotClean(browser);
     const revealed =
       after.interactiveElements.length - before.interactiveElements.length >= STATE_REVEAL_MIN_NEW_ELEMENTS ||
@@ -372,7 +535,7 @@ async function closeAffordanceGapDeterministic(
     if (!revealed) return null;
     const route: CrawledRoute = {
       ...newAnonymousRoute(gap.parentRouteUrl, after, gap.parentRouteRole ?? 'anonymous'),
-      stateKey: `${gap.parentRouteUrl}>>${gap.targetSelectorGuess}`,
+      stateKey: `${gap.parentRouteUrl}>>${selector}`,
     };
     return { attempt: { gap, outcome: 'closed', newRoutesCaptured: 1 }, route };
   } catch {
@@ -460,6 +623,7 @@ function buildMicroAgentPrompt(
     'type(<selector>, <value>)',
     'pressKey(<key>)',
     'done()',
+    'When two elements share the same name, prefer the one whose page context (nearby text, section heading) matches the goal above.',
     'Never choose an action that deletes, removes, submits, logs out, pays, or otherwise mutates real data. Reply with done() if nothing safe and useful remains to try.',
   ]
     .filter(Boolean)
@@ -638,6 +802,47 @@ export async function runGapFillingPass(input: RunGapFillInput): Promise<GapFill
             detail: 'no resolvable page URL for this endpoint, and no gap-fill provider configured',
           });
         }
+        continue;
+      }
+
+      if (gap.kind === 'unmet-content-need') {
+        if (!input.gapFillProvider) {
+          attempts.push({
+            gap,
+            outcome: 'partial',
+            newRoutesCaptured: 0,
+            detail: 'no gap-fill provider configured',
+          });
+          continue;
+        }
+        // Try each candidate route in turn — a plan item's content may live on any one of
+        // several visited routes (or none yet crawled at all) — stopping at the first that
+        // reveals something. All candidates share this one gap's own deadline; runMicroAgent's
+        // multi-turn ReAct loop (click/type/pressKey/done, up to MICRO_AGENT_MAX_ACTIONS) already
+        // gives it room to navigate/look-around/act within a single candidate route.
+        const routesToTry = gap.candidateRouteUrls?.length ? gap.candidateRouteUrls : [input.baseUrl];
+        let micro: { newRoute?: CrawledRoute } = {};
+        for (const url of routesToTry) {
+          if (Date.now() >= perGapDeadline) break;
+          await input.browser.goto(url).catch(() => undefined);
+          micro = await runMicroAgent(
+            input.browser,
+            gap.description,
+            origin,
+            input.gapFillProvider,
+            input.emit,
+            perGapDeadline,
+            gap.parentRouteRole ?? 'anonymous',
+          );
+          if (micro.newRoute) break;
+        }
+        attempts.push({
+          gap,
+          outcome: micro.newRoute ? 'closed' : 'partial',
+          newRoutesCaptured: micro.newRoute ? 1 : 0,
+          usedMicroAgent: true,
+        });
+        if (micro.newRoute) newRoutes.push(micro.newRoute);
         continue;
       }
 

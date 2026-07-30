@@ -45,7 +45,12 @@ export interface CrawledRoute {
   /** Click candidates on this route that survived the safety filter but were never actually
    * attempted (budget ran out first) — see `ClickDiscoveryResult.unattemptedClickCandidates`.
    * Primary source for a gap-fill pass's "unclicked-affordance" gaps. */
-  unattemptedClickCandidates?: { selector: string; name: string }[];
+  unattemptedClickCandidates?: {
+    selector: string;
+    name: string;
+    selectorTier?: 1 | 2 | 3 | 4;
+    repeatedRowText?: string;
+  }[];
 }
 
 export interface CrawlResult {
@@ -387,7 +392,12 @@ export interface ClickDiscoveryResult {
    * actually attempted this page visit — the loop stopped early on budget exhaustion. Surfaced
    * so a later gap-fill pass can specifically target the ones ordinary discovery ran out of time
    * for, rather than a page simply looking (falsely) fully explored. */
-  unattemptedClickCandidates: { selector: string; name: string }[];
+  unattemptedClickCandidates: {
+    selector: string;
+    name: string;
+    selectorTier?: 1 | 2 | 3 | 4;
+    repeatedRowText?: string;
+  }[];
 }
 
 /** Enables the deep-probe behavior in `discoverClickRoutes` — engaged on every route (see
@@ -573,7 +583,12 @@ async function discoverClickRoutes(
 
   const unattemptedClickCandidates = candidates
     .slice(attempted)
-    .map((c) => ({ selector: c.selector, name: c.name }));
+    .map((c) => ({
+      selector: c.selector,
+      name: c.name,
+      selectorTier: c.selectorTier,
+      repeatedRowText: c.repeatedRowText,
+    }));
 
   return {
     attempted,

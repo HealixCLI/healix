@@ -105,7 +105,35 @@ describe('identifyExplorationGaps()', () => {
     });
   });
 
-  it('sorts plan-linked gaps first and caps the total at MAX_GAPS_PER_RUN', () => {
+  it("copies a candidate's selectorTier and repeatedRowText onto the resulting gap", () => {
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      unattemptedClickCandidates: [
+        {
+          selector: 'div > div > div:nth-of-type(1) > div > div:nth-of-type(3) > p',
+          name: 'zmeniť',
+          selectorTier: 4,
+          repeatedRowText: 'Meno Priezvisko Dátum narodenia zmeniť',
+        },
+      ],
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [],
+      observedEndpoints: [],
+    });
+
+    expect(gaps[0]).toMatchObject({
+      targetSelectorTier: 4,
+      targetRepeatedRowText: 'Meno Priezvisko Dátum narodenia zmeniť',
+    });
+  });
+
+  it('sorts plan-linked gaps first and caps only the UNLINKED tail at MAX_GAPS_PER_RUN', () => {
+    // None of these 15 generic buttons correlate to the "Unsubscribe page" plan item (no shared
+    // significant word — "button" is a correlation stopword), so they're all unlinked and compete
+    // for the fixed backstop; the one genuinely plan-linked route gap is never subject to it.
     const unattempted = Array.from({ length: 15 }, (_, i) => ({
       selector: `[data-testid=btn-${i}]`,
       name: `Button ${i}`,
@@ -119,8 +147,29 @@ describe('identifyExplorationGaps()', () => {
       observedEndpoints: [],
     });
 
-    expect(gaps.length).toBeLessThanOrEqual(10);
+    // 1 plan-linked route gap (uncapped) + 10 of the 15 unlinked affordance gaps (capped).
+    expect(gaps.length).toBe(11);
     expect(gaps[0].relatedPlanItemId).toBe('p1');
+    expect(gaps.filter((g) => !g.relatedPlanItemId).length).toBe(10);
+  });
+
+  it('never truncates plan-linked gaps even when there are more than MAX_GAPS_PER_RUN of them', () => {
+    const dashboard = route('https://a.test/#/SK/dashboard');
+    const planItems = Array.from({ length: 15 }, (_, i) => ({
+      id: `p${i}`,
+      title: `Item ${i}`,
+      unitKey: `route:/route-${i}`,
+    }));
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems,
+      observedEndpoints: [],
+    });
+
+    expect(gaps.length).toBe(15);
+    expect(gaps.every((g) => g.relatedPlanItemId)).toBe(true);
   });
 
   it('sorts an authenticated-route affordance gap ahead of an anonymous-route one when neither correlates to a plan item', () => {
@@ -194,6 +243,154 @@ describe('identifyExplorationGaps()', () => {
     expect(appleWalletGap?.lowValueAffordance).not.toBe(true);
     expect(facebookGap?.lowValueAffordance).toBe(true);
     expect(gaps.indexOf(appleWalletGap!)).toBeLessThan(gaps.indexOf(facebookGap!));
+  });
+
+  it('emits an unmet-content-need gap when a plan item describes content absent from every visited route, with the item scenario text as the goal', () => {
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      unattemptedClickCandidates: [],
+      snapshot: {
+        url: 'https://a.test/#/SK/dashboard',
+        title: 'Dashboard',
+        interactiveElements: [{ role: 'generic', name: 'zmeniť', selector: 'p' }],
+      },
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [
+        {
+          id: 'p1',
+          title: 'Change password from dashboard',
+          unitKey: 'route:/dashboard',
+          intent: 'verify the password-change flow',
+          tier: 'tierB-auth',
+          scenarios: [{ kind: 'positive', description: 'enter current password, new password, and submit' }],
+        },
+      ],
+      observedEndpoints: [],
+    });
+
+    const contentGap = gaps.find((g) => g.kind === 'unmet-content-need');
+    expect(contentGap).toBeDefined();
+    expect(contentGap?.relatedPlanItemId).toBe('p1');
+    expect(contentGap?.description).toContain('current password, new password, and submit');
+    expect(contentGap?.candidateRouteUrls).toEqual(['https://a.test/#/SK/dashboard']);
+  });
+
+  it('does NOT emit an unmet-content-need gap when the requirement is already covered by an existing element', () => {
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      snapshot: {
+        url: 'https://a.test/#/SK/dashboard',
+        title: 'Dashboard',
+        interactiveElements: [{ role: 'textbox', name: 'New password', selector: '#np' }],
+      },
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [
+        {
+          id: 'p1',
+          title: 'Change password from dashboard',
+          unitKey: 'route:/dashboard',
+          intent: 'verify the password-change flow',
+          tier: 'tierB-auth',
+          scenarios: [{ kind: 'positive', description: 'enter a new password' }],
+        },
+      ],
+      observedEndpoints: [],
+    });
+
+    expect(gaps.some((g) => g.kind === 'unmet-content-need')).toBe(false);
+  });
+
+  it('never emits an unmet-content-need gap for a tierC-api item', () => {
+    const dashboard = route('https://a.test/#/SK/dashboard', { role: 'authenticated' });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [
+        {
+          id: 'p1',
+          title: 'Backend rejects invalid tokens',
+          unitKey: 'route:/dashboard',
+          intent: 'verify API auth rejection',
+          tier: 'tierC-api',
+          scenarios: [{ kind: 'negative', description: 'expired token returns 401' }],
+        },
+      ],
+      observedEndpoints: [],
+    });
+
+    expect(gaps.some((g) => g.kind === 'unmet-content-need')).toBe(false);
+  });
+
+  it('sorts an unmet-content-need gap ahead of a plan-correlated unclicked-affordance gap', () => {
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      unattemptedClickCandidates: [{ selector: '[data-testid=voucher-btn]', name: 'Voucher barcode' }],
+      snapshot: {
+        url: 'https://a.test/#/SK/dashboard',
+        title: 'Dashboard',
+        interactiveElements: [],
+      },
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [
+        { id: 'p1', title: 'Voucher listing with barcode' },
+        {
+          id: 'p2',
+          title: 'Change password from dashboard',
+          unitKey: 'route:/dashboard',
+          intent: 'verify the password-change flow',
+          tier: 'tierB-auth',
+          scenarios: [{ kind: 'positive', description: 'enter current password and new password' }],
+        },
+      ],
+      observedEndpoints: [],
+    });
+
+    expect(gaps[0].kind).toBe('unmet-content-need');
+    expect(gaps[0].relatedPlanItemId).toBe('p2');
+  });
+
+  it('prefers authenticated routes for a tierB-auth item with no unitKey to resolve against (a common real-world case — many projects never populate unitKey at all)', () => {
+    // Anonymous route listed FIRST in crawl order — if candidates weren't re-ordered by the
+    // item's own tier, parentRouteRole/candidateRouteUrls[0] would arbitrarily inherit this
+    // anonymous route's role even though the item is clearly about authenticated content.
+    const home = route('https://a.test/#/SK/home', { role: 'anonymous' });
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      snapshot: { url: 'https://a.test/#/SK/dashboard', title: 'Dashboard', interactiveElements: [] },
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([home, dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [
+        {
+          id: 'p1',
+          title: 'Change password from dashboard',
+          // No unitKey — candidates fall back to every visited route.
+          intent: 'verify the password-change flow',
+          tier: 'tierB-auth',
+          scenarios: [{ kind: 'positive', description: 'enter current password and new password' }],
+        },
+      ],
+      observedEndpoints: [],
+    });
+
+    const contentGap = gaps.find((g) => g.kind === 'unmet-content-need');
+    expect(contentGap?.parentRouteRole).toBe('authenticated');
+    expect(contentGap?.candidateRouteUrls?.[0]).toBe('https://a.test/#/SK/dashboard');
   });
 });
 
@@ -293,6 +490,98 @@ describe('runGapFillingPass()', () => {
     expect(result.attempts[0].outcome).toBe('closed');
     expect(result.newRoutes).toHaveLength(1);
     expect(result.newRoutes[0].stateKey).toBe('https://a.test/#/SK/dashboard>>[data-testid=wallet-btn]');
+  });
+
+  it('retries with a text-anchored locator when a tier-4 positional selector reveals nothing on a fresh reload, and closes the gap', async () => {
+    const staleSelector = 'div > div > div:nth-of-type(1) > div > div:nth-of-type(3) > p';
+    const textSelector = ':text-is("zmeniť")';
+    const revealed = [button('A'), button('B'), button('C'), button('D'), button('E'), button('F')];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/#/SK/dashboard': [button('zmeniť', staleSelector)] },
+      // The stale positional selector resolves to a different (or non-revealing) node on reload —
+      // only the text-anchored retry selector actually reveals the form.
+      onClickSelectorReveal: { [textSelector]: revealed },
+    });
+    const gaps = [
+      {
+        id: `click:https://a.test/#/SK/dashboard>>${staleSelector}`,
+        kind: 'unclicked-affordance' as const,
+        description: 'test',
+        parentRouteUrl: 'https://a.test/#/SK/dashboard',
+        targetSelectorGuess: staleSelector,
+        targetName: 'zmeniť',
+        targetSelectorTier: 4 as const,
+      },
+    ];
+
+    const result = await runGapFillingPass({ browser, baseUrl: 'https://a.test/', gaps, emit: () => {} });
+
+    expect(result.attempts[0].outcome).toBe('closed');
+    expect(result.newRoutes).toHaveLength(1);
+    expect(result.newRoutes[0].stateKey).toBe(`https://a.test/#/SK/dashboard>>${textSelector}`);
+  });
+
+  it('does not attempt a text-anchored retry for a stable (tier 1-3) selector that reveals nothing — the selector was never the suspected problem', async () => {
+    const stableSelector = '[data-testid=wallet-btn]';
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/#/SK/dashboard': [button('Wallet', stableSelector)] },
+      onClickSelectorReveal: {
+        ':text-is("Wallet")': [button('A'), button('B'), button('C'), button('D'), button('E'), button('F')],
+      },
+    });
+    const gaps = [
+      {
+        id: `click:https://a.test/#/SK/dashboard>>${stableSelector}`,
+        kind: 'unclicked-affordance' as const,
+        description: 'test',
+        parentRouteUrl: 'https://a.test/#/SK/dashboard',
+        targetSelectorGuess: stableSelector,
+        targetName: 'Wallet',
+        targetSelectorTier: 1 as const,
+      },
+    ];
+
+    // No provider configured — if the deterministic step wrongly closed the gap via the
+    // never-should-have-been-tried text retry, this would show 'closed' instead of 'partial'.
+    const result = await runGapFillingPass({ browser, baseUrl: 'https://a.test/', gaps, emit: () => {} });
+
+    expect(result.attempts[0].outcome).toBe('partial');
+    expect(result.newRoutes).toHaveLength(0);
+  });
+
+  it('disambiguates between two identically-named triggers by scoping the retry to the row identified by targetRepeatedRowText', async () => {
+    // Regression test for the live-discovered bug: `gap.targetName` ("zmeniť") is shared by BOTH
+    // triggers, so a name-only retry's `.first()` would always resolve to whichever happens to be
+    // first in DOM order — arbitrarily closing the WRONG one. Only the row-scoped selector
+    // (targetRepeatedRowText + targetName combined) reveals the correct (password) section.
+    const staleSelector = 'div > div:nth-of-type(2) > p';
+    const rowScopedSelector = ':has-text("Heslo ******** zmeniť") >> :text-is("zmeniť")';
+    const revealed = [button('A'), button('B'), button('C'), button('D'), button('E'), button('F')];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/#/SK/dashboard': [button('zmeniť', staleSelector)] },
+      onClickSelectorReveal: {
+        [rowScopedSelector]: revealed,
+        // Deliberately NOT configured to reveal anything for the ambiguous bare-name selector —
+        // if the fix regressed back to name-only, this test would see 'partial', not 'closed'.
+      },
+    });
+    const gaps = [
+      {
+        id: `click:https://a.test/#/SK/dashboard>>${staleSelector}`,
+        kind: 'unclicked-affordance' as const,
+        description: 'test',
+        parentRouteUrl: 'https://a.test/#/SK/dashboard',
+        targetSelectorGuess: staleSelector,
+        targetName: 'zmeniť',
+        targetSelectorTier: 4 as const,
+        targetRepeatedRowText: 'Heslo ******** zmeniť',
+      },
+    ];
+
+    const result = await runGapFillingPass({ browser, baseUrl: 'https://a.test/', gaps, emit: () => {} });
+
+    expect(result.attempts[0].outcome).toBe('closed');
+    expect(result.newRoutes[0].stateKey).toBe(`https://a.test/#/SK/dashboard>>${rowScopedSelector}`);
   });
 
   it('marks a gap skipped-budget once the total deadline has passed, without attempting it', async () => {
@@ -692,5 +981,129 @@ describe('runGapFillingPass()', () => {
     // The gap behind it must still be genuinely attempted, not starved into skipped-budget.
     expect(result.attempts[1].outcome).toBe('closed');
     expect(result.newRoutes).toHaveLength(1);
+  });
+
+  it('unmet-content-need: tries each candidate route in turn, stopping at the first that reveals content, without visiting the rest', async () => {
+    const revealed = [button('A'), button('B'), button('C'), button('D'), button('E'), button('F')];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/#/SK/route1': [button('Nothing useful', '[data-testid=r1-btn]')],
+        'https://a.test/#/SK/route2': [button('Password field', '[data-testid=r2-btn]')],
+        'https://a.test/#/SK/route3': [button('Also nothing', '[data-testid=r3-btn]')],
+      },
+      onClickSelectorReveal: { '[data-testid=r2-btn]': revealed },
+    });
+
+    let visitedRoute3 = false;
+    const fakeProvider: ProviderAdapter = {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      detect: async () => ({ installed: true, binPath: null, version: null }),
+      health: async () => {
+        throw new Error('unused');
+      },
+      plan: async () => {
+        throw new Error('unused');
+      },
+      complete: async (prompt: string): Promise<CompletionResult> => {
+        if (prompt.includes('r1-btn'))
+          return { provider: 'claude', ok: true, text: 'done()', raw: null, detail: '' };
+        if (prompt.includes('r2-btn')) {
+          return { provider: 'claude', ok: true, text: 'click([data-testid=r2-btn])', raw: null, detail: '' };
+        }
+        if (prompt.includes('r3-btn')) visitedRoute3 = true;
+        return { provider: 'claude', ok: true, text: 'done()', raw: null, detail: '' };
+      },
+    };
+
+    const gaps = [
+      {
+        id: 'content:p1',
+        kind: 'unmet-content-need' as const,
+        description: 'needs a password field',
+        relatedPlanItemId: 'p1',
+        candidateRouteUrls: [
+          'https://a.test/#/SK/route1',
+          'https://a.test/#/SK/route2',
+          'https://a.test/#/SK/route3',
+        ],
+      },
+    ];
+
+    const result = await runGapFillingPass({
+      browser,
+      baseUrl: 'https://a.test/',
+      gaps,
+      emit: () => {},
+      gapFillProvider: { provider: fakeProvider },
+    });
+
+    expect(result.attempts[0].outcome).toBe('closed');
+    expect(result.attempts[0].usedMicroAgent).toBe(true);
+    expect(result.newRoutes).toHaveLength(1);
+    expect(visitedRoute3).toBe(false);
+  });
+
+  it('unmet-content-need: reports partial (not failed) when no candidate route reveals anything', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/#/SK/route1': [button('Nothing useful', '[data-testid=r1-btn]')] },
+    });
+    const fakeProvider: ProviderAdapter = {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      detect: async () => ({ installed: true, binPath: null, version: null }),
+      health: async () => {
+        throw new Error('unused');
+      },
+      plan: async () => {
+        throw new Error('unused');
+      },
+      complete: async (): Promise<CompletionResult> => ({
+        provider: 'claude',
+        ok: true,
+        text: 'done()',
+        raw: null,
+        detail: '',
+      }),
+    };
+    const gaps = [
+      {
+        id: 'content:p1',
+        kind: 'unmet-content-need' as const,
+        description: 'needs a password field',
+        relatedPlanItemId: 'p1',
+        candidateRouteUrls: ['https://a.test/#/SK/route1'],
+      },
+    ];
+
+    const result = await runGapFillingPass({
+      browser,
+      baseUrl: 'https://a.test/',
+      gaps,
+      emit: () => {},
+      gapFillProvider: { provider: fakeProvider },
+    });
+
+    expect(result.attempts[0].outcome).toBe('partial');
+    expect(result.newRoutes).toHaveLength(0);
+  });
+
+  it('unmet-content-need: reports partial with a detail when no gap-fill provider is configured', async () => {
+    const browser = makeFakeBrowser({ pages: {} });
+    const gaps = [
+      {
+        id: 'content:p1',
+        kind: 'unmet-content-need' as const,
+        description: 'needs a password field',
+        relatedPlanItemId: 'p1',
+      },
+    ];
+
+    const result = await runGapFillingPass({ browser, baseUrl: 'https://a.test/', gaps, emit: () => {} });
+
+    expect(result.attempts[0].outcome).toBe('partial');
+    expect(result.attempts[0].detail).toBe('no gap-fill provider configured');
   });
 });

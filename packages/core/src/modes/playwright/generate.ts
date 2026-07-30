@@ -8,6 +8,11 @@ import { ProviderUnavailableError } from '../types.js';
 import { ABSOLUTE_BACKSTOP_MS } from '../../providers/types.js';
 import { TIERS, tierLabel } from './templates.js';
 import { splitTestBlocks } from './quality-audit.js';
+import {
+  buildRequirementTokens,
+  NON_SEMANTIC_ROLES,
+  rankRouteElements,
+} from '../../util/requirement-tokens.js';
 
 // Re-exported for call sites/tests that import it alongside generate() —
 // the class itself lives in modes/types.ts since it's shared across modes,
@@ -827,12 +832,6 @@ const MAX_ELEMENT_NAME_LEN = 80;
 interface InventoryOpts {
   expand?: boolean;
 }
-/**
- * Roles the DOM doesn't natively expose as `link`/`button` even though the element is
- * clickable (e.g. a `<div>` with a click handler and no `role` attribute) — the single
- * biggest source of `getByRole('link'/'button', ...)` hallucination in production.
- */
-const NON_SEMANTIC_ROLES = new Set(['generic']);
 
 type CrawledRouteLike = NonNullable<TestModeContext['exploration']>['crawl']['routes'][number];
 type InventoryElementLike = CrawledRouteLike['snapshot']['interactiveElements'][number];
@@ -841,138 +840,6 @@ interface SelectedElement {
   el: InventoryElementLike;
 }
 
-/** Words too common/generic to carry any relevance signal on their own. */
-const STOPWORD_TOKENS = new Set([
-  'the',
-  'a',
-  'an',
-  'and',
-  'or',
-  'to',
-  'of',
-  'in',
-  'on',
-  'for',
-  'is',
-  'are',
-  'with',
-  'that',
-  'this',
-  'it',
-  'be',
-  'as',
-  'by',
-  'at',
-  'from',
-  'renders',
-  'page',
-]);
-
-/** Lowercase, split on non-alphanumeric runs, drop stopwords and single characters. */
-function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length > 1 && !STOPWORD_TOKENS.has(t));
-}
-
-/**
- * Tokenizes a plan item's requirement text (title, intent, every scenario description, unitKey)
- * into a lowercased/stopword-stripped token set, computed once per selectInventoryElements() call
- * and used by scoreElement() to rank DOM elements by relevance to THIS item rather than truncating
- * by blind positional order.
- */
-function buildRequirementTokens(item?: TestPlanItem): Set<string> {
-  const tokens = new Set<string>();
-  if (!item) return tokens;
-  const parts = [item.title, item.intent, item.unitKey ?? '', ...item.scenarios.map((s) => s.description)];
-  for (const part of parts) {
-    for (const t of tokenize(part)) tokens.add(t);
-  }
-  return tokens;
-}
-
-/**
- * Action-verb requirement token -> element predicate. When the requirement text names an action
- * (e.g. "submit", "upload") and an element's role/type matches what that action implies, the
- * element is very likely the one the scenario means to target, even if its accessible name shares
- * no literal words with the requirement text.
- */
-const ACTION_VERB_BONUSES: Record<string, (el: InventoryElementLike) => boolean> = {
-  submit: (el) => el.role === 'button',
-  login: (el) => el.role === 'button',
-  signin: (el) => el.role === 'button',
-  register: (el) => el.role === 'button',
-  signup: (el) => el.role === 'button',
-  save: (el) => el.role === 'button',
-  delete: (el) => el.role === 'button',
-  select: (el) => el.role === 'combobox',
-  choose: (el) => el.role === 'combobox',
-  upload: (el) => el.inputType === 'file',
-  search: (el) => el.role === 'searchbox',
-};
-
-/**
- * Weighted relevance score for one crawled element against a plan item's requirement tokens:
- * keyword overlap with the accessible name, an action-verb -> role/type bonus, a penalty for
- * non-semantic roles (NON_SEMANTIC_ROLES — the single biggest hallucination source), a route-role
- * match bonus, and a stability bonus/penalty from the element's locator tier (selectors.ts's
- * selectorFor tiering) so a fragile positional selector must clear a higher relevance bar than a
- * stable testid to make the cut. Higher is more relevant.
- */
-function scoreElement(
-  el: InventoryElementLike,
-  route: CrawledRouteLike,
-  reqTokens: Set<string>,
-  preferredRole: string,
-): number {
-  let score = 0;
-  for (const t of tokenize(el.name)) {
-    if (reqTokens.has(t)) score += 2;
-  }
-  for (const [verb, matches] of Object.entries(ACTION_VERB_BONUSES)) {
-    if (reqTokens.has(verb) && matches(el)) score += 3;
-  }
-  if (NON_SEMANTIC_ROLES.has(el.role)) score -= 2;
-  if (route.role === preferredRole) score += 1;
-  const tierBonus: Record<1 | 2 | 3 | 4, number> = { 1: 2, 2: 1, 3: 0, 4: -2 };
-  if (el.selectorTier !== undefined) score += tierBonus[el.selectorTier];
-  return score;
-}
-
-/**
- * Ranks one route's interactive elements by relevance (see scoreElement), applying a small
- * proximity bonus for an element sitting next to another keyword-matching element (form fields
- * cluster near their submit button, table cells near a matching header) and a duplicate-suppression
- * penalty for a (role, name) pair repeated later in the same route (the first occurrence keeps its
- * full score; a later, redundant duplicate is de-prioritized in favor of something new). Ties break
- * on the ORIGINAL DOM-order index, ascending — required so a uniform-score fixture (no keyword
- * signal at all) degrades to exactly today's first-K-by-DOM-order behavior.
- */
-function rankRouteElements(
-  route: CrawledRouteLike,
-  reqTokens: Set<string>,
-  preferredRole: string,
-): InventoryElementLike[] {
-  const elements = route.snapshot.interactiveElements;
-  const matchedKeyword = elements.map((el) => tokenize(el.name).some((t) => reqTokens.has(t)));
-  const seenRoleName = new Map<string, number>();
-  const scored = elements.map((el, index) => {
-    let score = scoreElement(el, route, reqTokens, preferredRole);
-    if (!matchedKeyword[index] && (matchedKeyword[index - 1] || matchedKeyword[index + 1])) {
-      score += 0.5;
-    }
-    if (el.name) {
-      const key = `${el.role} ${el.name}`;
-      const priorCount = seenRoleName.get(key) ?? 0;
-      seenRoleName.set(key, priorCount + 1);
-      if (priorCount > 0) score -= 1.5;
-    }
-    return { el, index, score };
-  });
-  scored.sort((a, b) => b.score - a.score || a.index - b.index);
-  return scored.map((s) => s.el);
-}
 interface InventorySelection {
   ordered: CrawledRouteLike[];
   selected: SelectedElement[];

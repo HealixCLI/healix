@@ -47,7 +47,6 @@ function reconcile(ai: TriageResult, rule: TriageResult): TriageResult {
     verdict: ai.verdict,
     confidence: ai.confidence,
     rationale: ai.rationale,
-    verdictSource: 'ai_reviewed',
   };
   // Carry the rule's patch forward only when the AI supplied none.
   const patch = ai.suggestedPatch ?? rule.suggestedPatch;

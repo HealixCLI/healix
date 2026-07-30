@@ -47,7 +47,6 @@ import { createTriageEngine } from '../triage/index.js';
 import type { TriageBatchItem, TriageInput, TriageResult } from '../triage/types.js';
 import { summarizeTriageGroups } from '../triage/grouping.js';
 import type { GroupingSummaryUnavailableReason } from '../triage/grouping.js';
-import { correlateBySignature } from '../triage/correlate.js';
 import {
   buildPlanPrompt,
   buildGapFillPlanPrompt,
@@ -115,22 +114,16 @@ export type { ResumeCheckpoint } from './checkpoint.js';
  */
 const TRIAGE_ANALYZE_TIMEOUT_MS = ABSOLUTE_BACKSTOP_MS + 60_000;
 /**
- * Historical note: this used to cap how many failures (at most) got escalated
- * to AI triage analysis (raised over time from 3 to 8 to 20). That cap is
- * gone — EVERY failure with a rule baseline is now escalated to AI, so a run
- * with more failures than any prior fixed limit no longer leaves the
- * remainder stuck on the generic low-confidence baseline just because they
- * didn't make the cut. If the AI call itself errors, times out, or returns an
- * unparseable reply for a given item, that item simply keeps its
- * classifyByRules() baseline — surfaced to the user via
- * TriageResult.verdictSource ('rule_fallback' vs 'ai_reviewed') rather than
- * silently looking identical to a reviewed-and-agreed verdict. Grouped into
- * TRIAGE_AI_BATCH_SIZE-sized batches, each triaged with ONE provider call
- * covering every item in the group (see TriageEngine.analyzeBatch) instead of
- * one call per item — every item still gets its own full evidence block,
- * only the fixed hypothesis/instructions preamble is paid once per batch
- * instead of once per item.
+ * How many failures (at most) get escalated to AI triage analysis. Raised from 3 to 8 to 20:
+ * a real 21-failure run showed 8 still left 14 failures stuck at the generic low-confidence
+ * baseline ('ambiguous', rationale "no more context available") — the un-escalated remainder is
+ * exactly what was causing ambiguous-heavy reports. Grouped into TRIAGE_AI_BATCH_SIZE-sized
+ * batches, each triaged with ONE provider call covering every item in the group (see
+ * TriageEngine.analyzeBatch) instead of one call per item — every item still gets its own full
+ * evidence block, only the fixed hypothesis/instructions preamble is paid once per batch instead
+ * of once per item.
  */
+const TRIAGE_AI_LIMIT = 20;
 /** How many failures share a single batched AI-triage call. */
 const TRIAGE_AI_BATCH_SIZE = 5;
 /**
@@ -2053,12 +2046,7 @@ async function runPipeline(
     if (checkCancelled()) return await pauseOrCancel('triage', executeComplete);
     setStatus('triaging');
     try {
-      // Stable non-null reference: `outcome` is a mutable `let`, so its
-      // non-null narrowing here doesn't survive into the .map() closure below
-      // (TS conservatively assumes a closure could run after a reassignment).
-      // Captured once so the closure can read outcome.apiEvidence directly.
-      const execOutcome = outcome;
-      const failed = execOutcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
+      const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
         const engine = createTriageEngine();
 
@@ -2106,10 +2094,6 @@ async function runPipeline(
               confidence: row.confidence,
               rationale: row.rationale,
               ...(row.suggestedPatch ? { suggestedPatch: row.suggestedPatch } : {}),
-              // Legacy rows persisted before the verdict_source column existed
-              // have no way to know their real provenance — default to the
-              // conservative label rather than falsely claiming AI review.
-              verdictSource: row.verdictSource === 'ai_reviewed' ? 'ai_reviewed' : 'rule_fallback',
             },
           });
         }
@@ -2137,12 +2121,6 @@ async function runPipeline(
             // but never threaded through before, so triage only ever "knew" a
             // trace existed by chance, never which file.
             const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
-            // Same identity execute.ts's own dedup keyOf()/readApiEvidence() use
-            // (`${specFile}#${title}`) — lets triage see the ACTUAL response this
-            // test's own API call(s) received, not just the one field its failing
-            // assertion happened to print.
-            const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
-            const apiEvidence = execOutcome.apiEvidence?.[apiEvidenceKey];
             // Recover the plan item this spec was generated from, to find the source-context unit
             // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
             // candidates below, since most failures never reach that stage.
@@ -2158,8 +2136,6 @@ async function runPipeline(
               ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
-              ...(apiEvidence ? { apiEvidence } : {}),
-              ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;
             try {
@@ -2170,18 +2146,21 @@ async function runPipeline(
             return { r, input, triage, unit };
           });
 
-          // AI enrichment for EVERY failure with a rule baseline — no cap. Run in
-          // TRIAGE_AI_BATCH_SIZE-sized batches (each call with its own bounded
-          // AbortController) rather than one at a time OR all at once — each call spawns a
-          // real CLI child process (providers/claude.ts's runCli), so an unbounded burst of
-          // simultaneous spawns is its own resource risk on a large run.
-          // Sorted ascending by baseline confidence so that if the run is cancelled or a
-          // budget ceiling hits mid-triage (see checkCancelled() in the batch loop below),
-          // whatever DID get reviewed was the failures that most needed it — not an
-          // ordering that limits which failures are eligible at all.
+          // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
+          // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
+          // AbortController) rather than one at a time OR all at once — triage was previously
+          // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
+          // child process (providers/claude.ts's runCli), so an unbounded burst of
+          // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
+          // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
+          // failures that most need it (low-confidence/ambiguous baselines) rather than on
+          // whichever failures happen to execute first — a rule-confident test_is_wrong near
+          // the top of the results array was previously "spending" a slot that a genuinely
+          // ambiguous failure further down needed far more.
           const aiCandidates = baseline
             .filter((b) => b.triage !== null)
-            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1));
+            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
+            .slice(0, TRIAGE_AI_LIMIT);
           const aiCandidateSet = new Set(aiCandidates);
 
           /**
@@ -2201,7 +2180,6 @@ async function runPipeline(
                 confidence: b.triage.confidence,
                 rationale: b.triage.rationale,
                 suggestedPatch: b.triage.suggestedPatch ?? null,
-                verdictSource: b.triage.verdictSource,
               });
               noteStoreOk();
             } catch (err) {
@@ -2309,25 +2287,6 @@ async function runPipeline(
             // whole phase being all-or-nothing.
             for (const b of batch) persistTriageResult(b);
           }
-
-          // Deterministic corroboration pass: two failures missing the exact
-          // same element can otherwise land on different verdicts purely
-          // because of which AI batch (or whether any) reviewed them — see
-          // correlateBySignature's own doc comment. Runs once, after all AI
-          // enrichment above has settled, so it sees every failure's FINAL
-          // per-item verdict. Only entries whose verdict actually changed are
-          // re-persisted; everything else keeps the row persistTriageResult
-          // already wrote above.
-          const correlated = correlateBySignature(
-            baseline.map((b) => ({ error: b.r.error ?? '', triage: b.triage })),
-          );
-          baseline.forEach((b, i) => {
-            const next = correlated[i]!.triage;
-            if (next && next !== b.triage) {
-              b.triage = next;
-              persistTriageResult(b);
-            }
-          });
 
           for (const b of baseline) {
             if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });

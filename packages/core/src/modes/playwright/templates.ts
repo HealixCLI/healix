@@ -28,23 +28,6 @@ export const EXEC_CHECKPOINT_INVERT_FILENAME = 'healix-completed-tests.txt';
  */
 export const MOCK_REQUEST_LOG_FILENAME = 'healix-mock-request-log.ndjson';
 
-/**
- * Write-through log of every HTTP call made via the `request` fixture, one
- * JSON line per call: `{key, method, url, status, mocked, body}`. `key` is
- * `${specFile}#${title}` (mirrors execute.ts's own dedup keyOf()), letting
- * execute.ts (readApiEvidence) attribute each captured response back to the
- * exact test that made the call — real backend calls (actionHighlighterFixtureContents())
- * and Healix-mocked ones (mockFixtureContents()) both log here, `mocked`
- * distinguishing which. Without this, triage previously saw only whichever
- * single field a failing assertion happened to print (e.g. "Received:
- * undefined") and had no way to tell "the real API is genuinely broken" apart
- * from "this dependency's mock is misconfigured" or "the response is fine but
- * the test's expectation is stale" — this is the actual evidence needed to
- * tell those apart. Lives at the suite's project root, alongside results.json
- * — same placement as the other sidecar logs.
- */
-export const API_EVIDENCE_LOG_FILENAME = 'healix-api-evidence-log.ndjson';
-
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -758,48 +741,6 @@ setup('authenticate', async ({ page, browser }) => {
 }
 
 /**
- * JS source snippet (interpolated into BOTH actionHighlighterFixtureContents()
- * and mockFixtureContents() below — independent generated files with no
- * shared JS module either could import a helper from) that best-effort logs
- * every HTTP call made through the `request` fixture to
- * API_EVIDENCE_LOG_FILENAME. Requires the caller's file to import
- * `appendFile` (node:fs/promises) and `join`/`relative`/`sep` (node:path).
- */
-function apiEvidenceHelperSource(): string {
-  return `const API_EVIDENCE_LOG_PATH = join(process.cwd(), ${JSON.stringify(API_EVIDENCE_LOG_FILENAME)});
-const API_EVIDENCE_BODY_CHARS = 500;
-
-function evidenceKey(testInfo) {
-  return relative(process.cwd(), testInfo.file).split(sep).join('/') + '#' + testInfo.title;
-}
-
-async function logApiEvidence(key, method, url, status, bodyText, mocked) {
-  try {
-    const body =
-      typeof bodyText === 'string' && bodyText.length > API_EVIDENCE_BODY_CHARS
-        ? bodyText.slice(0, API_EVIDENCE_BODY_CHARS) + '…'
-        : bodyText || '';
-    await appendFile(
-      API_EVIDENCE_LOG_PATH,
-      JSON.stringify({ key, method, url, status, mocked, body }) + '\\n',
-      'utf-8',
-    );
-  } catch {
-    // best-effort — never fail the actual test run over this
-  }
-}
-
-async function safeBodyText(res) {
-  try {
-    return await res.text();
-  } catch {
-    return '';
-  }
-}
-`;
-}
-
-/**
  * Fixture wrapping @playwright/test's `test`/`page` with an auto-injected
  * browser-side script that makes a recorded video actually show what a test
  * is doing: a fake cursor, a highlight ring around whatever was just
@@ -823,10 +764,7 @@ async function safeBodyText(res) {
  */
 export function actionHighlighterFixtureContents(): string {
   return `import { test as base, expect } from '@playwright/test';
-import { appendFile } from 'node:fs/promises';
-import { join, relative, sep } from 'node:path';
 
-${apiEvidenceHelperSource()}
 /**
  * Healix-generated visual action highlighter. Injected into every page via
  * addInitScript so it runs before any page script, on every navigation.
@@ -973,37 +911,6 @@ export const test = base.extend({
     await page.addInitScript(healixActionHighlighter);
     await use(page);
   },
-  // Mocking is disabled for this run (or this fixture is loaded transitively
-  // by mockFixtureContents() for a route with no mocked dependencies at all)
-  // — every call through \`request\` hits the REAL backend. Log it (method,
-  // url, status, a truncated response body) so triage can see what the app
-  // actually returned, not just the one field a failing assertion printed.
-  // Never changes the returned response/behavior — pure observation.
-  request: async ({ request }, use, testInfo) => {
-    const key = evidenceKey(testInfo);
-    const wrap = (method) => async (url, options) => {
-      const res = await request[method](url, options);
-      await logApiEvidence(key, method.toUpperCase(), String(url), res.status(), await safeBodyText(res), false);
-      return res;
-    };
-    const wrapped = {
-      get: wrap('get'),
-      post: wrap('post'),
-      put: wrap('put'),
-      patch: wrap('patch'),
-      delete: wrap('delete'),
-      head: wrap('head'),
-      options: wrap('options'),
-      fetch: async (url, opts) => {
-        const res = await request.fetch(url, opts);
-        await logApiEvidence(key, (opts && opts.method) || 'GET', String(url), res.status(), await safeBodyText(res), false);
-        return res;
-      },
-      dispose: () => request.dispose(),
-      storageState: (opts) => request.storageState(opts),
-    };
-    await use(wrapped);
-  },
 });
 
 export { expect };
@@ -1034,7 +941,7 @@ export function mockFixtureContents(routes: MockRouteEntry[]): string {
   const serialized = JSON.stringify(routes, null, 2);
   return `import { test as base, expect } from './action-highlighter.js';
 import { appendFile } from 'node:fs/promises';
-import { join, relative, sep } from 'node:path';
+import { join } from 'node:path';
 
 /**
  * Healix-generated mock fixture — intercepts network requests to detected
@@ -1044,8 +951,6 @@ import { join, relative, sep } from 'node:path';
  */
 
 const MOCKED_ROUTES = ${serialized};
-
-${apiEvidenceHelperSource()}
 
 // F-15: write-through log of every request this fixture actually intercepted,
 // read back by execute.ts's readMockRequestCounts() so the report's
@@ -1224,22 +1129,17 @@ export const test = base.extend({
   // matchAnyRoute) rather than unconditionally trusting whichever dependency
   // happens to be first — request-fixture calls use relative paths with no
   // hostname to disambiguate between multiple mocked dependencies.
-  request: async ({ request, mockOverride }, use, testInfo) => {
+  request: async ({ request, mockOverride }, use) => {
     void mockOverride;
     if (MOCKED_ROUTES.length === 0) {
-      // No mocked dependency to fake — \`request\` here is already the
-      // logging-wrapped real fixture from action-highlighter.js (this file's
-      // \`base\`), so passing it through unchanged still captures evidence.
       await use(request);
       return;
     }
-    const key = evidenceKey(testInfo);
     const respond = async (method, requestPath) => {
       const match = matchAnyRoute(MOCKED_ROUTES, method, (requestPath || '/').split('?')[0]);
       await logMockHit(match.id);
       const canned = match.response;
       const { contentType, text } = serializeBody(canned);
-      await logApiEvidence(key, method, requestPath || '', canned.status, text, true);
       return {
         ok: () => canned.status >= 200 && canned.status < 300,
         status: () => canned.status,

@@ -15,7 +15,6 @@ import type {
 } from '../types.js';
 import { tiersForScope } from '../types.js';
 import {
-  API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
@@ -837,72 +836,6 @@ export async function readMockRequestCounts(projectDir: string): Promise<Record<
   return counts;
 }
 
-interface ApiEvidenceLogEntry {
-  key: string;
-  method: string;
-  url: string;
-  status: number;
-  mocked: boolean;
-  body: string;
-}
-
-/** How many of a test's own logged API calls get folded into its evidence string — the LAST few (most likely the one whose response a failing assertion was checking), bounded so a chatty test doesn't blow up the triage prompt. */
-const API_EVIDENCE_MAX_CALLS_PER_TEST = 3;
-
-/**
- * Best-effort read of the request-fixture's write-through call log (see
- * API_EVIDENCE_LOG_FILENAME's doc comment in templates.ts) — groups entries by
- * key (`${specFile}#${title}`, same identity as this file's own checkpoint
- * keyOf()) and formats the LAST few calls per key into a compact, prompt-ready
- * evidence string: which backend actually answered (Healix's own mock, or the
- * real one), the status, and a truncated body. This is what lets triage see
- * the ACTUAL response a failing API-tier assertion was checking against,
- * instead of just the one field Playwright's own error text happened to
- * print. A missing file (no tierC-api tests ran this invocation, or nothing
- * called through `request` at all) just means "no evidence" (`{}`), same
- * best-effort contract as readMockRequestCounts.
- */
-export async function readApiEvidence(projectDir: string): Promise<Record<string, string>> {
-  let raw: string;
-  try {
-    raw = await readFile(join(projectDir, API_EVIDENCE_LOG_FILENAME), 'utf-8');
-  } catch {
-    return {};
-  }
-  const byKey = new Map<string, ApiEvidenceLogEntry[]>();
-  for (const line of raw.split('\n')) {
-    const trimmed = line.trim();
-    if (!trimmed) continue;
-    try {
-      const entry = JSON.parse(trimmed) as Partial<ApiEvidenceLogEntry>;
-      if (typeof entry.key !== 'string' || !entry.key) continue;
-      const list = byKey.get(entry.key) ?? [];
-      list.push({
-        key: entry.key,
-        method: typeof entry.method === 'string' && entry.method ? entry.method : 'GET',
-        url: typeof entry.url === 'string' ? entry.url : '',
-        status: typeof entry.status === 'number' ? entry.status : 0,
-        mocked: entry.mocked === true,
-        body: typeof entry.body === 'string' ? entry.body : '',
-      });
-      byKey.set(entry.key, list);
-    } catch {
-      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
-    }
-  }
-  const out: Record<string, string> = {};
-  for (const [key, entries] of byKey) {
-    out[key] = entries
-      .slice(-API_EVIDENCE_MAX_CALLS_PER_TEST)
-      .map(
-        (e) =>
-          `[${e.mocked ? 'HEALIX MOCK' : 'REAL BACKEND'}] ${e.method} ${e.url} -> status ${e.status}\nBody: ${e.body || '(empty)'}`,
-      )
-      .join('\n\n');
-  }
-  return out;
-}
-
 /** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
 export async function readCheckpointEntries(projectDir: string): Promise<CheckpointEntry[]> {
   let raw: string;
@@ -956,10 +889,6 @@ export async function clearExecCheckpoint(projectDir: string): Promise<void> {
     // reusing this projectDir (next coverage-loop gap-fill iteration) must
     // start counting fresh rather than inheriting this phase's hits.
     unlink(join(projectDir, MOCK_REQUEST_LOG_FILENAME)).catch(() => {}),
-    // Same rationale as MOCK_REQUEST_LOG_FILENAME above: cleared here (after
-    // readApiEvidence has already run for THIS invocation) so a later,
-    // unrelated execute() call reusing this projectDir starts fresh.
-    unlink(join(projectDir, API_EVIDENCE_LOG_FILENAME)).catch(() => {}),
   ]);
 }
 
@@ -1494,10 +1423,6 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // of results.json/steps.json — present regardless of whether the report
   // parsed, since the fixture logs a hit the moment it fulfills a request.
   const mockedRequestCounts = await readMockRequestCounts(ctx.projectDir);
-  // Same rationale as mockedRequestCounts above: present regardless of
-  // whether results.json parsed, since the request fixture logs a call the
-  // moment it resolves.
-  const apiEvidence = await readApiEvidence(ctx.projectDir);
 
   const outcome: ExecOutcome = {
     passed: parsed.passed,
@@ -1507,7 +1432,6 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     skipped: parsed.skipped,
     results: parsed.results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
-    ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
     raw: {
       exitCode: cmd.code,
       signal: cmd.signal,

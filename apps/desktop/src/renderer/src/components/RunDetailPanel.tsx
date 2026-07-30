@@ -874,11 +874,6 @@ function TriageList({ entries }: { entries: ReportTriageEntryShape[] }) {
             <span className="flex shrink-0 items-center gap-2">
               <Badge tone={VERDICT_TONE[t.triage.verdict] ?? 'default'}>{t.triage.verdict}</Badge>
               <span className="text-xs text-muted">{Math.round((t.triage.confidence ?? 0) * 100)}%</span>
-              {t.triage.verdictSource && (
-                <Badge tone={t.triage.verdictSource === 'ai_reviewed' ? 'default' : 'muted'}>
-                  {t.triage.verdictSource === 'ai_reviewed' ? 'AI-reviewed' : 'Rule-based'}
-                </Badge>
-              )}
             </span>
           </div>
           <p className="mt-1.5 text-xs leading-relaxed text-muted">{t.triage.rationale}</p>

@@ -151,12 +151,6 @@ function migrate(db: DatabaseSync): void {
     // 'reason')/test.fixme(...) annotation description, when given), added
     // via ensureColumn for existing DBs.
     ensureColumn(db, 'results', 'skip_reason', 'TEXT');
-    // v16: verdict_source on triage_results — 'ai_reviewed' vs 'rule_fallback',
-    // added via ensureColumn for existing DBs. Lets a resumed run reconstruct
-    // a persisted verdict's provenance instead of guessing, and surfaces to
-    // users whether a verdict was genuinely AI-reviewed or fell back to the
-    // deterministic rule baseline (AI call errored/timed out/unparseable).
-    ensureColumn(db, 'triage_results', 'verdict_source', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

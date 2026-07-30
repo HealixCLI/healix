@@ -145,20 +145,6 @@ describe('actionHighlighterFixtureContents', () => {
     expect(src).not.toContain('waitForTimeout');
     expect(src).not.toContain('slowMo');
   });
-
-  it('wraps the `request` fixture to log real (unmocked) API calls as evidence, tagged [REAL BACKEND]', () => {
-    const src = actionHighlighterFixtureContents();
-    // The mock-disabled path: request calls hit the real backend, and are logged.
-    expect(src).toContain('request: async ({ request }, use, testInfo)');
-    expect(src).toContain('logApiEvidence');
-    expect(src).toContain('join(process.cwd(), "healix-api-evidence-log.ndjson")');
-    // Every HTTP verb is wrapped so no call type escapes logging.
-    for (const verb of ['get', 'post', 'put', 'patch', 'delete', 'fetch']) {
-      expect(src).toContain(`${verb}:`);
-    }
-    // Logged as REAL (not a Healix mock) since nothing is intercepted here.
-    expect(src).toContain(', false)'); // logApiEvidence(..., mocked=false)
-  });
 });
 
 describe('stepsReporterContents', () => {
@@ -427,17 +413,6 @@ describe('mockFixtureContents', () => {
   it('produces a harmless no-op fixture for an empty route list', () => {
     const src = mockFixtureContents([]);
     expect(src).toContain('const MOCKED_ROUTES = []');
-  });
-
-  it('logs each mocked request-fixture call as evidence, tagged [HEALIX MOCK] (mocked=true)', () => {
-    const src = mockFixtureContents([
-      { id: 'pkg:stripe', hostnames: ['api.stripe.com'], response: { status: 200, body: { ok: true } } },
-    ]);
-    expect(src).toContain('logApiEvidence');
-    expect(src).toContain('join(process.cwd(), "healix-api-evidence-log.ndjson")');
-    // The fake request path logs with mocked=true (distinguishing it from the
-    // real-backend path in action-highlighter.js).
-    expect(src).toContain("await logApiEvidence(key, method, requestPath || '', canned.status, text, true)");
   });
 
   describe('F-13/F-14 — path-aware resolution across ALL mocked routes, not just the first one', () => {

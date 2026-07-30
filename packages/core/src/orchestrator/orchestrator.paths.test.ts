@@ -1227,10 +1227,12 @@ describe('orchestrator paths (offline DI seam)', () => {
       expect(opts.signal?.aborted).toBe(false);
     }
   });
-  it('TRIAGE AI BUDGET: escalates every failure, uncapped, ordered least-confident-first', async () => {
+  it('TRIAGE AI BUDGET: escalates the least-confident baseline verdicts first when failures exceed the cap', async () => {
     // 25 failures: 15 whose deterministic baseline is CONFIDENT (environment rule, 0.75) and 10
-    // whose baseline is the low-confidence ambiguous default (0.3, unrecognized error text). No
-    // cap exists anymore — every one of the 25 must be escalated to AI, not just a subset.
+    // whose baseline is the low-confidence ambiguous default (0.3, unrecognized error text) —
+    // more than TRIAGE_AI_LIMIT (20), so the cap actually excludes some. All 10 low-confidence
+    // failures must be escalated (they need AI help most); only 10 of the 15 confident ones
+    // should be, since 5 of that budget's slots go to the failures that need it more.
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Triage Budget Demo',
@@ -1286,19 +1288,19 @@ describe('orchestrator paths (offline DI seam)', () => {
 
     await orchestrator.run({ projectId: project.id, autoApprove: true }, {});
 
-    // 25 candidates triaged in TRIAGE_AI_BATCH_SIZE(5)-sized batches = 5 calls —
-    // each batched call covers up to 5 failures' full evidence in one provider
-    // round trip instead of one call per failure (see TriageEngine.analyzeBatch).
-    expect(escalatedPrompts.length).toBe(5);
+    // 20 candidates triaged in TRIAGE_AI_BATCH_SIZE(5)-sized batches = 4 calls,
+    // not 20 — each batched call covers up to 5 failures' full evidence in one
+    // provider round trip instead of one call per failure (see
+    // TriageEngine.analyzeBatch).
+    expect(escalatedPrompts.length).toBe(4);
     const escalatedAmbiguousCount = ambiguousTitles.filter((t) =>
       escalatedPrompts.some((p) => p.includes(t)),
     ).length;
     const escalatedConfidentCount = confidentTitles.filter((t) =>
       escalatedPrompts.some((p) => p.includes(t)),
     ).length;
-    // Every failure is escalated now — no cap excludes any of them.
     expect(escalatedAmbiguousCount).toBe(10);
-    expect(escalatedConfidentCount).toBe(15);
+    expect(escalatedConfidentCount).toBe(10);
   });
 
   it('TRIAGE PERSISTENCE: recordTriageResult is written incrementally per batch, not once at phase end, and never duplicated', async () => {

@@ -35,12 +35,12 @@ const ENTRIES: GroupingTriageEntry[] = [
   {
     title: 'Checkout completes',
     error: '500 Internal Server Error at /api/checkout',
-    triage: { verdict: 'app_is_wrong', confidence: 0.85, rationale: 'x', verdictSource: 'ai_reviewed' },
+    triage: { verdict: 'app_is_wrong', confidence: 0.85, rationale: 'x' },
   },
   {
     title: 'Cart totals update',
     error: '500 Internal Server Error at /api/checkout',
-    triage: { verdict: 'app_is_wrong', confidence: 0.8, rationale: 'x', verdictSource: 'ai_reviewed' },
+    triage: { verdict: 'app_is_wrong', confidence: 0.8, rationale: 'x' },
   },
 ];
 
@@ -69,7 +69,7 @@ describe('buildGroupingPrompt', () => {
     const many: GroupingTriageEntry[] = Array.from({ length: 35 }, (_, i) => ({
       title: `Failure ${i}`,
       error: 'boom',
-      triage: { verdict: 'ambiguous', confidence: 0.3, rationale: 'x', verdictSource: 'rule_fallback' },
+      triage: { verdict: 'ambiguous', confidence: 0.3, rationale: 'x' },
     }));
     const prompt = buildGroupingPrompt(many);
     expect(prompt).toContain('5 more failure(s) omitted');

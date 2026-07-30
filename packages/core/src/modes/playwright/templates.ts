@@ -968,7 +968,75 @@ function healixActionHighlighter() {
   });
 }
 
+// A generated test occasionally needs a browser session that's DIFFERENT
+// from the default one Playwright's own \`page\` fixture provides — e.g. an
+// "unauthenticated access is denied" check running alongside authenticated
+// tests in the same file, two simultaneous logged-in users, a deliberately
+// stale/invalid session, or a different role/tenant's session — and calls
+// \`browser.newContext()\` itself to get one. \`playwright.config.ts\`'s
+// \`video: 'on'\` only auto-applies to the context Playwright's OWN fixtures
+// create; a manually-created one needs \`recordVideo\` passed explicitly and
+// its video attached by hand, or it silently has no video at all. Patching
+// \`browser.newContext\` once per worker (guarded so repeated test setup
+// doesn't stack the wrapper) makes every manually-created context behave
+// like the fixture-provided one automatically, with no change needed to
+// whatever the generated test itself writes.
+//
+// This MUST be its own \`auto: true\` fixture, not folded into the \`page\`
+// override below — a test that only destructures \`browser\` (the exact
+// shape of the manual-context pattern this exists for) never instantiates
+// \`page\` at all, so a patch installed there would never run for the one
+// case it's meant to cover.
+let healixManualContextVideoCounter = 0;
+
 export const test = base.extend({
+  _healixVideoPatch: [
+    async ({ browser }, use) => {
+      if (!browser.newContext.__healixVideoPatched) {
+        const originalNewContext = browser.newContext.bind(browser);
+        browser.newContext = async (options) => {
+          const info = base.info();
+          // Playwright's own \`context\`/\`page\` fixtures also go through
+          // \`browser.newContext()\` to create the DEFAULT context, and already
+          // pass their own \`recordVideo\` (derived from \`use.video\` in
+          // playwright.config.ts) plus attach that video themselves once the
+          // test ends. Only a genuinely manual \`browser.newContext()\` call
+          // from generated test code omits \`recordVideo\` — that's the one
+          // case this patch exists to cover. Re-attaching the default
+          // context's video here would duplicate it (and the duplicate is
+          // attached mid-recording, before Playwright finalizes the file, so
+          // it shows up broken/unplayable alongside the real one).
+          const isDefaultContext = Boolean(options?.recordVideo);
+          const ctx = await originalNewContext({ recordVideo: { dir: info.outputDir }, ...options });
+          if (isDefaultContext) {
+            return ctx;
+          }
+          const pages = [];
+          ctx.on('page', (p) => pages.push(p));
+          ctx.on('close', async () => {
+            for (const p of pages) {
+              try {
+                const videoPath = await p.video()?.path();
+                if (videoPath) {
+                  healixManualContextVideoCounter += 1;
+                  await info.attach(\`video-manual-context-\${healixManualContextVideoCounter}\`, {
+                    path: videoPath,
+                    contentType: 'video/webm',
+                  });
+                }
+              } catch {
+                // Best-effort — never fail the test over evidence capture.
+              }
+            }
+          });
+          return ctx;
+        };
+        browser.newContext.__healixVideoPatched = true;
+      }
+      await use();
+    },
+    { auto: true },
+  ],
   page: async ({ page }, use) => {
     await page.addInitScript(healixActionHighlighter);
     await use(page);

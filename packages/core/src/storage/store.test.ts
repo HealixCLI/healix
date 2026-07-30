@@ -550,6 +550,49 @@ describe('insertResult', () => {
     const [result] = s.listResults(run.id);
     expect(result?.skipReason).toBeNull();
   });
+
+  it('round-trips videoUnavailableReason through insertResult/listResults', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'video-reason-project', baseUrl: 'https://video-reason.test' });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({
+      runId: run.id,
+      title: 'api-only check',
+      reqTag: null,
+      tier: null,
+      status: 'pending',
+    });
+
+    s.insertResult({
+      testId: t.id,
+      status: 'passed',
+      durationMs: 100,
+      error: null,
+      artifactsJson: null,
+      videoUnavailableReason:
+        'This test only used the API request context — no browser page was opened, so no video could be recorded.',
+    });
+
+    const [result] = s.listResults(run.id);
+    expect(result?.videoUnavailableReason).toBe(
+      'This test only used the API request context — no browser page was opened, so no video could be recorded.',
+    );
+  });
+
+  it('defaults videoUnavailableReason to null when omitted (a video IS present, or an older call site)', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'no-video-reason-project',
+      baseUrl: 'https://no-video-reason.test',
+    });
+    const run = s.createRun(project.id);
+    const t = s.insertTest({ runId: run.id, title: 't1', reqTag: null, tier: null, status: 'pending' });
+
+    s.insertResult({ testId: t.id, status: 'passed', durationMs: 5, error: null, artifactsJson: null });
+
+    const [result] = s.listResults(run.id);
+    expect(result?.videoUnavailableReason).toBeNull();
+  });
 });
 
 describe('deleteUnexecutedTests', () => {

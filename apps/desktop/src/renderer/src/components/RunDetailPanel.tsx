@@ -397,6 +397,8 @@ interface JoinedRow {
   details: string | null;
   /** This test's own artifact paths (relative to the suite's test-results dir), from TestResult.artifactsJson. */
   artifacts: string[];
+  /** Why no usable video is present for this executed result (tierC-api/no-browser-page, blank recording, or a genuine artifact-retention gap) — see ExecResultItem.videoUnavailableReason. */
+  videoUnavailableReason: string | null;
   /** Step-by-step breakdown (click, fill, navigate, assert...) from TestResult.stepsJson — present for both passed and failed tests. */
   steps: StepItem[];
 }
@@ -453,6 +455,7 @@ export function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow
         details: t.details,
         artifacts: parseArtifacts(r?.artifactsJson),
         steps: parseSteps(r?.stepsJson),
+        videoUnavailableReason: r?.videoUnavailableReason ?? null,
       };
     });
   }
@@ -470,6 +473,7 @@ export function joinResults(tests: TestCase[], results: TestResult[]): JoinedRow
     details: null,
     artifacts: parseArtifacts(r.artifactsJson),
     steps: parseSteps(r.stepsJson),
+    videoUnavailableReason: r.videoUnavailableReason,
   }));
 }
 
@@ -690,7 +694,11 @@ function ResultsTable({
                         </p>
                       )}
                       <TestCaseSteps steps={r.steps} />
-                      <TestCaseEvidence artifacts={r.artifacts} setPreview={setPreview} />
+                      <TestCaseEvidence
+                        artifacts={r.artifacts}
+                        setPreview={setPreview}
+                        videoUnavailableReason={r.status === 'skipped' ? null : r.videoUnavailableReason}
+                      />
                     </div>
                   </TableCell>
                 </TableRow>
@@ -785,20 +793,31 @@ function StepListItem({ step }: { step: StepItem }) {
 function TestCaseEvidence({
   artifacts,
   setPreview,
+  videoUnavailableReason,
 }: {
   artifacts: string[];
   setPreview: (p: Preview | null) => void;
+  /** Why no usable video is present — see JoinedRow's own doc comment. Null when a video IS present, or not applicable (e.g. a skipped result). */
+  videoUnavailableReason?: string | null;
 }) {
-  if (artifacts.length === 0) {
+  if (artifacts.length === 0 && !videoUnavailableReason) {
     return <p className="text-xs text-muted/70">No evidence captured for this test.</p>;
   }
   const images = artifacts.filter((a) => artifactKind(a) === 'image');
-  const videos = artifacts.filter((a) => artifactKind(a) === 'video');
+  // A run recorded before the double-video-attachment fix can have the same
+  // underlying video file attached twice under two different Playwright
+  // attachment names (the default context's own "video" plus this patch's
+  // "video-manual-context-N" for that same context) — same path, so a plain
+  // dedupe collapses it back down to the one real video.
+  const videos = [...new Set(artifacts.filter((a) => artifactKind(a) === 'video'))];
   const other = artifacts.filter((a) => artifactKind(a) !== 'image' && artifactKind(a) !== 'video');
 
   return (
     <div className="flex flex-col gap-2 border-t border-border/50 pt-2">
       <span className="text-[11px] font-medium uppercase tracking-wide text-muted">Evidence</span>
+      {videos.length === 0 && videoUnavailableReason && (
+        <p className="text-xs italic text-muted/70">{videoUnavailableReason}</p>
+      )}
       {videos.length > 0 && (
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">
           {videos.map((abs) => (

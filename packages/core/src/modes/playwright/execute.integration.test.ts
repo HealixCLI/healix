@@ -317,4 +317,56 @@ test('a deliberately skipped test with a real reason', async () => {
     expect(html).toContain('<div class="n warn">1</div><div>skipped</div>');
     expect(html).toContain('Feature flag X is disabled in this environment');
   }, 90_000);
+
+  it('a test that manually creates its own browser context (browser.newContext()) still gets a real video recorded and attached, via the patched fixture', async () => {
+    const ctx = makeCtx();
+    await scaffold(ctx);
+
+    // tierA-public (not tierB-auth) deliberately — the fixture patch itself
+    // isn't tier-specific, and tierB-auth would additionally require a real
+    // auth-setup pass (see the "dependency ordering" test above), which is
+    // unrelated to what this test is actually verifying.
+    await writeSpec(
+      'tests/tierA-public/manual-context.spec.ts',
+      `import { test, expect } from '../../fixtures/action-highlighter.js';
+test('unauthenticated access is denied', async ({ browser }) => {
+  const context = await browser.newContext();
+  const page = await context.newPage();
+  // A continuously-animating page (not a static one) — the video encoder
+  // compresses a static frame down to almost nothing regardless of how long
+  // it runs, which would trip the product's own isBlankVideo() heuristic
+  // even though a real recording exists. Real frame-to-frame motion is what
+  // that heuristic is actually trying to distinguish from a genuinely-empty
+  // recording, so this is the right way to produce a non-trivial file here.
+  await page.goto(
+    'data:text/html,<h1>Not found</h1><div id="spin" style="width:100px;height:100px;background:red;position:absolute;animation:move 0.3s linear infinite alternate"></div><style>@keyframes move{from{left:0}to{left:300px}}</style>',
+  );
+  await expect(page.locator('h1')).toHaveText('Not found');
+  await page.waitForTimeout(1500);
+  await context.close();
+});
+`,
+    );
+
+    const specs: GeneratedSpec[] = [
+      {
+        path: join(dir, 'tests/tierA-public/manual-context.spec.ts'),
+        title: 'unauthenticated access is denied',
+        tier: 'tierA-public',
+        contents: '',
+      },
+    ];
+
+    const outcome = await execute(ctx, specs);
+
+    expect(outcome.passed).toBe(1);
+    const result = outcome.results.find((r) => r.title === 'unauthenticated access is denied');
+    // Video WAS captured — the patched fixture recorded and attached it, so
+    // there's nothing to explain (contrast with the pre-fix behavior, which
+    // would have left this test with no video at all).
+    expect(result?.videoUnavailableReason).toBeUndefined();
+    const videoPath = result?.artifacts?.find((a) => /\.webm$/i.test(a));
+    expect(videoPath).toBeDefined();
+    expect(readFileSync(videoPath!).length).toBeGreaterThan(1024); // a real recording, not a blank stub
+  }, 60_000);
 });

@@ -107,7 +107,8 @@ function extractJava(rel: string, source: string): FunctionalityUnit[] {
   const units: FunctionalityUnit[] = [];
   const requestMappingRe = /@RequestMapping\s*\(([^)]*)\)/g;
   const requestMappingMatches = [...source.matchAll(requestMappingRe)];
-  const classBase = requestMappingMatches.length > 0 ? extractSpringMappingPath(requestMappingMatches[0][1]) : '';
+  const classBase =
+    requestMappingMatches.length > 0 ? extractSpringMappingPath(requestMappingMatches[0][1]) : '';
 
   for (const [annotation, method] of Object.entries(SPRING_METHOD_ANNOTATIONS)) {
     const re = new RegExp(`@${annotation}(?:\\s*\\(([^)]*)\\))?`, 'g');

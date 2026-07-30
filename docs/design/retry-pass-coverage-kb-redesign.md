@@ -4,7 +4,7 @@
 
 Retry-pass recovers from partial generation/execution failures — a plan item
 never got a spec generated, or a spec was generated but the run crashed before
-any of its scenarios executed. Today this is detected by *inference* rather
+any of its scenarios executed. Today this is detected by _inference_ rather
 than record: `matchGenerationGaps`
 ([repair-candidates.ts](../../apps/desktop/src/main/repair-candidates.ts))
 diffs `plan.json` against the `tests` table after the fact, using a
@@ -17,7 +17,7 @@ really a same-run problem.
 
 This has two problems:
 
-1. **No durable traceability.** Nothing records *why* an item was dropped, or
+1. **No durable traceability.** Nothing records _why_ an item was dropped, or
    even that it was dropped, once a run finishes. The only per-item failure
    reason that exists today — `GenCheckpointEntry.reason`
    ([generate.ts](../../packages/core/src/modes/playwright/generate.ts)) —
@@ -31,7 +31,7 @@ Separately, the **coverage-feedback-loop**
 ([index.ts](../../packages/core/src/orchestrator/index.ts), capped at
 `COVERAGE_MAX_ITERATIONS = 4` —
 [coverage.ts](../../packages/core/src/orchestrator/coverage.ts)) already
-proves the right *shape* for same-run iteration — no new run row, generate and
+proves the right _shape_ for same-run iteration — no new run row, generate and
 execute merged straight into the running pipeline's own bookkeeping — but each
 iteration currently **re-plans**: it calls the AI planner via
 `buildGapFillPlanPrompt` for functionality units the initial plan never
@@ -73,7 +73,7 @@ visible from reading this design alone.
   the same regenerate-dropped + execute-all-pending primitive, up to 4
   iterations or until target coverage is met.
 - `GEN_CHECKPOINT` stays completely separate and untouched — the KB write is
-  an *additional* write at the same call sites, not a replacement.
+  an _additional_ write at the same call sites, not a replacement.
 - Top-up (`suiteMode: 'topup'` for genuine requirement-delta runs) is
   untouched — detangling Retry-pass from it must not change top-up's real
   behavior.
@@ -97,9 +97,9 @@ visible from reading this design alone.
 1. §3b is new. v1's "Detangling from top-up" section proposed removing
    `opts.retryItemIds`/`forceRegenerate` from `runPipeline`'s top-up path,
    reasoning "only the old Retry-pass/Repair buttons set it." That's true, but
-   Repair's *only* implementation today is that exact branch — confirmed by
-   `topup.ts`'s own doc comment on `forceRegenerate`: *"the escape hatch
-   Repair (and, degenerately, Retry-pass) need."* Removing it would have
+   Repair's _only_ implementation today is that exact branch — confirmed by
+   `topup.ts`'s own doc comment on `forceRegenerate`: _"the escape hatch
+   Repair (and, degenerately, Retry-pass) need."_ Removing it would have
    silently deleted the Repair button's functionality while v1's own
    "Decisions" section claimed Repair was untouched. Resolution: **don't
    remove anything from the top-up path.** Retry-pass simply stops calling
@@ -172,7 +172,7 @@ item-level, boolean-ish), with no scenario-level output and no status for
 items that generated/executed successfully. The backfill needs a full walk:
 for every `plan.json` item, for every scenario, find its real `tests`/
 `results` row (same title/reqTag matching `matchGenerationGaps` already does)
-and seed `plan_kb_items`/`plan_kb_scenarios` with its *actual* status
+and seed `plan_kb_items`/`plan_kb_scenarios` with its _actual_ status
 (`passed`/`failed`/`pending`/etc., not just "gap or not"). `matchGenerationGaps`
 is a useful reference for the matching logic, not a drop-in implementation —
 budget this as new code.
@@ -215,7 +215,7 @@ SQL shapes** and must not be implemented with the same statement:
 - Planner (seed): `INSERT OR IGNORE` — idempotent seeding, safe to re-run on
   a resumed run, must never overwrite an already-advanced status.
 - Generator / Link / Executor: **`UPDATE ... WHERE (run_id, plan_item_id) = ?`
-  / `WHERE test_id = ?`** — these mutate an *existing* seeded row's status
+  / `WHERE test_id = ?`** — these mutate an _existing_ seeded row's status
   forward (`planned`→`generated`, `dropped`→`generated` on retry,
   `pending`→`passed`). If these are implemented as `INSERT OR IGNORE` by
   copying the seed pattern, the `UNIQUE` constraint silently no-ops the write
@@ -251,7 +251,7 @@ Add `runRetryPass(runId, hooks?, signal?)`, exported from
    health-gated fallback path a fresh run uses (§"Resolve the planning
    provider" in index.ts) rather than hardcoding it — if the original
    provider is no longer ready/authenticated, fall back the same way a fresh
-   run would, but never silently substitute default *options* (scope, PRD,
+   run would, but never silently substitute default _options_ (scope, PRD,
    coverage target) for ones the run was actually configured with. If the
    snapshot is missing entirely (a pre-`run-config.json` run), fall back to
    the run's bare DB-recorded `suiteMode` and otherwise-empty options — same
@@ -287,7 +287,7 @@ Add `runRetryPass(runId, hooks?, signal?)`, exported from
    `store.updateRunStatus(runId, ...)` on the same row (never a new one).
 7. **Full report refresh — every field, not just test counts.** Recompute
    `coverage = computeCoverage(units, planForGeneration.items, allSpecs,
-   mergedOutcome)` exactly as the coverage loop does today, rebuild
+mergedOutcome)` exactly as the coverage loop does today, rebuild
    `coverageSummary`, and call `finalizeReport(...)` (or the equivalent
    composition of `buildReport`/`renderReportHtml`) against the same `runDir`
    with the **complete, merged** picture — all specs (original + retry-pass),
@@ -300,7 +300,7 @@ Add `runRetryPass(runId, hooks?, signal?)`, exported from
    previously would NOT have refreshed automatically is the coverage number
    and anything else sourced only from `report.json`, which is exactly why
    this step exists and must not be skipped or treated as optional cleanup.
-7a. **Fresh triage for THIS pass's own newly-failed results (added post-review,
+   7a. **Fresh triage for THIS pass's own newly-failed results (added post-review,
    not in the original v2 scope).** Before building `triageEntries` for step
    7's report, diff `mergedOutcome.results` (failed/blocked) against
    `store.listTriageResults(runId)` by testId — anything not already triaged
@@ -332,7 +332,7 @@ permanently as part of this effort's scope:
   `startRepair`), and its IPC path are unchanged.
 - `topup.ts`'s `diffAgainstBase`/`forceRegenerate` and `runPipeline`'s
   `opts.retryItemIds`-gated branches (the `suiteMode === 'topup' &&
-  opts.retryItemIds` reload, and the `forceRegenerate` derivation feeding
+opts.retryItemIds` reload, and the `forceRegenerate` derivation feeding
   `diffAgainstBase`) are **not removed, not modified**. They continue to
   exist solely to serve Repair going forward.
 - The only change from Repair's point of view: Retry-pass's button no longer
@@ -388,12 +388,12 @@ Replace the loop body in
 - Remove the `buildGapFillPlanPrompt` / `provider.complete(mode: 'plan')` /
   `parsePlan` block entirely — no more AI re-planning per iteration.
 - Each iteration instead calls `regenerateDroppedAndExecutePending(ctx, runId,
-  ...)` (§3c), passing the loop's already-open `ctx`/`specs`/`outcome`/
+...)` (§3c), passing the loop's already-open `ctx`/`specs`/`outcome`/
   `testIdByKey` in-process (matching the loop's existing shape) — the same
   function `runRetryPass` calls with `existing` omitted.
 - The loop condition stays structurally the same —
   `iteration < COVERAGE_MAX_ITERATIONS && coverage.ratio < coverageTarget &&
-  <something left to regenerate>` — but "something left" now means "the KB
+<something left to regenerate>` — but "something left" now means "the KB
   still has `dropped` items or `pending` scenarios for this run," not
   "uncovered functionality units remain," since the loop can no longer
   discover coverage gaps that were never planned in the first place. It only
@@ -401,7 +401,7 @@ Replace the loop body in
   finish.
 - The loop's existing end-of-run report finalization already recomputes
   coverage and rewrites the report on every iteration (confirmed: `coverage =
-  computeCoverage(...)` is called after each loop body, and
+computeCoverage(...)` is called after each loop body, and
   `finalizeReport(...)` runs once after the loop with the final
   `coverageSummary`) — §3 step 7 for `runRetryPass` is bringing that same
   guarantee to the cold-start path, not inventing new behavior for the loop.
@@ -616,7 +616,7 @@ pending scenario(s).`, regenerated the 2 dropped items correctly, but then
 reported "pending" scenarios were ever reconstructed or executed. Direct
 `healix.db` inspection showed all 16 stuck at `plan_kb_scenarios.status =
 'pending'` with `test_id = NULL` — not because their test rows had been
-deleted, but because they had *never been linked at all*.
+deleted, but because they had _never been linked at all_.
 
 **Root cause:** the plan legitimately paired a UI-tier item and a
 `tierC-api` contract item under the same functional `reqTag` (e.g. `REQ-001`
@@ -636,6 +636,7 @@ would still silently overwrite each other's slot, losing one item's
 results/status-sync even with correct KB linkage.
 
 **Fix, two parts:**
+
 1. `GeneratedSpec` gained an optional `planItemId` field, set by
    `generate.ts` at the exact moment it produces a spec (it always knows
    unambiguously which item it's processing — no string matching needed).
@@ -679,17 +680,17 @@ item's `plan_kb_scenarios` rows stuck at `status = 'pending'` with
 neither aware of the other. `generate.ts`'s own per-item checks (selector/
 endpoint grounding, forbidden APIs, etc.) accepted this spec, so
 `recordGenOutcome` called `ctx.onKbItemOutcome(item.id, 'generated')` —
-cascading the item's scenarios to `'pending'`. Only *afterward*, once ALL
+cascading the item's scenarios to `'pending'`. Only _afterward_, once ALL
 items finish generating, does index.ts run the batch-level
 `mode.validate()` pass (a real parse check the regex/string gates in
 generate.ts can't do — see index.ts's "Pre-execution validation gate"
 comment) — which caught a genuine codegen defect and quarantined it. A
-quarantined spec is filtered out of `newSpecs` *before* `registerSpecRows`
+quarantined spec is filtered out of `newSpecs` _before_ `registerSpecRows`
 ever runs for it, so its scenarios' `test_id` never gets linked either. The
 KB was never told about this later rejection: it stayed at
 `'generated'`/`'pending'` forever. Retry-pass could neither regenerate it
 (not marked `'dropped'`) nor execute it (never registered) — a permanent,
-silent dead end, distinct from Bug 3 (which was a *linking* mismatch, not a
+silent dead end, distinct from Bug 3 (which was a _linking_ mismatch, not a
 missed status transition).
 
 **Fix:** after the quarantine-warning `emit(...)` in index.ts, loop over

@@ -192,7 +192,10 @@ describe.skipIf(!fs.existsSync(TODOAPP_AUTH_CONTROLLER))(
   'extractMultiLangEndpoints against TODOAPP/backend (isolated check, real Spring Boot fixture)',
   () => {
     it('extracts every real endpoint from AuthController.java and TodoController.java', () => {
-      const authUnits = extractMultiLangEndpoints('AuthController.java', fs.readFileSync(TODOAPP_AUTH_CONTROLLER, 'utf-8'));
+      const authUnits = extractMultiLangEndpoints(
+        'AuthController.java',
+        fs.readFileSync(TODOAPP_AUTH_CONTROLLER, 'utf-8'),
+      );
       const todoUnits = extractMultiLangEndpoints(
         'TodoController.java',
         fs.readFileSync(TODOAPP_TODO_CONTROLLER, 'utf-8'),

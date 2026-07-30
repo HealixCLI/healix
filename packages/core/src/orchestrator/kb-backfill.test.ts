@@ -72,7 +72,9 @@ describe('computeKbBackfillRows', () => {
   });
 
   it('classifies an item with a matched-but-unexecuted test row as generated/pending (NOT "generated" at the scenario level)', () => {
-    const tests = [test({ id: 'tst_b', title: '[REQ:REQ-B] Item B — positive: one scenario', reqTag: 'REQ-B' })];
+    const tests = [
+      test({ id: 'tst_b', title: '[REQ:REQ-B] Item B — positive: one scenario', reqTag: 'REQ-B' }),
+    ];
     const rows = computeKbBackfillRows(PLAN, tests, []);
     const b = rows.find((r) => r.planItemId === 'pli_b')!;
     expect(b.status).toBe('generated');
@@ -81,7 +83,9 @@ describe('computeKbBackfillRows', () => {
   });
 
   it("classifies an item with a matched, executed test row using the result's real status", () => {
-    const tests = [test({ id: 'tst_a', title: '[REQ:REQ-A] Item A — positive: one scenario', reqTag: 'REQ-A' })];
+    const tests = [
+      test({ id: 'tst_a', title: '[REQ:REQ-A] Item A — positive: one scenario', reqTag: 'REQ-A' }),
+    ];
     const results = [result({ id: 'res_a', testId: 'tst_a', status: 'passed' })];
     const rows = computeKbBackfillRows(PLAN, tests, results);
     const a = rows.find((r) => r.planItemId === 'pli_a')!;

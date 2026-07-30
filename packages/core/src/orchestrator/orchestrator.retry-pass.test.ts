@@ -912,7 +912,10 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
     expect(triageRows[0]!.verdict).toBeTruthy();
 
     const report = JSON.parse(
-      await readFile(join(dataDir, 'projects', project.id, 'runs', run1.runId, 'reports', 'report.json'), 'utf-8'),
+      await readFile(
+        join(dataDir, 'projects', project.id, 'runs', run1.runId, 'reports', 'report.json'),
+        'utf-8',
+      ),
     ) as { triage: Array<{ title: string }> };
     expect(report.triage).toHaveLength(1);
   });
@@ -978,7 +981,7 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
     }
   });
 
-  it('a spec quarantined by the LATER validate() step (not generate.ts\'s own checks) gets the KB corrected to dropped, so retry-pass can regenerate it (regression)', async () => {
+  it("a spec quarantined by the LATER validate() step (not generate.ts's own checks) gets the KB corrected to dropped, so retry-pass can regenerate it (regression)", async () => {
     // Root-cause regression for a real bug found via manual testing on a real
     // app: generate.ts's own per-item checks can accept a spec — recording the
     // item 'generated' via ctx.onKbItemOutcome — that STILL fails the separate,

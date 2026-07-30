@@ -647,7 +647,15 @@ export class HealixStore {
       .prepare(
         'INSERT OR IGNORE INTO plan_kb_items (id, run_id, plan_item_id, title, req_tag, tier, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
       )
-      .run(id, input.runId, input.planItemId, input.title, input.reqTag, input.tier, input.status ?? 'planned');
+      .run(
+        id,
+        input.runId,
+        input.planItemId,
+        input.title,
+        input.reqTag,
+        input.tier,
+        input.status ?? 'planned',
+      );
     const row = this.db
       .prepare('SELECT id FROM plan_kb_items WHERE run_id = ? AND plan_item_id = ?')
       .get(input.runId, input.planItemId) as { id: string } | undefined;
@@ -734,9 +742,9 @@ export class HealixStore {
   /** KB items still needing regeneration for this run. */
   listDroppedPlanKbItems(runId: string): PlanKbItem[] {
     return (
-      this.db.prepare("SELECT * FROM plan_kb_items WHERE run_id = ? AND status = 'dropped'").all(runId) as Array<
-        Record<string, unknown>
-      >
+      this.db
+        .prepare("SELECT * FROM plan_kb_items WHERE run_id = ? AND status = 'dropped'")
+        .all(runId) as Array<Record<string, unknown>>
     ).map(rowToPlanKbItem);
   }
 
@@ -752,7 +760,9 @@ export class HealixStore {
   /** All KB items for a run — used by the lazy backfill's "already seeded?" callers that need full rows, not just a boolean. */
   listPlanKbItems(runId: string): PlanKbItem[] {
     return (
-      this.db.prepare('SELECT * FROM plan_kb_items WHERE run_id = ?').all(runId) as Array<Record<string, unknown>>
+      this.db.prepare('SELECT * FROM plan_kb_items WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
     ).map(rowToPlanKbItem);
   }
 

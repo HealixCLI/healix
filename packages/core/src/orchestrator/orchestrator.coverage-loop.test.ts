@@ -301,9 +301,9 @@ describe('coverage feedback loop opt-in (offline DI seam, real functionality det
     expect(planCallCount.n).toBe(1);
     expect(genAttempts.n).toBe(2);
     expect(events.some((e) => e.message.toLowerCase().includes('recovering dropped'))).toBe(true);
-    expect(events.some((e) => e.message.toLowerCase().includes('regenerating') && e.message.includes('dropped'))).toBe(
-      true,
-    );
+    expect(
+      events.some((e) => e.message.toLowerCase().includes('regenerating') && e.message.includes('dropped')),
+    ).toBe(true);
     expect(events.some((e) => e.message.toLowerCase().includes('gap-fill'))).toBe(false);
 
     const report = JSON.parse(await readFile(summary.reportPath as string, 'utf8')) as RunReport;

@@ -274,11 +274,21 @@ async function regenerateDroppedAndExecutePending(params: {
   runId: string;
   store: HealixStore;
   plan: TestPlan;
-  emit: (phase: OrchestratorPhase | string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void;
+  emit: (
+    phase: OrchestratorPhase | string,
+    level: OrchestratorEvent['level'],
+    message: string,
+    data?: unknown,
+  ) => void;
   testIdByKey: Map<string, string>;
   noteStoreOk: () => void;
   noteStoreFailure: (op: string, err: unknown) => void;
-}): Promise<{ specs: GeneratedSpec[]; outcome: ExecOutcome; regeneratedCount: number; executedPendingCount: number }> {
+}): Promise<{
+  specs: GeneratedSpec[];
+  outcome: ExecOutcome;
+  regeneratedCount: number;
+  executedPendingCount: number;
+}> {
   const { ctx, mode, runId, store, plan, emit, testIdByKey, noteStoreOk, noteStoreFailure } = params;
 
   const droppedKb = store.listDroppedPlanKbItems(runId);
@@ -296,12 +306,10 @@ async function regenerateDroppedAndExecutePending(params: {
   const kbItemById = new Map(kbItems.map((k) => [k.id, k]));
   const itemByPlanItemId = new Map(plan.items.map((it) => [it.id, it]));
   const droppedItemIds = new Set(droppedItems.map((it) => it.id));
-  const pendingScenariosBefore = store
-    .listPendingPlanKbScenarios(runId)
-    .filter((scenario) => {
-      const kbItem = kbItemById.get(scenario.kbItemId);
-      return !kbItem || !droppedItemIds.has(kbItem.planItemId);
-    });
+  const pendingScenariosBefore = store.listPendingPlanKbScenarios(runId).filter((scenario) => {
+    const kbItem = kbItemById.get(scenario.kbItemId);
+    return !kbItem || !droppedItemIds.has(kbItem.planItemId);
+  });
 
   let newSpecs: GeneratedSpec[] = [];
   if (droppedItems.length > 0) {
@@ -310,7 +318,8 @@ async function regenerateDroppedAndExecutePending(params: {
       summary: 'Regenerating previously dropped item(s).',
       items: droppedItems,
     });
-    for (const spec of newSpecs) registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey);
+    for (const spec of newSpecs)
+      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey);
   }
 
   // Reconstruct still-pending (generated but never executed) specs from
@@ -356,7 +365,12 @@ async function regenerateDroppedAndExecutePending(params: {
     persistResults(store, runId, toExecute, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
   }
 
-  return { specs: toExecute, outcome, regeneratedCount: newSpecs.length, executedPendingCount: pendingSpecs.length };
+  return {
+    specs: toExecute,
+    outcome,
+    regeneratedCount: newSpecs.length,
+    executedPendingCount: pendingSpecs.length,
+  };
 }
 
 /**
@@ -435,7 +449,12 @@ function reconstructRunStateFromDb(
 async function launchProjectForRetryPass(
   project: Project,
   target: ReturnType<typeof createTargetAdapter>,
-  emit: (phase: OrchestratorPhase | string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+  emit: (
+    phase: OrchestratorPhase | string,
+    level: OrchestratorEvent['level'],
+    message: string,
+    data?: unknown,
+  ) => void,
 ): Promise<{ baseUrl: string | null | undefined; stop: (() => Promise<void>) | null }> {
   if (project.baseUrl || !project.repoPath) return { baseUrl: project.baseUrl, stop: null };
   emit('launch', 'info', `[launch] (retry-pass) Detecting app in ${project.repoPath}.`);
@@ -535,7 +554,7 @@ async function retryPassPipeline(
 
   // Lazy backfill for a run that predates the Knowledge Base.
   if (!store.hasPlanKbItems(runId)) {
-    emit('plan', 'info', "No Knowledge Base rows for this run yet; backfilling from plan.json/tests.");
+    emit('plan', 'info', 'No Knowledge Base rows for this run yet; backfilling from plan.json/tests.');
     const tests = store.listTests(runId);
     const results = store.listResults(runId);
     for (const row of computeKbBackfillRows(plan, tests, results)) {
@@ -635,7 +654,8 @@ async function retryPassPipeline(
 
     try {
       const removed = store.deleteUnexecutedTests(runId);
-      if (removed > 0) emit('execute', 'debug', `Dropped ${removed} pre-registered test row(s) that never executed.`);
+      if (removed > 0)
+        emit('execute', 'debug', `Dropped ${removed} pre-registered test row(s) that never executed.`);
     } catch (err) {
       noteStoreFailure('deleteUnexecutedTests', err);
     }
@@ -643,14 +663,19 @@ async function retryPassPipeline(
     // Full report refresh — merge this pass's work with everything already
     // durably persisted, recompute coverage, rewrite report.json/report.html
     // in place. See docs/design/retry-pass-coverage-kb-redesign.md §3 step 7.
-    const { specs: allSpecs, outcome: mergedOutcome } = reconstructRunStateFromDb(store, runId, ctx.projectDir);
+    const { specs: allSpecs, outcome: mergedOutcome } = reconstructRunStateFromDb(
+      store,
+      runId,
+      ctx.projectDir,
+    );
 
     let coverageSummary: ReportCoverageSummary | null = null;
     if (project.repoPath) {
       const cached = loadSourceContext(project.repoPath);
       if (cached && cached.context.units.length > 0) {
         const coverageTarget =
-          snapshot?.coverageTarget ?? (run.suiteMode === 'topup' ? TOPUP_COVERAGE_TARGET : FRESH_COVERAGE_TARGET);
+          snapshot?.coverageTarget ??
+          (run.suiteMode === 'topup' ? TOPUP_COVERAGE_TARGET : FRESH_COVERAGE_TARGET);
         const coverage = computeCoverage(cached.context.units, plan.items, allSpecs, mergedOutcome);
         coverageSummary = {
           ratio: coverage.ratio,

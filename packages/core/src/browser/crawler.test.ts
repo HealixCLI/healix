@@ -487,7 +487,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test is about nav-discovery click-probing only; the deep-probe
+    // second pass (GAP-060) would otherwise re-click the same candidate for its own reveal check.
+    await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(recordClicks).toEqual(['#toggle-login-btn']);
   });
@@ -640,7 +642,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test pins MAX_CLICKS_PER_PAGE for nav-discovery only; the
+    // deep-probe second pass (GAP-060) would otherwise re-click the same 8 candidates.
+    await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(recordClicks.length).toBeLessThanOrEqual(8);
   });
@@ -662,7 +666,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       log,
     });
 
-    const result = await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test pins the reset-after-click sequencing for nav-discovery
+    // only; the deep-probe second pass (GAP-060) would otherwise re-click both candidates again.
+    const result = await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(result.routes.map((r) => r.url).sort()).toEqual([
       'https://a.test/',
@@ -703,7 +709,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
 
     const browser = makeFakeBrowser({ pages, onClickGoTo, recordClicks });
 
-    const result = await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test pins MAX_CLICK_PROBES_PER_CRAWL for nav-discovery only;
+    // the deep-probe second pass (GAP-060) would otherwise re-click every reached page again.
+    const result = await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(recordClicks.length).toBeLessThanOrEqual(20);
     // Nowhere near all 10 button-only pages get reached before the
@@ -894,20 +902,18 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     expect(result.routes.filter((r) => r.stateKey).length).toBeGreaterThan(0);
   });
 
-  // KNOWN LIMITATION (GAP-060, open): a route visited LAST does not reach its own click
-  // candidates, because the routes before it spend the shared deep-probe pool on ordinary
-  // navigation clicks. Measured on the real C&A authenticated crawl: /dashboard/vouchers and
-  // /dashboard/points each spend 8 of the 20, leaving /dashboard 4 — one short of any of its
-  // four `zmeniť` profile-edit triggers, whose forms a dashboard-only probe confirms ARE
-  // recorded once clicks reach them.
+  // FIXED (GAP-060): a route visited LAST used to never reach its own click candidates, because
+  // the routes before it spent the shared deep-probe pool on ordinary navigation clicks. Measured
+  // on the real C&A authenticated crawl: /dashboard/vouchers and /dashboard/points each spent 8 of
+  // the 20, leaving /dashboard 4 — one short of any of its four `zmeniť` profile-edit triggers,
+  // whose forms a dashboard-only probe confirmed ARE recorded once clicks reach them.
   //
-  // Raising the pool and charging per-recorded-state were both tried; each traded this
-  // starvation for wall-clock starvation, losing route coverage entirely (see
-  // MAX_STATE_PROBES_PER_CRAWL). The fix is structural — deferring deep-probe to a real second
-  // pass over the collected routes — so this is `.fails` rather than deleted: it documents the
-  // exact shape of the gap, and it will START FAILING (i.e. demand its own update) the moment
-  // someone lands that restructure and the behaviour becomes correct.
-  it.fails('does NOT yet let a route visited LAST reach its own candidates', async () => {
+  // Raising the pool and charging per-recorded-state were both tried; each traded this starvation
+  // for wall-clock starvation, losing route coverage entirely (see MAX_STATE_PROBES_PER_CRAWL).
+  // The fix is structural: deep-probe now runs as a genuine second pass over the routes discovery
+  // already collected, in REVERSE of their visit order, so the route that used to be starved gets
+  // first crack at the shared pool.
+  it('lets a route visited LAST reach its own candidates now that deep-probe runs as a genuine second pass', async () => {
     const navOnly = (tag: string) => Array.from({ length: 8 }, (_, i) => button(`${tag} nav ${i}`));
     const editTrigger = button('zmeniť');
     const recordClicks: string[] = [];
@@ -931,10 +937,70 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
 
     const result = await crawl(browser, 'https://a.test/');
 
-    // These are the assertions a CORRECT crawler would satisfy. They currently do not hold —
-    // 16 navigation clicks on /a and /b exhaust the pool before /c's own slice begins.
     expect(recordClicks).toContain(editTrigger.selector);
     expect(result.routes.some((r) => r.stateKey?.endsWith(editTrigger.selector))).toBe(true);
+  });
+
+  it('deep-probes pass-1 routes in reverse visit order so the last-discovered route is not starved', async () => {
+    // Two routes each hide a real, budget-worthy reveal behind a filler-heavy candidate list.
+    // With a state-probe budget only big enough for ONE route's reveal to be reached, reverse
+    // order means the LAST-visited route (/b) wins, not the first (/a).
+    const navOnly = (tag: string) => Array.from({ length: 7 }, (_, i) => button(`${tag} nav ${i}`));
+    const triggerA = button('reveal-a');
+    const triggerB = button('reveal-b');
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/a'), link('https://a.test/b')],
+        },
+        'https://a.test/a': { elements: [...navOnly('a'), triggerA] },
+        'https://a.test/b': { elements: [...navOnly('b'), triggerB] },
+      },
+      onClickSelectorReveal: {
+        [triggerA.selector]: [
+          { role: 'textbox', name: 'A field', selector: '#a-field' } as InteractiveElement,
+        ],
+        [triggerB.selector]: [
+          { role: 'textbox', name: 'B field', selector: '#b-field' } as InteractiveElement,
+        ],
+      },
+    });
+
+    // Only one route's worth of candidates (8) fits in this budget.
+    const result = await crawl(browser, 'https://a.test/', { stateProbeBudget: 8 });
+
+    expect(result.routes.some((r) => r.stateKey?.endsWith(triggerB.selector))).toBe(true);
+    expect(result.routes.some((r) => r.stateKey?.endsWith(triggerA.selector))).toBe(false);
+  });
+
+  it('does not re-enqueue a URL discovered only during the pass-2 deep-probe', async () => {
+    // A same-URL reveal that also contains a fresh <a href> must not reopen BFS discovery —
+    // pass 2 only ever records same-URL state reveals, never new navigable routes. Five filler
+    // links keep the queue non-thin after the root visit, so `wantsClickProbe` stays false for
+    // the root in pass 1 — the trigger is only ever clicked in pass 2, isolating what this test
+    // means to cover.
+    const trigger = button('reveal');
+    const fillerLinks = Array.from({ length: 5 }, (_, i) => link(`https://a.test/filler-${i}`));
+    const pages: Record<string, FakePage> = {
+      'https://a.test/': { elements: [trigger, ...fillerLinks] },
+    };
+    for (const l of fillerLinks) pages[l.href!] = { elements: [] };
+
+    const browser = makeFakeBrowser({
+      pages,
+      onClickSelectorReveal: {
+        [trigger.selector]: [
+          { role: 'textbox', name: 'Field', selector: '#field' } as InteractiveElement,
+          link('https://a.test/late-discovered'),
+        ],
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes.some((r) => r.stateKey?.endsWith(trigger.selector))).toBe(true);
+    expect(result.routes.some((r) => r.url === 'https://a.test/late-discovered')).toBe(false);
+    expect(result.unvisitedQueuedCount).toBe(0);
   });
 
   // --- reveal metric: a view SWAP, not just a net-growth reveal (GAP-060) -------------------

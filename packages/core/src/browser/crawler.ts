@@ -131,18 +131,6 @@ const DEFAULT_MAX_ROUTES = 60;
 // MAX_CLICKS_PER_PAGE/MAX_CLICK_PROBES_PER_CRAWL so the larger candidate pool has
 // room to actually run instead of hitting budgetExhausted mid-page.
 const DEFAULT_BUDGET_MS = 240_000;
-/**
- * Fraction of the wall-clock budget after which a deep probe will no longer be STARTED while
- * unvisited routes are still queued. Deep-probe is enrichment (it re-discovers a state that
- * only exists behind a click); ordinary route discovery is a prerequisite for everything
- * downstream, so when the two compete for the tail of the budget, discovery has to win —
- * otherwise budget exhaustion costs whole routes instead of merely costing detail. Note this
- * gates on the BUDGET, not on the route's own element count: GAP-056's finding that every
- * route deserves deep-probe eligibility (a well-populated page can still hide an ungrounded
- * same-URL form) is untouched — probes still run on every route, just not once they'd be
- * spending time the queue still needs.
- */
-const DEEP_PROBE_BUDGET_FRACTION = 0.5;
 /** Once a DOM fingerprint has repeated this many times, stop following that page's links. */
 const SHELL_REPEAT_THRESHOLD = 3;
 /** Share of visited routes sharing the dominant fingerprint that counts as "collapsed". */
@@ -326,12 +314,12 @@ const MAX_STATE_DEPTH = 2;
  * coverage 8 -> 7, budgetExhausted false -> true). Charging per recorded state rather than per
  * click regressed it the same way, for the same underlying reason.
  *
- * The real constraint is structural, not a number: `wantsStateProbe`'s `queue.length === 0`
- * escape always fires on the FIRST route of a pass (nothing has been discovered yet), so the
- * landing route deep-probes at full cost before any route discovery has happened, and the pass
- * is out of wall clock by the last route. Fixing that means genuinely deferring deep-probe to a
- * second pass over the collected routes rather than interleaving it — see GAP-060. Until then
- * 20 is the value that at least preserves full route coverage.
+ * The real constraint was structural, not a number: interleaving deep-probe with discovery let
+ * the FIRST routes visited in a pass spend the whole pool before the pass's own interesting
+ * route (often visited last) got a turn. Fixed by deferring deep-probe to a genuine second pass
+ * over the routes discovery already collected, probed in reverse visit order so the routes that
+ * were structurally starved before now go first — see GAP-060 (Fixed) and `crawl()`'s pass-2
+ * loop below.
  */
 const MAX_STATE_PROBES_PER_CRAWL = 20;
 /** A same-URL click only counts as "revealed a real state" (worth recording/recursing into),
@@ -482,6 +470,19 @@ function routePathSegment(url: string): string {
  * OTP_HINT_RE) — a real code requires an external channel no crawl can observe, so those flows
  * correctly remain ungrounded for GENERATE's escape hatch.
  */
+/** Shared `.catch()` fallback for both `crawl()` passes' `discoverClickRoutes` calls — a failed
+ * click-probe attempt (page navigated away unexpectedly, browser error) should never abort the
+ * whole crawl, just contribute nothing this round. */
+function emptyClickDiscoveryResult(): ClickDiscoveryResult {
+  return {
+    attempted: 0,
+    discoveredUrls: [],
+    loginToggleSelectors: [],
+    discoveredStates: [],
+    unattemptedClickCandidates: [],
+  };
+}
+
 async function discoverClickRoutes(
   browser: BrowserSurface,
   snapshot: DomSnapshot,
@@ -798,8 +799,6 @@ export async function crawl(
   const maxRoutes = opts.maxRoutes ?? DEFAULT_MAX_ROUTES;
   const budgetMs = opts.wallClockBudgetMs ?? DEFAULT_BUDGET_MS;
   const deadline = Date.now() + budgetMs;
-  // See DEEP_PROBE_BUDGET_FRACTION: past this point, enrichment yields to discovery.
-  const deepProbeCutoff = Date.now() + budgetMs * DEEP_PROBE_BUDGET_FRACTION;
 
   // baseUrl stays unconditionally first — it's the crawl root, and visiting it first is what
   // seeds link discovery and the route-prefix detection every later URL is reconciled
@@ -915,49 +914,17 @@ export async function crawl(
     // GAP-042). Only probe once the link queue is running thin — following a
     // real link is cheaper and safer than guessing at a click target.
     const wantsClickProbe = remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD;
-    // Every route is deep-probe eligible (see GAP-056) — NOT gated on this route's own element
-    // count. A live audit of the real C&A app found a healthy, well-populated "My account" page
-    // whose "change password" button still reveals an un-grounded same-URL form; gating on
-    // route-thinness would keep missing exactly that shape. The reveal tests (only a click that
-    // grows the DOM materially, or brings new inputs on screen, ever gets recorded) and the
-    // separate MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
-    // ...but past DEEP_PROBE_BUDGET_FRACTION of the budget, only when nothing is left to
-    // discover — see that constant for why enrichment yields to discovery at the tail.
-    const wantsStateProbe = remainingStateProbes > 0 && (queue.length === 0 || Date.now() < deepProbeCutoff);
-    if (wantsClickProbe || wantsStateProbe) {
-      const maxClicks = wantsClickProbe
-        ? Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes)
-        : MAX_CLICKS_PER_PAGE;
-      const stateBudget = wantsStateProbe ? { remaining: remainingStateProbes } : undefined;
-      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks, {
-        deepProbe: stateBudget
-          ? {
-              stateKeyPrefix: resolvedUrl,
-              depth: 0,
-              parentDepth: item.depth,
-              budget: stateBudget,
-              stateFingerprints,
-            }
-          : undefined,
-      }).catch(
-        (): ClickDiscoveryResult => ({
-          attempted: 0,
-          discoveredUrls: [],
-          loginToggleSelectors: [],
-          discoveredStates: [],
-          unattemptedClickCandidates: [],
-        }),
+    if (wantsClickProbe) {
+      const maxClicks = Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes);
+      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks).catch(
+        emptyClickDiscoveryResult,
       );
-      if (wantsClickProbe) remainingClickProbes -= clickResult.attempted;
-      if (stateBudget) remainingStateProbes = stateBudget.remaining;
+      remainingClickProbes -= clickResult.attempted;
       if (clickResult.loginToggleSelectors.length > 0) {
         routes[routes.length - 1].loginToggleSelector = clickResult.loginToggleSelectors[0];
       }
       if (clickResult.unattemptedClickCandidates.length > 0) {
         routes[routes.length - 1].unattemptedClickCandidates = clickResult.unattemptedClickCandidates;
-      }
-      if (clickResult.discoveredStates.length > 0) {
-        routes.push(...clickResult.discoveredStates);
       }
       for (const discovered of clickResult.discoveredUrls) {
         const norm = normalizeUrl(discovered);
@@ -967,6 +934,57 @@ export async function crawl(
         }
       }
     }
+  }
+
+  // Deep-probe (state-reveal) pass — deliberately deferred until discovery (above) is fully
+  // done, rather than interleaved with it (see GAP-060, Fixed). Interleaving let whichever
+  // routes were dequeued FIRST in a pass spend the whole shared MAX_STATE_PROBES_PER_CRAWL pool
+  // on their own click candidates, starving a route visited later in the same pass — on the real
+  // target app, that was the authenticated dashboard itself, holding the actual edit-reveal
+  // triggers the run needed. Probing pass-1's routes in REVERSE of their visit order flips that:
+  // the routes structurally starved before now go first against the full pool. Bounded by the
+  // same `deadline` as pass 1 — never runs past the crawl's own overall wall-clock budget.
+  // Deliberately does NOT re-enqueue `discoveredUrls` from these probes: reopening BFS this late
+  // would reintroduce the interleaving this restructure removes, and the common case (SPA nav via
+  // onClick) is already covered by pass 1's own click-probing above.
+  if (remainingStateProbes > 0) {
+    const stateBudget = { remaining: remainingStateProbes };
+    const pass1Routes = [...routes];
+    for (let i = pass1Routes.length - 1; i >= 0; i -= 1) {
+      if (stateBudget.remaining <= 0 || Date.now() >= deadline) break;
+      const route = pass1Routes[i];
+
+      let snapshot: DomSnapshot;
+      try {
+        await browser.goto(route.url);
+        snapshot = await snapshotClean(browser);
+      } catch {
+        browser.drainNetworkEvents();
+        continue;
+      }
+      browser.drainNetworkEvents();
+
+      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, MAX_CLICKS_PER_PAGE, {
+        deepProbe: {
+          stateKeyPrefix: route.url,
+          depth: 0,
+          parentDepth: route.depth,
+          budget: stateBudget,
+          stateFingerprints,
+        },
+      }).catch(emptyClickDiscoveryResult);
+
+      if (clickResult.loginToggleSelectors.length > 0) {
+        route.loginToggleSelector = clickResult.loginToggleSelectors[0];
+      }
+      if (clickResult.unattemptedClickCandidates.length > 0) {
+        route.unattemptedClickCandidates = clickResult.unattemptedClickCandidates;
+      }
+      if (clickResult.discoveredStates.length > 0) {
+        routes.push(...clickResult.discoveredStates);
+      }
+    }
+    remainingStateProbes = stateBudget.remaining;
   }
 
   const dominant = fingerprintCounts.size > 0 ? Math.max(...fingerprintCounts.values()) : 0;

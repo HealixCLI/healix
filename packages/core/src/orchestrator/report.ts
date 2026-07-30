@@ -320,7 +320,7 @@ const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
  */
 function renderVideoUnavailableNote(reason: string | undefined): string {
   if (!reason) return '';
-  return `<div class="video-unavailable"><em>No video: ${esc(reason)}</em></div>`;
+  return `<div class="video-unavailable"><em>${esc(reason)}</em></div>`;
 }
 
 /**

@@ -250,16 +250,23 @@ export interface ExecResultItem {
   skipReason?: string;
   /**
    * Why no usable video is present for this (executed, non-skipped) result —
-   * a human-readable explanation for one of three distinct cases, never a
-   * silent gap: (1) a tierC-api test never opened a browser page, so a video
-   * was structurally impossible; (2) Playwright recorded a video but it was
-   * blank (the test finished before anything rendered) and was discarded;
-   * (3) no video attachment at all for a browser-based test — a genuine,
-   * worth-investigating anomaly. Absent when a real, usable video IS present
-   * in `artifacts`, or for a 'skipped' result (which never executed at all).
+   * never a silent gap. Always a complete, ready-to-display message (callers
+   * render it as-is, no prefix/suffix assembly needed) — see
+   * UNEXPLAINED_MISSING_VIDEO_REASON for the one genuinely-unknown case.
+   * Absent when a real, usable video IS present in `artifacts`, or for a
+   * 'skipped' result (which never executed at all).
    */
   videoUnavailableReason?: string;
 }
+
+/**
+ * ExecResultItem.videoUnavailableReason's value for the one genuinely
+ * unexplained case: no video attachment exists at all for a browser-based
+ * test, and nothing else (e.g. tierC-api) explains why. Exported as a named
+ * constant — rather than every caller re-typing the literal string — so
+ * emit-a-warning call sites can detect it by identity.
+ */
+export const UNEXPLAINED_MISSING_VIDEO_REASON = 'No video recorded.';
 
 export interface ExecOutcome {
   passed: number;

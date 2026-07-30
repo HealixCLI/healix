@@ -886,7 +886,7 @@ describe('parseReport — videoUnavailableReason: never a silent gap', () => {
       ],
     };
     const parsed = parseReport(r, LOGGED_IN);
-    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/no visible frames/);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/too quickly/);
     expect(parsed.videoWarnings).toEqual([]); // expected/explained case, not an operational anomaly
   });
 
@@ -912,7 +912,7 @@ describe('parseReport — videoUnavailableReason: never a silent gap', () => {
       ],
     };
     const parsed = parseReport(r, LOGGED_IN);
-    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/API request context/);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/Video not applicable/);
     expect(parsed.videoWarnings).toEqual([]);
   });
 
@@ -938,7 +938,7 @@ describe('parseReport — videoUnavailableReason: never a silent gap', () => {
       ],
     };
     const parsed = parseReport(r, LOGGED_IN);
-    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/artifact retention/);
+    expect(parsed.results[0]?.videoUnavailableReason).toBe('No video recorded.');
     expect(parsed.videoWarnings).toHaveLength(1);
     expect(parsed.videoWarnings[0]).toContain('no video attachment somehow');
   });
@@ -1833,6 +1833,13 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(remaining[0].title).toBe('a');
   });
 });
+
+// The manually-created-browser-context case is no longer a distinct
+// videoUnavailableReason — templates.ts's page fixture now patches
+// browser.newContext() to record and attach video automatically, so a test
+// using that pattern gets a real video (or, if something still goes wrong,
+// falls through to the generic UNEXPLAINED_MISSING_VIDEO_REASON case covered
+// above) rather than a dedicated explanatory message.
 
 // ---------------------------------------------------------------------------
 // Windows process-tree kill: an aborted/timed-out run must terminate the

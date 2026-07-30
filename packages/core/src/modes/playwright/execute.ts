@@ -13,7 +13,7 @@ import type {
   TestingScope,
   TestModeContext,
 } from '../types.js';
-import { tiersForScope } from '../types.js';
+import { tiersForScope, UNEXPLAINED_MISSING_VIDEO_REASON } from '../types.js';
 import {
   API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
@@ -794,21 +794,12 @@ function computeVideoUnavailableReason(
   const video = findVideoAttachment(attachments);
   if (video?.path) {
     if (!isBlankVideo(video.path)) return undefined;
-    return (
-      'Playwright recorded a video for this test, but it contained no visible frames ' +
-      '(the test likely finished before anything rendered) and was discarded as unusable.'
-    );
+    return 'No video recorded — the test finished too quickly for anything to be captured.';
   }
   if (projectIsTierC(projectName)) {
-    return (
-      'This test only used the API request context — no browser page was opened, ' +
-      'so no video could be recorded.'
-    );
+    return 'Video not applicable — this is an API test and did not involve a browser session.';
   }
-  return (
-    'No video was found for this test even though it ran in a browser — ' +
-    'this may indicate a gap in artifact retention.'
-  );
+  return UNEXPLAINED_MISSING_VIDEO_REASON;
 }
 
 interface ParsedReport {
@@ -1224,11 +1215,8 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
     // attachment at all — not the expected tierC-api/blank-recording cases)
     // is worth an operational warning; distinguish it by message content
     // rather than re-deriving the classification here.
-    if (
-      videoUnavailableReason &&
-      videoUnavailableReason.startsWith('No video was found for this test even though it ran in a browser')
-    ) {
-      videoWarnings.push(`No video captured for "${title}" — possible artifact retention gap.`);
+    if (videoUnavailableReason === UNEXPLAINED_MISSING_VIDEO_REASON) {
+      videoWarnings.push(`No video captured for "${title}" and the cause is unclear — worth a closer look.`);
     }
 
     switch (worst) {
@@ -1546,6 +1534,9 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // Surface the genuinely-anomalous missing-video case operationally (not
   // just in the report) — a browser-based test with no video attachment at
   // all may indicate a real artifact-retention gap worth investigating.
+  // (A manually-created browser context, previously the dominant cause of
+  // this, no longer reaches here — templates.ts's page fixture now patches
+  // browser.newContext() to record and attach video automatically.)
   for (const warning of parsed.videoWarnings) {
     emit(ctx, `[execute] ${warning}`);
   }

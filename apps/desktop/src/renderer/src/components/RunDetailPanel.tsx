@@ -811,7 +811,7 @@ function TestCaseEvidence({
     <div className="flex flex-col gap-2 border-t border-border/50 pt-2">
       <span className="text-[11px] font-medium uppercase tracking-wide text-muted">Evidence</span>
       {videos.length === 0 && videoUnavailableReason && (
-        <p className="text-xs italic text-muted/70">No video: {videoUnavailableReason}</p>
+        <p className="text-xs italic text-muted/70">{videoUnavailableReason}</p>
       )}
       {videos.length > 0 && (
         <div className="grid grid-cols-1 gap-2 sm:grid-cols-2">

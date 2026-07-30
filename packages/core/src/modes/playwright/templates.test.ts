@@ -159,6 +159,20 @@ describe('actionHighlighterFixtureContents', () => {
     // Logged as REAL (not a Healix mock) since nothing is intercepted here.
     expect(src).toContain(', false)'); // logApiEvidence(..., mocked=false)
   });
+
+  it('patches browser.newContext() to record and attach video for manually-created contexts', () => {
+    const src = actionHighlighterFixtureContents();
+    // Guarded so the patch is only installed once per worker, not re-wrapped every test.
+    expect(src).toContain('__healixVideoPatched');
+    expect(src).toContain('browser.newContext.bind(browser)');
+    // recordVideo is injected, but a caller's own options (if any) still win via the spread order.
+    expect(src).toContain('recordVideo: { dir: info.outputDir }, ...options');
+    // Every page opened in the manually-created context gets tracked and its video attached on close.
+    expect(src).toContain("ctx.on('page'");
+    expect(src).toContain("ctx.on('close'");
+    expect(src).toContain('.video()?.path()');
+    expect(src).toContain("contentType: 'video/webm'");
+  });
 });
 
 describe('stepsReporterContents', () => {

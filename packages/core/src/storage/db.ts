@@ -157,6 +157,13 @@ function migrate(db: DatabaseSync): void {
     // users whether a verdict was genuinely AI-reviewed or fell back to the
     // deterministic rule baseline (AI call errored/timed out/unparseable).
     ensureColumn(db, 'triage_results', 'verdict_source', 'TEXT');
+    // v17: video_unavailable_reason on results — explicit, human-readable
+    // explanation for WHY a video isn't present for an executed test
+    // (tierC-api tests never open a browser page; a blank/near-empty
+    // recording was discarded as unusable; or, genuinely anomalously, no
+    // video attachment at all for a browser-based test), added via
+    // ensureColumn for existing DBs so a missing video is never a silent gap.
+    ensureColumn(db, 'results', 'video_unavailable_reason', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

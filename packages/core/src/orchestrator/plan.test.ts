@@ -203,6 +203,185 @@ describe('parsePlan', () => {
       { kind: 'positive', description: 'Still works without scenarios.' },
     ]);
   });
+
+  describe('bundled data-variant splitting (each example gets its own executed test)', () => {
+    it("splits a description bundling multiple quoted examples into one scenario per example, since GENERATE only ever writes one test per scenario — otherwise only the model's single picked example ever runs, executes, or gets a recording", () => {
+      const text = JSON.stringify({
+        summary: 'Plan with a bundled negative scenario.',
+        items: [
+          {
+            title: 'Email validation',
+            tier: 'tierA-public',
+            intent: 'Malformed emails are rejected.',
+            scenarios: [
+              {
+                kind: 'negative',
+                description: "Malformed email formats ('abc', 'abc@', 'abc@.com') show 'Invalid email' error",
+              },
+            ],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        { kind: 'negative', description: "Malformed email formats 'abc' show 'Invalid email' error" },
+        { kind: 'negative', description: "Malformed email formats 'abc@' show 'Invalid email' error" },
+        { kind: 'negative', description: "Malformed email formats 'abc@.com' show 'Invalid email' error" },
+      ]);
+    });
+
+    it('leaves an ordinary (non-bundled) description with a single quoted value untouched', () => {
+      const text = JSON.stringify({
+        summary: 'Plan with a normal scenario.',
+        items: [
+          {
+            title: 'Login',
+            tier: 'tierA-public',
+            intent: 'User can sign in.',
+            scenarios: [{ kind: 'positive', description: "Submitting 'valid@example.com' logs the user in" }],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        { kind: 'positive', description: "Submitting 'valid@example.com' logs the user in" },
+      ]);
+    });
+
+    it('does not split a pathologically large bundled list (over the cap) — left as one scenario rather than exploding into dozens of tests', () => {
+      const many = Array.from({ length: 9 }, (_, i) => `'v${i}'`).join(', ');
+      const bundled = `Many formats (${many}) are all rejected`;
+      const text = JSON.stringify({
+        summary: 'Plan with an oversized bundle.',
+        items: [
+          {
+            title: 'Bulk validation',
+            tier: 'tierA-public',
+            intent: 'n/a',
+            scenarios: [{ kind: 'negative', description: bundled }],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([{ kind: 'negative', description: bundled }]);
+    });
+
+    it('splits a bundle using double-quoted (or mixed-quote) examples the same way', () => {
+      const text = JSON.stringify({
+        summary: 'Plan with double-quoted bundled examples.',
+        items: [
+          {
+            title: 'Phone validation',
+            tier: 'tierA-public',
+            intent: 'n/a',
+            scenarios: [
+              { kind: 'negative', description: 'Invalid phone formats ("123", \'abc\') are rejected' },
+            ],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        { kind: 'negative', description: 'Invalid phone formats "123" are rejected' },
+        { kind: 'negative', description: "Invalid phone formats 'abc' are rejected" },
+      ]);
+    });
+
+    it('splits an UNQUOTED bundled list of numeric values (no quotes needed for a value list to count)', () => {
+      const text = JSON.stringify({
+        summary: 'Plan with an unquoted numeric bundle.',
+        items: [
+          {
+            title: 'Age validation',
+            tier: 'tierA-public',
+            intent: 'n/a',
+            scenarios: [{ kind: 'negative', description: 'Invalid ages (13, 15, 17) are rejected' }],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        { kind: 'negative', description: 'Invalid ages 13 are rejected' },
+        { kind: 'negative', description: 'Invalid ages 15 are rejected' },
+        { kind: 'negative', description: 'Invalid ages 17 are rejected' },
+      ]);
+    });
+
+    it('splits an unquoted bundle whose bare tokens contain symbols (still recognizably literal values, not prose)', () => {
+      const text = JSON.stringify({
+        summary: 'Plan with an unquoted symbol-bearing bundle.',
+        items: [
+          {
+            title: 'Date validation',
+            tier: 'tierA-public',
+            intent: 'n/a',
+            scenarios: [
+              { kind: 'negative', description: 'Malformed dates (13/45/2020, 00/00/0000) show an error' },
+            ],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        { kind: 'negative', description: 'Malformed dates 13/45/2020 show an error' },
+        { kind: 'negative', description: 'Malformed dates 00/00/0000 show an error' },
+      ]);
+    });
+
+    it('does NOT split an ordinary parenthetical listing plain words (e.g. field names) — avoids corrupting prose unrelated to data variants', () => {
+      const text = JSON.stringify({
+        summary: 'Plan with an ordinary field-name aside.',
+        items: [
+          {
+            title: 'Registration form',
+            tier: 'tierA-public',
+            intent: 'n/a',
+            scenarios: [
+              { kind: 'positive', description: 'All required fields (name, email, phone) are validated' },
+            ],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        { kind: 'positive', description: 'All required fields (name, email, phone) are validated' },
+      ]);
+    });
+
+    it('does NOT split a bare list containing a multi-word item (not a flat value list)', () => {
+      const text = JSON.stringify({
+        summary: 'Plan with a multi-word parenthetical.',
+        items: [
+          {
+            title: 'Browser support',
+            tier: 'tierA-public',
+            intent: 'n/a',
+            scenarios: [
+              {
+                kind: 'positive',
+                description: 'Works across browsers (Google Chrome, Mozilla Firefox) consistently',
+              },
+            ],
+          },
+        ],
+      });
+
+      const plan = parsePlan(text);
+      expect(plan?.items[0]?.scenarios).toEqual([
+        {
+          kind: 'positive',
+          description: 'Works across browsers (Google Chrome, Mozilla Firefox) consistently',
+        },
+      ]);
+    });
+  });
 });
 
 describe('parsePlanWithDiagnostics', () => {

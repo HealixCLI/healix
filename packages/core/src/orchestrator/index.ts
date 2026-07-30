@@ -3229,6 +3229,7 @@ function persistResults(
         details: parentTest?.details ?? null,
         stepsJson: r.steps && r.steps.length > 0 ? JSON.stringify(r.steps) : null,
         skipReason: r.skipReason ?? null,
+        videoUnavailableReason: r.videoUnavailableReason ?? null,
       });
       noteStoreOk();
     } catch (err) {

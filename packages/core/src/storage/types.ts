@@ -154,6 +154,8 @@ export interface TestResult {
   stepsJson: string | null;
   /** Why a 'skipped' result was skipped (Playwright's own test.skip(cond, 'reason')/test.fixme(...) annotation description, when given). Null for a non-skipped result, a skip with no reason, or an older row from before this column existed. */
   skipReason: string | null;
+  /** Why no usable video is present for this executed result (tierC-api/no-browser-page, blank recording, or a genuine artifact-retention gap) — see ExecResultItem.videoUnavailableReason. Null when a real video IS present, for a skipped result, or an older row from before this column existed. */
+  videoUnavailableReason: string | null;
 }
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error';

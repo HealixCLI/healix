@@ -804,7 +804,12 @@ function TestCaseEvidence({
     return <p className="text-xs text-muted/70">No evidence captured for this test.</p>;
   }
   const images = artifacts.filter((a) => artifactKind(a) === 'image');
-  const videos = artifacts.filter((a) => artifactKind(a) === 'video');
+  // A run recorded before the double-video-attachment fix can have the same
+  // underlying video file attached twice under two different Playwright
+  // attachment names (the default context's own "video" plus this patch's
+  // "video-manual-context-N" for that same context) — same path, so a plain
+  // dedupe collapses it back down to the one real video.
+  const videos = [...new Set(artifacts.filter((a) => artifactKind(a) === 'video'))];
   const other = artifacts.filter((a) => artifactKind(a) !== 'image' && artifactKind(a) !== 'video');
 
   return (

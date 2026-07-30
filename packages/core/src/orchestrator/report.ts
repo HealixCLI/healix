@@ -345,7 +345,13 @@ function renderArtifacts(
   if (!reportDir) {
     return `<div class="hist">${artifacts.map((a) => esc(baseName(a))).join(', ')}</div>${renderVideoUnavailableNote(videoUnavailableReason)}`;
   }
-  const items = artifacts.map((abs) => ({
+  // A run recorded before the double-video-attachment fix can list the same
+  // underlying video file twice (once under Playwright's own "video"
+  // attachment, once under this project's now-removed "video-manual-context-N"
+  // duplicate for that same default context) — same absolute path, so a
+  // dedupe here collapses it back down to the one real video.
+  const dedupedArtifacts = [...new Set(artifacts)];
+  const items = dedupedArtifacts.map((abs) => ({
     href: relative(reportDir, abs).split(sep).join('/'),
     name: baseName(abs),
   }));

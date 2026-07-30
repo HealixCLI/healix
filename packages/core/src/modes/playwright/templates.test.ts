@@ -172,6 +172,10 @@ describe('actionHighlighterFixtureContents', () => {
     expect(src).toContain("ctx.on('close'");
     expect(src).toContain('.video()?.path()');
     expect(src).toContain("contentType: 'video/webm'");
+    // The default context/page fixture also routes through browser.newContext()
+    // and already requests + attaches its own video — skip re-attaching it
+    // here so every test doesn't get a duplicate (broken, mid-recording) video.
+    expect(src).toContain('isDefaultContext');
   });
 });
 

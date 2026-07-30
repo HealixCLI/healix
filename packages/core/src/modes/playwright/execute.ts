@@ -763,10 +763,15 @@ function isBlankVideo(path: string): boolean {
 }
 
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
-  return (attachments ?? [])
+  const paths = (attachments ?? [])
     .map((a) => a.path)
     .filter((p): p is string => typeof p === 'string' && p.length > 0)
     .filter((p) => !isBlankVideo(p));
+  // Two attachments can point at the exact same file (e.g. the default
+  // context's own "video" attachment and a manual-context video attachment
+  // for that same context) — dedupe so the same recording is never listed
+  // twice.
+  return [...new Set(paths)];
 }
 
 /** The raw video attachment (before blank-filtering), if Playwright reported one at all. */

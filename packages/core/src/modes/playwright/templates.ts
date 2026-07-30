@@ -996,7 +996,21 @@ export const test = base.extend({
         const originalNewContext = browser.newContext.bind(browser);
         browser.newContext = async (options) => {
           const info = base.info();
+          // Playwright's own \`context\`/\`page\` fixtures also go through
+          // \`browser.newContext()\` to create the DEFAULT context, and already
+          // pass their own \`recordVideo\` (derived from \`use.video\` in
+          // playwright.config.ts) plus attach that video themselves once the
+          // test ends. Only a genuinely manual \`browser.newContext()\` call
+          // from generated test code omits \`recordVideo\` — that's the one
+          // case this patch exists to cover. Re-attaching the default
+          // context's video here would duplicate it (and the duplicate is
+          // attached mid-recording, before Playwright finalizes the file, so
+          // it shows up broken/unplayable alongside the real one).
+          const isDefaultContext = Boolean(options?.recordVideo);
           const ctx = await originalNewContext({ recordVideo: { dir: info.outputDir }, ...options });
+          if (isDefaultContext) {
+            return ctx;
+          }
           const pages = [];
           ctx.on('page', (p) => pages.push(p));
           ctx.on('close', async () => {

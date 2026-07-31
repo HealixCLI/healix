@@ -323,6 +323,29 @@ describe('detectExternalDependencies', () => {
     ).toBe(true);
   });
 
+  it('detects a relative-path auth call site written with an explicit TypeScript generic argument (real axios idiom, GAP-064 follow-up)', async () => {
+    // Mirrors the ACTUAL real call site in psv-ui-c-and-a-react-latest-development's
+    // authService.ts:32 verbatim: `authApi.post<TokenGenerateResponse>('v1/web/token/generate', body)`.
+    // Found via real-app verification — the synthetic test above (no generic) passed while this
+    // exact real shape was still silently invisible to CALL_SITE_RE.
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(
+      dir,
+      'src/authService.ts',
+      "const { data } = await authApi.post<TokenGenerateResponse>('v1/web/token/generate', body);\n",
+    );
+    write(dir, '.env', 'AUTH_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = process.env.AUTH_API_URL;\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'AUTH_API_URL');
+    expect(dep).toBeDefined();
+    expect(
+      dep?.endpoints?.some((e) => e.method === 'POST' && e.pathPattern === 'v1/web/token/generate'),
+    ).toBe(true);
+  });
+
   it('does NOT capture a bare relative-path .get() call (still gated — likely a Map/Storage getter, not an HTTP call)', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({}));

@@ -32,15 +32,17 @@ function observedHostMatchesDependency(observedHost: string, depHostnames: strin
 /**
  * Best-effort parse of a captured response body into JSON for the runtime mock fixture.
  *
- * Falls back to `{}` (NOT the raw string) on parse failure. The raw string is almost always a
- * genuinely truncated capture (browser/index.ts caps captured bodies at a fixed char length,
- * appending `…` when it cuts) rather than real non-JSON content — serving that truncated,
- * invalid-JSON string AS the mock response body silently corrupts the fixture: every property
- * access the app makes against it resolves to `undefined` instead of throwing, producing
- * confusing app-level failures that look like real bugs (GAP-063). `{}` is a safe, consistent
- * shape that degrades the same way regardless of the body's real content. A proper fix (content-
- * type-aware truncation at capture time) is tracked separately; this only prevents the raw
- * truncated string from ever reaching a generated fixture as if it were valid data.
+ * Falls back to `{}` (NOT the raw string) on parse failure. `browser/index.ts`'s `truncateBody()`
+ * is now JSON-structure-aware (GAP-063: it caps array length and long string values within a
+ * parsed body, rather than flat-slicing the raw text), so the result is valid JSON in the common
+ * case and `{}` is now the rare fallback — reached only for a genuinely non-JSON body (HTML,
+ * plaintext, XML/SOAP) or the unusual case where `JSON.parse` still fails. `{}` remains a safe,
+ * consistent degrade for those cases: serving an invalid-JSON string AS the mock response body
+ * would silently corrupt the fixture (every property access resolving to `undefined` instead of
+ * throwing, producing confusing app-level failures that look like real bugs). Content-type-aware
+ * passthrough for non-JSON bodies (e.g. serving real XML/SOAP text instead of degrading to `{}`)
+ * is tracked as a separate follow-up gap — it needs a well-formed-XML-safe truncator, which
+ * `truncateBody()` doesn't yet have for non-JSON bodies.
  */
 function parseObservedBody(sampleResponseBody: string | undefined): unknown {
   if (!sampleResponseBody) return {};
@@ -79,7 +81,11 @@ function mergedEndpoints(
     merged.push({
       method: observed.method,
       pathPattern: observed.pathPattern,
-      response: { status: observed.status, body: parseObservedBody(observed.sampleResponseBody) },
+      response: {
+        status: observed.status,
+        body: parseObservedBody(observed.sampleResponseBody),
+        headers: observed.contentType ? { 'content-type': observed.contentType } : undefined,
+      },
     });
   }
   return merged;

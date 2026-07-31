@@ -16,6 +16,10 @@ export interface ObservedEndpoint {
    * multi-dependency run attribute an observed call to the specific dependency it belongs
    * to, instead of collapsing to one dependency-wide mock (see scaffold.ts's mockRouteEntries). */
   host?: string;
+  /** The response's real `content-type`, when captured — lets the runtime mock built from
+   * this endpoint serve back the real content-type instead of always defaulting to
+   * application/json (GAP-063 follow-up; see scaffold.ts's mergedEndpoints). */
+  contentType?: string;
 }
 
 /** Mirrors `target/dependencies.ts`'s MAX_ENDPOINTS_PER_DEP — same order of magnitude,
@@ -75,6 +79,7 @@ export function collectObservedEndpoints(crawl: CrawlWithAuthResult): ObservedEn
         status: event.status,
         sampleResponseBody: event.responseBody ? redactSecrets(event.responseBody) : undefined,
         host,
+        contentType: event.contentType,
       });
       if (observed.length >= MAX_OBSERVED_ENDPOINTS) break outer;
     }

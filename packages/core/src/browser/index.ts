@@ -18,23 +18,73 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
 const SETTLE_TIMEOUT_MS = 8000;
 /** Poll interval for the same-document content-settle check below. */
 const SAME_DOC_POLL_MS = 150;
-/** Per-body character cap on captured request/response bodies — mirrors
- * generate.ts's MAX_MOCK_BODY_CHARS so captured ground truth and the prompt
- * budget it eventually feeds stay the same order of magnitude. */
+/** Char-length gate for whether a captured body needs truncating at all. Not a hard
+ * output cap for JSON bodies (see {@link truncateJsonValue}) — those are shrunk
+ * structurally instead, so the result stays valid JSON regardless of final length. */
 const MAX_CAPTURED_BODY_CHARS = 400;
+/** Arrays anywhere in a captured JSON body are capped to their first N elements
+ * (GAP-063) — a real API list response can be hundreds of KB; keeping the shape and
+ * a handful of real samples is enough for both prompt grounding and a runtime mock,
+ * without needing to fit an arbitrary char budget. */
+const MAX_ARRAY_ELEMENTS = 5;
+/** Per-string-value cap applied to any JSON string field longer than this (GAP-063) —
+ * e.g. a `description`/`metadata` field carrying embedded HTML/CSS boilerplate can run
+ * to several KB on its own, independent of any array truncation. */
+const STRING_FIELD_MAX_CHARS = 200;
 /** Hard cap on buffered network events between drains, so a chatty page
  * (polling/analytics) can't grow the buffer unbounded during a long crawl. */
 const MAX_BUFFERED_EVENTS = 200;
 
-function truncateBody(text: string): string {
-  return text.length > MAX_CAPTURED_BODY_CHARS ? `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…` : text;
+/** Cuts a long string at its first sentence boundary (`.`/`!`/`?` followed by
+ * whitespace-or-end) when one exists within the cap; otherwise hard-cuts with `…`.
+ * Markup-heavy fields (HTML/CSS boilerplate) rarely have an early sentence boundary
+ * and fall through to the hard cut — expected, not a defect. */
+function truncateStringField(value: string): string {
+  if (value.length <= STRING_FIELD_MAX_CHARS) return value;
+  const window = value.slice(0, STRING_FIELD_MAX_CHARS);
+  const sentenceEnd = window.match(/[.!?](?=\s|$)/);
+  if (sentenceEnd?.index !== undefined) return window.slice(0, sentenceEnd.index + 1);
+  return `${window}…`;
+}
+
+/** Recursively caps array length and long string values within a parsed JSON value
+ * (GAP-063) so a captured body stays valid, representative JSON regardless of how
+ * large the real response was — instead of a flat char-slice that can cut mid-structure
+ * and produce invalid JSON. */
+function truncateJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_ARRAY_ELEMENTS).map(truncateJsonValue);
+  }
+  if (typeof value === 'string') {
+    return truncateStringField(value);
+  }
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = truncateJsonValue(v);
+    }
+    return result;
+  }
+  return value;
+}
+
+/** Exported for direct unit testing (GAP-063) — otherwise only used internally by
+ * {@link captureNetworkEvent}. */
+export function truncateBody(text: string): string {
+  if (text.length <= MAX_CAPTURED_BODY_CHARS) return text;
+  try {
+    const parsed = JSON.parse(text);
+    return JSON.stringify(truncateJsonValue(parsed));
+  } catch {
+    return `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…`;
+  }
 }
 
 /** Best-effort capture of one response + its originating request. Only called for
  * xhr/fetch resource types (see caller) — other resource types (images, css, fonts,
  * documents) are irrelevant to mock-endpoint ground truth and are skipped before this
  * is ever invoked. Swallows read errors (binary bodies, aborted/redirected responses). */
-async function captureNetworkEvent(response: Response): Promise<CapturedNetworkEvent> {
+export async function captureNetworkEvent(response: Response): Promise<CapturedNetworkEvent> {
   const request = response.request();
   const event: CapturedNetworkEvent = {
     method: request.method(),
@@ -52,6 +102,12 @@ async function captureNetworkEvent(response: Response): Promise<CapturedNetworkE
     if (text) event.responseBody = truncateBody(text);
   } catch {
     // Binary, redirected, or otherwise unreadable response body.
+  }
+  try {
+    const contentType = response.headers()['content-type'];
+    if (contentType) event.contentType = contentType;
+  } catch {
+    // Headers unavailable (redirected/aborted response).
   }
   return event;
 }

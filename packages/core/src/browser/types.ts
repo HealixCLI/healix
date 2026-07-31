@@ -62,6 +62,10 @@ export interface CapturedNetworkEvent {
   requestBody?: string;
   /** Best-effort, size-capped; omitted when the body couldn't be read (binary, redirect, etc). */
   responseBody?: string;
+  /** The response's real `content-type` header, when readable (GAP-063 follow-up: lets a
+   * mock built from this event serve back the real content-type instead of always
+   * defaulting to application/json). */
+  contentType?: string;
 }
 
 /**

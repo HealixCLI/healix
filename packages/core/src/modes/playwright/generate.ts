@@ -1393,6 +1393,11 @@ async function recordGenOutcome(
     ...(!outcome.spec && outcome.reason ? { reason: outcome.reason } : {}),
   };
   await appendGenerateCheckpointEntry(ctx.projectDir, entry);
+  // Second, independent write alongside the checkpoint above — see
+  // docs/design/retry-pass-coverage-kb-redesign.md. Same abort guard, same
+  // funnel, so the KB inherits "don't record an in-flight item as
+  // permanently dropped on pause/abort" for free.
+  ctx.onKbItemOutcome?.(item.id, outcome.spec ? 'generated' : 'dropped');
 }
 
 /** Reconstructs a GeneratedSpec for an already-finished item from an earlier, interrupted generate() call — by re-reading its spec file rather than re-asking the AI. Returns null (best-effort) if the file is gone or the entry wasn't a 'generated' one. */
@@ -1400,7 +1405,14 @@ async function restoreGeneratedSpec(entry: GenCheckpointEntry): Promise<Generate
   if (entry.status !== 'generated' || !entry.specPath || !entry.specTitle) return null;
   try {
     const contents = await readFile(entry.specPath, 'utf-8');
-    return { path: entry.specPath, title: entry.specTitle, reqTag: entry.reqTag, tier: entry.tier, contents };
+    return {
+      path: entry.specPath,
+      title: entry.specTitle,
+      reqTag: entry.reqTag,
+      tier: entry.tier,
+      contents,
+      planItemId: entry.itemId,
+    };
   } catch {
     return null;
   }
@@ -1591,7 +1603,7 @@ async function validateAndPersist(
 
   const title = `[REQ:${reqTag}] ${item.title}`;
   return {
-    spec: { path: absPath, title, reqTag, tier, contents: source },
+    spec: { path: absPath, title, reqTag, tier, contents: source, planItemId: item.id },
     ungroundedWarn: ungroundedWarn.length > 0 ? ungroundedWarn : undefined,
   };
 }

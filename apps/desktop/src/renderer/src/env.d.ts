@@ -51,6 +51,7 @@ export interface HealixBridge {
   resumeRun: (
     runId: string,
   ) => Promise<{ resumed: true; summary: RunSummary } | { resumed: false; reason: string }>;
+  retryPass: (runId: string) => Promise<{ ok: true; summary: RunSummary } | { ok: false; reason: string }>;
   getActiveRun: () => Promise<ActiveRunSnapshot | null>;
 
   // ---- run queue ----

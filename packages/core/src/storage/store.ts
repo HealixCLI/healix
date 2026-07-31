@@ -6,16 +6,21 @@ import { validateNewProject } from './validate.js';
 import type {
   AgentEvent,
   EventLevel,
+  KbItemStatus,
+  KbScenarioStatus,
   NewProject,
   NewProjectCredential,
   NewTriageResult,
   NewUsage,
   PauseReason,
+  PlanKbItem,
+  PlanKbScenario,
   Project,
   ProjectCredential,
   Run,
   RunStatus,
   SuiteMode,
+  Tier,
   TestCase,
   TestResult,
   TestStatus,
@@ -611,6 +616,165 @@ export class HealixStore {
     return Number(res.changes ?? 0);
   }
 
+  // ---- plan Knowledge Base (Retry-pass / coverage-feedback-loop) ----
+  /**
+   * Seed one KB item + its scenarios, idempotently (INSERT OR IGNORE — safe
+   * to re-run on a resumed run without clobbering a further-along status).
+   * `status`/each scenario's `status`/`testId` default to 'planned'/undefined
+   * for the normal Planner seed call; the lazy pre-KB backfill (see
+   * repair-candidates.ts) passes real current statuses instead, since it's
+   * seeding a KB for a run whose items/scenarios may already be generated,
+   * executed, or dropped. Returns the item's persisted KB id (existing row's,
+   * if one already existed).
+   */
+  seedPlanKbItem(input: {
+    runId: string;
+    planItemId: string;
+    title: string;
+    reqTag: string | null;
+    tier: Tier | null;
+    status?: KbItemStatus;
+    scenarios: Array<{
+      index: number;
+      kind: string;
+      description: string;
+      status?: KbScenarioStatus;
+      testId?: string | null;
+    }>;
+  }): string {
+    const id = `kbi_${nanoid(10)}`;
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO plan_kb_items (id, run_id, plan_item_id, title, req_tag, tier, status) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        id,
+        input.runId,
+        input.planItemId,
+        input.title,
+        input.reqTag,
+        input.tier,
+        input.status ?? 'planned',
+      );
+    const row = this.db
+      .prepare('SELECT id FROM plan_kb_items WHERE run_id = ? AND plan_item_id = ?')
+      .get(input.runId, input.planItemId) as { id: string } | undefined;
+    const kbItemId = row?.id ?? id;
+    for (const scenario of input.scenarios) {
+      const scenarioId = `kbs_${nanoid(10)}`;
+      this.db
+        .prepare(
+          'INSERT OR IGNORE INTO plan_kb_scenarios (id, kb_item_id, run_id, scenario_index, kind, description, status, test_id) VALUES (?, ?, ?, ?, ?, ?, ?, ?)',
+        )
+        .run(
+          scenarioId,
+          kbItemId,
+          input.runId,
+          scenario.index,
+          scenario.kind,
+          scenario.description,
+          scenario.status ?? 'planned',
+          scenario.testId ?? null,
+        );
+    }
+    return kbItemId;
+  }
+
+  /** True once at least one KB item exists for this run — used to decide whether a pre-KB run needs the lazy backfill. */
+  hasPlanKbItems(runId: string): boolean {
+    const row = this.db.prepare('SELECT 1 FROM plan_kb_items WHERE run_id = ? LIMIT 1').get(runId);
+    return row !== undefined;
+  }
+
+  /**
+   * Mark a KB item generated or dropped, cascading the CORRESPONDING status
+   * to all its scenarios in the same write — GENERATE's own atomicity
+   * guarantee (a spec is never partially accepted) means an item and its
+   * scenarios always transition together. The cascade is NOT the same
+   * literal string as the item's status: 'generated' is item-level only (it
+   * means "a spec was produced") — a scenario whose item was just generated
+   * is 'pending' (spec exists, no execution result yet; this is exactly what
+   * listPendingPlanKbScenarios/Retry-pass/the coverage loop look for), not
+   * 'generated'. A dropped item's scenarios genuinely are 'dropped' too, so
+   * that one cascades as-is. UPDATE, not insert — the row must already exist
+   * from the Planner's seed write; see
+   * docs/design/retry-pass-coverage-kb-redesign.md's write-semantics callout
+   * for why this must never be implemented as INSERT OR IGNORE.
+   */
+  updatePlanKbItemStatus(runId: string, planItemId: string, status: 'generated' | 'dropped'): void {
+    const scenarioStatus: KbScenarioStatus = status === 'generated' ? 'pending' : 'dropped';
+    this.db
+      .prepare(
+        "UPDATE plan_kb_items SET status = ?, updated_at = datetime('now') WHERE run_id = ? AND plan_item_id = ?",
+      )
+      .run(status, runId, planItemId);
+    this.db
+      .prepare(
+        `UPDATE plan_kb_scenarios SET status = ?, updated_at = datetime('now')
+         WHERE run_id = ? AND kb_item_id = (SELECT id FROM plan_kb_items WHERE run_id = ? AND plan_item_id = ?)`,
+      )
+      .run(scenarioStatus, runId, runId, planItemId);
+  }
+
+  /** Link a KB scenario row to the real tests row registerSpecRows just created for it. */
+  linkPlanKbScenarioTest(runId: string, planItemId: string, scenarioIndex: number, testId: string): void {
+    this.db
+      .prepare(
+        `UPDATE plan_kb_scenarios SET test_id = ?, updated_at = datetime('now')
+         WHERE run_id = ? AND scenario_index = ?
+           AND kb_item_id = (SELECT id FROM plan_kb_items WHERE run_id = ? AND plan_item_id = ?)`,
+      )
+      .run(testId, runId, scenarioIndex, runId, planItemId);
+  }
+
+  /**
+   * Mirror an execution result's status onto whichever KB scenario row is
+   * linked to this test (by test_id, not by re-deriving position) — best
+   * effort no-op when the test predates the KB or has no KB link (a fallback
+   * row persistResults minted with no matching plan item).
+   */
+  updatePlanKbScenarioStatusByTestId(testId: string, status: TestStatus): void {
+    this.db
+      .prepare("UPDATE plan_kb_scenarios SET status = ?, updated_at = datetime('now') WHERE test_id = ?")
+      .run(status, testId);
+  }
+
+  /** KB items still needing regeneration for this run. */
+  listDroppedPlanKbItems(runId: string): PlanKbItem[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM plan_kb_items WHERE run_id = ? AND status = 'dropped'")
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToPlanKbItem);
+  }
+
+  /** KB scenarios that were generated but never got an execution result. */
+  listPendingPlanKbScenarios(runId: string): PlanKbScenario[] {
+    return (
+      this.db
+        .prepare("SELECT * FROM plan_kb_scenarios WHERE run_id = ? AND status = 'pending'")
+        .all(runId) as Array<Record<string, unknown>>
+    ).map(rowToPlanKbScenario);
+  }
+
+  /** All KB items for a run — used by the lazy backfill's "already seeded?" callers that need full rows, not just a boolean. */
+  listPlanKbItems(runId: string): PlanKbItem[] {
+    return (
+      this.db.prepare('SELECT * FROM plan_kb_items WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToPlanKbItem);
+  }
+
+  /** All KB scenarios for a run. */
+  listPlanKbScenarios(runId: string): PlanKbScenario[] {
+    return (
+      this.db.prepare('SELECT * FROM plan_kb_scenarios WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToPlanKbScenario);
+  }
+
   // ---- orchestrator events (resumable checkpoints) ----
   appendEvent(
     runId: string,
@@ -915,6 +1079,35 @@ function rowToTriageResult(r: Record<string, unknown>): TriageResultRow {
     suggestedPatch: s(r.suggested_patch),
     verdictSource: s(r.verdict_source),
     createdAt: String(r.created_at),
+  };
+}
+
+function rowToPlanKbItem(r: Record<string, unknown>): PlanKbItem {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    planItemId: String(r.plan_item_id),
+    title: String(r.title),
+    reqTag: s(r.req_tag),
+    tier: s(r.tier),
+    status: String(r.status) as KbItemStatus,
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function rowToPlanKbScenario(r: Record<string, unknown>): PlanKbScenario {
+  return {
+    id: String(r.id),
+    kbItemId: String(r.kb_item_id),
+    runId: String(r.run_id),
+    scenarioIndex: Number(r.scenario_index),
+    kind: String(r.kind),
+    description: String(r.description),
+    status: String(r.status) as KbScenarioStatus,
+    testId: s(r.test_id),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
   };
 }
 

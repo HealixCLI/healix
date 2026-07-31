@@ -98,6 +98,7 @@ const api = {
   cancelRun: (runId: string) => ipcRenderer.invoke('run:cancel', { runId }),
   pauseRun: (runId: string) => ipcRenderer.invoke('run:pause', { runId }),
   resumeRun: (runId: string) => ipcRenderer.invoke('run:resume', { runId }),
+  retryPass: (runId: string) => ipcRenderer.invoke('run:retryPass', { runId }),
   getActiveRun: () => ipcRenderer.invoke('run:active'),
 
   // run queue (requests that arrived while another run was executing)

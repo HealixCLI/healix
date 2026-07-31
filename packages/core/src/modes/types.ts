@@ -160,6 +160,17 @@ export interface GeneratedSpec {
   reqTag?: string;
   tier: Tier;
   contents: string;
+  /**
+   * The plan item this spec was generated for, set by the mode that produced
+   * it. Unlike `reqTag`, which two DISTINCT items may legitimately share (e.g.
+   * a UI-tier item and its tierC-api counterpart under the same requirement),
+   * this is always unique — orchestrator/index.ts's registerSpecRows uses it
+   * to resolve the exact originating item instead of guessing by reqTag, which
+   * silently picks the wrong item whenever two share one. Absent for
+   * carried-forward specs (copied bytes from a prior run — see
+   * hydrateCarriedSpecs), which have no "originating item" in THIS run.
+   */
+  planItemId?: string;
 }
 
 /**
@@ -348,6 +359,14 @@ export interface TestModeContext {
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Reports a provider.complete() call's token/cost usage back to the run's store — see UsageRecorder. */
   onUsage?: UsageRecorder;
+  /**
+   * Reports a plan item's terminal GENERATE outcome (generated/dropped) back
+   * to the run's Knowledge Base — see docs/design/retry-pass-coverage-kb-redesign.md.
+   * Called from generate.ts's recordGenOutcome, the single funnel every
+   * per-item terminal outcome already passes through. Optional: undefined
+   * for callers/tests that don't need KB tracking (e.g. bare test contexts).
+   */
+  onKbItemOutcome?: (planItemId: string, status: 'generated' | 'dropped') => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
   /**

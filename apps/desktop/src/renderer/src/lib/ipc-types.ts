@@ -191,7 +191,7 @@ export interface RunReportShape {
   planSource?: 'ai' | 'fallback' | 'reuse';
   fallbackReason?: string;
   generation?: { requestedItems: number; acceptedItems: number };
-  coverage?: { ratio: number; target: number } | null;
+  coverage?: { ratio: number; target: number; coveredCount?: number; totalCount?: number } | null;
   /** End-of-run AI synthesis across every triaged failure — see @healix/core's triage/grouping.ts. */
   groupingSummary?: string | null;
 }
@@ -231,7 +231,12 @@ export function asRunReport(value: unknown): RunReportShape | null {
         : undefined,
     coverage:
       coverage && typeof coverage.ratio === 'number' && typeof coverage.target === 'number'
-        ? { ratio: coverage.ratio, target: coverage.target }
+        ? {
+            ratio: coverage.ratio,
+            target: coverage.target,
+            coveredCount: typeof coverage.coveredCount === 'number' ? coverage.coveredCount : undefined,
+            totalCount: typeof coverage.totalCount === 'number' ? coverage.totalCount : undefined,
+          }
         : null,
     groupingSummary: typeof v.groupingSummary === 'string' ? v.groupingSummary : null,
   };
@@ -261,12 +266,13 @@ export function reportDegradationNotes(report: RunReportShape | null): string[] 
       `Generated ${gen.acceptedItems}/${gen.requestedItems} planned spec(s); ${dropped} dropped after failed generation attempts.`,
     );
   }
-  const cov = report.coverage;
-  if (cov && cov.ratio < cov.target) {
-    notes.push(
-      `Coverage-feedback loop stopped at ${Math.round(cov.ratio * 100)}% (target ${Math.round(cov.target * 100)}%).`,
-    );
-  }
+  // Coverage-feedback loop has no UI entry point anymore (see RunsView.tsx —
+  // the toggle/target-% controls were removed; the feature stays supported
+  // server-side but is no longer user-facing) — a note about it stopping
+  // short would be confusing with nothing in the UI to explain what it is or
+  // let the user configure. Historical runs that DID use it (started before
+  // this change, or via a non-UI caller) still carry real coverage data in
+  // report.coverage; this just stops surfacing it as a degradation warning.
   return notes;
 }
 

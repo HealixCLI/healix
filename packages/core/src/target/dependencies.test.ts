@@ -308,6 +308,33 @@ describe('detectExternalDependencies', () => {
     expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
   });
 
+  it('detects a relative-path (no leading slash) auth call site on an axios instance with its own baseURL (GAP-064)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/authService.ts', "authApi.post('v1/web/token/generate', body);\n");
+    write(dir, '.env', 'AUTH_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = process.env.AUTH_API_URL;\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'AUTH_API_URL');
+    expect(dep).toBeDefined();
+    expect(
+      dep?.endpoints?.some((e) => e.method === 'POST' && e.pathPattern === 'v1/web/token/generate'),
+    ).toBe(true);
+  });
+
+  it('does NOT capture a bare relative-path .get() call (still gated — likely a Map/Storage getter, not an HTTP call)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/cache.ts', "cache.get('token');\n");
+    write(dir, '.env', 'AUTH_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = process.env.AUTH_API_URL;\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'AUTH_API_URL');
+    expect(dep?.endpoints?.some((e) => e.pathPattern === 'token')).toBeFalsy();
+  });
+
   it('detects an auth path expressed as a template-literal interpolation the call-site regexes miss (fetch(`${base}/auth/token/generate`))', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({}));

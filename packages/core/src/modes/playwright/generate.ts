@@ -1251,9 +1251,20 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem, tier: T
   const form = ctx.sourceContext?.forms.find((f) => f.file === unit.file);
   if (form && form.fields.length > 0) {
     const fieldList = form.fields
-      .map((f) => `${f.name} (${f.type}${f.required ? ', required' : ''})`)
+      .map((f) => `${f.name} (${f.type}${f.required ? ', required' : ''}${f.widgetLike ? ', WIDGET' : ''})`)
       .join(', ');
     lines.push(`Real form fields observed in ${unit.file}: ${fieldList}.`);
+
+    // GAP-066: a field tagged WIDGET (react-datepicker-style calendar/picker/autocomplete
+    // component) only updates its bound value through its own onChange callback — .fill() sets
+    // the DOM value directly and never invokes it, so the field never actually changes and any
+    // `required` validation gating a submit control never clears.
+    const widgetFields = form.fields.filter((f) => f.widgetLike);
+    if (widgetFields.length > 0) {
+      lines.push(
+        `WARNING: field(s) tagged WIDGET above (${widgetFields.map((f) => f.name).join(', ')}) are backed by a custom calendar/picker/autocomplete-style widget component, not a plain input — calling \`.fill()\` on them sets the DOM value directly and will NOT trigger the widget's own change handler, so the underlying form value stays empty/unset. Interact via the widget's own UI instead (click to open it, then select the value from its own picker/calendar/list), or otherwise use whatever interaction its real behavior requires — do not assume \`.fill()\` alone is sufficient for these fields.`,
+      );
+    }
   }
 
   return lines.join('\n');

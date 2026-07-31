@@ -2,6 +2,7 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { TestModeContext } from '../types.js';
+import { isXmlContentType } from '../../browser/index.js';
 import type { ObservedEndpoint } from '../../browser/network-capture.js';
 import {
   TIERS,
@@ -30,26 +31,24 @@ function observedHostMatchesDependency(observedHost: string, depHostnames: strin
 }
 
 /**
- * Best-effort parse of a captured response body into JSON for the runtime mock fixture.
+ * Best-effort resolve of a captured response body for the runtime mock fixture.
  *
- * Falls back to `{}` (NOT the raw string) on parse failure. `browser/index.ts`'s `truncateBody()`
- * is now JSON-structure-aware (GAP-063: it caps array length and long string values within a
- * parsed body, rather than flat-slicing the raw text), so the result is valid JSON in the common
- * case and `{}` is now the rare fallback — reached only for a genuinely non-JSON body (HTML,
- * plaintext, XML/SOAP) or the unusual case where `JSON.parse` still fails. `{}` remains a safe,
- * consistent degrade for those cases: serving an invalid-JSON string AS the mock response body
- * would silently corrupt the fixture (every property access resolving to `undefined` instead of
- * throwing, producing confusing app-level failures that look like real bugs). Content-type-aware
- * passthrough for non-JSON bodies (e.g. serving real XML/SOAP text instead of degrading to `{}`)
- * is tracked as a separate follow-up gap — it needs a well-formed-XML-safe truncator, which
- * `truncateBody()` doesn't yet have for non-JSON bodies.
+ * Tries `JSON.parse()` first. On failure, an XML/SOAP body (per `contentType`) is passed
+ * through as-is: `browser/index.ts`'s `truncateBody()` routes XML content-types through a
+ * structural, well-formedness-preserving truncator (GAP-069), so the raw string is always
+ * safe to serve verbatim — `templates.ts`'s `serializeBody()` already knows to emit a
+ * non-JSON `body` string as-is by content-type instead of `JSON.stringify`-encoding it.
+ * Any other non-JSON body (HTML, plaintext, or a genuinely malformed capture) still falls
+ * back to `{}`: serving an invalid-JSON string AS the mock response body would silently
+ * corrupt the fixture (every property access resolving to `undefined` instead of throwing,
+ * producing confusing app-level failures that look like real bugs).
  */
-function parseObservedBody(sampleResponseBody: string | undefined): unknown {
+function parseObservedBody(sampleResponseBody: string | undefined, contentType: string | undefined): unknown {
   if (!sampleResponseBody) return {};
   try {
     return JSON.parse(sampleResponseBody);
   } catch {
-    return {};
+    return isXmlContentType(contentType) ? sampleResponseBody : {};
   }
 }
 
@@ -83,7 +82,7 @@ function mergedEndpoints(
       pathPattern: observed.pathPattern,
       response: {
         status: observed.status,
-        body: parseObservedBody(observed.sampleResponseBody),
+        body: parseObservedBody(observed.sampleResponseBody, observed.contentType),
         headers: observed.contentType ? { 'content-type': observed.contentType } : undefined,
       },
     });

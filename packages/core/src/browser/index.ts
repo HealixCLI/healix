@@ -68,14 +68,128 @@ function truncateJsonValue(value: unknown): unknown {
   return value;
 }
 
+/** True for `application/xml`, `text/xml`, `application/soap+xml`, and any other
+ * `*+xml` content-type (GAP-069) — the set of types `truncateBody()` routes to the
+ * structural XML truncator instead of the flat char-slice fallback. */
+export function isXmlContentType(contentType: string | undefined): boolean {
+  if (!contentType) return false;
+  return /(?:^|\/)xml\s*(?:;|$)|\+xml\s*(?:;|$)/i.test(contentType);
+}
+
+/** A parsed XML element (`children` holds nested elements/text) or a text run between
+ * tags. Deliberately minimal — only what a captured API response body needs (elements,
+ * attributes carried verbatim, text, CDATA) — not a general/validating XML parser. */
+type XmlNode =
+  | { type: 'element'; tag: string; attrs: string; selfClosing: boolean; children: XmlNode[] }
+  | { type: 'text'; value: string }
+  | { type: 'cdata'; value: string }
+  | { type: 'other'; value: string };
+
+/** Tokenizes and parses `text` into a tree of {@link XmlNode}s, tolerating a single
+ * leading prolog/declaration and comments anywhere. Returns `null` on any structural
+ * inconsistency (unclosed/mismatched tags) — same contract as `JSON.parse` throwing:
+ * the caller falls back to a safe default rather than emitting something malformed. */
+function parseXmlLoose(text: string): XmlNode[] | null {
+  const tokenRe = /<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/[^>]+>|<[^>/][^>]*\/?>|[^<]+/g;
+  const root: XmlNode[] = [];
+  const stack: Array<{ tag: string; children: XmlNode[] }> = [];
+  const current = () => (stack.length > 0 ? stack[stack.length - 1].children : root);
+
+  let match: RegExpExecArray | null;
+  while ((match = tokenRe.exec(text)) !== null) {
+    const token = match[0];
+    if (token.startsWith('<?') || token.startsWith('<!--')) {
+      current().push({ type: 'other', value: token });
+    } else if (token.startsWith('<![CDATA[')) {
+      current().push({ type: 'cdata', value: token.slice(9, -3) });
+    } else if (token.startsWith('</')) {
+      const tag = token.slice(2, -1).trim();
+      const top = stack.pop();
+      if (!top || top.tag !== tag) return null;
+    } else if (token.startsWith('<')) {
+      const selfClosing = /\/>$/.test(token);
+      const body = token.slice(1, selfClosing ? -2 : -1).trim();
+      const nameMatch = body.match(/^[^\s/]+/);
+      if (!nameMatch) return null;
+      const tag = nameMatch[0];
+      const attrs = body.slice(tag.length);
+      const node: XmlNode = { type: 'element', tag, attrs, selfClosing, children: [] };
+      current().push(node);
+      if (!selfClosing) stack.push({ tag, children: node.children });
+    } else {
+      current().push({ type: 'text', value: token });
+    }
+  }
+  if (stack.length > 0) return null;
+  return root;
+}
+
+/** Re-emits a parsed {@link XmlNode} tree back into XML text, the inverse of
+ * {@link parseXmlLoose}. */
+function serializeXmlNodes(nodes: XmlNode[]): string {
+  return nodes
+    .map((node) => {
+      switch (node.type) {
+        case 'text':
+        case 'other':
+          return node.value;
+        case 'cdata':
+          return `<![CDATA[${node.value}]]>`;
+        case 'element': {
+          const open = `<${node.tag}${node.attrs}`;
+          if (node.selfClosing) return `${open}/>`;
+          return `${open}>${serializeXmlNodes(node.children)}</${node.tag}>`;
+        }
+      }
+    })
+    .join('');
+}
+
+/** Recursively caps repeated sibling elements and long text runs within a parsed XML
+ * tree (GAP-069) — the XML analogue of {@link truncateJsonValue}: a run of more than
+ * {@link MAX_ARRAY_ELEMENTS} sibling elements sharing the same tag (the XML equivalent
+ * of a JSON array of records, e.g. repeated `<item>`/`<row>` elements) is capped to the
+ * first N, and long text content is cut with {@link truncateStringField} — same caps,
+ * same rationale, applied structurally so the result is well-formed by construction. */
+function truncateXmlNodes(nodes: XmlNode[]): XmlNode[] {
+  const result: XmlNode[] = [];
+  const tagCounts = new Map<string, number>();
+  for (const node of nodes) {
+    if (node.type === 'element') {
+      const count = (tagCounts.get(node.tag) ?? 0) + 1;
+      tagCounts.set(node.tag, count);
+      if (count > MAX_ARRAY_ELEMENTS) continue;
+      result.push({ ...node, children: truncateXmlNodes(node.children) });
+    } else if (node.type === 'text') {
+      result.push({ type: 'text', value: truncateStringField(node.value) });
+    } else {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
+/** Structural, well-formedness-preserving XML/SOAP truncation (GAP-069) — the XML
+ * counterpart to `truncateBody()`'s JSON branch. Parses `text`, caps it via
+ * {@link truncateXmlNodes}, and re-serializes; falls back to the original flat
+ * char-slice when the body doesn't parse with {@link parseXmlLoose}'s loose grammar. */
+export function truncateXmlBody(text: string): string {
+  const nodes = parseXmlLoose(text);
+  if (nodes === null) return `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…`;
+  return serializeXmlNodes(truncateXmlNodes(nodes));
+}
+
 /** Exported for direct unit testing (GAP-063) — otherwise only used internally by
- * {@link captureNetworkEvent}. */
-export function truncateBody(text: string): string {
+ * {@link captureNetworkEvent}. `contentType`, when it looks like XML/SOAP (GAP-069),
+ * routes the non-JSON fallback through {@link truncateXmlBody} instead of a flat
+ * char-slice, so a truncated XML body stays well-formed. */
+export function truncateBody(text: string, contentType?: string): string {
   if (text.length <= MAX_CAPTURED_BODY_CHARS) return text;
   try {
     const parsed = JSON.parse(text);
     return JSON.stringify(truncateJsonValue(parsed));
   } catch {
+    if (isXmlContentType(contentType)) return truncateXmlBody(text);
     return `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…`;
   }
 }
@@ -98,16 +212,16 @@ export async function captureNetworkEvent(response: Response): Promise<CapturedN
     // No readable request body.
   }
   try {
-    const text = await response.text();
-    if (text) event.responseBody = truncateBody(text);
-  } catch {
-    // Binary, redirected, or otherwise unreadable response body.
-  }
-  try {
     const contentType = response.headers()['content-type'];
     if (contentType) event.contentType = contentType;
   } catch {
     // Headers unavailable (redirected/aborted response).
+  }
+  try {
+    const text = await response.text();
+    if (text) event.responseBody = truncateBody(text, event.contentType);
+  } catch {
+    // Binary, redirected, or otherwise unreadable response body.
   }
   return event;
 }

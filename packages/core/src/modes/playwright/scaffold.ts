@@ -29,13 +29,25 @@ function observedHostMatchesDependency(observedHost: string, depHostnames: strin
   );
 }
 
-/** Best-effort parse of a captured response body into JSON; falls back to the raw string wrapped as-is when it isn't valid JSON. */
+/**
+ * Best-effort parse of a captured response body into JSON for the runtime mock fixture.
+ *
+ * Falls back to `{}` (NOT the raw string) on parse failure. The raw string is almost always a
+ * genuinely truncated capture (browser/index.ts caps captured bodies at a fixed char length,
+ * appending `…` when it cuts) rather than real non-JSON content — serving that truncated,
+ * invalid-JSON string AS the mock response body silently corrupts the fixture: every property
+ * access the app makes against it resolves to `undefined` instead of throwing, producing
+ * confusing app-level failures that look like real bugs (GAP-063). `{}` is a safe, consistent
+ * shape that degrades the same way regardless of the body's real content. A proper fix (content-
+ * type-aware truncation at capture time) is tracked separately; this only prevents the raw
+ * truncated string from ever reaching a generated fixture as if it were valid data.
+ */
 function parseObservedBody(sampleResponseBody: string | undefined): unknown {
   if (!sampleResponseBody) return {};
   try {
     return JSON.parse(sampleResponseBody);
   } catch {
-    return sampleResponseBody;
+    return {};
   }
 }
 

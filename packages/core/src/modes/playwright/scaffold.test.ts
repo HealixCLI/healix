@@ -223,6 +223,59 @@ describe('scaffold — mock fixture generation', () => {
     ]);
   });
 
+  it('falls back to {} (not the raw string) for an observed body that is not valid JSON, e.g. a truncated capture (GAP-063)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_API_BASE_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example.com'],
+      },
+    ];
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses: { 'env:VITE_API_BASE_URL': { status: 200, body: { profile: true } } },
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/customer/getbyemail',
+            status: 200,
+            // Mirrors a real capture cut mid-structure at browser/index.ts's char cap.
+            sampleResponseBody: '{"entity":{"customers":[{"id":"abc123","email":"user@examp…',
+            host: 'eu.api.example.com',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    const routesMatch = /const MOCKED_ROUTES = (\[[\s\S]*?\n\]);/.exec(contents);
+    const routes = JSON.parse(routesMatch![1]);
+    const route = routes.find((r: { id: string }) => r.id === 'env:VITE_API_BASE_URL');
+    const endpoint = route.endpoints.find(
+      (e: { pathPattern: string }) => e.pathPattern === '/customer/getbyemail',
+    );
+    expect(endpoint.response.body).toEqual({});
+  });
+
   it('lets a statically-detected endpoint win over an observed one for the same (method, path)', async () => {
     const deps: ExternalDependency[] = [
       {

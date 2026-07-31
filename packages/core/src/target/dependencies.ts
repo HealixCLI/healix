@@ -366,9 +366,15 @@ function authTargets(mockableDeps: ExternalDependency[]): ExternalDependency[] {
  * look like a path (starts with '/') to keep false positives low, matching
  * this module's existing "best-effort, not exhaustive" static-analysis
  * philosophy elsewhere.
+ *
+ * The optional `(?:<[^()]{0,80}>)?` between the method name and `(` matches an explicit
+ * TypeScript generic type argument (e.g. axios's `client.post<ResponseType>('/path', body)`,
+ * the standard typed-axios idiom) — without it, this real, common call shape was invisible to
+ * the regex entirely, silently discarding the call site rather than just its path (found via
+ * real-app verification against a live axios-based login call site, GAP-064 follow-up).
  */
 const CALL_SITE_RE =
-  /\b[\w$]+\.(get|post|put|patch|delete|head|options)\(\s*(?:`([^`]*)`|'([^']*)'|"([^"]*)")/gi;
+  /\b[\w$]+\.(get|post|put|patch|delete|head|options)(?:<[^()]{0,80}>)?\(\s*(?:`([^`]*)`|'([^']*)'|"([^"]*)")/gi;
 
 /**
  * Object-config call style: `axios({ method: 'get', url: '/path' })` (or

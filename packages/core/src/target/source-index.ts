@@ -30,7 +30,7 @@ import type { SourceContext } from './source-context.js';
 
 /** Hard cap on extracted units — mirrors functionality-index.ts's DEFAULT_MAX_UNITS. */
 const DEFAULT_MAX_UNITS = 300;
-const MULTILANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.php']);
+const MULTILANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.php', '.java']);
 const JS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 /** Same hard file-count cap indexSource() itself walks with (via walkSourceFiles below). */
 const WALK_HARD_CAP = 5000;

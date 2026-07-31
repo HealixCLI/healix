@@ -140,6 +140,12 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     // when idleTimeoutMs is omitted, preserving today's fixed-timeout
     // behaviour byte-for-byte for every non-streaming caller.
     const hardTimer = setTimeout(() => {
+      // killTree() below is async (taskkill/signal, not an instant reap) — a
+      // chunk still in flight from before the kill lands can call
+      // armIdleTimer() again afterward. Without this guard that re-armed
+      // idle timer can fire later and overwrite an already-correct 'hard'
+      // verdict with 'idle', misreporting which timer actually ended the run.
+      if (timedOut) return;
       timedOut = true;
       timeoutKind = 'hard';
       killTree();
@@ -153,8 +159,14 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     let idleTimer: NodeJS.Timeout | undefined;
     const armIdleTimer = (): void => {
       if (opts.idleTimeoutMs === undefined) return;
+      // Once a timeout has already been recorded (e.g. hardTimer fired and
+      // killTree() is still in flight), don't arm a new idle window that
+      // could later fire and clobber the real verdict — see hardTimer's
+      // matching guard above.
+      if (timedOut) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {
+        if (timedOut) return;
         timedOut = true;
         timeoutKind = 'idle';
         killTree();

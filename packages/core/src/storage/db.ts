@@ -164,6 +164,10 @@ function migrate(db: DatabaseSync): void {
     // video attachment at all for a browser-based test), added via
     // ensureColumn for existing DBs so a missing video is never a silent gap.
     ensureColumn(db, 'results', 'video_unavailable_reason', 'TEXT');
+    // v18: plan_kb_items/plan_kb_scenarios (Retry-pass/coverage-loop
+    // Knowledge Base) — brand-new tables, no ensureColumn needed; same
+    // reasoning as v11's usage table: CREATE TABLE IF NOT EXISTS already
+    // retrofits them onto an existing DB.
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

@@ -35,13 +35,19 @@ import type {
 import type { BrowserSurface, BrowserSurfaceOptions, DomSnapshot, Point } from '../browser/types.js';
 
 /**
- * Exercises the coverage feedback loop's real gap-fill iteration end-to-end
- * (offline DI seam, same pattern as orchestrator.paths.test.ts) — a real tmp
- * repo with two Express endpoints, so `indexSource` genuinely detects two
- * functionality units (`endpoint:GET /api/x`, `endpoint:GET /api/y`), and a
- * fake plan provider that covers only the first on its initial response,
- * covering the second only on a later (gap-fill) call — real, not stubbed,
- * evidence of whether the loop actually retried.
+ * Exercises the coverage feedback loop's real dropped-item recovery
+ * iteration end-to-end (offline DI seam, same pattern as
+ * orchestrator.paths.test.ts) — a real tmp repo with two Express endpoints,
+ * so `indexSource` genuinely detects two functionality units
+ * (`endpoint:GET /api/x`, `endpoint:GET /api/y`), a plan that includes BOTH
+ * items up front, and a fake generate() that deliberately drops ITEM_B on
+ * its first attempt (simulating a real generation failure) but succeeds on
+ * any later attempt — real, not stubbed, evidence of whether the loop
+ * recovers a dropped item via regeneration WITHOUT re-planning (the
+ * pre-KB-redesign loop used to discover ITEM_B via a second AI plan call;
+ * the redesigned loop can only recover items the initial plan already
+ * included, never plan brand-new ones — see
+ * docs/design/retry-pass-coverage-kb-redesign.md §4).
  */
 
 function fencedPlan(plan: { summary: string; items: unknown[] }): string {
@@ -63,7 +69,7 @@ const ITEM_B = {
   unitKey: 'endpoint:GET /api/y',
 };
 
-/** Returns only ITEM_A on the first plan call, ITEM_A+ITEM_B (well, just B — A is already covered) on any later call. */
+/** Always returns BOTH items on every plan-mode call — the redesigned loop never issues a second one, so `planCallCount` staying at 1 is itself proof no re-planning happened. */
 function makeFakeProvider(planCallCount: { n: number }): ProviderAdapter {
   return {
     id: 'claude',
@@ -86,17 +92,16 @@ function makeFakeProvider(planCallCount: { n: number }): ProviderAdapter {
       };
     },
     async plan(): Promise<PlanResult> {
-      const text = fencedPlan({ summary: 'fake', items: [ITEM_A] });
+      const text = fencedPlan({ summary: 'fake', items: [ITEM_A, ITEM_B] });
       return { provider: 'claude', ok: true, plan: text, raw: {}, detail: 'OK' };
     },
     async complete(_prompt: string, opts?: CompleteOptions): Promise<CompletionResult> {
       if (opts?.mode === 'plan') {
         planCallCount.n += 1;
-        const items = planCallCount.n === 1 ? [ITEM_A] : [ITEM_B];
         return {
           provider: 'claude',
           ok: true,
-          text: fencedPlan({ summary: 'fake', items }),
+          text: fencedPlan({ summary: 'fake', items: [ITEM_A, ITEM_B] }),
           raw: {},
           detail: 'OK',
         };
@@ -106,19 +111,36 @@ function makeFakeProvider(planCallCount: { n: number }): ProviderAdapter {
   };
 }
 
-/** generate()/execute() genuinely respect whatever items/specs they're given — required for the gap-fill call's own items to produce their own covering result. */
-function makeFakeMode(): TestMode {
+/**
+ * generate() drops ITEM_B (REQ-Y) on its very first invocation across the
+ * whole run — simulating a real generation failure — and accepts it on any
+ * later call (the coverage-loop's recovery iteration, or Retry-pass). Calls
+ * ctx.onKbItemOutcome itself for both the accepted and dropped items, since
+ * this fake bypasses real generate.ts's recordGenOutcome entirely — the
+ * orchestrator's KB status tracking depends on that callback firing.
+ */
+function makeFakeMode(genAttempts: { n: number }): TestMode {
   return {
     id: 'playwright',
     async scaffold(_ctx: TestModeContext): Promise<void> {},
-    async generate(_ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
-      return plan.items.map((item) => ({
-        path: `/fake/${item.reqTag}.spec.ts`,
-        title: item.title,
-        reqTag: item.reqTag,
-        tier: item.tier,
-        contents: '// fake spec',
-      }));
+    async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+      genAttempts.n += 1;
+      const specs: GeneratedSpec[] = [];
+      for (const item of plan.items) {
+        if (item.reqTag === 'REQ-Y' && genAttempts.n === 1) {
+          ctx.onKbItemOutcome?.(item.id, 'dropped');
+          continue;
+        }
+        specs.push({
+          path: `/fake/${item.reqTag}.spec.ts`,
+          title: item.title,
+          reqTag: item.reqTag,
+          tier: item.tier,
+          contents: '// fake spec',
+        });
+        ctx.onKbItemOutcome?.(item.id, 'generated');
+      }
+      return specs;
     },
     async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
       const results = specs.map((s) => ({
@@ -224,10 +246,11 @@ describe('coverage feedback loop opt-in (offline DI seam, real functionality det
     const project = store.createProject({ name: 'Coverage Loop Off', mode: 'playwright', repoPath });
 
     const planCallCount = { n: 0 };
+    const genAttempts = { n: 0 };
     const events: OrchestratorEvent[] = [];
     const orchestrator = createOrchestrator({
       provider: makeFakeProvider(planCallCount),
-      getMode: () => makeFakeMode(),
+      getMode: () => makeFakeMode(genAttempts),
       makeTarget: () => makeFakeTarget(),
       makeBrowser: () => fakeBrowser,
     });
@@ -237,10 +260,12 @@ describe('coverage feedback loop opt-in (offline DI seam, real functionality det
       { onEvent: (e) => events.push(e) },
     );
 
-    // Only the initial plan call happened — no gap-fill retry.
+    // One plan call (both items planned up front) and one generate call
+    // (ITEM_B dropped on it, never retried since the loop is off).
     expect(planCallCount.n).toBe(1);
+    expect(genAttempts.n).toBe(1);
     expect(events.some((e) => e.message.includes('Coverage loop is off'))).toBe(true);
-    expect(events.some((e) => e.message.toLowerCase().includes('gap-fill'))).toBe(false);
+    expect(events.some((e) => e.message.toLowerCase().includes('recovering dropped'))).toBe(false);
 
     const report = JSON.parse(await readFile(summary.reportPath as string, 'utf8')) as RunReport;
     // Coverage was still measured (not skipped) — only unit A is covered.
@@ -250,15 +275,16 @@ describe('coverage feedback loop opt-in (offline DI seam, real functionality det
     expect(report.coverage?.ratio).toBeCloseTo(0.5);
   });
 
-  it('LOOP ON: retries the gap-fill iteration and reaches full coverage', async () => {
+  it('LOOP ON: recovers the dropped item via regeneration, with zero re-planning', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({ name: 'Coverage Loop On', mode: 'playwright', repoPath });
 
     const planCallCount = { n: 0 };
+    const genAttempts = { n: 0 };
     const events: OrchestratorEvent[] = [];
     const orchestrator = createOrchestrator({
       provider: makeFakeProvider(planCallCount),
-      getMode: () => makeFakeMode(),
+      getMode: () => makeFakeMode(genAttempts),
       makeTarget: () => makeFakeTarget(),
       makeBrowser: () => fakeBrowser,
     });
@@ -268,9 +294,17 @@ describe('coverage feedback loop opt-in (offline DI seam, real functionality det
       { onEvent: (e) => events.push(e) },
     );
 
-    // Initial plan call + exactly one gap-fill iteration (unit B closes the gap).
-    expect(planCallCount.n).toBe(2);
-    expect(events.some((e) => e.message.toLowerCase().includes('gap-fill'))).toBe(true);
+    // Exactly one plan call, ever — the redesigned loop never calls
+    // provider.complete(mode: 'plan') again, unlike the old gap-fill
+    // mechanism. Two generate() calls: the initial pass (drops ITEM_B) and
+    // the loop's one recovery iteration (regenerates it successfully).
+    expect(planCallCount.n).toBe(1);
+    expect(genAttempts.n).toBe(2);
+    expect(events.some((e) => e.message.toLowerCase().includes('recovering dropped'))).toBe(true);
+    expect(
+      events.some((e) => e.message.toLowerCase().includes('regenerating') && e.message.includes('dropped')),
+    ).toBe(true);
+    expect(events.some((e) => e.message.toLowerCase().includes('gap-fill'))).toBe(false);
 
     const report = JSON.parse(await readFile(summary.reportPath as string, 'utf8')) as RunReport;
     expect(report.coverage).not.toBeNull();

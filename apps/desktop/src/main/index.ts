@@ -734,6 +734,93 @@ ipcMain.handle(
   },
 );
 
+/**
+ * Same-run recovery for a completed run: regenerate whatever the Knowledge
+ * Base flags as dropped, execute everything still pending, refresh the
+ * report in place — no new run row. Mirrors resumeRun's shape (registers in
+ * activeRuns so it shares the "one run executes at a time" gate, reuses
+ * 'run:started' so the renderer's existing handler resets its live view for
+ * this SAME runId instead of treating it as a new one). See
+ * docs/design/retry-pass-coverage-kb-redesign.md.
+ */
+async function retryPassRun(
+  runId: string,
+  send: (channel: string, payload: unknown) => void,
+): Promise<RunSummary> {
+  const controller = new AbortController();
+  activeRuns.set(runId, controller);
+
+  const store = await requireStore();
+  const run = store.getRun(runId);
+  send('run:started', { runId, projectId: run?.projectId ?? 'unknown' });
+
+  const orchestrator = createOrchestrator();
+  const summary = await orchestrator
+    .retryPass(
+      runId,
+      {
+        onEvent: (e) => send('run:event', { runId, event: e }),
+      },
+      controller.signal,
+    )
+    .catch((err: unknown) => {
+      const message = err instanceof Error ? err.message : String(err);
+      send('run:event', { runId, event: { phase: 'error', level: 'error', message } });
+      const failed: RunSummary = { runId, status: 'error' };
+      return failed;
+    })
+    .finally(() => {
+      activeRuns.delete(runId);
+    });
+
+  send('run:done', { runId, summary });
+  return summary;
+}
+
+// Retry-pass only ever recovers a run that has already finished (dropped
+// items to regenerate, pending scenarios to execute) — 'paused' is
+// deliberately excluded even though it has no live activeRuns entry, since a
+// paused run still has a checkpoint that resumeRun can act on, and letting
+// both mechanisms write into the same run's tests/results concurrently would
+// race.
+const RETRY_PASS_ELIGIBLE_STATUSES: ReadonlySet<string> = new Set([
+  'passed',
+  'failed',
+  'blocked',
+  'error',
+  'cancelled',
+]);
+
+ipcMain.handle(
+  'run:retryPass',
+  async (
+    event,
+    payload: { runId: string },
+  ): Promise<{ ok: true; summary: RunSummary } | { ok: false; reason: string }> => {
+    const runId = payload?.runId;
+    if (!runId) return { ok: false, reason: 'A runId is required.' };
+
+    const store = await requireStore();
+    const run = store.getRun(runId);
+    if (!run) return { ok: false, reason: `No run found with id ${runId}.` };
+    if (!RETRY_PASS_ELIGIBLE_STATUSES.has(run.status)) {
+      return {
+        ok: false,
+        reason: `Run is ${run.status}; retry-pass only applies to a completed run.`,
+      };
+    }
+    // Same "one run executes at a time" gate run:start/run:resume enforce.
+    if (activeRuns.size > 0) {
+      return { ok: false, reason: 'Another run is currently active. Try again once it finishes.' };
+    }
+
+    const sender = event.sender;
+    const summary = await retryPassRun(runId, (channel, msg) => safeSend(sender, channel, msg));
+    void startNextQueued();
+    return { ok: true, summary };
+  },
+);
+
 /** Swallows the level param so resolveProvider's emit callback has somewhere harmless to go. */
 function noopEmit(_phase: string, _level: 'debug' | 'info' | 'warn' | 'error', _message: string): void {
   /* no-op: revise-item is a one-off call, not worth a Timeline entry */

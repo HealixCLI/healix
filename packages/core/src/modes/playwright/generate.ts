@@ -1265,6 +1265,18 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem, tier: T
         `WARNING: field(s) tagged WIDGET above (${widgetFields.map((f) => f.name).join(', ')}) are backed by a custom calendar/picker/autocomplete-style widget component, not a plain input — calling \`.fill()\` on them sets the DOM value directly and will NOT trigger the widget's own change handler, so the underlying form value stays empty/unset. Interact via the widget's own UI instead (click to open it, then select the value from its own picker/calendar/list), or otherwise use whatever interaction its real behavior requires — do not assume \`.fill()\` alone is sufficient for these fields.`,
       );
     }
+
+    // GAP-067: a submit control gated on a form's overall validity (e.g. React Hook Form's
+    // `disabled={!isValid}`) never enables until EVERY required field is satisfied — including a
+    // confirm/repeat field cross-validated against another one. A test that fills only some of a
+    // multi-required-field form before clicking/asserting that submit control will hang or fail
+    // for a reason that has nothing to do with the app itself.
+    const requiredFields = form.fields.filter((f) => f.required);
+    if (requiredFields.length > 1) {
+      lines.push(
+        `RULE: this form has multiple required fields (${requiredFields.map((f) => f.name).join(', ')}) — before clicking or asserting against its validity-gated submit control, you MUST fill/select EVERY field listed as required above, including any confirm/repeat field cross-validated against another field. Filling only some of them leaves the submit control's disabled/gating condition permanently unmet, causing the interaction to hang or the assertion to fail for a reason that has nothing to do with the app itself.`,
+      );
+    }
   }
 
   return lines.join('\n');

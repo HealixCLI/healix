@@ -2493,6 +2493,67 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     expect(calls[0].prompt).not.toContain('WIDGET');
   });
 
+  it('requires filling every required field (incl. confirm/repeat) before a validity-gated submit when a form has 2+ required fields (GAP-067)', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'password', type: 'password', required: true },
+            { name: 'confirm_password', type: 'password', required: true },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('RULE: this form has multiple required fields');
+    expect(prompt).toContain('password, confirm_password');
+    expect(prompt).toContain('confirm/repeat field cross-validated');
+  });
+
+  it('adds no multi-required-field rule when a form has 0 or 1 required fields', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'email', type: 'email', required: true },
+            { name: 'nickname', type: 'text', required: false },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('RULE: this form has multiple required fields');
+  });
+
   it('rejects and retries a spec missing its mandatory [SRC:...] citation, accepting a corrected retry', async () => {
     const sourceContext: TestModeContext['sourceContext'] = {
       units: [

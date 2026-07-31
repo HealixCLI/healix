@@ -1962,7 +1962,20 @@ async function runPipeline(
       target,
       browser,
       explorationMode: opts.explorationMode ?? deriveExplorationMode(project),
-      testingScope: opts.testingScope ?? 'both',
+      // 'reuse'/'topup' carry the ENTIRE base run's suite forward regardless
+      // of tier (see baseTestsWithSpec above and diffAgainstBase's carried
+      // set) — execute()'s playwrightProjectArgs restricts which Playwright
+      // --project tiers actually run based on THIS field, entirely
+      // independent of which specs got carried. A caller-supplied
+      // testingScope narrower than the carried suite's own tiers (e.g. the
+      // desktop compose form's scope selector, which defaults to 'frontend'
+      // and isn't synced to whatever scope the base run was originally
+      // planned with) would silently execute zero of a backend-only carried
+      // suite — the exact "Run verified nothing: no runnable specs were
+      // produced" failure. Force 'both' for these two modes so every carried
+      // tier actually runs; opts.testingScope only meaningfully scopes a
+      // 'fresh' run's own planning/generation.
+      testingScope: suiteMode === 'reuse' || suiteMode === 'topup' ? 'both' : (opts.testingScope ?? 'both'),
       sourceContext,
       emit: ctxEmit,
       onUsage: recordUsage,

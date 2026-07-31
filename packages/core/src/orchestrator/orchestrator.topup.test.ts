@@ -625,6 +625,67 @@ describe('orchestrator top-up / reuse suite modes', () => {
     expect(carriedReq002.specPath).toBe(baseReq002.specPath);
   });
 
+  it('REUSE/TOP-UP EXECUTE A NARROWER-SCOPED FORM: a carried backend-only suite still runs in full even when the compose form\'s testingScope is "frontend" (regression for "Run verified nothing: no runnable specs were produced")', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Scope Mismatch Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    // ---- Run 1: fresh, backend-only suite (tierC-api). ----
+    const run1Provider = fakeProviderWithPlan(
+      [{ title: 'API responds', reqTag: 'REQ-001', tier: 'tierC-api', intent: 'Endpoint contract.' }],
+      [],
+    );
+    const run1Orchestrator = createOrchestrator({
+      provider: run1Provider,
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run1 = await run1Orchestrator.run({
+      projectId: project.id,
+      testingScope: 'backend',
+      autoApprove: true,
+    });
+    expect(run1.status).toBe('passed');
+
+    // ---- Run 2/3: reuse/top-up, but the CALLER passes 'frontend' (e.g. the
+    // desktop compose form's scope selector, which isn't synced to whatever
+    // scope the base run actually used) — every carried test is tierC-api, so
+    // a naive tier-filtered execution would run zero specs and the whole run
+    // would wrongly settle 'error' ("verified nothing"). Capture ctx.testingScope
+    // as mode.execute() actually receives it, to assert the fix directly.
+    for (const suiteMode of ['reuse', 'topup'] as const) {
+      const seenScopes: Array<string | undefined> = [];
+      const realistic = makeRealisticFakeMode([]);
+      const spyMode: TestMode = {
+        ...realistic,
+        async execute(ctx, specs) {
+          seenScopes.push(ctx.testingScope);
+          return realistic.execute(ctx, specs);
+        },
+      };
+      const orchestrator = createOrchestrator({
+        provider: fakeProviderWithPlan([], []),
+        getMode: () => spyMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      });
+      const run = await orchestrator.run({
+        projectId: project.id,
+        suiteMode,
+        testingScope: 'frontend',
+        autoApprove: true,
+      });
+
+      expect(seenScopes).toEqual(['both']);
+      expect(run.status).toBe('passed');
+      expect(store.listTests(run.runId).some((t) => t.reqTag === 'REQ-001')).toBe(true);
+    }
+  });
+
   it('NO BASE RUN: top-up/reuse with no prior successful run errors up front, no run row, no provider calls', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

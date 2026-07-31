@@ -139,6 +139,42 @@ export interface TestCase {
   specCode: string | null;
 }
 
+/** Item-level Knowledge Base status — whether GENERATE ever produced (and accepted) a spec for this plan item. */
+export type KbItemStatus = 'planned' | 'generated' | 'dropped';
+/** Scenario-level KB status — starts the same as its item, then tracks its own real execution outcome once one exists. */
+export type KbScenarioStatus = 'planned' | 'generated' | 'dropped' | TestStatus;
+
+/** One row per plan item, durably tracking whether GENERATE produced a spec for it — see docs/design/retry-pass-coverage-kb-redesign.md. */
+export interface PlanKbItem {
+  id: string;
+  runId: string;
+  /** TestPlanItem.id (pli_...) from this run's plan.json — the join key back to full plan-item content. */
+  planItemId: string;
+  title: string;
+  reqTag: string | null;
+  tier: Tier | null;
+  status: KbItemStatus;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** One child row per scenario of a PlanKbItem — see docs/design/retry-pass-coverage-kb-redesign.md. */
+export interface PlanKbScenario {
+  id: string;
+  kbItemId: string;
+  /** Denormalized from the parent item, for direct by-run queries without a join. */
+  runId: string;
+  /** Position within TestPlanItem.scenarios[] — matches registerSpecRows' own positional `${base}#${i}` keying. */
+  scenarioIndex: number;
+  kind: string;
+  description: string;
+  status: KbScenarioStatus;
+  /** Set once registerSpecRows creates the matching tests row; null until then, or for a still-dropped item. */
+  testId: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface TestResult {
   id: string;
   testId: string;
@@ -154,6 +190,8 @@ export interface TestResult {
   stepsJson: string | null;
   /** Why a 'skipped' result was skipped (Playwright's own test.skip(cond, 'reason')/test.fixme(...) annotation description, when given). Null for a non-skipped result, a skip with no reason, or an older row from before this column existed. */
   skipReason: string | null;
+  /** Why no usable video is present for this executed result (tierC-api/no-browser-page, blank recording, or a genuine artifact-retention gap) — see ExecResultItem.videoUnavailableReason. Null when a real video IS present, for a skipped result, or an older row from before this column existed. */
+  videoUnavailableReason: string | null;
 }
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error';
@@ -287,6 +325,8 @@ export interface TriageResultRow {
   confidence: number;
   rationale: string;
   suggestedPatch: string | null;
+  /** 'ai_reviewed' | 'rule_fallback' | null — null only for rows persisted before this column existed. */
+  verdictSource: string | null;
   createdAt: string;
 }
 
@@ -297,4 +337,5 @@ export interface NewTriageResult {
   confidence: number;
   rationale: string;
   suggestedPatch?: string | null;
+  verdictSource?: string | null;
 }

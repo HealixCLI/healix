@@ -45,6 +45,37 @@ function fakeProvider(complete: ProviderAdapter['complete']): ProviderAdapter {
 
 const INPUT: TriageInput = { title: 'Home page loads', error: 'expect(locator).toBeVisible() failed' };
 
+describe('provider call timeout budget', () => {
+  // The exact value is an internal, intentionally-private implementation detail
+  // (see triage/index.ts's own ANALYZE_TIMEOUT_MS doc comment on why the
+  // orchestrator's outer wrapper must stay >= it) — these just guard that a
+  // real CLI-spawned call actually gets a generous budget passed through,
+  // without hardcoding the private constant's value here.
+  it('passes a generous timeoutMs through to provider.complete() (analyze)', async () => {
+    let seenOpts: CompleteOptions | undefined;
+    const provider = fakeProvider(async (_prompt, opts) => {
+      seenOpts = opts;
+      return { provider: 'claude', ok: true, text: '', raw: null, detail: '' } satisfies CompletionResult;
+    });
+
+    await createTriageEngine().analyze(INPUT, provider);
+
+    expect(seenOpts?.timeoutMs).toBeGreaterThanOrEqual(60_000);
+  });
+
+  it('passes a generous timeoutMs through to provider.complete() (analyzeBatch)', async () => {
+    let seenOpts: CompleteOptions | undefined;
+    const provider = fakeProvider(async (_prompt, opts) => {
+      seenOpts = opts;
+      return { provider: 'claude', ok: true, text: '[]', raw: null, detail: '' } satisfies CompletionResult;
+    });
+
+    await createTriageEngine().analyzeBatch([{ id: 'a', input: INPUT }], provider);
+
+    expect(seenOpts?.timeoutMs).toBeGreaterThanOrEqual(60_000);
+  });
+});
+
 describe('createTriageEngine().analyze — signal forwarding', () => {
   it('forwards the caller-provided signal into provider.complete() unchanged', async () => {
     let seenOpts: CompleteOptions | undefined;

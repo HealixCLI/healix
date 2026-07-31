@@ -52,9 +52,11 @@ import {
   clearExecCheckpoint,
   playwrightProjectArgs,
   readMockRequestCounts,
+  readApiEvidence,
   type AuthSignals,
 } from './execute.js';
 import {
+  API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
@@ -221,6 +223,100 @@ describe('suiteEnv — allowlisted environment for untrusted specs', () => {
       }),
     );
     expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/login');
+  });
+
+  it('prefers a PROVEN verifiedLogin over the independently-scored loginCandidates, and sets grounded selector env vars', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: true,
+            authVerified: true,
+            verifiedLogin: {
+              pageUrl: 'http://localhost:3000/#/SK/register',
+              toggleSelector: '#toggle-login-btn',
+              identifierSelector: '#login-email',
+              passwordSelector: '#login-password',
+              submitSelector: '#login-submit',
+            },
+          },
+          routing: { hashRouted: true, invariantPrefix: '#/SK' },
+          // Deliberately a DIFFERENT (wrong) URL than verifiedLogin.pageUrl — scoreLoginCandidates
+          // doesn't know which route crawlWithAuth actually authenticated through, so its top
+          // pick must lose to the proven one.
+          loginCandidates: [{ url: 'http://localhost:3000/#/SK/login', score: 5, source: 'crawled' }],
+          useful: true,
+          observedEndpoints: [],
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/register');
+    expect(env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR).toBe('#login-email');
+    expect(env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR).toBe('#login-password');
+    expect(env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR).toBe('#login-submit');
+    expect(env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR).toBe('#toggle-login-btn');
+  });
+
+  it('omits the grounded selector env vars when no verifiedLogin is present', () => {
+    const env = suiteEnv(
+      makeCtx({
+        baseUrl: 'http://localhost:3000',
+        credentials: [
+          {
+            id: 'c1',
+            username: 'user@test.com',
+            password: 'hunter2',
+            role: null,
+            authType: 'form',
+            token: null,
+            urlTemplate: null,
+            extraParams: null,
+            authCheckText: null,
+          },
+        ],
+        exploration: {
+          crawl: {
+            routes: [],
+            visitedCount: 0,
+            budgetExhausted: false,
+            redirectLoopsDetected: [],
+            shellCollapsed: false,
+            degenerateRedirectsSkipped: [],
+            authAttempted: false,
+            authVerified: false,
+          },
+          routing: { hashRouted: true, invariantPrefix: '#/SK' },
+          loginCandidates: [{ url: 'http://localhost:3000/#/SK/login', score: 5, source: 'crawled' }],
+          useful: true,
+          observedEndpoints: [],
+        },
+      }),
+    );
+    expect(env.HEALIX_TIERB_LOGIN_URL).toBe('http://localhost:3000/#/SK/login');
+    expect(env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR).toBeUndefined();
+    expect(env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR).toBeUndefined();
   });
 
   it('falls back to the naive /login default when EXPLORE found no login candidates', () => {
@@ -813,6 +909,160 @@ describe('parseReport — drops blank-recording videos, keeps everything else', 
   });
 });
 
+describe('parseReport — videoUnavailableReason: never a silent gap', () => {
+  const tmpDir = mkdtempSync(join(tmpdir(), 'healix-video-status-test-'));
+  const blankVideo = join(tmpDir, 'blank-video.webm');
+  const realVideo = join(tmpDir, 'real-video.webm');
+  writeFileSync(blankVideo, Buffer.alloc(1024));
+  writeFileSync(realVideo, Buffer.alloc(20 * 1024));
+
+  afterAll(() => {
+    rmSync(tmpDir, { recursive: true, force: true });
+  });
+
+  it('sets no reason when a real, non-blank video is present', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'real interaction',
+              file: 'tests/tierA-public/real2.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'passed',
+                      duration: 5000,
+                      attachments: [{ name: 'video', path: realVideo }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toBeUndefined();
+    expect(parsed.videoWarnings).toEqual([]);
+  });
+
+  it('explains a blank/discarded video with the blank-recording reason', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'fails fast, nothing ever painted, again',
+              file: 'tests/tierA-public/fast2.spec.ts',
+              tests: [
+                {
+                  status: 'failed',
+                  projectName: 'tierA-public',
+                  results: [
+                    {
+                      status: 'failed',
+                      duration: 300,
+                      attachments: [{ name: 'video', path: blankVideo }],
+                    },
+                  ],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/too quickly/);
+    expect(parsed.videoWarnings).toEqual([]); // expected/explained case, not an operational anomaly
+  });
+
+  it('explains a tierC-api test (no browser page) with the api-only reason, no operational warning', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'GET /api/x returns well-formed data',
+              file: 'tests/tierC-api/x.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierC-api',
+                  results: [{ status: 'passed', duration: 100, attachments: [] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toMatch(/Video not applicable/);
+    expect(parsed.videoWarnings).toEqual([]);
+  });
+
+  it('flags a browser-based test with NO video attachment at all as an anomaly, with an operational warning', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'no video attachment somehow',
+              file: 'tests/tierB-auth/gap.spec.ts',
+              tests: [
+                {
+                  status: 'passed',
+                  projectName: 'tierB-auth',
+                  results: [{ status: 'passed', duration: 100, attachments: [] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toBe('No video recorded.');
+    expect(parsed.videoWarnings).toHaveLength(1);
+    expect(parsed.videoWarnings[0]).toContain('no video attachment somehow');
+  });
+
+  it('does not set a reason for a skipped result (never executed at all)', () => {
+    const r: PwReportArg = {
+      suites: [
+        {
+          title: 'suite',
+          specs: [
+            {
+              title: 'skipped test',
+              file: 'tests/tierA-public/skip.spec.ts',
+              tests: [
+                {
+                  status: 'skipped',
+                  projectName: 'tierA-public',
+                  results: [{ status: 'skipped', duration: 0, attachments: [] }],
+                },
+              ],
+            },
+          ],
+        },
+      ],
+    };
+    const parsed = parseReport(r, LOGGED_IN);
+    expect(parsed.results[0]?.videoUnavailableReason).toBeUndefined();
+  });
+});
+
 describe('parseReport — error text stays simple, not a wall of duplicates', () => {
   it('picks a single clear error instead of concatenating result.error and every result.errors[] entry', () => {
     const r: PwReportArg = {
@@ -1047,6 +1297,81 @@ describe("readMockRequestCounts — F-15: tallies the mock fixture's write-throu
   });
 });
 
+describe('readApiEvidence — per-test summary of actual request-fixture calls', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-api-evidence-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (no tierC-api tests ran, or nothing called request)', async () => {
+    expect(await readApiEvidence(dir)).toEqual({});
+  });
+
+  it('groups calls by key and formats a compact, mock-vs-real-labeled summary', async () => {
+    const lines = [
+      {
+        key: 'tests/tierC-api/x.spec.ts#a',
+        method: 'GET',
+        url: '/lookup',
+        status: 500,
+        mocked: false,
+        body: '{}',
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, API_EVIDENCE_LOG_FILENAME), `${lines}\n`);
+    const out = await readApiEvidence(dir);
+    const summary = out['tests/tierC-api/x.spec.ts#a'];
+    expect(summary).toContain('[REAL BACKEND]');
+    expect(summary).toContain('GET /lookup -> status 500');
+    expect(summary).toContain('Body: {}');
+  });
+
+  it('labels a mocked call [HEALIX MOCK]', async () => {
+    writeFileSync(
+      join(dir, API_EVIDENCE_LOG_FILENAME),
+      `${JSON.stringify({ key: 'f#t', method: 'POST', url: '/pay', status: 200, mocked: true, body: '{"ok":true}' })}\n`,
+    );
+    const out = await readApiEvidence(dir);
+    expect(out['f#t']).toContain('[HEALIX MOCK]');
+    expect(out['f#t']).toContain('POST /pay -> status 200');
+  });
+
+  it('keeps only the LAST few calls per key (bounded, so a chatty test cannot blow up the prompt)', async () => {
+    const many = Array.from({ length: 6 }, (_, i) =>
+      JSON.stringify({ key: 'f#t', method: 'GET', url: `/call-${i}`, status: 200, mocked: false, body: '' }),
+    ).join('\n');
+    writeFileSync(join(dir, API_EVIDENCE_LOG_FILENAME), `${many}\n`);
+    const summary = (await readApiEvidence(dir))['f#t'];
+    // Bounded to the last 3 (API_EVIDENCE_MAX_CALLS_PER_TEST) — the earliest calls are dropped.
+    expect(summary).not.toContain('/call-0');
+    expect(summary).not.toContain('/call-2');
+    expect(summary).toContain('/call-3');
+    expect(summary).toContain('/call-5');
+  });
+
+  it('skips a malformed line instead of losing every other entry, and drops lines with no key', async () => {
+    writeFileSync(
+      join(dir, API_EVIDENCE_LOG_FILENAME),
+      [
+        JSON.stringify({ key: 'f#t', method: 'GET', url: '/ok', status: 200, mocked: false, body: '' }),
+        'not valid json',
+        JSON.stringify({ method: 'GET', url: '/nokey', status: 200, mocked: false, body: '' }),
+        '',
+      ].join('\n') + '\n',
+    );
+    const out = await readApiEvidence(dir);
+    expect(Object.keys(out)).toEqual(['f#t']);
+    expect(out['f#t']).toContain('/ok');
+  });
+});
+
 describe('findAuthSetupOutcomeFromEntries', () => {
   it('detects a failed checkpoint-restored auth-setup entry', () => {
     const entries = [
@@ -1157,6 +1482,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const b = {
       results: [{ title: 'b', status: 'failed' as const }],
@@ -1165,6 +1491,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results.map((r) => r.title).sort()).toEqual(['a', 'b']);
@@ -1180,6 +1507,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const b = {
       results: [{ title: 'a', specFile: 'x.spec.ts', status: 'passed' as const }],
@@ -1188,6 +1516,7 @@ describe('mergeParsedReports', () => {
       blocked: 0,
       flaky: 0,
       skipped: 0,
+      videoWarnings: [],
     };
     const merged = mergeParsedReports(a, b);
     expect(merged.results).toHaveLength(1);
@@ -1598,6 +1927,13 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(remaining[0].title).toBe('a');
   });
 });
+
+// The manually-created-browser-context case is no longer a distinct
+// videoUnavailableReason — templates.ts's page fixture now patches
+// browser.newContext() to record and attach video automatically, so a test
+// using that pattern gets a real video (or, if something still goes wrong,
+// falls through to the generic UNEXPLAINED_MISSING_VIDEO_REASON case covered
+// above) rather than a dedicated explanatory message.
 
 // ---------------------------------------------------------------------------
 // Windows process-tree kill: an aborted/timed-out run must terminate the

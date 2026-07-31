@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 15;
+export const SCHEMA_VERSION = 18;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `
@@ -65,7 +65,8 @@ CREATE TABLE IF NOT EXISTS results (
   description    TEXT,
   details        TEXT,
   steps_json     TEXT,
-  skip_reason    TEXT
+  skip_reason    TEXT,
+  video_unavailable_reason TEXT
 );
 
 CREATE TABLE IF NOT EXISTS agent_events (
@@ -118,7 +119,41 @@ CREATE TABLE IF NOT EXISTS triage_results (
   confidence      REAL NOT NULL,
   rationale       TEXT NOT NULL,
   suggested_patch TEXT,
+  verdict_source  TEXT,
   created_at      TEXT NOT NULL DEFAULT (datetime('now'))
+);
+
+-- v18: two-tier Knowledge Base — one row per plan item, one child row per
+-- scenario — durably tracking generation/execution status per run so
+-- Retry-pass and the coverage-feedback-loop can query "what's dropped/still
+-- pending" directly instead of re-diffing plan.json against tests after the
+-- fact. Additive alongside plan.json (which stays the source of full
+-- plan-item content) and GEN_CHECKPOINT (unrelated, untouched).
+CREATE TABLE IF NOT EXISTS plan_kb_items (
+  id            TEXT PRIMARY KEY,
+  run_id        TEXT NOT NULL REFERENCES runs(id),
+  plan_item_id  TEXT NOT NULL,
+  title         TEXT NOT NULL,
+  req_tag       TEXT,
+  tier          TEXT,
+  status        TEXT NOT NULL DEFAULT 'planned',
+  created_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at    TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(run_id, plan_item_id)
+);
+
+CREATE TABLE IF NOT EXISTS plan_kb_scenarios (
+  id             TEXT PRIMARY KEY,
+  kb_item_id     TEXT NOT NULL REFERENCES plan_kb_items(id),
+  run_id         TEXT NOT NULL REFERENCES runs(id),
+  scenario_index INTEGER NOT NULL,
+  kind           TEXT NOT NULL,
+  description    TEXT NOT NULL,
+  status         TEXT NOT NULL DEFAULT 'planned',
+  test_id        TEXT REFERENCES tests(id),
+  created_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  updated_at     TEXT NOT NULL DEFAULT (datetime('now')),
+  UNIQUE(kb_item_id, scenario_index)
 );
 
 CREATE INDEX IF NOT EXISTS idx_credentials_project ON project_credentials(project_id);
@@ -128,4 +163,8 @@ CREATE INDEX IF NOT EXISTS idx_results_test ON results(test_id);
 CREATE INDEX IF NOT EXISTS idx_events_run ON agent_events(run_id);
 CREATE INDEX IF NOT EXISTS idx_usage_run ON usage(run_id);
 CREATE INDEX IF NOT EXISTS idx_triage_results_test ON triage_results(test_id);
+CREATE INDEX IF NOT EXISTS idx_plan_kb_items_run ON plan_kb_items(run_id);
+CREATE INDEX IF NOT EXISTS idx_plan_kb_scenarios_kb_item ON plan_kb_scenarios(kb_item_id);
+CREATE INDEX IF NOT EXISTS idx_plan_kb_scenarios_run ON plan_kb_scenarios(run_id);
+CREATE INDEX IF NOT EXISTS idx_plan_kb_scenarios_test ON plan_kb_scenarios(test_id);
 `;

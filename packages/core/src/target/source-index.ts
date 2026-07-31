@@ -26,11 +26,12 @@ import { extractAuthPatternsFromAst, type AuthPatternInfo } from './ast/auth-pat
 import { extractSelectorHintsFromAst, type SelectorHint } from './ast/selectors.js';
 import { extractMultiLangEndpoints } from './ast/multilang.js';
 import { findSpecFiles, parseOpenApiSpec, parsePostmanCollection } from './spec-parser.js';
+import { detectStaticRegionCodes } from './region-index.js';
 import type { SourceContext } from './source-context.js';
 
 /** Hard cap on extracted units — mirrors functionality-index.ts's DEFAULT_MAX_UNITS. */
 const DEFAULT_MAX_UNITS = 300;
-const MULTILANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.php']);
+const MULTILANG_EXTENSIONS = new Set(['.py', '.go', '.rb', '.php', '.java']);
 const JS_EXTENSIONS = new Set(['.ts', '.tsx', '.js', '.jsx', '.mjs', '.cjs']);
 /** Same hard file-count cap indexSource() itself walks with (via walkSourceFiles below). */
 const WALK_HARD_CAP = 5000;
@@ -104,12 +105,15 @@ export async function indexSource(repoPath: string, opts?: { maxUnits?: number }
   const authPatterns: AuthPatternInfo[] = [];
   const selectorHints: SelectorHint[] = [];
   const expressInfoByFile = new Map<string, FileRouterInfo>();
+  const regionCodes = new Set<string>();
 
   const jsFiles = files.filter((f) => JS_EXTENSIONS.has(path.extname(f.rel).toLowerCase()));
 
   for (const f of jsFiles) {
     const source = readSafe(f.abs);
     if (!source) continue;
+
+    for (const code of detectStaticRegionCodes(source)) regionCodes.add(code);
 
     if (isNext) codeUnits.push(...extractNextRoutes(f.rel));
 
@@ -189,5 +193,14 @@ export async function indexSource(repoPath: string, opts?: { maxUnits?: number }
           truncated ? ` (capped at ${maxUnits})` : ''
         }.`;
 
-  return { units, forms, authPatterns, selectorHints, specSources, summary, truncated };
+  return {
+    units,
+    forms,
+    authPatterns,
+    selectorHints,
+    specSources,
+    summary,
+    truncated,
+    regionCodes: [...regionCodes],
+  };
 }

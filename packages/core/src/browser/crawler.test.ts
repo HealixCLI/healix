@@ -1,6 +1,7 @@
 import { describe, expect, it } from 'vitest';
 import {
   crawl,
+  crawlManySeeds,
   crawlWithAuth,
   reconcileStaticRoutePaths,
   scoreLoginCandidates,
@@ -38,9 +39,17 @@ interface FakePage {
  * register<->login switch that doesn't change the route); `pressKey('Escape')`
  * reverts back to the page's original elements, and any `goto()` also clears
  * the reveal (client-side toggle state doesn't survive a fresh navigation).
- * `log`, when provided, records every `goto`/`click` call (as `goto:<url>` /
- * `click:<selector>`) in order, so tests can assert reset-after-click
- * sequencing.
+ * `log`, when provided, records every `goto`/`click`/`reload` call (as `goto:<url>` /
+ * `click:<selector>` / `reload:<url>`) in order, so tests can assert reset-after-click
+ * sequencing. `escapeIneffective` names selectors whose reveal survives `pressKey('Escape')` —
+ * models a custom modal that doesn't listen for Escape, only a `reload()` (or a real cross-URL
+ * `goto()`) can clear it. `sameUrlGotoIneffective`, when true, makes `goto()` to the URL the fake
+ * is already on NOT clear a reveal — mirrors the real same-URL hash-routed-SPA no-op bug
+ * (goto() to a genuinely different URL still clears it). `reloadIneffective` names selectors whose
+ * reveal survives even a forced `reload()` too — models a truly unrecoverable page (should never
+ * happen for a genuine reload in real life, but lets a test exercise resetAfterProbe's own
+ * give-up path). All exist to reproduce docs/click-probe-reset-corruption.md in a test, where the
+ * default (everything reverts perfectly) can't.
  */
 function makeFakeBrowser(config: {
   pages: Record<string, FakePage>;
@@ -50,6 +59,9 @@ function makeFakeBrowser(config: {
   onClickGoTo?: Record<string, string>;
   onClickSelectorGoTo?: Record<string, string>;
   onClickSelectorReveal?: Record<string, InteractiveElement[]>;
+  escapeIneffective?: Set<string>;
+  sameUrlGotoIneffective?: boolean;
+  reloadIneffective?: Set<string>;
   recordClicks?: string[];
   /** Records every selector passed to type(), in call order — used to assert fillSafeInputs'
    * safety filters (never password/file/OTP-shaped fields). */
@@ -59,11 +71,16 @@ function makeFakeBrowser(config: {
   let currentUrl = '';
   let networkBuffer: CapturedNetworkEvent[] = [];
   let revealedElements: InteractiveElement[] | undefined;
+  let lastRevealSelector: string | undefined;
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
       config.log?.push(`goto:${url}`);
-      revealedElements = undefined;
+      const isSameUrl = url === currentUrl;
+      if (!(isSameUrl && config.sameUrlGotoIneffective)) {
+        revealedElements = undefined;
+        lastRevealSelector = undefined;
+      }
       if (config.throwFor?.has(url)) {
         // Model a request that actually fired (and would otherwise leak into the
         // next route's drain) even though this navigation ultimately fails.
@@ -77,6 +94,12 @@ function makeFakeBrowser(config: {
       currentUrl = config.redirects?.[url] ?? url;
       const events = config.pages[currentUrl]?.network;
       if (events) networkBuffer.push(...events);
+    },
+    async reload(): Promise<void> {
+      config.log?.push(`reload:${currentUrl}`);
+      if (lastRevealSelector && config.reloadIneffective?.has(lastRevealSelector)) return;
+      revealedElements = undefined;
+      lastRevealSelector = undefined;
     },
     async screenshot(): Promise<Buffer> {
       return Buffer.alloc(0);
@@ -99,18 +122,21 @@ function makeFakeBrowser(config: {
       const reveal = config.onClickSelectorReveal?.[selector];
       if (reveal) {
         revealedElements = reveal;
+        lastRevealSelector = selector;
         return;
       }
       const bySelector = config.onClickSelectorGoTo?.[selector];
       if (bySelector) {
         currentUrl = bySelector;
         revealedElements = undefined;
+        lastRevealSelector = undefined;
         return;
       }
       const next = config.onClickGoTo?.[currentUrl];
       if (next) {
         currentUrl = next;
         revealedElements = undefined;
+        lastRevealSelector = undefined;
       }
     },
     async clickAt(_point: Point): Promise<void> {},
@@ -118,7 +144,10 @@ function makeFakeBrowser(config: {
       config.recordTypes?.push(selector);
     },
     async pressKey(key: string): Promise<void> {
-      if (key === 'Escape') revealedElements = undefined;
+      if (key !== 'Escape') return;
+      if (lastRevealSelector && config.escapeIneffective?.has(lastRevealSelector)) return;
+      revealedElements = undefined;
+      lastRevealSelector = undefined;
     },
     onFrame(_cb: (png: Buffer) => void): () => void {
       return () => {};
@@ -127,6 +156,9 @@ function makeFakeBrowser(config: {
       const drained = networkBuffer;
       networkBuffer = [];
       return drained;
+    },
+    async exportStorageState() {
+      return {};
     },
     async stop(): Promise<void> {},
   };
@@ -404,6 +436,63 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
     expect(recordClicks).toContain(safeButton.selector);
   });
 
+  it('never click-probes a LOCALIZED destructive control (an English-only list stops filtering entirely)', async () => {
+    // Observed live on a Slovak app: "Odhlásiť sa" (log out) was the FIRST click candidate on the
+    // authenticated dashboard, so the crawl's own opening click destroyed the session it had just
+    // established — every later candidate on that page then fired against a logged-out page and
+    // revealed nothing. "odstrániť" (delete account) sat one row outside the click slice by pure
+    // luck of DOM order.
+    const logout = button('Odhlásiť sa');
+    const deleteAccount = button('odstrániť');
+    const safe = button('Moje kupóny');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [logout, deleteAccount, safe] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/dashboard');
+
+    expect(recordClicks).not.toContain(logout.selector);
+    expect(recordClicks).not.toContain(deleteAccount.selector);
+    expect(recordClicks).toContain(safe.selector);
+  });
+
+  it('never click-probes a logo/brand element — a "go home" affordance, not a real feature', async () => {
+    // Observed live (C&A app): clicking a "logo" candidate inside a deep-probed reveal resets
+    // the whole SPA view rather than undoing just that one click, which resetAfterProbe
+    // correctly detects as unrecoverable and gives up on — discarding whatever real candidates
+    // were left in that reveal. Filtering it out here avoids ever paying that cost.
+    const logo = button('logo');
+    const safe = button('Moje kupóny');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [logo, safe] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/dashboard');
+
+    expect(recordClicks).not.toContain(logo.selector);
+    expect(recordClicks).toContain(safe.selector);
+  });
+
+  it('STILL click-probes "zmeniť" (change/edit) — it reveals a form rather than mutating anything', async () => {
+    // The counterpart to the test above: over-blocking here would re-hide exactly the
+    // profile-edit states GAP-060's reveal detection exists to capture. The form's own submit is
+    // already excluded independently via buttonType === 'submit'.
+    const edit = button('zmeniť');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [edit] } },
+      recordClicks,
+    });
+
+    await crawl(browser, 'https://a.test/dashboard');
+
+    expect(recordClicks).toContain(edit.selector);
+  });
+
   it('DOES click-probe a "Register"/"Sign up" nav control — navigating there is safe, only the submit is excluded', async () => {
     // A button-driven SPA nav often renders "Register"/"Create account" as a plain <button
     // onClick> rather than a real <a href> — excluding it by name would hide that whole route on
@@ -445,7 +534,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test is about nav-discovery click-probing only; the deep-probe
+    // second pass (GAP-060) would otherwise re-click the same candidate for its own reveal check.
+    await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(recordClicks).toEqual(['#toggle-login-btn']);
   });
@@ -598,7 +689,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test pins MAX_CLICKS_PER_PAGE for nav-discovery only; the
+    // deep-probe second pass (GAP-060) would otherwise re-click the same 8 candidates.
+    await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(recordClicks.length).toBeLessThanOrEqual(8);
   });
@@ -620,7 +713,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
       log,
     });
 
-    const result = await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test pins the reset-after-click sequencing for nav-discovery
+    // only; the deep-probe second pass (GAP-060) would otherwise re-click both candidates again.
+    const result = await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(result.routes.map((r) => r.url).sort()).toEqual([
       'https://a.test/',
@@ -661,7 +756,9 @@ describe('crawl() click-probing (route discovery beyond <a href>)', () => {
 
     const browser = makeFakeBrowser({ pages, onClickGoTo, recordClicks });
 
-    const result = await crawl(browser, 'https://a.test/');
+    // stateProbeBudget: 0 — this test pins MAX_CLICK_PROBES_PER_CRAWL for nav-discovery only;
+    // the deep-probe second pass (GAP-060) would otherwise re-click every reached page again.
+    const result = await crawl(browser, 'https://a.test/', { stateProbeBudget: 0 });
 
     expect(recordClicks.length).toBeLessThanOrEqual(20);
     // Nowhere near all 10 button-only pages get reached before the
@@ -707,9 +804,15 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     expect(result.routes.some((r) => r.url === 'https://a.test/wallet/history')).toBe(true);
     // After recording the state (and probing whatever it reveals), the page must end up back at
     // its original state — same revert guarantee the plain click-probing pass already gives
-    // every other candidate, so the next top-level BFS step starts from a known page.
-    const clickIdx = log.indexOf(`click:${walletButton.selector}`);
-    expect(log.slice(clickIdx)).toContain('goto:https://a.test/dashboard');
+    // every other candidate, so the next top-level BFS step starts from a known page. Checked by
+    // re-snapshotting the live browser rather than asserting a specific goto()/reload() call: a
+    // working Escape alone (this fake's default) is just as valid a recovery as a forced reload —
+    // what matters is the resulting state, not the mechanism (see resetAfterProbe in crawler.ts).
+    expect(log).toContain(`click:${walletButton.selector}`);
+    expect(await browser.snapshot()).toMatchObject({
+      url: 'https://a.test/dashboard',
+      interactiveElements: thinPage,
+    });
   });
 
   it('deep-probes a route that already has plenty of interactive elements too, when a candidate reveals a real modal', async () => {
@@ -809,9 +912,14 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     // hop1 (level1) and hop2 (level2) are recorded (MAX_STATE_DEPTH=2); level3 would be hop3 and
     // must never even be attempted — nothing ever clicks INSIDE a hop2 state's own candidates.
     const stateRoutes = result.routes.filter((r) => r.stateKey);
-    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level1)).toBe(true);
-    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level2)).toBe(true);
-    expect(stateRoutes.some((r) => r.snapshot.interactiveElements === level3)).toBe(false);
+    // Compared by content, not reference: snapshotClean() (repeated-sibling collapse) now
+    // returns a fresh array even when nothing actually collapses, so the raw fixture array is
+    // never literally the same object as what gets stored on the route.
+    const sameElements = (a: InteractiveElement[], b: InteractiveElement[]): boolean =>
+      JSON.stringify(a) === JSON.stringify(b);
+    expect(stateRoutes.some((r) => sameElements(r.snapshot.interactiveElements, level1))).toBe(true);
+    expect(stateRoutes.some((r) => sameElements(r.snapshot.interactiveElements, level2))).toBe(true);
+    expect(stateRoutes.some((r) => sameElements(r.snapshot.interactiveElements, level3))).toBe(false);
     // Safety: card number/nickname get filled, password and OTP-shaped fields never do.
     expect(recordTypes).toContain('#card-number');
     expect(recordTypes).toContain('#nick');
@@ -836,12 +944,309 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
       recordClicks,
     });
 
-    await crawl(browser, 'https://a.test/');
+    const result = await crawl(browser, 'https://a.test/');
 
-    // Only 4 top-level candidates exist, so ordinary click-probe/link-discovery budget (60) is
-    // nowhere near the limiting factor here — MAX_STATE_PROBES_PER_CRAWL (20) is what actually
-    // caps this run, well short of the 4 * (1 + 8) = 36 clicks unbounded recursion would spend.
-    expect(recordClicks.length).toBeLessThanOrEqual(20);
+    // MAX_STATE_PROBES_PER_CRAWL is charged per ATTEMPTED deep-probe click (see
+    // discoverClickRoutes for why: the per-click charge doubles as the wall-clock throttle, and
+    // charging per recorded state instead cost route coverage without gaining states). So the
+    // clicks are what it bounds — only 4 top-level candidates exist here, so the ordinary
+    // click-probe pool (60) is nowhere near the limiting factor.
+    expect(recordClicks.length).toBeLessThanOrEqual(45);
+    expect(result.routes.filter((r) => r.stateKey).length).toBeGreaterThan(0);
+  });
+
+  // FIXED (GAP-060): a route visited LAST used to never reach its own click candidates, because
+  // the routes before it spent the shared deep-probe pool on ordinary navigation clicks. Measured
+  // on the real C&A authenticated crawl: /dashboard/vouchers and /dashboard/points each spent 8 of
+  // the 20, leaving /dashboard 4 — one short of any of its four `zmeniť` profile-edit triggers,
+  // whose forms a dashboard-only probe confirmed ARE recorded once clicks reach them.
+  //
+  // Raising the pool and charging per-recorded-state were both tried; each traded this starvation
+  // for wall-clock starvation, losing route coverage entirely (see MAX_STATE_PROBES_PER_CRAWL).
+  // The fix is structural: deep-probe now runs as a genuine second pass over the routes discovery
+  // already collected, in REVERSE of their visit order, so the route that used to be starved gets
+  // first crack at the shared pool.
+  it('lets a route visited LAST reach its own candidates now that deep-probe runs as a genuine second pass', async () => {
+    const navOnly = (tag: string) => Array.from({ length: 8 }, (_, i) => button(`${tag} nav ${i}`));
+    const editTrigger = button('zmeniť');
+    const recordClicks: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/a'), link('https://a.test/b'), link('https://a.test/c')],
+        },
+        'https://a.test/a': { elements: navOnly('a') },
+        'https://a.test/b': { elements: navOnly('b') },
+        // Visited last, and the only route with a state worth recording.
+        'https://a.test/c': { elements: [...navOnly('c').slice(0, 7), editTrigger] },
+      },
+      onClickSelectorReveal: {
+        [editTrigger.selector]: [
+          { role: 'textbox', name: 'First name', selector: '#firstname' } as InteractiveElement,
+        ],
+      },
+      recordClicks,
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(recordClicks).toContain(editTrigger.selector);
+    expect(result.routes.some((r) => r.stateKey?.endsWith(editTrigger.selector))).toBe(true);
+  });
+
+  it('deep-probes pass-1 routes in reverse visit order so the last-discovered route is not starved', async () => {
+    // Two routes each hide a real, budget-worthy reveal behind a filler-heavy candidate list.
+    // With a state-probe budget only big enough for ONE route's reveal to be reached, reverse
+    // order means the LAST-visited route (/b) wins, not the first (/a).
+    const navOnly = (tag: string) => Array.from({ length: 7 }, (_, i) => button(`${tag} nav ${i}`));
+    const triggerA = button('reveal-a');
+    const triggerB = button('reveal-b');
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [link('https://a.test/a'), link('https://a.test/b')],
+        },
+        'https://a.test/a': { elements: [...navOnly('a'), triggerA] },
+        'https://a.test/b': { elements: [...navOnly('b'), triggerB] },
+      },
+      onClickSelectorReveal: {
+        [triggerA.selector]: [
+          { role: 'textbox', name: 'A field', selector: '#a-field' } as InteractiveElement,
+        ],
+        [triggerB.selector]: [
+          { role: 'textbox', name: 'B field', selector: '#b-field' } as InteractiveElement,
+        ],
+      },
+    });
+
+    // Only one route's worth of candidates (8) fits in this budget.
+    const result = await crawl(browser, 'https://a.test/', { stateProbeBudget: 8 });
+
+    expect(result.routes.some((r) => r.stateKey?.endsWith(triggerB.selector))).toBe(true);
+    expect(result.routes.some((r) => r.stateKey?.endsWith(triggerA.selector))).toBe(false);
+  });
+
+  it('does not re-enqueue a URL discovered only during the pass-2 deep-probe', async () => {
+    // A same-URL reveal that also contains a fresh <a href> must not reopen BFS discovery —
+    // pass 2 only ever records same-URL state reveals, never new navigable routes. Five filler
+    // links keep the queue non-thin after the root visit, so `wantsClickProbe` stays false for
+    // the root in pass 1 — the trigger is only ever clicked in pass 2, isolating what this test
+    // means to cover.
+    const trigger = button('reveal');
+    const fillerLinks = Array.from({ length: 5 }, (_, i) => link(`https://a.test/filler-${i}`));
+    const pages: Record<string, FakePage> = {
+      'https://a.test/': { elements: [trigger, ...fillerLinks] },
+    };
+    for (const l of fillerLinks) pages[l.href!] = { elements: [] };
+
+    const browser = makeFakeBrowser({
+      pages,
+      onClickSelectorReveal: {
+        [trigger.selector]: [
+          { role: 'textbox', name: 'Field', selector: '#field' } as InteractiveElement,
+          link('https://a.test/late-discovered'),
+        ],
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes.some((r) => r.stateKey?.endsWith(trigger.selector))).toBe(true);
+    expect(result.routes.some((r) => r.url === 'https://a.test/late-discovered')).toBe(false);
+    expect(result.unvisitedQueuedCount).toBe(0);
+  });
+
+  // --- reveal metric: a view SWAP, not just a net-growth reveal (GAP-060) -------------------
+  //
+  // The element-count test measures NET growth, so it is structurally blind to a same-URL view
+  // swap — which is how real apps implement inline editing. Measured against C&A's dashboard:
+  // clicking "zmeniť" REPLACES ~5 edit links with a 3-input form plus submit, a net change of
+  // about MINUS ONE, so no threshold value could ever fire. These cover the input-based signal
+  // that does see it, and pin the boundaries so it doesn't start swallowing ordinary menus.
+
+  /** The measured C&A shape: four `zmeniť` edit links plus `odstrániť`, replaced by a name form. */
+  const EDIT_LINKS = [
+    button('zmeniť'),
+    button('zmeniť 2'),
+    button('zmeniť 3'),
+    button('zmeniť 4'),
+    button('odstrániť'),
+  ];
+  const NAME_FORM = [
+    { role: 'textbox', name: 'First name', selector: '#firstname' } as InteractiveElement,
+    { role: 'textbox', name: 'Surname', selector: '#surname' } as InteractiveElement,
+    { role: 'textbox', name: 'Salutation', selector: '#salutation' } as InteractiveElement,
+    { role: 'button', name: 'Save', selector: '#save', buttonType: 'submit' } as InteractiveElement,
+  ];
+
+  it('records a view swap that NETS FEWER elements but reveals input fields', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: EDIT_LINKS } },
+      onClickSelectorReveal: { [EDIT_LINKS[0]!.selector]: NAME_FORM },
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard');
+
+    // 5 elements before, 4 after: net -1, i.e. impossible for the element-count test at ANY
+    // threshold. Three previously-absent inputs is what makes it a form.
+    expect(NAME_FORM.length - EDIT_LINKS.length).toBeLessThan(0);
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.stateKey).toBe(`https://a.test/dashboard>>${EDIT_LINKS[0]!.selector}`);
+    expect(stateRoute?.snapshot.interactiveElements).toEqual(NAME_FORM);
+  });
+
+  it('still does NOT record an ordinary dropdown that reveals no inputs', async () => {
+    // The whole point of having a threshold: a menu opening must stay a menu opening. Two new
+    // links is under STATE_REVEAL_MIN_NEW_ELEMENTS and contributes no inputs, so neither signal
+    // fires and the click falls through to harvest-and-revert as before.
+    const menuButton = button('Account menu');
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [menuButton] },
+        'https://a.test/a': { elements: [] },
+        'https://a.test/b': { elements: [] },
+      },
+      onClickSelectorReveal: {
+        [menuButton.selector]: [menuButton, link('https://a.test/a'), link('https://a.test/b')],
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes.some((r) => r.stateKey)).toBe(false);
+    // ...while the links it revealed are still harvested for ordinary route discovery.
+    expect(result.routes.map((r) => r.url)).toContain('https://a.test/a');
+  });
+
+  it('compares revealed inputs BY SELECTOR, so an input-for-input swap still registers', async () => {
+    // A count-only check sees three inputs before and three after and concludes nothing changed;
+    // switching from the name form to the DOB form is a genuinely different state.
+    const toDob = button('zmeniť dob');
+    const dobForm = [
+      { role: 'textbox', name: 'Day', selector: '#dob-day' } as InteractiveElement,
+      { role: 'textbox', name: 'Month', selector: '#dob-month' } as InteractiveElement,
+      { role: 'textbox', name: 'Year', selector: '#dob-year' } as InteractiveElement,
+    ];
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/dashboard': {
+          elements: [toDob, ...NAME_FORM.filter((el) => el.role === 'textbox')],
+        },
+      },
+      onClickSelectorReveal: { [toDob.selector]: dobForm },
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard');
+
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.snapshot.interactiveElements).toEqual(dobForm);
+  });
+
+  it('keeps recording an input-free reveal that clears the element-count bar (GAP-056 guard)', async () => {
+    // A date-picker is buttons, not inputs — it must keep qualifying on the original signal, or
+    // adding the input test would have traded one blind spot for another.
+    const openCalendar = button('Open calendar');
+    const calendar = [
+      openCalendar,
+      button('1'),
+      button('2'),
+      button('3'),
+      button('4'),
+      button('5'),
+      button('6'),
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [openCalendar] } },
+      onClickSelectorReveal: { [openCalendar.selector]: calendar },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    const stateRoute = result.routes.find((r) => r.stateKey);
+    expect(stateRoute).toBeDefined();
+    expect(stateRoute?.snapshot.interactiveElements.every((el) => el.role === 'button')).toBe(true);
+  });
+
+  it('does not starve route discovery now that more reveals qualify (GAP-059 guard)', async () => {
+    // The looser rule spends MAX_STATE_PROBES_PER_CRAWL faster, which is exactly what let
+    // deep-probe eat the whole budget before. Every linked route must still be visited, and
+    // nothing may be left queued.
+    const editLink = button('zmeniť');
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': {
+          elements: [editLink, link('https://a.test/x'), link('https://a.test/y')],
+        },
+        'https://a.test/x': { elements: [] },
+        'https://a.test/y': { elements: [] },
+      },
+      onClickSelectorReveal: { [editLink.selector]: NAME_FORM },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.unvisitedQueuedCount).toBe(0);
+    expect(result.budgetExhausted).toBe(false);
+    const visited = result.routes.filter((r) => !r.stateKey).map((r) => r.url);
+    expect(visited).toContain('https://a.test/x');
+    expect(visited).toContain('https://a.test/y');
+  });
+});
+
+describe('crawl() click-probe reset corruption (docs/click-probe-reset-corruption.md)', () => {
+  it('recovers via a forced reload() when Escape alone cannot close a stuck same-URL modal', async () => {
+    // Reproduces the live C&A bug directly: a custom modal that doesn't listen for Escape.
+    // stateProbeBudget: 0 isolates the plain click-probing pass's own reset (the branch the bug
+    // doc's root cause #1 is about — deep-probe was never involved in the original failure since
+    // it's off in pass 1) from the separate deep-probe pass this file already covers elsewhere.
+    const triggerA = button('Open stuck modal');
+    const triggerB = button('Other action');
+    const stuckModal = [button('Add card'), button('Close')];
+    const log: string[] = [];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [triggerA, triggerB] } },
+      onClickSelectorReveal: { [triggerA.selector]: stuckModal },
+      escapeIneffective: new Set([triggerA.selector]),
+      log,
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard', { stateProbeBudget: 0 });
+
+    // Escape couldn't close it, so resetAfterProbe had to escalate to a genuine reload() — and
+    // since the browser was already sitting on originalUrl, it skips the always-doomed
+    // goto(originalUrl) rather than wasting a call known to be a no-op for a same-URL SPA route.
+    const clickAIdx = log.indexOf(`click:${triggerA.selector}`);
+    expect(log.slice(clickAIdx)).toContain(`reload:https://a.test/dashboard`);
+    expect(log.slice(clickAIdx)).not.toContain(`goto:https://a.test/dashboard`);
+    // Recovery worked: the next candidate on the same page still got attempted, proving the
+    // stuck modal didn't poison the rest of this route's click-probing.
+    expect(log).toContain(`click:${triggerB.selector}`);
+    expect(result.resetFailures ?? 0).toBe(0);
+  });
+
+  it('gives up on remaining candidates when even a forced reload cannot recover a stuck page', async () => {
+    const triggerA = button('Open permanently stuck modal');
+    const triggerB = button('Never reached');
+    const stuckModal = [button('Add card'), button('Close')];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dashboard': { elements: [triggerA, triggerB] } },
+      onClickSelectorReveal: { [triggerA.selector]: stuckModal },
+      escapeIneffective: new Set([triggerA.selector]),
+      reloadIneffective: new Set([triggerA.selector]),
+    });
+
+    const result = await crawl(browser, 'https://a.test/dashboard', { stateProbeBudget: 0 });
+
+    // Neither Escape nor a forced reload could recover the page — click-probing must give up on
+    // this route's remaining candidates rather than burning a full actionability timeout hunting
+    // for each one behind the still-open modal (the exact failure mode the bug doc describes).
+    expect(result.resetFailures).toBe(1);
+    const dashboardRoute = result.routes.find((r) => r.url === 'https://a.test/dashboard');
+    expect(dashboardRoute?.unattemptedClickCandidates?.some((c) => c.selector === triggerB.selector)).toBe(
+      true,
+    );
   });
 });
 
@@ -867,6 +1272,166 @@ const SUBMIT_BUTTON: InteractiveElement = {
   inForm: true,
   buttonType: 'submit',
 };
+
+describe('crawl() repeated-sibling collapse (state-dedup)', () => {
+  it("collapses a run of near-identical siblings (e.g. a date-picker's day cells) into one representative + repeatedGroupSize", async () => {
+    const dayCells: InteractiveElement[] = Array.from({ length: 27 }, (_, i) => ({
+      role: 'button',
+      name: `Choose ${i + 1}, 2008`,
+      selector: `div:nth-of-type(${i + 1}) > span`,
+    }));
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: dayCells } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(1);
+    expect(result.routes[0].snapshot.interactiveElements[0].repeatedGroupSize).toBe(27);
+  });
+
+  it('leaves a small group of same-shaped elements (2-3 real, distinct nav items) uncollapsed', async () => {
+    const navItems: InteractiveElement[] = [
+      { role: 'link', name: 'Home', selector: 'nav > a:nth-of-type(1)' },
+      { role: 'link', name: 'About', selector: 'nav > a:nth-of-type(2)' },
+      { role: 'link', name: 'Contact', selector: 'nav > a:nth-of-type(3)' },
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: navItems } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(3);
+    expect(
+      result.routes[0].snapshot.interactiveElements.every((el) => el.repeatedGroupSize === undefined),
+    ).toBe(true);
+  });
+
+  it("does not erase a differently-named minority sibling into a same-shaped majority's collapsed representative (zmeniť/odstrániť)", async () => {
+    const editTriggers: InteractiveElement[] = [
+      { role: 'generic', name: 'zmeniť', selector: 'div:nth-of-type(1) > p', repeatedRowText: 'Meno zmeniť' },
+      {
+        role: 'generic',
+        name: 'zmeniť',
+        selector: 'div:nth-of-type(2) > p',
+        repeatedRowText: 'Dátum narodenia zmeniť',
+      },
+      {
+        role: 'generic',
+        name: 'zmeniť',
+        selector: 'div:nth-of-type(3) > p',
+        repeatedRowText: 'Email zmeniť',
+      },
+      {
+        role: 'generic',
+        name: 'zmeniť',
+        selector: 'div:nth-of-type(4) > p',
+        repeatedRowText: 'Heslo zmeniť',
+      },
+      {
+        role: 'generic',
+        name: 'odstrániť',
+        selector: 'div:nth-of-type(5) > p',
+        repeatedRowText: 'Odstrániť účet odstrániť',
+      },
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: editTriggers } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    const names = result.routes[0].snapshot.interactiveElements.map((el) => el.name).sort();
+    expect(names).toEqual(['odstrániť', 'zmeniť', 'zmeniť', 'zmeniť', 'zmeniť']);
+    expect(
+      result.routes[0].snapshot.interactiveElements.every((el) => el.repeatedGroupSize === undefined),
+    ).toBe(true);
+  });
+
+  it('still collapses a same-name subgroup that reaches the threshold when repeatedRowText is absent or repeats', async () => {
+    const deleteButtons: InteractiveElement[] = Array.from({ length: 5 }, (_, i) => ({
+      role: 'button',
+      name: 'Delete',
+      selector: `tr:nth-of-type(${i + 1}) > td > button`,
+    }));
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: deleteButtons } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(1);
+    expect(result.routes[0].snapshot.interactiveElements[0].repeatedGroupSize).toBe(5);
+  });
+
+  it('leaves a small mixed-name group uncollapsed when no single name reaches the threshold', async () => {
+    const mixed: InteractiveElement[] = [
+      { role: 'generic', name: 'A', selector: 'div:nth-of-type(1) > p' },
+      { role: 'generic', name: 'A', selector: 'div:nth-of-type(2) > p' },
+      { role: 'generic', name: 'A', selector: 'div:nth-of-type(3) > p' },
+      { role: 'generic', name: 'B', selector: 'div:nth-of-type(4) > p' },
+      { role: 'generic', name: 'B', selector: 'div:nth-of-type(5) > p' },
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: mixed } },
+    });
+
+    const result = await crawl(browser, 'https://a.test/');
+
+    expect(result.routes[0].snapshot.interactiveElements).toHaveLength(5);
+    expect(
+      result.routes[0].snapshot.interactiveElements.every((el) => el.repeatedGroupSize === undefined),
+    ).toBe(true);
+  });
+
+  it('stops recursing into a deep-probe reveal once its (route, fingerprint) pair has recurred, but still records it', async () => {
+    const openA = button('Open A');
+    const openB = button('Open B');
+    const openC = button('Open C');
+    const deeper = button('Deeper');
+    // 3 base elements; a reveal needs >= 3+5=8 elements to count as a real state (see
+    // STATE_REVEAL_MIN_NEW_ELEMENTS). The exact same array is revealed by all three buttons —
+    // same underlying shared component (e.g. a cookie-consent-style modal).
+    const sharedModal: InteractiveElement[] = [
+      deeper,
+      button('M1'),
+      button('M2'),
+      button('M3'),
+      button('M4'),
+      button('M5'),
+      button('M6'),
+      button('M7'),
+    ];
+    // sharedModal has 8 elements; a second-hop reveal needs >= 8+5=13 to register.
+    const deeperReveal: InteractiveElement[] = Array.from({ length: 13 }, (_, i) => button(`D${i}`));
+
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/dash': { elements: [openA, openB, openC] } },
+      onClickSelectorReveal: {
+        [openA.selector]: sharedModal,
+        [openB.selector]: sharedModal,
+        [openC.selector]: sharedModal,
+        [deeper.selector]: deeperReveal,
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/dash');
+
+    const stateRoutes = result.routes.filter((r) => r.stateKey);
+    const sharedModalHits = stateRoutes.filter(
+      (r) => r.snapshot.interactiveElements.length === sharedModal.length,
+    );
+    const deeperRevealHits = stateRoutes.filter(
+      (r) => r.snapshot.interactiveElements.length === deeperReveal.length,
+    );
+    // All three reveals of the identical shared modal are still recorded...
+    expect(sharedModalHits).toHaveLength(3);
+    // ...but only the first two (below STATE_REPEAT_THRESHOLD) were recursed into far enough to
+    // reach and record the second-hop reveal — the third recognized the repeat and stopped short.
+    expect(deeperRevealHits).toHaveLength(2);
+  });
+});
 
 describe('crawlWithAuth()', () => {
   it('returns anonymous-only routes and skips auth when no credentials are supplied', async () => {
@@ -923,6 +1488,13 @@ describe('crawlWithAuth()', () => {
 
     expect(result.authAttempted).toBe(true);
     expect(result.authVerified).toBe(true);
+    expect(result.verifiedLogin).toEqual({
+      pageUrl: 'https://a.test/login',
+      toggleSelector: undefined,
+      identifierSelector: EMAIL_FIELD.selector,
+      passwordSelector: PASSWORD_FIELD.selector,
+      submitSelector: SUBMIT_BUTTON.selector,
+    });
 
     const anonymousUrls = result.routes.filter((r) => r.role === 'anonymous').map((r) => r.url);
     expect(anonymousUrls.sort()).toEqual(['https://a.test/', 'https://a.test/login']);
@@ -1004,6 +1576,18 @@ describe('crawlWithAuth()', () => {
     expect(result.authReason).toBeUndefined();
     const authUrls = result.routes.filter((r) => r.role === 'authenticated').map((r) => r.url);
     expect(authUrls).toEqual(['https://a.test/dashboard']);
+
+    // This is the crux of the login-selector-grounding fix: the proven-working page URL and
+    // toggle selector must be the REGISTER page's toggle, not re-derived from scratch — a
+    // route with no password field until the toggle fires would otherwise be invisible to
+    // scoreLoginCandidates(), which never sees loginToggleSelector at all.
+    expect(result.verifiedLogin).toEqual({
+      pageUrl: 'https://a.test/register',
+      toggleSelector: '#toggle-login-btn',
+      identifierSelector: '#login-email',
+      passwordSelector: '#login-password',
+      submitSelector: '#login-submit',
+    });
   });
 
   // Runs ~10s on purpose: a submit that never leaves the login page is only CONFIRMED failed
@@ -1493,5 +2077,113 @@ describe('crawl() login-route discovery priority', () => {
 
     expect(result.budgetExhausted).toBe(false);
     expect(result.unvisitedQueuedCount).toBe(0);
+  });
+});
+
+describe('crawlManySeeds() (separate-origin fallback fan-out)', () => {
+  /** A fresh fake BrowserSurface per call, one page per seed's own origin, recording every
+   * `start()` call's opts so a test can verify storageState propagation. */
+  function makeSeedBrowserFactory(config: {
+    pagesByOrigin: Record<string, InteractiveElement[]>;
+    delayMs?: Record<string, number>;
+    throwOnStartFor?: Set<string>;
+    startCalls: BrowserSurfaceOptions[];
+  }): () => BrowserSurface {
+    return () => {
+      let currentUrl = '';
+      return {
+        async start(opts: BrowserSurfaceOptions = {}): Promise<void> {
+          if (opts.baseUrl && config.throwOnStartFor?.has(opts.baseUrl)) {
+            throw new Error(`fake start failure for ${opts.baseUrl}`);
+          }
+          config.startCalls.push(opts);
+        },
+        async goto(url: string): Promise<void> {
+          currentUrl = url;
+          const delay = config.delayMs?.[url];
+          if (delay) await new Promise((resolve) => setTimeout(resolve, delay));
+        },
+        async reload(): Promise<void> {},
+        async screenshot(): Promise<Buffer> {
+          return Buffer.alloc(0);
+        },
+        async snapshot(): Promise<DomSnapshot> {
+          const origin = new URL(currentUrl).origin;
+          return {
+            url: currentUrl,
+            title: currentUrl,
+            interactiveElements: config.pagesByOrigin[origin] ?? [],
+          };
+        },
+        async click(): Promise<void> {},
+        async clickAt(): Promise<void> {},
+        async type(): Promise<void> {},
+        async pressKey(): Promise<void> {},
+        onFrame(): () => void {
+          return () => {};
+        },
+        drainNetworkEvents(): CapturedNetworkEvent[] {
+          return [];
+        },
+        async exportStorageState() {
+          return {};
+        },
+        async stop(): Promise<void> {},
+      };
+    };
+  }
+
+  it('crawls each seed in its own browser, pre-authenticated from the given storageState', async () => {
+    const startCalls: BrowserSurfaceOptions[] = [];
+    const sharedStorageState = { cookies: [{ name: 'session', value: 'abc' }] };
+    const factory = makeSeedBrowserFactory({
+      pagesByOrigin: {
+        'https://a.test': [button('A')],
+        'https://b.test': [button('B')],
+      },
+      startCalls,
+    });
+
+    const result = await crawlManySeeds(['https://a.test/', 'https://b.test/'], factory, sharedStorageState);
+
+    expect(result.routes.map((r) => r.seedLabel).sort()).toEqual(['https://a.test', 'https://b.test']);
+    expect(startCalls.every((opts) => opts.storageState === sharedStorageState)).toBe(true);
+  });
+
+  it('never lets one seed whose browser fails to start abort the rest of the fan-out', async () => {
+    const factory = makeSeedBrowserFactory({
+      pagesByOrigin: { 'https://b.test': [button('B')] },
+      throwOnStartFor: new Set(['https://a.test/']),
+      startCalls: [],
+    });
+
+    const result = await crawlManySeeds(['https://a.test/', 'https://b.test/'], factory, undefined);
+
+    expect(result.routes.some((r) => r.seedLabel === 'https://b.test')).toBe(true);
+    expect(result.routes.some((r) => r.seedLabel === 'https://a.test')).toBe(false);
+  });
+
+  it('never crawls more seeds than fit in the total budget ceiling', async () => {
+    const seeds = ['https://a.test/', 'https://b.test/', 'https://c.test/'];
+    const delayMs: Record<string, number> = {};
+    for (const s of seeds) delayMs[s] = 40;
+    const factory = makeSeedBrowserFactory({
+      pagesByOrigin: {
+        'https://a.test': [button('A')],
+        'https://b.test': [button('B')],
+        'https://c.test': [button('C')],
+      },
+      delayMs,
+      startCalls: [],
+    });
+
+    const result = await crawlManySeeds(seeds, factory, undefined, {
+      perSeedBudgetMs: 5_000,
+      totalBudgetMs: 30, // shorter than even one seed's own navigation delay
+    });
+
+    // The calibration probe (first seed) always runs, but the deadline check before starting
+    // subsequent seeds means the fan-out can't run away past its total budget.
+    expect(result.routes.length).toBeLessThan(seeds.length);
   });
 });

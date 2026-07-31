@@ -28,6 +28,23 @@ export const EXEC_CHECKPOINT_INVERT_FILENAME = 'healix-completed-tests.txt';
  */
 export const MOCK_REQUEST_LOG_FILENAME = 'healix-mock-request-log.ndjson';
 
+/**
+ * Write-through log of every HTTP call made via the `request` fixture, one
+ * JSON line per call: `{key, method, url, status, mocked, body}`. `key` is
+ * `${specFile}#${title}` (mirrors execute.ts's own dedup keyOf()), letting
+ * execute.ts (readApiEvidence) attribute each captured response back to the
+ * exact test that made the call — real backend calls (actionHighlighterFixtureContents())
+ * and Healix-mocked ones (mockFixtureContents()) both log here, `mocked`
+ * distinguishing which. Without this, triage previously saw only whichever
+ * single field a failing assertion happened to print (e.g. "Received:
+ * undefined") and had no way to tell "the real API is genuinely broken" apart
+ * from "this dependency's mock is misconfigured" or "the response is fine but
+ * the test's expectation is stale" — this is the actual evidence needed to
+ * tell those apart. Lives at the suite's project root, alongside results.json
+ * — same placement as the other sidecar logs.
+ */
+export const API_EVIDENCE_LOG_FILENAME = 'healix-api-evidence-log.ndjson';
+
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -536,6 +553,25 @@ async function waitForSubmitEnabled(button, timeoutMs) {
 }
 
 /**
+ * Prefers \`groundedSelector\` — the exact element EXPLORE's own crawl-time login attempt
+ * actually typed into/clicked, and therefore PROVED works (see browser/login.ts,
+ * browser/crawler.ts's \`verifiedLogin\`) — over the independent generic guess this fixture
+ * would otherwise make on its own. Falls back to \`fallbackLocator\` unchanged whenever no
+ * grounded selector was captured, or it no longer resolves to a visible element (stale
+ * exploration data, app markup changed since the crawl) — so behavior is byte-identical to
+ * today whenever grounding isn't available or doesn't hold up.
+ */
+async function preferGrounded(page, groundedSelector, fallbackLocator, timeoutMs) {
+  if (groundedSelector) {
+    const grounded = page.locator(groundedSelector).first();
+    if (await grounded.isVisible({ timeout: timeoutMs }).catch(() => false)) {
+      return grounded;
+    }
+  }
+  return fallbackLocator;
+}
+
+/**
  * One username/password form login against \`page\`, saving storageState to
  * \`path\` on success. Throws on failure — including when the submit click
  * "succeeded" (no exception) but the page never actually left the login
@@ -546,6 +582,15 @@ async function waitForSubmitEnabled(button, timeoutMs) {
  */
 async function loginForm(page, email, password, loginUrl, path) {
   await page.goto(loginUrl);
+
+  // If EXPLORE's own crawl-time login proved the form sits behind a same-URL client-side
+  // toggle, replay that click before anything else — neither the grounded nor the guessed
+  // field locators below resolve to anything until this fires. Best-effort: a stale/absent
+  // toggle selector just leaves the reveal-guess further down to handle it, same as today.
+  const groundedToggle = process.env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR;
+  if (groundedToggle) {
+    await page.locator(groundedToggle).first().click({ timeout: 5000 }).catch(() => {});
+  }
 
   // Locale-aware matchers (English + common Slovak forms observed in the
   // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
@@ -559,23 +604,38 @@ async function loginForm(page, email, password, loginUrl, path) {
   // environment/target problem rather than a selector gap. Matching
   // "username" (label/placeholder text) and the standards-based
   // autocomplete="username" attribute alongside email covers both shapes.
-  const identifierField = fieldLocator(
+  const guessIdentifierField = fieldLocator(
     page,
     /e-?mail|user\\s*name/i,
     /e-?mail|user\\s*name/i,
     'input[type="email"], input[autocomplete="username"], input[name*="email" i], input[name*="user" i], input[id*="email" i], input[id*="user" i]',
   );
-  const passwordField = fieldLocator(
+  const guessPasswordField = fieldLocator(
     page,
     /heslo|password/i,
     /heslo|password/i,
     'input[type="password"]',
   );
+  // Prefer the exact fields EXPLORE's login attempt actually typed into and proved work —
+  // see preferGrounded(); falls back to the generic guess above whenever unset or stale.
+  const identifierField = await preferGrounded(
+    page,
+    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR,
+    guessIdentifierField,
+    3000,
+  );
+  const passwordField = await preferGrounded(
+    page,
+    process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR,
+    guessPasswordField,
+    3000,
+  );
   const loginRevealRe = /prihl|sign in|log ?in/i;
 
   // Some apps gate the login form behind a reveal button/link (e.g. a
   // "Prihlásiť sa" click before the identifier/password fields even render) —
-  // click through it before searching for the form.
+  // click through it before searching for the form. A no-op when the grounded
+  // toggle above already revealed it.
   const hasIdentifierField = await identifierField
     .first()
     .isVisible()
@@ -602,23 +662,43 @@ async function loginForm(page, email, password, loginUrl, path) {
   }
 
   const beforeUrl = page.url();
-  const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i);
+  // EXPLORE's own login attempt is grounded when it captured identifier/password selectors —
+  // and when it's grounded AND captured no submit selector, that's not "unknown", it's a
+  // PROVEN fact: the real submit control was disabled/unusable at fill-time and the app was
+  // actually driven by pressing Enter (see login.ts's submitLoginAttempt — Enter is the
+  // fallback there too). Guessing a button to click in that case would repeat exactly the
+  // mismatch this grounding exists to prevent, so ground the SUBMIT MECHANISM itself rather
+  // than only the element: only fall back to the generic guess-and-click when there's no
+  // grounded form data at all (no exploration data, or a stale cache from before this field
+  // was added).
+  const hasGroundedForm = !!(
+    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR || process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR
+  );
+  const groundedSubmitSelector = process.env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR;
 
-  if (!(await waitForSubmitEnabled(submitButton, 8000))) {
-    // Never interpolate the credential VALUES here — this text reaches the AI triage
-    // provider (see triage/prompt.ts). Lengths/booleans only.
-    const identifierFilled = (await identifierField.first().inputValue().catch(() => '')).length > 0;
-    const passwordFilled = (await passwordField.first().inputValue().catch(() => '')).length > 0;
-    throw new Error(
-      \`Login submit button never became enabled within 8s of filling both credential fields (still on \${page.url()}). \` +
-        \`Both fields were located (identifier field non-empty: \${identifierFilled}, password field non-empty: \${passwordFilled}), \` +
-        "so this is not a selector gap — the app's own client-side validation is still refusing to enable submit. " +
-        "Check that the configured test credentials are valid and match the app's format rules, and that the form has no " +
-        'additional required field (tenant/company code, consent checkbox, captcha, OTP) this fixture does not fill.',
-    );
+  if (hasGroundedForm && !groundedSubmitSelector) {
+    await page.keyboard.press('Enter');
+  } else {
+    const guessSubmitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i);
+    // Prefer the exact submit control EXPLORE's login attempt actually clicked, when captured.
+    const submitButton = await preferGrounded(page, groundedSubmitSelector, guessSubmitButton, 3000);
+
+    if (!(await waitForSubmitEnabled(submitButton, 8000))) {
+      // Never interpolate the credential VALUES here — this text reaches the AI triage
+      // provider (see triage/prompt.ts). Lengths/booleans only.
+      const identifierFilled = (await identifierField.first().inputValue().catch(() => '')).length > 0;
+      const passwordFilled = (await passwordField.first().inputValue().catch(() => '')).length > 0;
+      throw new Error(
+        \`Login submit button never became enabled within 8s of filling both credential fields (still on \${page.url()}). \` +
+          \`Both fields were located (identifier field non-empty: \${identifierFilled}, password field non-empty: \${passwordFilled}), \` +
+          "so this is not a selector gap — the app's own client-side validation is still refusing to enable submit. " +
+          "Check that the configured test credentials are valid and match the app's format rules, and that the form has no " +
+          'additional required field (tenant/company code, consent checkbox, captcha, OTP) this fixture does not fill.',
+      );
+    }
+
+    await submitButton.click({ timeout: 15_000 });
   }
-
-  await submitButton.click({ timeout: 15_000 });
 
   const { navigatedAway, stillHasPasswordField } = await waitForLoginOutcome(page, beforeUrl);
   if (stillHasPasswordField && !navigatedAway) {
@@ -741,6 +821,48 @@ setup('authenticate', async ({ page, browser }) => {
 }
 
 /**
+ * JS source snippet (interpolated into BOTH actionHighlighterFixtureContents()
+ * and mockFixtureContents() below — independent generated files with no
+ * shared JS module either could import a helper from) that best-effort logs
+ * every HTTP call made through the `request` fixture to
+ * API_EVIDENCE_LOG_FILENAME. Requires the caller's file to import
+ * `appendFile` (node:fs/promises) and `join`/`relative`/`sep` (node:path).
+ */
+function apiEvidenceHelperSource(): string {
+  return `const API_EVIDENCE_LOG_PATH = join(process.cwd(), ${JSON.stringify(API_EVIDENCE_LOG_FILENAME)});
+const API_EVIDENCE_BODY_CHARS = 500;
+
+function evidenceKey(testInfo) {
+  return relative(process.cwd(), testInfo.file).split(sep).join('/') + '#' + testInfo.title;
+}
+
+async function logApiEvidence(key, method, url, status, bodyText, mocked) {
+  try {
+    const body =
+      typeof bodyText === 'string' && bodyText.length > API_EVIDENCE_BODY_CHARS
+        ? bodyText.slice(0, API_EVIDENCE_BODY_CHARS) + '…'
+        : bodyText || '';
+    await appendFile(
+      API_EVIDENCE_LOG_PATH,
+      JSON.stringify({ key, method, url, status, mocked, body }) + '\\n',
+      'utf-8',
+    );
+  } catch {
+    // best-effort — never fail the actual test run over this
+  }
+}
+
+async function safeBodyText(res) {
+  try {
+    return await res.text();
+  } catch {
+    return '';
+  }
+}
+`;
+}
+
+/**
  * Fixture wrapping @playwright/test's `test`/`page` with an auto-injected
  * browser-side script that makes a recorded video actually show what a test
  * is doing: a fake cursor, a highlight ring around whatever was just
@@ -764,7 +886,10 @@ setup('authenticate', async ({ page, browser }) => {
  */
 export function actionHighlighterFixtureContents(): string {
   return `import { test as base, expect } from '@playwright/test';
+import { appendFile } from 'node:fs/promises';
+import { join, relative, sep } from 'node:path';
 
+${apiEvidenceHelperSource()}
 /**
  * Healix-generated visual action highlighter. Injected into every page via
  * addInitScript so it runs before any page script, on every navigation.
@@ -906,10 +1031,109 @@ function healixActionHighlighter() {
   });
 }
 
+// A generated test occasionally needs a browser session that's DIFFERENT
+// from the default one Playwright's own \`page\` fixture provides — e.g. an
+// "unauthenticated access is denied" check running alongside authenticated
+// tests in the same file, two simultaneous logged-in users, a deliberately
+// stale/invalid session, or a different role/tenant's session — and calls
+// \`browser.newContext()\` itself to get one. \`playwright.config.ts\`'s
+// \`video: 'on'\` only auto-applies to the context Playwright's OWN fixtures
+// create; a manually-created one needs \`recordVideo\` passed explicitly and
+// its video attached by hand, or it silently has no video at all. Patching
+// \`browser.newContext\` once per worker (guarded so repeated test setup
+// doesn't stack the wrapper) makes every manually-created context behave
+// like the fixture-provided one automatically, with no change needed to
+// whatever the generated test itself writes.
+//
+// This MUST be its own \`auto: true\` fixture, not folded into the \`page\`
+// override below — a test that only destructures \`browser\` (the exact
+// shape of the manual-context pattern this exists for) never instantiates
+// \`page\` at all, so a patch installed there would never run for the one
+// case it's meant to cover.
+let healixManualContextVideoCounter = 0;
+
 export const test = base.extend({
+  _healixVideoPatch: [
+    async ({ browser }, use) => {
+      if (!browser.newContext.__healixVideoPatched) {
+        const originalNewContext = browser.newContext.bind(browser);
+        browser.newContext = async (options) => {
+          const info = base.info();
+          // Playwright's own \`context\`/\`page\` fixtures also go through
+          // \`browser.newContext()\` to create the DEFAULT context, and already
+          // pass their own \`recordVideo\` (derived from \`use.video\` in
+          // playwright.config.ts) plus attach that video themselves once the
+          // test ends. Only a genuinely manual \`browser.newContext()\` call
+          // from generated test code omits \`recordVideo\` — that's the one
+          // case this patch exists to cover. Re-attaching the default
+          // context's video here would duplicate it (and the duplicate is
+          // attached mid-recording, before Playwright finalizes the file, so
+          // it shows up broken/unplayable alongside the real one).
+          const isDefaultContext = Boolean(options?.recordVideo);
+          const ctx = await originalNewContext({ recordVideo: { dir: info.outputDir }, ...options });
+          if (isDefaultContext) {
+            return ctx;
+          }
+          const pages = [];
+          ctx.on('page', (p) => pages.push(p));
+          ctx.on('close', async () => {
+            for (const p of pages) {
+              try {
+                const videoPath = await p.video()?.path();
+                if (videoPath) {
+                  healixManualContextVideoCounter += 1;
+                  await info.attach(\`video-manual-context-\${healixManualContextVideoCounter}\`, {
+                    path: videoPath,
+                    contentType: 'video/webm',
+                  });
+                }
+              } catch {
+                // Best-effort — never fail the test over evidence capture.
+              }
+            }
+          });
+          return ctx;
+        };
+        browser.newContext.__healixVideoPatched = true;
+      }
+      await use();
+    },
+    { auto: true },
+  ],
   page: async ({ page }, use) => {
     await page.addInitScript(healixActionHighlighter);
     await use(page);
+  },
+  // Mocking is disabled for this run (or this fixture is loaded transitively
+  // by mockFixtureContents() for a route with no mocked dependencies at all)
+  // — every call through \`request\` hits the REAL backend. Log it (method,
+  // url, status, a truncated response body) so triage can see what the app
+  // actually returned, not just the one field a failing assertion printed.
+  // Never changes the returned response/behavior — pure observation.
+  request: async ({ request }, use, testInfo) => {
+    const key = evidenceKey(testInfo);
+    const wrap = (method) => async (url, options) => {
+      const res = await request[method](url, options);
+      await logApiEvidence(key, method.toUpperCase(), String(url), res.status(), await safeBodyText(res), false);
+      return res;
+    };
+    const wrapped = {
+      get: wrap('get'),
+      post: wrap('post'),
+      put: wrap('put'),
+      patch: wrap('patch'),
+      delete: wrap('delete'),
+      head: wrap('head'),
+      options: wrap('options'),
+      fetch: async (url, opts) => {
+        const res = await request.fetch(url, opts);
+        await logApiEvidence(key, (opts && opts.method) || 'GET', String(url), res.status(), await safeBodyText(res), false);
+        return res;
+      },
+      dispose: () => request.dispose(),
+      storageState: (opts) => request.storageState(opts),
+    };
+    await use(wrapped);
   },
 });
 
@@ -941,7 +1165,7 @@ export function mockFixtureContents(routes: MockRouteEntry[]): string {
   const serialized = JSON.stringify(routes, null, 2);
   return `import { test as base, expect } from './action-highlighter.js';
 import { appendFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { join, relative, sep } from 'node:path';
 
 /**
  * Healix-generated mock fixture — intercepts network requests to detected
@@ -951,6 +1175,8 @@ import { join } from 'node:path';
  */
 
 const MOCKED_ROUTES = ${serialized};
+
+${apiEvidenceHelperSource()}
 
 // F-15: write-through log of every request this fixture actually intercepted,
 // read back by execute.ts's readMockRequestCounts() so the report's
@@ -1129,17 +1355,22 @@ export const test = base.extend({
   // matchAnyRoute) rather than unconditionally trusting whichever dependency
   // happens to be first — request-fixture calls use relative paths with no
   // hostname to disambiguate between multiple mocked dependencies.
-  request: async ({ request, mockOverride }, use) => {
+  request: async ({ request, mockOverride }, use, testInfo) => {
     void mockOverride;
     if (MOCKED_ROUTES.length === 0) {
+      // No mocked dependency to fake — \`request\` here is already the
+      // logging-wrapped real fixture from action-highlighter.js (this file's
+      // \`base\`), so passing it through unchanged still captures evidence.
       await use(request);
       return;
     }
+    const key = evidenceKey(testInfo);
     const respond = async (method, requestPath) => {
       const match = matchAnyRoute(MOCKED_ROUTES, method, (requestPath || '/').split('?')[0]);
       await logMockHit(match.id);
       const canned = match.response;
       const { contentType, text } = serializeBody(canned);
+      await logApiEvidence(key, method, requestPath || '', canned.status, text, true);
       return {
         ok: () => canned.status >= 200 && canned.status < 300,
         status: () => canned.status,

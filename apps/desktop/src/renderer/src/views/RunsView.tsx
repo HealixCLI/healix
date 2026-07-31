@@ -7,8 +7,6 @@ import { Badge, type BadgeTone } from '../components/ui/badge';
 import { Select } from '../components/ui/select';
 import { Label } from '../components/ui/label';
 import { Textarea } from '../components/ui/textarea';
-import { Switch } from '../components/ui/switch';
-import { Input } from '../components/ui/input';
 import { SheetPickerDialog } from '../components/ui/sheet-picker-dialog';
 import { ConsoleLog } from '../components/ConsoleLog';
 import { PlanGate } from '../components/PlanGate';
@@ -130,14 +128,11 @@ export function RunsView({
   const { runs, loading: runsLoading, error: runsError, refresh: refreshRuns } = useRuns();
 
   const [projectId, setProjectId] = useState<string>('');
-  const [testingScope, setTestingScope] = useState<TestingScope>('both');
+  // Only 'frontend' is user-selectable in the Start-a-run form right now (see
+  // TESTING_SCOPES.map below) — defaulting here to 'both' would render the
+  // dropdown pre-selected on a disabled option.
+  const [testingScope, setTestingScope] = useState<TestingScope>('frontend');
   const [suiteMode, setSuiteMode] = useState<SuiteMode>('fresh');
-  // Off by default — each iteration of the coverage feedback loop can add a
-  // full extra plan+generate+execute cycle (up to 4). coverageTargetPct is the
-  // user-facing 0-100 override; empty means "use the backend's own default"
-  // (80% fresh / 98% top-up) rather than duplicating those constants here.
-  const [coverageLoopEnabled, setCoverageLoopEnabled] = useState(false);
-  const [coverageTargetPct, setCoverageTargetPct] = useState('');
   const [prd, setPrd] = useState('');
   // Set once a PRD file is successfully uploaded; cleared if the user edits the
   // textarea by hand, since the displayed text no longer matches the file.
@@ -187,6 +182,11 @@ export function RunsView({
   // to a different project's run panel, or any other remount of this view,
   // resets back to expanded rather than remembering a previous collapse.
   const [formCollapsed, setFormCollapsed] = useState(false);
+  // Set to the target runId the instant Retry-pass is dispatched, cleared once
+  // the engine settles — lets RunDetailPanel show "Retrying…" for the actual
+  // duration of the call instead of relying on its own local `busy` flag,
+  // which clears synchronously right after the fire-and-forget dispatch.
+  const [retryPassRunId, setRetryPassRunId] = useState<string | null>(null);
 
   const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
   const { run: lastSuccessfulRun, reload: reloadLastSuccessful } = useLastSuccessfulRun(projectId || null);
@@ -198,11 +198,6 @@ export function RunsView({
   useEffect(() => {
     if (!hasSuite && suiteMode !== 'fresh') setSuiteMode('fresh');
   }, [hasSuite, suiteMode]);
-  // 'reuse' never plans/generates at all, so the coverage loop has nothing to
-  // retry — force the toggle off rather than showing it inertly enabled.
-  useEffect(() => {
-    if (suiteMode === 'reuse' && coverageLoopEnabled) setCoverageLoopEnabled(false);
-  }, [suiteMode, coverageLoopEnabled]);
   // Refresh "last successful run" once a run just settled, so the toggle picks
   // up a run that only just became eligible as a top-up/reuse base.
   useEffect(() => {
@@ -328,6 +323,7 @@ export function RunsView({
       // here too.
       setCancelling(false);
       setPausing(false);
+      setRetryPassRunId((prev) => (prev === engine.runId ? null : prev));
       const settledId = engine.runId;
       void refreshRuns().then(() => {
         // Stale by the time this resolves: the user already moved on (e.g.
@@ -434,10 +430,6 @@ export function RunsView({
       prdSourceKind: prd.trim() ? (prdSourceKind ?? 'text') : undefined,
       prdFileName: prd.trim() ? (prdFileName ?? undefined) : undefined,
       prdSelectedSheets: prd.trim() ? (prdSelectedSheets ?? undefined) : undefined,
-      // No effect in 'reuse' mode (never plans/generates), but harmless to send.
-      coverageLoopEnabled,
-      coverageTarget:
-        coverageLoopEnabled && coverageTargetPct.trim() ? Number(coverageTargetPct) / 100 : undefined,
     };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
@@ -457,13 +449,14 @@ export function RunsView({
   };
 
   /**
-   * Start (or queue) a Retry-pass/Repair run: RunDetailPanel resolves which
-   * plan item ids to target (generation gaps or triaged-wrong tests) and
-   * hands back a ready-to-send StartRunArgs; this just runs it through the
-   * exact same engine start-or-queue mechanics as startOrQueue above, so the
-   * new run gets full live-console/browser tracking like any other run.
+   * Start (or queue) a Repair run: RunDetailPanel resolves which triaged-wrong
+   * tests to target and hands back a ready-to-send StartRunArgs (suiteMode
+   * 'topup', a new run row); this runs it through the exact same
+   * engine start-or-queue mechanics as startOrQueue above. Repair is
+   * intentionally NOT on the same-run Retry-pass mechanism below — see
+   * docs/design/retry-pass-coverage-kb-redesign.md §3b.
    */
-  const startRetryPass = (args: StartRunArgs): void => {
+  const startRepairRun = (args: StartRunArgs): void => {
     if (isActive) {
       setQueueError(null);
       void engine.queueRun(args).catch((err) => {
@@ -474,6 +467,26 @@ export function RunsView({
     setSelectedRunId(null);
     setFormCollapsed(true);
     void engine.start(args);
+  };
+
+  /**
+   * Same-run Retry-pass: no StartRunArgs to build anymore — RunDetailPanel
+   * just hands back the runId it's already showing, and engine.retryPass
+   * adopts that SAME runId as the live one (no new run:started for a fresh
+   * id). Unlike Repair/startOrQueue, there's no queue path yet: retry-pass
+   * isn't a StartRunArgs-shaped request the existing queue can hold, so it
+   * simply surfaces an error if another run is already active rather than
+   * queuing behind it.
+   */
+  const startRetryPass = (runId: string): void => {
+    if (isActive) {
+      setQueueError('Another run is currently active. Try Retry-pass again once it finishes.');
+      return;
+    }
+    setSelectedRunId(null);
+    setFormCollapsed(true);
+    setRetryPassRunId(runId);
+    void engine.retryPass(runId);
   };
 
   const cancel = (): void => {
@@ -637,14 +650,6 @@ export function RunsView({
     ? (detail?.runConfig?.suiteMode ?? detail?.run?.suiteMode ?? 'fresh')
     : suiteMode;
   const effectivePrd = viewingHistoricalRun ? (detail?.runConfig?.prd ?? '') : prd;
-  const effectiveCoverageLoopEnabled = viewingHistoricalRun
-    ? (detail?.runConfig?.coverageLoopEnabled ?? false)
-    : coverageLoopEnabled;
-  const effectiveCoverageTargetPct = viewingHistoricalRun
-    ? detail?.runConfig?.coverageTarget !== undefined
-      ? String(Math.round(detail.runConfig.coverageTarget * 100))
-      : ''
-    : coverageTargetPct;
   const effectiveInstructions = viewingHistoricalRun ? (detail?.runConfig?.instructions ?? '') : instructions;
   // "Source: TestCases.xlsx (sheets: Login, Signup)" for a spreadsheet-sourced
   // run, falling back to plain filename-only display otherwise. Historical
@@ -687,10 +692,9 @@ export function RunsView({
     setPrdSelectedSheets(null);
     setSheetPickerFile(null);
     setInstructions('');
-    setTestingScope('both');
+    // Only 'frontend' is user-selectable right now (see TESTING_SCOPES.map).
+    setTestingScope('frontend');
     setSuiteMode('fresh');
-    setCoverageLoopEnabled(false);
-    setCoverageTargetPct('');
     setFormCollapsed(false);
   }, []);
 
@@ -805,7 +809,12 @@ export function RunsView({
                       disabled={configLocked}
                     >
                       {TESTING_SCOPES.map((s) => (
-                        <option key={s.value} value={s.value}>
+                        // UI-only restriction: only 'frontend' is user-selectable right
+                        // now — 'backend'/'both' stay in the list (so a historical run
+                        // started with one of them still renders correctly via
+                        // effectiveTestingScope) but can't be picked for a new run. No
+                        // backend change: RunOptions.testingScope still accepts all three.
+                        <option key={s.value} value={s.value} disabled={s.value !== 'frontend'}>
                           {s.label}
                         </option>
                       ))}
@@ -822,7 +831,16 @@ export function RunsView({
                       disabled={configLocked}
                     >
                       {SUITE_MODES.map((m) => (
-                        <option key={m.value} value={m.value} disabled={m.value !== 'fresh' && !hasSuite}>
+                        // UI-only restriction: 'topup' stays in the list (Repair still
+                        // starts a topup run internally, and a historical topup run
+                        // still renders via effectiveSuiteMode) but isn't user-selectable
+                        // from this form. No backend change: RunOptions.suiteMode still
+                        // accepts 'topup'.
+                        <option
+                          key={m.value}
+                          value={m.value}
+                          disabled={m.value === 'topup' || (m.value !== 'fresh' && !hasSuite)}
+                        >
                           {m.label}
                         </option>
                       ))}
@@ -834,42 +852,6 @@ export function RunsView({
                       <p className="mt-1 truncate text-[11px] text-muted" title={lastSuccessfulRun.id}>
                         Base: run {lastSuccessfulRun.id} ({formatCreatedAt(lastSuccessfulRun.createdAt)})
                       </p>
-                    )}
-                  </div>
-                  <div>
-                    <div className="flex items-center justify-between">
-                      <Label htmlFor="coverage-loop-toggle" className="mb-0">
-                        Coverage feedback loop
-                      </Label>
-                      <Switch
-                        id="coverage-loop-toggle"
-                        checked={effectiveCoverageLoopEnabled}
-                        onCheckedChange={setCoverageLoopEnabled}
-                        disabled={configLocked || suiteMode === 'reuse'}
-                        aria-label="Enable coverage feedback loop"
-                      />
-                    </div>
-                    <p className="mt-1 text-[11px] text-muted">
-                      {effectiveSuiteMode === 'reuse'
-                        ? 'Not applicable — reuse never plans or generates.'
-                        : 'Off by default. When on, re-plans and regenerates just the uncovered units, up to 4 extra passes, until the target below is reached.'}
-                    </p>
-                    {effectiveCoverageLoopEnabled && effectiveSuiteMode !== 'reuse' && (
-                      <div className="mt-2">
-                        <Label htmlFor="coverage-target" className="mb-1.5 block">
-                          Target coverage %
-                        </Label>
-                        <Input
-                          id="coverage-target"
-                          type="number"
-                          min={1}
-                          max={100}
-                          placeholder={effectiveSuiteMode === 'topup' ? 'default: 98' : 'default: 80'}
-                          value={effectiveCoverageTargetPct}
-                          onChange={(e) => setCoverageTargetPct(e.target.value)}
-                          disabled={configLocked}
-                        />
-                      </div>
                     )}
                   </div>
                   <div className="sm:col-span-3">
@@ -1214,6 +1196,8 @@ export function RunsView({
                 loading={detailLoading}
                 onSelectRun={setSelectedRunId}
                 onRetryPass={startRetryPass}
+                retryPassInProgress={detail?.run?.id === retryPassRunId}
+                onRepair={startRepairRun}
               />
             </div>
           )}

@@ -22,6 +22,13 @@ export interface ExplorationArtifact {
   /** Real endpoints observed on the wire during the crawl — see GAP-046 and
    * `browser/network-capture.ts`'s `collectObservedEndpoints()`. */
   observedEndpoints: ObservedEndpoint[];
+  /** Diagnostic summary of any region/config-driven seed fan-out performed beyond the primary
+   * crawl — see `browser/seed-discovery.ts`. Absent when no additional seeds were derived. */
+  seedsCrawled?: { url: string; label?: string; routeCount: number }[];
+  /** Diagnostic record of the plan/endpoint-targeted gap-filling pass (see
+   * `orchestrator/gap-fill.ts`), run once against whichever crawl came out of this artifact
+   * (fresh or cache-reused). Absent when gap-fill found nothing to do or didn't run. */
+  gapFillAttempts?: import('../orchestrator/gap-fill.js').GapFillAttempt[];
 }
 
 export type ExplorationMode = 'computer-use' | 'codegen';
@@ -153,6 +160,17 @@ export interface GeneratedSpec {
   reqTag?: string;
   tier: Tier;
   contents: string;
+  /**
+   * The plan item this spec was generated for, set by the mode that produced
+   * it. Unlike `reqTag`, which two DISTINCT items may legitimately share (e.g.
+   * a UI-tier item and its tierC-api counterpart under the same requirement),
+   * this is always unique — orchestrator/index.ts's registerSpecRows uses it
+   * to resolve the exact originating item instead of guessing by reqTag, which
+   * silently picks the wrong item whenever two share one. Absent for
+   * carried-forward specs (copied bytes from a prior run — see
+   * hydrateCarriedSpecs), which have no "originating item" in THIS run.
+   */
+  planItemId?: string;
 }
 
 /**
@@ -182,7 +200,8 @@ export type QualityFindingCode =
   | 'disabled-button-race-risk'
   | 'disabled-button-click-race'
   | 'ambiguous-locator-risk'
-  | 'unvalidated-status-code-assumption';
+  | 'unvalidated-status-code-assumption'
+  | 'unblurred-validation-assertion';
 
 export interface QualityFinding {
   code: QualityFindingCode;
@@ -248,7 +267,25 @@ export interface ExecResultItem {
    * given, or for any non-skipped status.
    */
   skipReason?: string;
+  /**
+   * Why no usable video is present for this (executed, non-skipped) result —
+   * never a silent gap. Always a complete, ready-to-display message (callers
+   * render it as-is, no prefix/suffix assembly needed) — see
+   * UNEXPLAINED_MISSING_VIDEO_REASON for the one genuinely-unknown case.
+   * Absent when a real, usable video IS present in `artifacts`, or for a
+   * 'skipped' result (which never executed at all).
+   */
+  videoUnavailableReason?: string;
 }
+
+/**
+ * ExecResultItem.videoUnavailableReason's value for the one genuinely
+ * unexplained case: no video attachment exists at all for a browser-based
+ * test, and nothing else (e.g. tierC-api) explains why. Exported as a named
+ * constant — rather than every caller re-typing the literal string — so
+ * emit-a-warning call sites can detect it by identity.
+ */
+export const UNEXPLAINED_MISSING_VIDEO_REASON = 'No video recorded.';
 
 export interface ExecOutcome {
   passed: number;
@@ -283,6 +320,18 @@ export interface ExecOutcome {
    * a mode with no fixture-level mocking (or no mocking at all) simply omits it.
    */
   mockedRequestCounts?: Record<string, number>;
+  /**
+   * Compact, prompt-ready summary of the actual HTTP call(s) a test made via
+   * the `request` fixture — keyed by `${specFile}#${title}` (the same
+   * identity execute.ts's own dedup keyOf() uses), from execute.ts's
+   * readApiEvidence(). Lets triage see the REAL response a failing API-tier
+   * assertion was checking against (which backend answered — Healix's own
+   * mock or the real one — the status, a truncated body), instead of only the
+   * one field Playwright's own error text happened to print. Optional: a test
+   * that never called `request` (or a run predating this feature) simply has
+   * no entry.
+   */
+  apiEvidence?: Record<string, string>;
 }
 
 export interface SuiteBundle {
@@ -311,6 +360,14 @@ export interface TestModeContext {
   emit?: (phase: string, message: string, data?: unknown) => void;
   /** Reports a provider.complete() call's token/cost usage back to the run's store — see UsageRecorder. */
   onUsage?: UsageRecorder;
+  /**
+   * Reports a plan item's terminal GENERATE outcome (generated/dropped) back
+   * to the run's Knowledge Base — see docs/design/retry-pass-coverage-kb-redesign.md.
+   * Called from generate.ts's recordGenOutcome, the single funnel every
+   * per-item terminal outcome already passes through. Optional: undefined
+   * for callers/tests that don't need KB tracking (e.g. bare test contexts).
+   */
+  onKbItemOutcome?: (planItemId: string, status: 'generated' | 'dropped') => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
   /**

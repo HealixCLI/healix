@@ -267,6 +267,21 @@ const VERDICT_LABEL: Record<TriageResult['verdict'], string> = {
   ambiguous: 'Ambiguous',
 };
 
+const VERDICT_SOURCE_LABEL: Record<TriageResult['verdictSource'], string> = {
+  ai_reviewed: 'AI-reviewed',
+  rule_fallback: 'Rule-based',
+};
+
+/**
+ * Small badge distinguishing a genuinely AI-reviewed verdict from one that
+ * fell back to the deterministic rule baseline (AI call errored, timed out,
+ * or returned an unparseable reply) — without this, both looked identical to
+ * a reader even though their evidentiary basis is very different.
+ */
+function renderVerdictSourceBadge(source: TriageResult['verdictSource']): string {
+  return `<span class="tag verdict-source-${esc(source)}">${esc(VERDICT_SOURCE_LABEL[source] ?? source)}</span>`;
+}
+
 /**
  * Split a raw Playwright error blob into a one-line summary (for the row
  * itself) and the remaining call log / stack trace (tucked behind a
@@ -298,6 +313,17 @@ const IMG_EXT = /\.(png|jpe?g|gif|webp)$/i;
 const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
 
 /**
+ * Explicit note rendered in place of a video player when one isn't present —
+ * see ExecResultItem.videoUnavailableReason's doc comment for the three
+ * distinct cases this covers. Never silently omitted: a missing video always
+ * shows either the player or this note, never neither.
+ */
+function renderVideoUnavailableNote(reason: string | undefined): string {
+  if (!reason) return '';
+  return `<div class="video-unavailable"><em>${esc(reason)}</em></div>`;
+}
+
+/**
  * Evidence for one test row — screenshot(s), video, and anything else
  * captured (trace.zip, error-context.md, …). `reportDir` is the absolute
  * directory report.html itself is written to (runDir/reports); artifact
@@ -308,12 +334,24 @@ const VIDEO_EXT = /\.(webm|mp4|mov)$/i;
  * callers, unit tests) we fall back to the original plain-basename listing,
  * since we have no safe path to link to.
  */
-function renderArtifacts(artifacts: string[] | undefined, reportDir: string | undefined): string {
-  if (!artifacts || artifacts.length === 0) return '';
-  if (!reportDir) {
-    return `<div class="hist">${artifacts.map((a) => esc(baseName(a))).join(', ')}</div>`;
+function renderArtifacts(
+  artifacts: string[] | undefined,
+  reportDir: string | undefined,
+  videoUnavailableReason?: string,
+): string {
+  if (!artifacts || artifacts.length === 0) {
+    return renderVideoUnavailableNote(videoUnavailableReason);
   }
-  const items = artifacts.map((abs) => ({
+  if (!reportDir) {
+    return `<div class="hist">${artifacts.map((a) => esc(baseName(a))).join(', ')}</div>${renderVideoUnavailableNote(videoUnavailableReason)}`;
+  }
+  // A run recorded before the double-video-attachment fix can list the same
+  // underlying video file twice (once under Playwright's own "video"
+  // attachment, once under this project's now-removed "video-manual-context-N"
+  // duplicate for that same default context) — same absolute path, so a
+  // dedupe here collapses it back down to the one real video.
+  const dedupedArtifacts = [...new Set(artifacts)];
+  const items = dedupedArtifacts.map((abs) => ({
     href: relative(reportDir, abs).split(sep).join('/'),
     name: baseName(abs),
   }));
@@ -331,8 +369,12 @@ function renderArtifacts(artifacts: string[] | undefined, reportDir: string | un
   const videoHtml = videos
     .map((i) => `<video controls preload="metadata" class="ev-video" src="${esc(i.href)}"></video>`)
     .join('');
+  // A video's own presence in `artifacts` means it's real (never blank —
+  // execute.ts already filtered those out), so the note only ever shows
+  // alongside images/other when there's genuinely no video among them.
+  const videoNote = videos.length === 0 ? renderVideoUnavailableNote(videoUnavailableReason) : '';
   const otherHtml = other.map((i) => `<a class="ev-file" href="${esc(i.href)}">${esc(i.name)}</a>`).join('');
-  return `<div class="evidence">${imgHtml}${videoHtml}${otherHtml}</div>`;
+  return `<div class="evidence">${imgHtml}${videoHtml}${videoNote}${otherHtml}</div>`;
 }
 
 /**
@@ -399,7 +441,7 @@ function renderErrorCell(error: string | undefined, triage: ReportTriageEntry | 
   const triageBlock = triage
     ? `<div class="diagnosis"><span class="tag verdict-${esc(triage.triage.verdict)}">${esc(
         VERDICT_LABEL[triage.triage.verdict] ?? triage.triage.verdict,
-      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span>
+      )}</span> <span class="hist">${esc((triage.triage.confidence * 100).toFixed(0))}% confidence</span> ${renderVerdictSourceBadge(triage.triage.verdictSource)}
       <div>${esc(triage.triage.rationale)}</div>
       ${triage.triage.suggestedPatch ? renderSuggestedFix(triage.triage.verdict, triage.triage.suggestedPatch) : ''}
     </div>`
@@ -519,7 +561,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
         formatDuration(r.durationMs),
       )}</td><td>${descriptionCell}</td><td>${errorCell}</td><td>${renderSteps(
         r.steps,
-      )}</td><td>${renderArtifacts(r.artifacts, reportDir)}</td></tr>`;
+      )}</td><td>${renderArtifacts(r.artifacts, reportDir, r.status === 'skipped' ? undefined : r.videoUnavailableReason)}</td></tr>`;
     })
     .join('');
 
@@ -528,7 +570,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
       (t) =>
         `<tr><td>${esc(t.title)}</td><td>${esc(t.triage.verdict)}</td><td>${esc(
           (t.triage.confidence * 100).toFixed(0),
-        )}%</td><td>${esc(t.triage.rationale)}${
+        )}%</td><td>${renderVerdictSourceBadge(t.triage.verdictSource)}</td><td>${esc(t.triage.rationale)}${
           t.triage.suggestedPatch ? renderSuggestedFix(t.triage.verdict, t.triage.suggestedPatch, 'hist') : ''
         }</td></tr>`,
     )
@@ -671,7 +713,7 @@ export function renderReportHtml(report: RunReport, opts: { reportDir?: string }
           : ''
     }
     <table>
-      <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Rationale</th></tr></thead>
+      <thead><tr><th>Title</th><th>Verdict</th><th>Confidence</th><th>Source</th><th>Rationale</th></tr></thead>
       <tbody>${triageRows}</tbody>
     </table>
   </section>`

@@ -114,6 +114,13 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
     }
   }
 
+  // apiEvidence is keyed by the SAME specFile#title identity as mergeIdentity
+  // above, so — unlike mockedRequestCounts (summed, since it's a pure tally
+  // with no notion of "latest") — a collision here should behave like the
+  // results themselves: `b`'s evidence (the later iteration's) wins, since
+  // it reflects what actually happened on the re-executed attempt.
+  const apiEvidence: Record<string, string> = { ...a.apiEvidence, ...b.apiEvidence };
+
   return {
     passed: results.filter((r) => r.status === 'passed').length,
     failed: results.filter((r) => r.status === 'failed').length,
@@ -122,5 +129,6 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
     skipped: results.filter((r) => r.status === 'skipped').length,
     results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
+    ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
   };
 }

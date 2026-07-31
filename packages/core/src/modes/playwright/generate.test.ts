@@ -1871,6 +1871,70 @@ describe('generate — relevance-ranked DOM inventory (Phase 2 scoring)', () => 
     expect(prompt).not.toContain('.filter({ hasText:');
   });
 
+  it('states that a tier-4 positional path is valid only on the route it was captured from', async () => {
+    // Observed live: the same "apple wallet" control appears in the inventory twice with
+    // different positional paths (one per route), and a generated test used one route's path on
+    // the other route — so toBeVisible() failed on an element that was genuinely present. The
+    // route was already printed on every line but never stated as a CONSTRAINT.
+    const elements = [
+      {
+        role: 'generic',
+        name: 'apple wallet',
+        selector: 'div:nth-of-type(6) > div > div:nth-of-type(3) > div > img',
+        selectorTier: 4 as const,
+        repeatedRowText: 'Moje kupóny',
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Add to wallet'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('valid ONLY on');
+    expect(prompt).toContain('NOT interchangeable');
+  });
+
+  it('does not add the route-scoped warning to a stable (tier-1) selector', async () => {
+    const elements = [
+      {
+        role: 'button',
+        name: 'Save',
+        selector: '[data-testid="save"]',
+        selectorTier: 1 as const,
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Save the form'));
+    expect(calls[0].prompt).not.toContain('valid ONLY on');
+  });
+
+  it('flags a readonly field inline so the model does not emit a .fill() against it', async () => {
+    // A readonly input is visible and enabled, so nothing else in its inventory line hints that
+    // filling it is impossible — and a .fill() against one doesn't fail fast, it retries
+    // "element is not editable" until the whole 60s test timeout is gone (observed on the
+    // password-reset confirm field, which the app gates until the first password validates).
+    const elements = [
+      {
+        role: 'textbox',
+        name: 'Confirm password',
+        selector: 'input[data-testid="reset-confirm-password"]',
+        inputType: 'password',
+        readOnly: true,
+      },
+      {
+        role: 'textbox',
+        name: 'New password',
+        selector: 'input[data-testid="reset-new-password"]',
+        inputType: 'password',
+      },
+    ];
+    await generate(ctxWith(explorationWithElements(elements)), planWithIntent('Reset the password'));
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('READONLY');
+    // Only the gated field carries the warning — the ordinary one beside it must stay clean, or
+    // the note becomes noise the model learns to ignore.
+    const confirmLine = prompt.split('\n').find((l) => l.includes('reset-confirm-password'));
+    const newLine = prompt.split('\n').find((l) => l.includes('reset-new-password'));
+    expect(confirmLine).toContain('READONLY');
+    expect(newLine).not.toContain('READONLY');
+  });
+
   it('handles a global inventory of 120+ elements across many routes without exceeding MAX_SNAPSHOT_ELEMENTS', async () => {
     const manyRoutesExploration: NonNullable<TestModeContext['exploration']> = {
       crawl: {
@@ -2186,6 +2250,121 @@ describe('generate — prompt trimming (per-item route filtering)', () => {
     const prompt = calls[0].prompt;
     expect(prompt).toContain('checkout-pay');
     expect(prompt).toContain('settings-save');
+  });
+});
+
+// ---- content inventory: non-interactive content (barcodes/images/status text) grounding --------
+
+describe('generate — non-interactive content inventory (formatContentInventory)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-content-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function explorationWithContent(
+    contentElements: NonNullable<
+      TestModeContext['exploration']
+    >['crawl']['routes'][number]['snapshot']['contentElements'],
+  ): NonNullable<TestModeContext['exploration']> {
+    const routes = [
+      {
+        url: 'https://app.acme.test/vouchers',
+        title: 'Vouchers',
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        snapshot: {
+          url: 'https://app.acme.test/vouchers',
+          title: 'Vouchers',
+          interactiveElements: [],
+          contentElements,
+        },
+        networkEvents: [],
+      },
+    ];
+    return {
+      crawl: {
+        routes,
+        visitedCount: routes.length,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+  }
+
+  function ctxWith(exploration: NonNullable<TestModeContext['exploration']>): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration,
+    };
+  }
+
+  it('includes a labeled, non-clickable content section when contentElements are present', async () => {
+    const ctx = ctxWith(
+      explorationWithContent([
+        { kind: 'svg', selector: '[data-testid="voucher-barcode"]', description: 'Voucher barcode: 123456' },
+      ]),
+    );
+    await generate(ctx, PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('Non-interactive content observed during exploration');
+    expect(prompt).toContain('NOT clickable');
+    expect(prompt).toContain('[data-testid="voucher-barcode"]');
+    expect(prompt).toContain('Voucher barcode: 123456');
+  });
+
+  it('omits the content section entirely when no route has contentElements', async () => {
+    const ctx = ctxWith(explorationWithContent(undefined));
+    await generate(ctx, PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('Non-interactive content observed during exploration');
+  });
+
+  it('omits the content section entirely when there is no exploration data at all', async () => {
+    const ctx: TestModeContext = {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+    };
+    await generate(ctx, PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('Non-interactive content observed during exploration');
+  });
+
+  it('never emits the content section for a tierC-api item', async () => {
+    const ctx = ctxWith(
+      explorationWithContent([
+        { kind: 'status-text', selector: '[role="status"]', description: 'Saved successfully' },
+      ]),
+    );
+    const apiPlan: TestPlan = {
+      summary: 'one api item',
+      items: [{ ...PLAN.items[0], tier: 'tierC-api' }],
+    };
+    await generate(ctx, apiPlan);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('Non-interactive content observed during exploration');
   });
 });
 

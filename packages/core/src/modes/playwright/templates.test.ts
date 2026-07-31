@@ -145,6 +145,38 @@ describe('actionHighlighterFixtureContents', () => {
     expect(src).not.toContain('waitForTimeout');
     expect(src).not.toContain('slowMo');
   });
+
+  it('wraps the `request` fixture to log real (unmocked) API calls as evidence, tagged [REAL BACKEND]', () => {
+    const src = actionHighlighterFixtureContents();
+    // The mock-disabled path: request calls hit the real backend, and are logged.
+    expect(src).toContain('request: async ({ request }, use, testInfo)');
+    expect(src).toContain('logApiEvidence');
+    expect(src).toContain('join(process.cwd(), "healix-api-evidence-log.ndjson")');
+    // Every HTTP verb is wrapped so no call type escapes logging.
+    for (const verb of ['get', 'post', 'put', 'patch', 'delete', 'fetch']) {
+      expect(src).toContain(`${verb}:`);
+    }
+    // Logged as REAL (not a Healix mock) since nothing is intercepted here.
+    expect(src).toContain(', false)'); // logApiEvidence(..., mocked=false)
+  });
+
+  it('patches browser.newContext() to record and attach video for manually-created contexts', () => {
+    const src = actionHighlighterFixtureContents();
+    // Guarded so the patch is only installed once per worker, not re-wrapped every test.
+    expect(src).toContain('__healixVideoPatched');
+    expect(src).toContain('browser.newContext.bind(browser)');
+    // recordVideo is injected, but a caller's own options (if any) still win via the spread order.
+    expect(src).toContain('recordVideo: { dir: info.outputDir }, ...options');
+    // Every page opened in the manually-created context gets tracked and its video attached on close.
+    expect(src).toContain("ctx.on('page'");
+    expect(src).toContain("ctx.on('close'");
+    expect(src).toContain('.video()?.path()');
+    expect(src).toContain("contentType: 'video/webm'");
+    // The default context/page fixture also routes through browser.newContext()
+    // and already requests + attaches its own video — skip re-attaching it
+    // here so every test doesn't get a duplicate (broken, mid-recording) video.
+    expect(src).toContain('isDefaultContext');
+  });
 });
 
 describe('stepsReporterContents', () => {
@@ -415,6 +447,17 @@ describe('mockFixtureContents', () => {
     expect(src).toContain('const MOCKED_ROUTES = []');
   });
 
+  it('logs each mocked request-fixture call as evidence, tagged [HEALIX MOCK] (mocked=true)', () => {
+    const src = mockFixtureContents([
+      { id: 'pkg:stripe', hostnames: ['api.stripe.com'], response: { status: 200, body: { ok: true } } },
+    ]);
+    expect(src).toContain('logApiEvidence');
+    expect(src).toContain('join(process.cwd(), "healix-api-evidence-log.ndjson")');
+    // The fake request path logs with mocked=true (distinguishing it from the
+    // real-backend path in action-highlighter.js).
+    expect(src).toContain("await logApiEvidence(key, method, requestPath || '', canned.status, text, true)");
+  });
+
   describe('F-13/F-14 — path-aware resolution across ALL mocked routes, not just the first one', () => {
     /** Pulls a named top-level function's source out of the generated fixture so its actual logic (not just a substring) is exercised. */
     function extractFunctionSource(src: string, name: string): string {
@@ -576,7 +619,7 @@ describe('authSetupContents — locale-aware login fixture', () => {
 
   it('F-16: matches a plain "Submit" button label — the RBAC live-run gap (an MUI <Button> with no type="submit" and no data-testid)', () => {
     const fixture = authSetupContents();
-    const match = /submitButton = await submitButtonLocator\(page, (\/[^/]+\/i)\)/.exec(fixture);
+    const match = /guessSubmitButton = await submitButtonLocator\(page, (\/[^/]+\/i)\)/.exec(fixture);
     expect(match).not.toBeNull();
     const re = new Function(`return ${match![1]}`)();
     for (const label of ['Submit', 'SUBMIT', 'submit']) {
@@ -586,6 +629,38 @@ describe('authSetupContents — locale-aware login fixture', () => {
     for (const label of ['Sign in', 'Log in', 'Continue', 'Prihlásiť']) {
       expect(re.test(label)).toBe(true);
     }
+  });
+
+  it('prefers EXPLORE-grounded login selectors over the generic guesses, falling back when unset', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('function preferGrounded(page, groundedSelector, fallbackLocator, timeoutMs)');
+    expect(fixture).toContain('HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR');
+    expect(fixture).toContain(
+      'const identifierField = await preferGrounded(\n    page,\n    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR,\n    guessIdentifierField,\n    3000,\n  );',
+    );
+    expect(fixture).toContain(
+      'const passwordField = await preferGrounded(\n    page,\n    process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR,\n    guessPasswordField,\n    3000,\n  );',
+    );
+    expect(fixture).toContain(
+      'const submitButton = await preferGrounded(page, groundedSubmitSelector, guessSubmitButton, 3000);',
+    );
+  });
+
+  it('presses Enter instead of guessing a submit button when the form is grounded but EXPLORE captured no submit selector (proven Enter-driven login)', () => {
+    const fixture = authSetupContents();
+    // A grounded form with no submit selector is a PROVEN fact (see login.ts's own Enter-key
+    // fallback), not a gap to guess at — must not fall through to guessSubmitButton in that case.
+    expect(fixture).toContain(
+      'const hasGroundedForm = !!(\n    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR || process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR\n  );',
+    );
+    const ifIdx = fixture.indexOf('if (hasGroundedForm && !groundedSubmitSelector) {');
+    expect(ifIdx).toBeGreaterThan(-1);
+    const enterIdx = fixture.indexOf("await page.keyboard.press('Enter');", ifIdx);
+    expect(enterIdx).toBeGreaterThan(ifIdx);
+    const elseIdx = fixture.indexOf('} else {', enterIdx);
+    expect(elseIdx).toBeGreaterThan(enterIdx);
+    const guessIdx = fixture.indexOf('guessSubmitButton', elseIdx);
+    expect(guessIdx).toBeGreaterThan(elseIdx);
   });
 
   it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {

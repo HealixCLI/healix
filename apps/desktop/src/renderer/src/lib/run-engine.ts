@@ -115,6 +115,14 @@ export interface RunEngine extends RunEngineState {
    * run this engine was last tracking) and adopt it as the live run.
    */
   resume: (runId: string) => Promise<void>;
+  /**
+   * Same-run recovery: regenerate whatever the Knowledge Base flags as
+   * dropped, execute everything still pending, refresh the run's
+   * report/coverage in place — no new run row, so this SAME runId is what
+   * goes live, not a freshly-minted one. See
+   * docs/design/retry-pass-coverage-kb-redesign.md.
+   */
+  retryPass: (runId: string) => Promise<void>;
   reset: () => void;
   /**
    * Re-attach to a run that is still genuinely parked awaiting approval in the
@@ -692,6 +700,32 @@ export function useRunEngine(): RunEngine {
     }
   }, []);
 
+  const retryPass = useCallback(async (runId: string): Promise<void> => {
+    // Same shape as resume(): adopt this run as the live one, reset the
+    // console/plan/summary, then track it exactly like a freshly-started
+    // run for the rest of its lifecycle — except no new runId is ever
+    // minted, since retryPassRun extends the SAME run row.
+    lineSeq.current = 0;
+    activeRunId.current = runId;
+    setState({ ...INITIAL, runId, phase: 'starting' });
+    try {
+      const result = await window.healix.retryPass(runId);
+      if (!result.ok) {
+        setState((prev) => ({ ...prev, phase: 'error', error: result.reason }));
+        return;
+      }
+      const summary = result.summary;
+      setState((prev) => ({
+        ...prev,
+        summary,
+        phase: prev.phase === 'error' ? 'error' : settledPhase(summary.status),
+      }));
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      setState((prev) => ({ ...prev, phase: 'error', error: message }));
+    }
+  }, []);
+
   const reset = useCallback((): void => {
     activeRunId.current = null;
     lineSeq.current = 0;
@@ -728,6 +762,7 @@ export function useRunEngine(): RunEngine {
     cancel,
     pause,
     resume,
+    retryPass,
     reset,
     hydrate,
     clearError,

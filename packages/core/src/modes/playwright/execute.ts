@@ -13,8 +13,9 @@ import type {
   TestingScope,
   TestModeContext,
 } from '../types.js';
-import { tiersForScope } from '../types.js';
+import { tiersForScope, UNEXPLAINED_MISSING_VIDEO_REASON } from '../types.js';
 import {
+  API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
@@ -125,16 +126,29 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     env.HEALIX_TIERB_EMAIL = defaultCredential.username;
     env.HEALIX_TIERB_PASSWORD = defaultCredential.password;
     // The auth fixture requires all three of email/password/loginUrl to
-    // attempt a real login (see authSetupContents() in templates.ts). Prefer
-    // EXPLORE's discovered/scored login candidate (hash- and region-prefix
-    // aware — see browser/crawler.ts scoreLoginCandidates) over the naive
-    // `/login` path join, which 404s or falls back to the app's default
-    // route on a HashRouter + region-prefixed app (the RCA's Branch 2).
-    const discovered = ctx.exploration?.loginCandidates?.[0]?.url;
+    // attempt a real login (see authSetupContents() in templates.ts). Prefer,
+    // in order: (1) the exact page/selectors EXPLORE's own login attempt
+    // PROVED work (crawl/verifiedLogin — see browser/crawler.ts crawlWithAuth),
+    // since it demonstrably worked and a re-derived score can't see that;
+    // (2) EXPLORE's discovered/scored login candidate (hash- and
+    // region-prefix aware — see browser/crawler.ts scoreLoginCandidates) over
+    // the naive `/login` path join, which 404s or falls back to the app's
+    // default route on a HashRouter + region-prefixed app (the RCA's Branch 2).
+    const verified = ctx.exploration?.crawl?.verifiedLogin;
+    const discovered = verified?.pageUrl ?? ctx.exploration?.loginCandidates?.[0]?.url;
     if (discovered) {
       env.HEALIX_TIERB_LOGIN_URL = discovered;
     } else if (ctx.baseUrl) {
       env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    }
+    // Grounds the generated fixture's field/submit locators in the selectors EXPLORE actually
+    // typed into/clicked, rather than letting it re-guess independently (see loginForm() in
+    // templates.ts, which falls back to its own guessing when these are unset).
+    if (verified) {
+      env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR = verified.identifierSelector;
+      env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR = verified.passwordSelector;
+      if (verified.submitSelector) env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR = verified.submitSelector;
+      if (verified.toggleSelector) env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR = verified.toggleSelector;
     }
   }
   return env;
@@ -591,6 +605,10 @@ function projectIsTierB(projectName: string | undefined): boolean {
   return /tierb/i.test(String(projectName ?? ''));
 }
 
+function projectIsTierC(projectName: string | undefined): boolean {
+  return /tierc/i.test(String(projectName ?? ''));
+}
+
 /** The auth-setup project/spec that produces the Tier B storageState. */
 function isAuthSetup(projectName: string | undefined, file: string | undefined): boolean {
   return (
@@ -758,10 +776,48 @@ function isBlankVideo(path: string): boolean {
 }
 
 function collectArtifactPaths(attachments: PwAttachment[] | undefined): string[] {
-  return (attachments ?? [])
+  const paths = (attachments ?? [])
     .map((a) => a.path)
     .filter((p): p is string => typeof p === 'string' && p.length > 0)
     .filter((p) => !isBlankVideo(p));
+  // Two attachments can point at the exact same file (e.g. the default
+  // context's own "video" attachment and a manual-context video attachment
+  // for that same context) — dedupe so the same recording is never listed
+  // twice.
+  return [...new Set(paths)];
+}
+
+/** The raw video attachment (before blank-filtering), if Playwright reported one at all. */
+function findVideoAttachment(attachments: PwAttachment[] | undefined): PwAttachment | undefined {
+  return (attachments ?? []).find((a) => typeof a.path === 'string' && VIDEO_EXT.test(a.path));
+}
+
+/**
+ * Why no usable video is present for a result, when one isn't — three
+ * distinct, identifiable causes rather than a silent gap:
+ *  1. tierC-api tests never open a browser page (request-fixture only), so a
+ *     video is structurally impossible regardless of the `video: 'on'` config
+ *     — expected, not a defect.
+ *  2. A video attachment exists but is blank (see isBlankVideo) — the test
+ *     finished before anything rendered; the file is real but useless.
+ *  3. No video attachment at all for a browser-based (tierA/tierB) test —
+ *     genuinely anomalous; worth surfacing as a possible artifact-retention
+ *     gap rather than looking identical to case 1 or 2.
+ * Returns undefined when a real, non-blank video is present (nothing to explain).
+ */
+function computeVideoUnavailableReason(
+  attachments: PwAttachment[] | undefined,
+  projectName: string | undefined,
+): string | undefined {
+  const video = findVideoAttachment(attachments);
+  if (video?.path) {
+    if (!isBlankVideo(video.path)) return undefined;
+    return 'No video recorded — the test finished too quickly for anything to be captured.';
+  }
+  if (projectIsTierC(projectName)) {
+    return 'Video not applicable — this is an API test and did not involve a browser session.';
+  }
+  return UNEXPLAINED_MISSING_VIDEO_REASON;
 }
 
 interface ParsedReport {
@@ -771,6 +827,8 @@ interface ParsedReport {
   blocked: number;
   flaky: number;
   skipped: number;
+  /** Operational warnings surfaced by the caller (e.g. an anomalous missing-video case). */
+  videoWarnings: string[];
 }
 
 // ---- Write-through per-test checkpoint (see templates.ts's checkpointReporterContents()) ----
@@ -836,6 +894,72 @@ export async function readMockRequestCounts(projectDir: string): Promise<Record<
   return counts;
 }
 
+interface ApiEvidenceLogEntry {
+  key: string;
+  method: string;
+  url: string;
+  status: number;
+  mocked: boolean;
+  body: string;
+}
+
+/** How many of a test's own logged API calls get folded into its evidence string — the LAST few (most likely the one whose response a failing assertion was checking), bounded so a chatty test doesn't blow up the triage prompt. */
+const API_EVIDENCE_MAX_CALLS_PER_TEST = 3;
+
+/**
+ * Best-effort read of the request-fixture's write-through call log (see
+ * API_EVIDENCE_LOG_FILENAME's doc comment in templates.ts) — groups entries by
+ * key (`${specFile}#${title}`, same identity as this file's own checkpoint
+ * keyOf()) and formats the LAST few calls per key into a compact, prompt-ready
+ * evidence string: which backend actually answered (Healix's own mock, or the
+ * real one), the status, and a truncated body. This is what lets triage see
+ * the ACTUAL response a failing API-tier assertion was checking against,
+ * instead of just the one field Playwright's own error text happened to
+ * print. A missing file (no tierC-api tests ran this invocation, or nothing
+ * called through `request` at all) just means "no evidence" (`{}`), same
+ * best-effort contract as readMockRequestCounts.
+ */
+export async function readApiEvidence(projectDir: string): Promise<Record<string, string>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, API_EVIDENCE_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const byKey = new Map<string, ApiEvidenceLogEntry[]>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as Partial<ApiEvidenceLogEntry>;
+      if (typeof entry.key !== 'string' || !entry.key) continue;
+      const list = byKey.get(entry.key) ?? [];
+      list.push({
+        key: entry.key,
+        method: typeof entry.method === 'string' && entry.method ? entry.method : 'GET',
+        url: typeof entry.url === 'string' ? entry.url : '',
+        status: typeof entry.status === 'number' ? entry.status : 0,
+        mocked: entry.mocked === true,
+        body: typeof entry.body === 'string' ? entry.body : '',
+      });
+      byKey.set(entry.key, list);
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  const out: Record<string, string> = {};
+  for (const [key, entries] of byKey) {
+    out[key] = entries
+      .slice(-API_EVIDENCE_MAX_CALLS_PER_TEST)
+      .map(
+        (e) =>
+          `[${e.mocked ? 'HEALIX MOCK' : 'REAL BACKEND'}] ${e.method} ${e.url} -> status ${e.status}\nBody: ${e.body || '(empty)'}`,
+      )
+      .join('\n\n');
+  }
+  return out;
+}
+
 /** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
 export async function readCheckpointEntries(projectDir: string): Promise<CheckpointEntry[]> {
   let raw: string;
@@ -889,6 +1013,10 @@ export async function clearExecCheckpoint(projectDir: string): Promise<void> {
     // reusing this projectDir (next coverage-loop gap-fill iteration) must
     // start counting fresh rather than inheriting this phase's hits.
     unlink(join(projectDir, MOCK_REQUEST_LOG_FILENAME)).catch(() => {}),
+    // Same rationale as MOCK_REQUEST_LOG_FILENAME above: cleared here (after
+    // readApiEvidence has already run for THIS invocation) so a later,
+    // unrelated execute() call reusing this projectDir starts fresh.
+    unlink(join(projectDir, API_EVIDENCE_LOG_FILENAME)).catch(() => {}),
   ]);
 }
 
@@ -972,7 +1100,7 @@ export function checkpointEntriesToOutcome(entries: CheckpointEntry[], auth: Aut
     }
   }
 
-  return { results, passed, failed, blocked, flaky, skipped };
+  return { results, passed, failed, blocked, flaky, skipped, videoWarnings: [] };
 }
 
 /**
@@ -996,6 +1124,7 @@ export function mergeParsedReports(a: ParsedReport, b: ParsedReport): ParsedRepo
     blocked: results.filter((r) => r.status === 'blocked').length,
     flaky: results.filter((r) => r.status === 'flaky').length,
     skipped: results.filter((r) => r.status === 'skipped').length,
+    videoWarnings: [...a.videoWarnings, ...b.videoWarnings],
   };
 }
 
@@ -1006,6 +1135,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   let blocked = 0;
   let flaky = 0;
   let skipped = 0;
+  const videoWarnings: string[] = [];
 
   const processSpec = (spec: PwSpec, suiteTitle: string, suiteFile: string | undefined): void => {
     const tests = spec.tests ?? [];
@@ -1028,6 +1158,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
     let worstSkipReason: string | undefined;
     let totalDuration = 0;
     let artifacts: string[] = [];
+    let videoUnavailableReason: string | undefined;
     let isFlaky = false;
 
     for (const test of tests) {
@@ -1071,6 +1202,10 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
         worstSkipReason = status === 'skipped' ? extractSkipReason(test) : undefined;
         const a = collectArtifactPaths(last?.attachments);
         if (a.length > 0) artifacts = a;
+        videoUnavailableReason =
+          status === 'skipped'
+            ? undefined
+            : computeVideoUnavailableReason(last?.attachments, test.projectName);
       }
     }
 
@@ -1090,8 +1225,17 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
       artifacts: artifacts.length > 0 ? artifacts : undefined,
       specFile: spec.file ?? suiteFile,
       skipReason: worstSkipReason,
+      videoUnavailableReason,
     };
     results.push(item);
+
+    // Only the genuinely-anomalous case (browser-based test, no video
+    // attachment at all — not the expected tierC-api/blank-recording cases)
+    // is worth an operational warning; distinguish it by message content
+    // rather than re-deriving the classification here.
+    if (videoUnavailableReason === UNEXPLAINED_MISSING_VIDEO_REASON) {
+      videoWarnings.push(`No video captured for "${title}" and the cause is unclear — worth a closer look.`);
+    }
 
     switch (worst) {
       case 'passed':
@@ -1130,7 +1274,7 @@ export function parseReport(report: PwReport, auth: AuthSignals = NO_AUTH_SIGNAL
   };
 
   for (const suite of report.suites ?? []) walk(suite, '', undefined);
-  return { results, passed, failed, blocked, flaky, skipped };
+  return { results, passed, failed, blocked, flaky, skipped, videoWarnings };
 }
 
 /** Read results.json if present and newer than the run start. */
@@ -1241,7 +1385,7 @@ function parseSummaryText(combined: string): ParsedReport {
   const failed = num(/(\d+)\s+failed/i);
   const flaky = num(/(\d+)\s+flaky/i);
   const skipped = num(/(\d+)\s+skipped/i);
-  return { results: [], passed, failed, blocked: 0, flaky, skipped };
+  return { results: [], passed, failed, blocked: 0, flaky, skipped, videoWarnings: [] };
 }
 
 /** Outcome returned when the caller cancelled the run — never a throw. */
@@ -1405,6 +1549,16 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     parsed = mergeParsedReports(parsed, checkpointEntriesToOutcome(priorEntries, auth));
   }
 
+  // Surface the genuinely-anomalous missing-video case operationally (not
+  // just in the report) — a browser-based test with no video attachment at
+  // all may indicate a real artifact-retention gap worth investigating.
+  // (A manually-created browser context, previously the dominant cause of
+  // this, no longer reaches here — templates.ts's page fixture now patches
+  // browser.newContext() to record and attach video automatically.)
+  for (const warning of parsed.videoWarnings) {
+    emit(ctx, `[execute] ${warning}`);
+  }
+
   // Best-effort: attach the step-by-step breakdown (see stepsReporterContents()
   // in templates.ts) to each result by title — steps.json is written
   // regardless of whether results.json parsed, so this runs unconditionally.
@@ -1423,6 +1577,10 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // of results.json/steps.json — present regardless of whether the report
   // parsed, since the fixture logs a hit the moment it fulfills a request.
   const mockedRequestCounts = await readMockRequestCounts(ctx.projectDir);
+  // Same rationale as mockedRequestCounts above: present regardless of
+  // whether results.json parsed, since the request fixture logs a call the
+  // moment it resolves.
+  const apiEvidence = await readApiEvidence(ctx.projectDir);
 
   const outcome: ExecOutcome = {
     passed: parsed.passed,
@@ -1432,6 +1590,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     skipped: parsed.skipped,
     results: parsed.results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
+    ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
     raw: {
       exitCode: cmd.code,
       signal: cmd.signal,

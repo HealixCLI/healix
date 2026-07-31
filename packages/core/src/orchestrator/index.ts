@@ -40,18 +40,20 @@ import { mockDependencyUrl, startMockServer } from '../target/mock-server.js';
 import type { ExternalDependency, MockResponse, MockServerHandle } from '../target/types.js';
 import { runCli } from '../exec/run-cli.js';
 import { createBrowserSurface } from '../browser/index.js';
-import { runExplorePhase, splitStaticUnitsForExplore } from './explore.js';
+import { runExplorePhase, splitStaticUnitsForExplore, assessExplorationUsefulness } from './explore.js';
+import { deriveRegionCodesFromText } from '../browser/seed-discovery.js';
+import { identifyExplorationGaps, runGapFillingPass } from './gap-fill.js';
+import { mergeCrawlResults } from '../browser/crawler.js';
 import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageBatchItem, TriageInput, TriageResult } from '../triage/types.js';
 import { summarizeTriageGroups } from '../triage/grouping.js';
 import type { GroupingSummaryUnavailableReason } from '../triage/grouping.js';
+import { correlateBySignature } from '../triage/correlate.js';
 import {
   buildPlanPrompt,
-  buildGapFillPlanPrompt,
   buildBatchPlanPrompt,
-  parsePlan,
   parsePlanWithDiagnostics,
   synthesizePlan,
   type PlanRepoContext,
@@ -83,7 +85,8 @@ import {
   writeCheckpoint,
   type ResumeCheckpoint,
 } from './checkpoint.js';
-import { writeRunConfigSnapshot } from './run-config.js';
+import { readRunConfigSnapshot, writeRunConfigSnapshot } from './run-config.js';
+import { computeKbBackfillRows } from './kb-backfill.js';
 import type {
   Orchestrator,
   OrchestratorEvent,
@@ -114,16 +117,22 @@ export type { ResumeCheckpoint } from './checkpoint.js';
  */
 const TRIAGE_ANALYZE_TIMEOUT_MS = ABSOLUTE_BACKSTOP_MS + 60_000;
 /**
- * How many failures (at most) get escalated to AI triage analysis. Raised from 3 to 8 to 20:
- * a real 21-failure run showed 8 still left 14 failures stuck at the generic low-confidence
- * baseline ('ambiguous', rationale "no more context available") — the un-escalated remainder is
- * exactly what was causing ambiguous-heavy reports. Grouped into TRIAGE_AI_BATCH_SIZE-sized
- * batches, each triaged with ONE provider call covering every item in the group (see
- * TriageEngine.analyzeBatch) instead of one call per item — every item still gets its own full
- * evidence block, only the fixed hypothesis/instructions preamble is paid once per batch instead
- * of once per item.
+ * Historical note: this used to cap how many failures (at most) got escalated
+ * to AI triage analysis (raised over time from 3 to 8 to 20). That cap is
+ * gone — EVERY failure with a rule baseline is now escalated to AI, so a run
+ * with more failures than any prior fixed limit no longer leaves the
+ * remainder stuck on the generic low-confidence baseline just because they
+ * didn't make the cut. If the AI call itself errors, times out, or returns an
+ * unparseable reply for a given item, that item simply keeps its
+ * classifyByRules() baseline — surfaced to the user via
+ * TriageResult.verdictSource ('rule_fallback' vs 'ai_reviewed') rather than
+ * silently looking identical to a reviewed-and-agreed verdict. Grouped into
+ * TRIAGE_AI_BATCH_SIZE-sized batches, each triaged with ONE provider call
+ * covering every item in the group (see TriageEngine.analyzeBatch) instead of
+ * one call per item — every item still gets its own full evidence block,
+ * only the fixed hypothesis/instructions preamble is paid once per batch
+ * instead of once per item.
  */
-const TRIAGE_AI_LIMIT = 20;
 /** How many failures share a single batched AI-triage call. */
 const TRIAGE_AI_BATCH_SIZE = 5;
 /**
@@ -184,6 +193,9 @@ export function createOrchestrator(overrides?: OrchestratorOverrides): Orchestra
     },
     resume(runId: string, hooks?: OrchestratorHooks, signal?: AbortSignal): Promise<RunSummary> {
       return resumePipeline(runId, hooks, overrides, signal);
+    },
+    retryPass(runId: string, hooks?: OrchestratorHooks, signal?: AbortSignal): Promise<RunSummary> {
+      return retryPassPipeline(runId, hooks, overrides, signal);
     },
   };
 }
@@ -248,6 +260,582 @@ async function resumePipeline(
     signal,
   };
   return runPipeline(resumeOpts, hooks, overrides, { run, checkpoint });
+}
+
+/**
+ * Regenerate whatever the Knowledge Base flags as 'dropped' for this run,
+ * then execute every scenario still 'pending' (freshly regenerated ones and
+ * any pre-existing crash-mid-execute survivors) — the single primitive both
+ * retryPassPipeline and the in-process coverage-feedback-loop call. Takes
+ * `ctx` as a required parameter rather than resolving one itself: the
+ * coverage loop already has a live one in scope; retryPassPipeline builds its
+ * own before calling this. See docs/design/retry-pass-coverage-kb-redesign.md §3c.
+ */
+async function regenerateDroppedAndExecutePending(params: {
+  ctx: TestModeContext;
+  mode: TestMode;
+  runId: string;
+  store: HealixStore;
+  plan: TestPlan;
+  emit: (
+    phase: OrchestratorPhase | string,
+    level: OrchestratorEvent['level'],
+    message: string,
+    data?: unknown,
+  ) => void;
+  testIdByKey: Map<string, string>;
+  noteStoreOk: () => void;
+  noteStoreFailure: (op: string, err: unknown) => void;
+}): Promise<{
+  specs: GeneratedSpec[];
+  outcome: ExecOutcome;
+  regeneratedCount: number;
+  executedPendingCount: number;
+}> {
+  const { ctx, mode, runId, store, plan, emit, testIdByKey, noteStoreOk, noteStoreFailure } = params;
+
+  const droppedKb = store.listDroppedPlanKbItems(runId);
+  const droppedItems = droppedKb
+    .map((kb) => plan.items.find((it) => it.id === kb.planItemId))
+    .filter((it): it is TestPlanItem => it !== undefined);
+
+  // Snapshot "pending BEFORE this call touches anything" — must happen
+  // BEFORE mode.generate() below, not after: a freshly-regenerated item's
+  // scenarios are cascaded to 'pending' by ctx.onKbItemOutcome as part of
+  // the SAME generate() call (see updatePlanKbItemStatus's generated ->
+  // pending cascade), so querying "pending" afterward would incorrectly
+  // catch the item this call JUST regenerated too, executing it twice.
+  const kbItems = store.listPlanKbItems(runId);
+  const kbItemById = new Map(kbItems.map((k) => [k.id, k]));
+  const itemByPlanItemId = new Map(plan.items.map((it) => [it.id, it]));
+  const droppedItemIds = new Set(droppedItems.map((it) => it.id));
+  const pendingScenariosBefore = store.listPendingPlanKbScenarios(runId).filter((scenario) => {
+    const kbItem = kbItemById.get(scenario.kbItemId);
+    return !kbItem || !droppedItemIds.has(kbItem.planItemId);
+  });
+
+  let newSpecs: GeneratedSpec[] = [];
+  if (droppedItems.length > 0) {
+    emit('generate', 'info', `Retry: regenerating ${droppedItems.length} dropped item(s).`);
+    newSpecs = await mode.generate(ctx, {
+      summary: 'Regenerating previously dropped item(s).',
+      items: droppedItems,
+    });
+    for (const spec of newSpecs)
+      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure);
+  }
+
+  // Reconstruct still-pending (generated but never executed) specs from
+  // their already-persisted tests rows — no need to regenerate them. One
+  // GeneratedSpec per unique spec file (several scenarios can share one).
+  // `base` here MUST match the key registerSpecRows originally used
+  // (`stableKey(item.reqTag ?? item.id, ...)` — stableKey ignores title
+  // entirely once a tag is present, see stableKey below), pre-seeded into
+  // testIdByKey using the KB's own durably-stored scenario_index, so
+  // persistResults' positional matching finds these EXISTING rows instead of
+  // minting new orphans when the reconstructed specs are re-executed.
+  const pendingSpecsByPath = new Map<string, GeneratedSpec>();
+  for (const scenario of pendingScenariosBefore) {
+    if (!scenario.testId) continue;
+    const test = store.getTest(scenario.testId);
+    if (!test || !test.specPath || !test.specCode) continue;
+    const kbItem = kbItemById.get(scenario.kbItemId);
+    const planItem = kbItem ? itemByPlanItemId.get(kbItem.planItemId) : undefined;
+    const reqTag = planItem ? (planItem.reqTag ?? planItem.id) : (test.reqTag ?? undefined);
+    const base = stableKey(reqTag, test.title);
+    testIdByKey.set(`${base}#${scenario.scenarioIndex}`, test.id);
+    if (!pendingSpecsByPath.has(test.specPath)) {
+      pendingSpecsByPath.set(test.specPath, {
+        path: join(ctx.projectDir, test.specPath),
+        title: planItem?.title ?? test.title,
+        reqTag,
+        tier: (test.tier ?? 'tierA-public') as Tier,
+        contents: test.specCode,
+      });
+    }
+  }
+  const pendingSpecs = [...pendingSpecsByPath.values()];
+
+  const toExecute = [...newSpecs, ...pendingSpecs];
+  let outcome: ExecOutcome = { passed: 0, failed: 0, blocked: 0, flaky: 0, skipped: 0, results: [] };
+  if (toExecute.length > 0) {
+    emit(
+      'execute',
+      'info',
+      `Executing ${toExecute.length} spec(s) (${newSpecs.length} regenerated, ${pendingSpecs.length} previously pending).`,
+    );
+    outcome = await mode.execute(ctx, toExecute);
+    persistResults(store, runId, toExecute, outcome, testIdByKey, noteStoreOk, noteStoreFailure);
+  }
+
+  return {
+    specs: toExecute,
+    outcome,
+    regeneratedCount: newSpecs.length,
+    executedPendingCount: pendingSpecs.length,
+  };
+}
+
+/**
+ * Reconstruct a full ExecOutcome + GeneratedSpec[] picture for a run purely
+ * from durable storage — no in-memory state survives between the original
+ * runPipeline() call finishing and a later retryPassPipeline() call, so
+ * everything needed for coverage/report recomputation has to come from the
+ * DB. Recomputes pass/fail/etc. counts from `results` directly (never trusts
+ * a stored total), matching mergeExecOutcomes' own convention.
+ */
+function reconstructRunStateFromDb(
+  store: HealixStore,
+  runId: string,
+  projectDir: string,
+): { specs: GeneratedSpec[]; outcome: ExecOutcome } {
+  const tests = store.listTests(runId);
+  const results = store.listResults(runId);
+  const testById = new Map(tests.map((t) => [t.id, t]));
+
+  const items: ExecOutcome['results'] = [];
+  for (const r of results) {
+    const test = testById.get(r.testId);
+    if (!test) continue;
+    let artifacts: string[] | undefined;
+    if (r.artifactsJson) {
+      try {
+        artifacts = JSON.parse(r.artifactsJson) as string[];
+      } catch {
+        artifacts = undefined;
+      }
+    }
+    items.push({
+      title: test.title,
+      status: r.status,
+      durationMs: r.durationMs ?? undefined,
+      error: r.error ?? undefined,
+      artifacts,
+      specFile: test.specPath ?? undefined,
+      skipReason: r.skipReason ?? undefined,
+    });
+  }
+
+  const specsByPath = new Map<string, GeneratedSpec>();
+  for (const t of tests) {
+    if (!t.specPath || !t.specCode || specsByPath.has(t.specPath)) continue;
+    specsByPath.set(t.specPath, {
+      path: join(projectDir, t.specPath),
+      title: t.title,
+      reqTag: t.reqTag ?? undefined,
+      tier: (t.tier ?? 'tierA-public') as Tier,
+      contents: t.specCode,
+    });
+  }
+
+  const outcome: ExecOutcome = {
+    passed: items.filter((i) => i.status === 'passed').length,
+    failed: items.filter((i) => i.status === 'failed').length,
+    blocked: items.filter((i) => i.status === 'blocked').length,
+    flaky: items.filter((i) => i.status === 'flaky').length,
+    skipped: items.filter((i) => i.status === 'skipped').length,
+    results: items,
+  };
+  return { specs: [...specsByPath.values()], outcome };
+}
+
+/**
+ * Simplified white-box relaunch for retry-pass's cold start: detect + launch
+ * to get a live baseUrl again, WITHOUT runPipeline's full install-and-retry
+ * recovery ladder or mock-server/env-override wiring — a deliberate scope
+ * cut given this is a bounded, on-demand recovery pass, not the primary run
+ * path. If the original run had env-override-mocked external dependencies,
+ * retry-pass does not restart the mock server for them. Black-box projects
+ * (baseUrl already set) and pure-reuse-suite runs with no repoPath are
+ * no-ops.
+ */
+async function launchProjectForRetryPass(
+  project: Project,
+  target: ReturnType<typeof createTargetAdapter>,
+  emit: (
+    phase: OrchestratorPhase | string,
+    level: OrchestratorEvent['level'],
+    message: string,
+    data?: unknown,
+  ) => void,
+): Promise<{ baseUrl: string | null | undefined; stop: (() => Promise<void>) | null }> {
+  if (project.baseUrl || !project.repoPath) return { baseUrl: project.baseUrl, stop: null };
+  emit('launch', 'info', `[launch] (retry-pass) Detecting app in ${project.repoPath}.`);
+  const det = await target.detect(project.repoPath);
+  const port = await findFreePort(det.port ?? undefined);
+  const handle = await target.launch({
+    repoPath: project.repoPath,
+    startCommand: det.startCommand ?? undefined,
+    installCommand: det.installCommand ?? undefined,
+    installDir: det.installDir ?? undefined,
+    port,
+    readyTimeoutMs: 120_000,
+  });
+  emit('launch', 'info', `[launch] (retry-pass) App relaunched at ${handle.baseUrl}.`);
+  return { baseUrl: handle.baseUrl, stop: () => handle.stop() };
+}
+
+/**
+ * On-demand, same-run recovery: regenerate whatever the Knowledge Base flags
+ * as 'dropped' for this run, execute everything still 'pending', and refresh
+ * the run's report/coverage in place — no new run row, no base_run_id. The
+ * run's original testingScope/provider/PRD/coverage settings are reloaded
+ * from run-config.json rather than defaulted. Never rides resumeRun's
+ * checkpoint (a completed run has none — see deleteCheckpoint above) and
+ * cannot reuse the coverage loop's in-process shape (that only exists while
+ * runPipeline() is still on the stack) — this is its own entry point. See
+ * docs/design/retry-pass-coverage-kb-redesign.md §3.
+ */
+async function retryPassPipeline(
+  runId: string,
+  hooks?: OrchestratorHooks,
+  overrides?: OrchestratorOverrides,
+  signal?: AbortSignal,
+): Promise<RunSummary> {
+  const getMode = overrides?.getMode ?? getTestMode;
+  const makeTarget = overrides?.makeTarget ?? createTargetAdapter;
+  const makeBrowser = overrides?.makeBrowser ?? createBrowserSurface;
+  const store = overrides?.store ?? (await getStore());
+
+  const emit = (
+    phase: OrchestratorPhase | string,
+    level: OrchestratorEvent['level'],
+    message: string,
+    data?: unknown,
+  ): void => {
+    try {
+      store?.appendEvent(runId, String(phase), message, { level, data });
+    } catch {
+      /* best-effort */
+    }
+    try {
+      hooks?.onEvent?.({ phase, level, message, data });
+    } catch {
+      /* never let a hook crash the run */
+    }
+  };
+  const noteStoreOk = (): void => {};
+  const noteStoreFailure = (op: string, err: unknown): void => {
+    emit('report', 'warn', `Store write failed during retry-pass (${op}): ${errMsg(err)}`);
+  };
+
+  if (!store) {
+    emit('plan', 'error', 'Storage unavailable (node:sqlite missing); cannot retry-pass.');
+    return { runId, status: 'error' };
+  }
+  const run = store.getRun(runId);
+  if (!run) {
+    emit('plan', 'error', `Run not found: ${runId}`);
+    return { runId, status: 'error' };
+  }
+  const project = store.getProject(run.projectId);
+  if (!project) {
+    emit('plan', 'error', `Project not found: ${run.projectId}`);
+    return { runId, status: 'error' };
+  }
+  const runDir = join(projectsDir(), project.id, 'runs', runId);
+
+  // Step 0: reuse the ORIGINAL run's configuration — never default it. See
+  // docs/design/retry-pass-coverage-kb-redesign.md §3 step 0.
+  const snapshot = await readRunConfigSnapshot(runDir);
+  const testingScope = snapshot?.testingScope ?? 'both';
+
+  const provider = overrides?.provider ?? (await resolveProvider(snapshot?.provider, emit));
+  if (!provider) {
+    emit('plan', 'error', 'No ready provider available for retry-pass.');
+    return { runId, status: 'error' };
+  }
+
+  let plan: TestPlan;
+  try {
+    const raw = await readFile(join(runDir, 'plan', 'plan.json'), 'utf-8');
+    plan = JSON.parse(raw) as TestPlan;
+  } catch (err) {
+    emit('plan', 'error', `Could not load this run's plan: ${errMsg(err)}`);
+    return { runId, status: 'error' };
+  }
+
+  // Lazy backfill for a run that predates the Knowledge Base.
+  if (!store.hasPlanKbItems(runId)) {
+    emit('plan', 'info', 'No Knowledge Base rows for this run yet; backfilling from plan.json/tests.');
+    const tests = store.listTests(runId);
+    const results = store.listResults(runId);
+    for (const row of computeKbBackfillRows(plan, tests, results)) {
+      try {
+        store.seedPlanKbItem({
+          runId,
+          planItemId: row.planItemId,
+          title: row.title,
+          reqTag: row.reqTag,
+          tier: row.tier,
+          status: row.status,
+          scenarios: row.scenarios,
+        });
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('seedPlanKbItem (backfill)', err);
+      }
+    }
+  }
+
+  const droppedCount = store.listDroppedPlanKbItems(runId).length;
+  const pendingCount = store.listPendingPlanKbScenarios(runId).length;
+  if (droppedCount === 0 && pendingCount === 0) {
+    emit('done', 'info', 'Nothing to retry — every planned item already has a generated, executed test.');
+    return { runId, status: run.status, retryPassResult: 'nothing-to-retry' };
+  }
+  emit('plan', 'info', `Retry-pass: ${droppedCount} dropped item(s), ${pendingCount} pending scenario(s).`);
+
+  const target = makeTarget();
+  const browser = makeBrowser();
+  const launched = await launchProjectForRetryPass(project, target, emit);
+
+  const recordUsage: UsageRecorder = (phase, task, providerId, raw) => {
+    try {
+      const usage = extractUsage(raw);
+      store.recordUsage({
+        runId,
+        phase,
+        task,
+        provider: providerId,
+        inputTokens: usage?.inputTokens ?? null,
+        outputTokens: usage?.outputTokens ?? null,
+        costUsd: usage?.costUsd ?? null,
+        cacheCreationInputTokens: usage?.cacheCreationInputTokens ?? null,
+        cacheReadInputTokens: usage?.cacheReadInputTokens ?? null,
+        model: usage?.model ?? null,
+      });
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('recordUsage', err);
+    }
+  };
+
+  const ctx: TestModeContext = {
+    projectDir: join(runDir, 'suite'),
+    repoPath: project.repoPath,
+    baseUrl: launched.baseUrl,
+    credentials: project.credentials,
+    provider,
+    target,
+    browser,
+    testingScope,
+    emit: (phase, message, data) => emit(phase, 'info', message, data),
+    onUsage: recordUsage,
+    onKbItemOutcome: (planItemId, status) => {
+      try {
+        store.updatePlanKbItemStatus(runId, planItemId, status);
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('updatePlanKbItemStatus', err);
+      }
+    },
+    signal,
+  };
+  const mode = getMode(project.mode);
+
+  try {
+    store.updateRunStatus(runId, droppedCount > 0 ? 'generating' : 'executing');
+  } catch (err) {
+    noteStoreFailure('updateRunStatus', err);
+  }
+
+  let finalStatus: RunStatus;
+  try {
+    const testIdByKey = new Map<string, string>();
+    await regenerateDroppedAndExecutePending({
+      ctx,
+      mode,
+      runId,
+      store,
+      plan,
+      emit,
+      testIdByKey,
+      noteStoreOk,
+      noteStoreFailure,
+    });
+
+    try {
+      const removed = store.deleteUnexecutedTests(runId);
+      if (removed > 0)
+        emit('execute', 'debug', `Dropped ${removed} pre-registered test row(s) that never executed.`);
+    } catch (err) {
+      noteStoreFailure('deleteUnexecutedTests', err);
+    }
+
+    // Full report refresh — merge this pass's work with everything already
+    // durably persisted, recompute coverage, rewrite report.json/report.html
+    // in place. See docs/design/retry-pass-coverage-kb-redesign.md §3 step 7.
+    const { specs: allSpecs, outcome: mergedOutcome } = reconstructRunStateFromDb(
+      store,
+      runId,
+      ctx.projectDir,
+    );
+
+    let coverageSummary: ReportCoverageSummary | null = null;
+    if (project.repoPath) {
+      const cached = loadSourceContext(project.repoPath);
+      if (cached && cached.context.units.length > 0) {
+        const coverageTarget =
+          snapshot?.coverageTarget ??
+          (run.suiteMode === 'topup' ? TOPUP_COVERAGE_TARGET : FRESH_COVERAGE_TARGET);
+        const coverage = computeCoverage(cached.context.units, plan.items, allSpecs, mergedOutcome);
+        coverageSummary = {
+          ratio: coverage.ratio,
+          target: coverageTarget,
+          coveredCount: coverage.coveredUnitKeys.size,
+          totalCount: cached.context.units.length,
+          uncovered: coverage.uncovered,
+          loopEnabled: snapshot?.coverageLoopEnabled ?? false,
+        };
+      }
+    }
+
+    if (mergedOutcome.failed > 0) finalStatus = 'failed';
+    else if (mergedOutcome.blocked > 0) finalStatus = 'blocked';
+    else if (mergedOutcome.passed > 0) finalStatus = 'passed';
+    else finalStatus = 'error';
+
+    let artifactFiles: string[] = [];
+    try {
+      const collected = await mode.collectArtifacts(ctx);
+      artifactFiles = collected.files;
+    } catch (err) {
+      emit('execute', 'warn', `Artifact collection failed (continuing): ${errMsg(err)}`);
+    }
+
+    let dependencies: ExternalDependency[] = [];
+    try {
+      const rawDeps = await readFile(join(runDir, 'plan', 'dependencies.json'), 'utf-8');
+      const saved = JSON.parse(rawDeps) as Array<ExternalDependency & { mockResponse: MockResponse | null }>;
+      dependencies = saved.map(({ mockResponse: _mockResponse, ...dep }) => dep);
+    } catch {
+      /* best-effort; no dependencies to report */
+    }
+
+    const testsAll = store.listTests(runId);
+    const testByIdForTriage = new Map(testsAll.map((t) => [t.id, t]));
+    const testIdByTitleForTriage = new Map(testsAll.map((t) => [t.title, t.id]));
+    const resultByTestIdForTriage = new Map(store.listResults(runId).map((r) => [r.testId, r]));
+    const alreadyTriagedIds = new Set(store.listTriageResults(runId).map((row) => row.testId));
+
+    // Best-effort triage for whatever THIS retry-pass newly failed/blocked —
+    // old verdicts are preserved below regardless, but without this step a
+    // freshly-regenerated item that still fails would show up untriaged
+    // until the next full run. Deliberately simpler than runPipeline's own
+    // TRIAGE phase (no batching/AI-limit/confidence-ranked selection — see
+    // that section's own comments) since retry-pass only ever deals with the
+    // small subset of results it just touched, not a whole run's worth of
+    // failures; each item still gets the same classify-then-AI-enrich
+    // behavior via TriageEngine.analyze(), just called one at a time.
+    const newlyFailed = mergedOutcome.results.filter(
+      (r) =>
+        (r.status === 'failed' || r.status === 'blocked') &&
+        !alreadyTriagedIds.has(testIdByTitleForTriage.get(r.title) ?? ''),
+    );
+    if (newlyFailed.length > 0) {
+      emit('triage', 'info', `Triaging ${newlyFailed.length} new failure(s)/blocked outcome(s).`);
+      const engine = createTriageEngine();
+      for (const r of newlyFailed) {
+        const spec = allSpecs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
+        const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+        const input: TriageInput = {
+          title: r.title,
+          error: r.error ?? '',
+          ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
+          ...(spec?.contents ? { specSource: spec.contents } : {}),
+          ...(tracePath ? { tracePath } : {}),
+        };
+        const controller = new AbortController();
+        let result: TriageResult;
+        try {
+          result = await withTimeoutAbort(
+            engine.analyze(input, provider, controller.signal, recordUsage, project.repoPath ?? undefined),
+            TRIAGE_ANALYZE_TIMEOUT_MS,
+            controller,
+          );
+        } catch (err) {
+          emit('triage', 'debug', `Triage failed for "${r.title}" (keeping no verdict): ${errMsg(err)}`);
+          continue;
+        }
+        const testId = testIdByTitleForTriage.get(r.title);
+        if (testId) {
+          try {
+            store.recordTriageResult({
+              testId,
+              verdict: result.verdict,
+              confidence: result.confidence,
+              rationale: result.rationale,
+              suggestedPatch: result.suggestedPatch ?? null,
+            });
+            noteStoreOk();
+          } catch (err) {
+            noteStoreFailure('recordTriageResult', err);
+          }
+        }
+      }
+      emit('triage', 'info', `Triaged ${newlyFailed.length} new failure(s).`);
+    }
+
+    const triageEntries: ReportTriageEntry[] = store.listTriageResults(runId).map((row) => {
+      const test = testByIdForTriage.get(row.testId);
+      const result = resultByTestIdForTriage.get(row.testId);
+      return {
+        title: test?.title ?? row.testId,
+        error: result?.error ?? '',
+        triage: {
+          verdict: row.verdict,
+          confidence: row.confidence,
+          rationale: row.rationale,
+          ...(row.suggestedPatch ? { suggestedPatch: row.suggestedPatch } : {}),
+          verdictSource: row.verdictSource === 'ai_reviewed' ? 'ai_reviewed' : 'rule_fallback',
+        },
+      };
+    });
+
+    try {
+      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso() });
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('updateRunStatus', err);
+    }
+
+    const { reportPath } = await finalizeReport(
+      store,
+      runDir,
+      run,
+      project,
+      finalStatus,
+      plan,
+      mergedOutcome,
+      triageEntries,
+      artifactFiles,
+      dependencies,
+      {},
+      noteStoreOk,
+      noteStoreFailure,
+      { coverage: coverageSummary },
+    );
+
+    emit('done', 'info', `Retry-pass complete. Run ${finalStatus}.`, { runId, status: finalStatus });
+    return { runId, status: finalStatus, reportPath, outcome: mergedOutcome };
+  } catch (err) {
+    emit('generate', 'error', `Retry-pass failed: ${errMsg(err)}`, { stack: errStack(err) });
+    try {
+      store.updateRunStatus(runId, 'error', { finishedAt: nowIso() });
+    } catch {
+      /* best-effort */
+    }
+    return { runId, status: 'error' };
+  } finally {
+    if (launched.stop) {
+      try {
+        await launched.stop();
+      } catch (err) {
+        emit('launch', 'warn', `[launch] (retry-pass) Failed to stop app: ${errMsg(err)}`);
+      }
+    }
+  }
 }
 
 async function runPipeline(
@@ -1118,6 +1706,31 @@ async function runPipeline(
       }
     }
 
+    // ---- 4b. KB SEED (Retry-pass / coverage-feedback-loop Knowledge Base) ----
+    // Seed durable per-item/per-scenario tracking rows now that the approved
+    // plan is finalized, on whichever branch above got here (fresh plan or
+    // resumed-past-plan). Idempotent (INSERT OR IGNORE — see
+    // seedPlanKbItem), so re-running this on a resumed run is harmless.
+    // Skipped for suiteMode 'reuse': that mode carries no new plan to track
+    // (planForGeneration is empty there — see suiteMode === 'reuse' above).
+    if (suiteMode !== 'reuse') {
+      try {
+        for (const item of planForGeneration.items) {
+          store.seedPlanKbItem({
+            runId,
+            planItemId: item.id,
+            title: item.title,
+            reqTag: item.reqTag ?? null,
+            tier: item.tier,
+            scenarios: item.scenarios.map((s, i) => ({ index: i, kind: s.kind, description: s.description })),
+          });
+        }
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('seedPlanKbItem', err);
+      }
+    }
+
     // ---- 5. ctx ----
     const browser = makeBrowser();
 
@@ -1352,10 +1965,31 @@ async function runPipeline(
       target,
       browser,
       explorationMode: opts.explorationMode ?? deriveExplorationMode(project),
-      testingScope: opts.testingScope ?? 'both',
+      // 'reuse'/'topup' carry the ENTIRE base run's suite forward regardless
+      // of tier (see baseTestsWithSpec above and diffAgainstBase's carried
+      // set) — execute()'s playwrightProjectArgs restricts which Playwright
+      // --project tiers actually run based on THIS field, entirely
+      // independent of which specs got carried. A caller-supplied
+      // testingScope narrower than the carried suite's own tiers (e.g. the
+      // desktop compose form's scope selector, which defaults to 'frontend'
+      // and isn't synced to whatever scope the base run was originally
+      // planned with) would silently execute zero of a backend-only carried
+      // suite — the exact "Run verified nothing: no runnable specs were
+      // produced" failure. Force 'both' for these two modes so every carried
+      // tier actually runs; opts.testingScope only meaningfully scopes a
+      // 'fresh' run's own planning/generation.
+      testingScope: suiteMode === 'reuse' || suiteMode === 'topup' ? 'both' : (opts.testingScope ?? 'both'),
       sourceContext,
       emit: ctxEmit,
       onUsage: recordUsage,
+      onKbItemOutcome: (planItemId, status) => {
+        try {
+          store.updatePlanKbItemStatus(runId, planItemId, status);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('updatePlanKbItemStatus', err);
+        }
+      },
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
@@ -1472,6 +2106,13 @@ async function runPipeline(
             cachedExploration.useful &&
             !cachedExploration.crawl.budgetExhausted;
           let exploration: ExplorationArtifact;
+          // Captured only on a fresh (non-cache-hit) crawl, in memory only — see
+          // ExploreInput.onBeforeStop's doc comment for why this never touches the persisted
+          // exploration cache. Lets the gap-fill pass below (which necessarily starts a NEW
+          // browser, since this phase's own `finally` already tore the session down) resume
+          // whatever authenticated session crawlWithAuth established, instead of running
+          // anonymous-only.
+          let explorationSessionStorageState: unknown;
           if (cachedExploration && cachedExplorationIsTrustworthy) {
             exploration = cachedExploration;
             emit(
@@ -1495,6 +2136,23 @@ async function runPipeline(
             // form — not every role. Prefer a roleless credential (the "default"
             // session Tier B also falls back to) over a role-tagged one.
             const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            // No structured project-config field for supported regions/locales exists yet (see
+            // the enrichment plan's "region-code sourcing is a design TBD"). Union two sources:
+            // sourceContext.regionCodes (static analysis of the target's own i18n/regions config,
+            // see target/region-index.ts — catches real sibling regions a PRD never mentions by
+            // name) and the plan-text heuristic below (catches the opposite case: a real
+            // project-config field or recognizable i18n file doesn't exist, but the plan text
+            // itself names a region). Neither alone was sufficient — confirmed live that a PRD
+            // scoped to one region ("SK") never surfaces its app's other real regions via text
+            // alone (docs/c-and-a-exploration-gap-analysis.md §6.3).
+            const knownRegionCodes = [
+              ...new Set([
+                ...(sourceContext?.regionCodes ?? []),
+                ...deriveRegionCodesFromText(
+                  planForGeneration.items.flatMap((it) => [it.title, it.intent, it.reqTag ?? '']),
+                ),
+              ]),
+            ];
             exploration = await runExplorePhase({
               browser,
               baseUrl: effectiveBaseUrl,
@@ -1503,12 +2161,100 @@ async function runPipeline(
                 : undefined,
               crawlOptions: opts.crawlBudget,
               staticRoutePaths,
+              knownRegionCodes,
+              browserFactory: makeBrowser,
+              onBeforeStop: async (b) => {
+                explorationSessionStorageState = await b.exportStorageState().catch(() => undefined);
+              },
               emit,
               onFrame: hooks?.onFrame,
             });
             persistExplorationCache(project.id, effectiveBaseUrl, exploration);
           }
           ctx.exploration = exploration;
+
+          // Gap-fill runs HERE, unconditionally — not inside runExplorePhase — because a cache
+          // hit skips the crawl entirely (see the trust-gate comment above), but the approved
+          // plan's required routes differ run to run regardless of whether the crawl itself is
+          // fresh or reused. Gap-fill is inherently plan-shaped, not crawl-shaped, so it must
+          // re-run against the CURRENT plan even on a cache hit.
+          try {
+            let explorationArtifact = ctx.exploration;
+            const gaps = identifyExplorationGaps({
+              crawlResult: explorationArtifact.crawl,
+              routing: explorationArtifact.routing,
+              baseUrl: effectiveBaseUrl,
+              planItems: planForGeneration.items.map((it) => ({
+                id: it.id,
+                title: it.title,
+                unitKey: it.unitKey,
+                intent: it.intent,
+                reqTag: it.reqTag,
+                scenarios: it.scenarios,
+                tier: it.tier,
+              })),
+              observedEndpoints: explorationArtifact.observedEndpoints,
+            });
+            if (gaps.length > 0) {
+              emit(
+                'explore',
+                'info',
+                `Gap-fill: attempting to close ${gaps.length} identified exploration gap(s).`,
+              );
+              await browser.start({
+                headless: true,
+                baseUrl: effectiveBaseUrl,
+                storageState: explorationSessionStorageState,
+              });
+              try {
+                const gapFill = await runGapFillingPass({
+                  browser,
+                  baseUrl: effectiveBaseUrl,
+                  gaps,
+                  emit,
+                  gapFillProvider: provider ? { provider, onUsage: recordUsage } : undefined,
+                });
+                if (gapFill.newRoutes.length > 0) {
+                  const mergedCrawl = {
+                    ...mergeCrawlResults(explorationArtifact.crawl, {
+                      routes: gapFill.newRoutes,
+                      visitedCount: gapFill.newRoutes.length,
+                      budgetExhausted: false,
+                      unvisitedQueuedCount: 0,
+                      redirectLoopsDetected: [],
+                      shellCollapsed: false,
+                      degenerateRedirectsSkipped: [],
+                    }),
+                    authAttempted: explorationArtifact.crawl.authAttempted,
+                    authVerified: explorationArtifact.crawl.authVerified,
+                    authReason: explorationArtifact.crawl.authReason,
+                    verifiedLogin: explorationArtifact.crawl.verifiedLogin,
+                  };
+                  const quality = assessExplorationUsefulness(mergedCrawl);
+                  explorationArtifact = {
+                    ...explorationArtifact,
+                    crawl: mergedCrawl,
+                    useful: quality.useful,
+                    uselessReason: quality.reason,
+                    thinRouteRatio: quality.thinRouteRatio,
+                  };
+                }
+                explorationArtifact = { ...explorationArtifact, gapFillAttempts: gapFill.attempts };
+                ctx.exploration = explorationArtifact;
+                const closedCount = gapFill.attempts.filter((a) => a.outcome === 'closed').length;
+                emit(
+                  'explore',
+                  'info',
+                  `Gap-fill: closed ${closedCount}/${gaps.length} gap(s), capturing ${gapFill.newRoutes.length} new route(s).`,
+                );
+                persistExplorationCache(project.id, effectiveBaseUrl, explorationArtifact);
+              } finally {
+                await browser.stop().catch(() => undefined);
+              }
+            }
+          } catch (err) {
+            emit('explore', 'debug', `Gap-fill pass failed (continuing): ${errMsg(err)}`);
+          }
 
           // Auth-pattern-aware breadcrumb: a recognized auth library was detected in source but
           // the crawl found no REAL login form — only the always-present common-path fallback
@@ -1686,6 +2432,22 @@ async function runPipeline(
               })),
             },
           );
+          // A spec that passed generate.ts's own per-item checks already recorded
+          // the item as 'generated' via ctx.onKbItemOutcome (see generate.ts's
+          // recordGenOutcome) — but THIS later, stricter validation pass (a real
+          // parse check the regex/string gates can't do) can still reject it.
+          // Without correcting the KB here, it's stuck believing the item is
+          // 'generated'/'pending' forever: retry-pass won't regenerate it (not
+          // marked 'dropped') and can't execute it either (registerSpecRows is
+          // never called for a quarantined spec below, so its scenarios' test_id
+          // never gets linked) — a permanent, silent dead end. Flip it back to
+          // 'dropped' so a later retry-pass can actually recover it. A
+          // carried-forward spec has no planItemId (nothing to correct — it
+          // isn't new generation for this run's own KB tracking, same as
+          // registerSpecRows' own carried-forward handling).
+          for (const q of validation.quarantined) {
+            if (q.spec.planItemId) ctx.onKbItemOutcome?.(q.spec.planItemId, 'dropped');
+          }
         }
         if (validation.warnings.length > 0) {
           emit(
@@ -1724,9 +2486,9 @@ async function runPipeline(
         // Carried-forward specs (copied bytes from a prior run, already at
         // whatever granularity that run used) get a single row, as before.
         for (const spec of newSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey, noteStoreFailure);
         for (const spec of carriedSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
@@ -1873,15 +2635,15 @@ async function runPipeline(
 
     // ---- 8c. COVERAGE FEEDBACK LOOP (best-effort) ----
     // Fresh/top-up runs bound their coverage to a MEASURED target instead of
-    // stopping after a single plan/generate/execute pass — the earlier "prefer
-    // 3-8 scenarios" cap meant the plan itself was the bottleneck no matter how
-    // much of the app's real surface area was detected. Each iteration here
-    // re-plans ONLY the still-uncovered functionality units (buildGapFillPlanPrompt),
-    // generates+executes just those items, and merges the results in. These
-    // fill-gap iterations are auto-approved (skip the human plan-approval gate)
-    // since they are strictly additive within the tiers/scope already approved
-    // in the initial plan — every iteration still emits a clear message so this
-    // is never silent about what it's adding or why it stopped.
+    // stopping after a single plan/generate/execute pass. Each iteration
+    // regenerates whatever the Knowledge Base flags as 'dropped' and
+    // executes everything still 'pending' — the SAME primitive Retry-pass
+    // uses on demand (regenerateDroppedAndExecutePending) — rather than
+    // re-planning via the AI: this loop can only recover items the initial
+    // plan already included but generation/execution failed to finish, it
+    // can no longer discover coverage gaps the plan never mentioned in the
+    // first place. See docs/design/retry-pass-coverage-kb-redesign.md §4 for
+    // why this is a deliberate behavior narrowing, not just a refactor.
     if (checkCancelled()) return await pauseOrCancel('generate', executeComplete);
     if (suiteMode === 'reuse' || !repoIndex?.functionality || repoIndex.functionality.length === 0) {
       emit('generate', 'debug', 'Skipping coverage loop (reuse mode or no functionality inventory).');
@@ -1890,7 +2652,7 @@ async function runPipeline(
         opts.coverageTarget ?? (suiteMode === 'topup' ? TOPUP_COVERAGE_TARGET : FRESH_COVERAGE_TARGET);
       const coverageLoopEnabled = opts.coverageLoopEnabled ?? false;
       const units = repoIndex.functionality;
-      let coveredPlanItems = planForGeneration.items;
+      const coveredPlanItems = planForGeneration.items;
       let iteration = 1;
       // Measured unconditionally — the report always needs a real coverage
       // number regardless of whether the loop below is allowed to retry.
@@ -1902,84 +2664,50 @@ async function runPipeline(
           (coverageLoopEnabled ? '' : ' Coverage loop is off (coverageLoopEnabled not set) — not retrying.'),
       );
 
+      const hasOutstandingKbWork = (): boolean =>
+        store.listDroppedPlanKbItems(runId).length > 0 || store.listPendingPlanKbScenarios(runId).length > 0;
+
       while (
         coverageLoopEnabled &&
         coverage.ratio < coverageTarget &&
-        coverage.uncovered.length > 0 &&
         iteration < COVERAGE_MAX_ITERATIONS &&
-        !checkCancelled()
+        !checkCancelled() &&
+        hasOutstandingKbWork()
       ) {
         iteration += 1;
         emit(
-          'plan',
+          'generate',
           'info',
           `Coverage ${Math.round(coverage.ratio * 100)}% below target ${Math.round(coverageTarget * 100)}%; ` +
-            `planning gap-fill iteration ${iteration}/${COVERAGE_MAX_ITERATIONS} for ${coverage.uncovered.length} uncovered unit(s).`,
+            `recovering dropped/pending item(s), iteration ${iteration}/${COVERAGE_MAX_ITERATIONS}.`,
         );
 
-        const gapPrompt = buildGapFillPlanPrompt(project, opts, coverage.uncovered, repoIndex);
-        let gapPlan: TestPlan | null = null;
+        let regen: Awaited<ReturnType<typeof regenerateDroppedAndExecutePending>>;
         try {
-          const completion = await provider.complete(gapPrompt, {
-            mode: 'plan',
-            cwd: project.repoPath ?? undefined,
-            signal,
-            taskType: 'plan-gapfill',
+          regen = await regenerateDroppedAndExecutePending({
+            ctx,
+            mode,
+            runId,
+            store,
+            plan: planForGeneration,
+            emit,
+            testIdByKey,
+            noteStoreOk,
+            noteStoreFailure,
           });
-          if (completion.model) {
-            emit('plan', 'debug', `plan-gapfill used model=${completion.model} effort=${completion.effort}.`);
-          }
-          recordUsage('plan', 'gap-fill', provider.id, completion.raw);
-          if (completion.ok && completion.text) {
-            gapPlan = parsePlan(completion.text, opts.testingScope ?? 'both');
-          } else {
-            emit('plan', 'warn', `Gap-fill planning returned no usable plan; stopping coverage loop.`);
-          }
         } catch (err) {
-          emit('plan', 'warn', `Gap-fill planning failed (stopping coverage loop): ${errMsg(err)}`);
-        }
-        if (!gapPlan || gapPlan.items.length === 0) break;
-
-        const inScopeTiers = new Set<Tier>(tiersForScope(opts.testingScope ?? 'both'));
-        const gapItems = gapPlan.items.filter((it) => inScopeTiers.has(it.tier));
-        if (gapItems.length === 0) {
-          emit('plan', 'info', 'Gap-fill plan had no in-scope items; stopping coverage loop.');
+          emit('generate', 'warn', `Coverage-loop recovery pass failed (stopping): ${errMsg(err)}`);
           break;
         }
-        emit('plan', 'info', `Gap-fill plan: ${gapItems.length} item(s), auto-approved.`);
-
-        if (checkCancelled()) break;
-        let gapSpecs: GeneratedSpec[] = [];
-        try {
-          emit('generate', 'info', `Generating ${gapItems.length} gap-fill spec(s).`);
-          gapSpecs = await mode.generate(ctx, { summary: gapPlan.summary, items: gapItems });
-          trackGeneration(gapItems.length, gapSpecs.length);
-        } catch (err) {
-          emit('generate', 'warn', `Gap-fill generation failed (stopping coverage loop): ${errMsg(err)}`);
+        if (regen.regeneratedCount === 0 && regen.executedPendingCount === 0) {
+          emit('generate', 'info', 'Nothing left to recover; stopping coverage loop.');
           break;
         }
-        if (gapSpecs.length === 0) {
-          emit('generate', 'info', 'Gap-fill generation produced no accepted specs; stopping coverage loop.');
-          break;
-        }
-        for (const spec of gapSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, gapItems, testIdByKey);
-        specs = [...specs, ...gapSpecs];
-
-        if (checkCancelled()) break;
-        try {
-          emit('execute', 'info', `Executing ${gapSpecs.length} gap-fill spec(s).`);
-          const gapOutcome = await mode.execute(ctx, gapSpecs);
-          persistResults(store, runId, gapSpecs, gapOutcome, testIdByKey, noteStoreOk, noteStoreFailure);
-          outcome = mergeExecOutcomes(outcome, gapOutcome);
-        } catch (err) {
-          emit('execute', 'warn', `Gap-fill execution failed (stopping coverage loop): ${errMsg(err)}`);
-          break;
-        }
-
-        coveredPlanItems = [...coveredPlanItems, ...gapItems];
-        planForGeneration = { ...planForGeneration, items: coveredPlanItems };
-        plan = { ...plan, items: [...plan.items, ...gapItems] };
+        specs = [...specs, ...regen.specs];
+        outcome = mergeExecOutcomes(outcome, regen.outcome);
+        // coveredPlanItems already includes every planned item (dropped items
+        // were part of the initial plan, just never generated) — nothing new
+        // to fold in beyond what regen just contributed to specs/outcome.
 
         const prevCovered = coverage.coveredUnitKeys.size;
         coverage = computeCoverage(units, coveredPlanItems, specs, outcome);
@@ -2046,7 +2774,12 @@ async function runPipeline(
     if (checkCancelled()) return await pauseOrCancel('triage', executeComplete);
     setStatus('triaging');
     try {
-      const failed = outcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
+      // Stable non-null reference: `outcome` is a mutable `let`, so its
+      // non-null narrowing here doesn't survive into the .map() closure below
+      // (TS conservatively assumes a closure could run after a reassignment).
+      // Captured once so the closure can read outcome.apiEvidence directly.
+      const execOutcome = outcome;
+      const failed = execOutcome.results.filter((r) => r.status === 'failed' || r.status === 'blocked');
       if (failed.length > 0) {
         const engine = createTriageEngine();
 
@@ -2094,6 +2827,10 @@ async function runPipeline(
               confidence: row.confidence,
               rationale: row.rationale,
               ...(row.suggestedPatch ? { suggestedPatch: row.suggestedPatch } : {}),
+              // Legacy rows persisted before the verdict_source column existed
+              // have no way to know their real provenance — default to the
+              // conservative label rather than falsely claiming AI review.
+              verdictSource: row.verdictSource === 'ai_reviewed' ? 'ai_reviewed' : 'rule_fallback',
             },
           });
         }
@@ -2121,6 +2858,12 @@ async function runPipeline(
             // but never threaded through before, so triage only ever "knew" a
             // trace existed by chance, never which file.
             const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+            // Same identity execute.ts's own dedup keyOf()/readApiEvidence() use
+            // (`${specFile}#${title}`) — lets triage see the ACTUAL response this
+            // test's own API call(s) received, not just the one field its failing
+            // assertion happened to print.
+            const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
+            const apiEvidence = execOutcome.apiEvidence?.[apiEvidenceKey];
             // Recover the plan item this spec was generated from, to find the source-context unit
             // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
             // candidates below, since most failures never reach that stage.
@@ -2136,6 +2879,8 @@ async function runPipeline(
               ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
+              ...(apiEvidence ? { apiEvidence } : {}),
+              ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;
             try {
@@ -2146,21 +2891,18 @@ async function runPipeline(
             return { r, input, triage, unit };
           });
 
-          // Best-effort AI enrichment for the N LEAST-CONFIDENT failures, run in
-          // TRIAGE_AI_BATCH_SIZE-sized CONCURRENT batches (each call with its own bounded
-          // AbortController) rather than one at a time OR all at once — triage was previously
-          // the run's most serial phase, and later all-at-once, but each call spawns a real CLI
-          // child process (providers/claude.ts's runCli), so an unbounded burst of
-          // TRIAGE_AI_LIMIT simultaneous spawns is its own resource risk once the limit is large.
-          // Sorted ascending by baseline confidence so the scarce AI budget is spent on the
-          // failures that most need it (low-confidence/ambiguous baselines) rather than on
-          // whichever failures happen to execute first — a rule-confident test_is_wrong near
-          // the top of the results array was previously "spending" a slot that a genuinely
-          // ambiguous failure further down needed far more.
+          // AI enrichment for EVERY failure with a rule baseline — no cap. Run in
+          // TRIAGE_AI_BATCH_SIZE-sized batches (each call with its own bounded
+          // AbortController) rather than one at a time OR all at once — each call spawns a
+          // real CLI child process (providers/claude.ts's runCli), so an unbounded burst of
+          // simultaneous spawns is its own resource risk on a large run.
+          // Sorted ascending by baseline confidence so that if the run is cancelled or a
+          // budget ceiling hits mid-triage (see checkCancelled() in the batch loop below),
+          // whatever DID get reviewed was the failures that most needed it — not an
+          // ordering that limits which failures are eligible at all.
           const aiCandidates = baseline
             .filter((b) => b.triage !== null)
-            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1))
-            .slice(0, TRIAGE_AI_LIMIT);
+            .sort((a, b) => (a.triage?.confidence ?? 1) - (b.triage?.confidence ?? 1));
           const aiCandidateSet = new Set(aiCandidates);
 
           /**
@@ -2180,6 +2922,7 @@ async function runPipeline(
                 confidence: b.triage.confidence,
                 rationale: b.triage.rationale,
                 suggestedPatch: b.triage.suggestedPatch ?? null,
+                verdictSource: b.triage.verdictSource,
               });
               noteStoreOk();
             } catch (err) {
@@ -2287,6 +3030,25 @@ async function runPipeline(
             // whole phase being all-or-nothing.
             for (const b of batch) persistTriageResult(b);
           }
+
+          // Deterministic corroboration pass: two failures missing the exact
+          // same element can otherwise land on different verdicts purely
+          // because of which AI batch (or whether any) reviewed them — see
+          // correlateBySignature's own doc comment. Runs once, after all AI
+          // enrichment above has settled, so it sees every failure's FINAL
+          // per-item verdict. Only entries whose verdict actually changed are
+          // re-persisted; everything else keeps the row persistTriageResult
+          // already wrote above.
+          const correlated = correlateBySignature(
+            baseline.map((b) => ({ error: b.r.error ?? '', triage: b.triage })),
+          );
+          baseline.forEach((b, i) => {
+            const next = correlated[i]!.triage;
+            if (next && next !== b.triage) {
+              b.triage = next;
+              persistTriageResult(b);
+            }
+          });
 
           for (const b of baseline) {
             if (b.triage) triageEntries.push({ title: b.r.title, error: b.r.error ?? '', triage: b.triage });
@@ -2894,11 +3656,12 @@ export async function runPlanPhase(
 
 /**
  * Insert `tests` rows for a batch of GENERATE-produced specs. A freshly generated
- * spec (found in `items` by reqTag) gets ONE row per scenario the plan requested —
- * so Total/Passed/Failed/etc. reflect real test-case counts, matching what the
- * report already shows (outcome.results is scenario-level), not spec-file counts.
- * A carried-forward spec (no matching item — copied bytes from a prior run,
- * already at whatever granularity that run used) gets a single row, as before.
+ * spec (found in `items` by planItemId, see below) gets ONE row per scenario the
+ * plan requested — so Total/Passed/Failed/etc. reflect real test-case counts,
+ * matching what the report already shows (outcome.results is scenario-level),
+ * not spec-file counts. A carried-forward spec (no matching item — copied bytes
+ * from a prior run, already at whatever granularity that run used) gets a
+ * single row, as before.
  *
  * Rows are keyed positionally (`${reqTag/title key}#${scenarioIndex}`) rather
  * than by the model's own scenario title text, since that text isn't known
@@ -2914,6 +3677,7 @@ function registerSpecRows(
   spec: GeneratedSpec,
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
+  noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
   // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
   // deliberately never persists the per-run synthetic tag — see persistedReqTag
@@ -2925,9 +3689,32 @@ function registerSpecRows(
   // title while matching keys by tag, and every carried scenario after the first
   // collides on persistResults' fallback path (see that function's comments).
   const reqTag = (spec.reqTag ?? extractReqTag(spec.contents) ?? '').trim();
-  const item = reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined;
+  // planItemId (set by generate.ts at the moment it produced this spec) is the
+  // PRIMARY lookup because reqTag is not guaranteed unique across items — a
+  // plan may deliberately pair two items (e.g. a UI-tier flow and its
+  // tierC-api contract test) under the same functional reqTag. Falling back to
+  // reqTag-only matching in that case would let `.find` silently resolve to
+  // whichever of the two items happens to come first in `items`, misattributing
+  // the other's scenarios/title and — critically — calling
+  // linkPlanKbScenarioTest against the wrong KB item, leaving the real one's
+  // scenarios permanently unlinked (stuck 'pending' forever; see
+  // docs/design/retry-pass-coverage-kb-redesign.md). A carried-forward spec has
+  // no planItemId at all, so it falls through to the reqTag path unchanged.
+  const item =
+    (spec.planItemId ? items.find((it) => it.id === spec.planItemId) : undefined) ??
+    (reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined);
   const specPath = relative(projectDir, spec.path);
   const base = stableKey(reqTag, spec.title);
+  // A SECOND, additional key scoped to the resolved item's own id (never
+  // shared across two DIFFERENT items, unlike reqTag/title — see the `item`
+  // lookup comment above). Written ALONGSIDE `base`, not instead of it: any
+  // caller whose corresponding persistResults-time spec doesn't carry
+  // planItemId (a carried-forward spec, or an older/fake TestMode) still
+  // finds its row via the original reqTag-based key, unchanged; only when
+  // persistResults CAN resolve planItemId does it prefer this collision-free
+  // key instead, which is what actually fixes two same-reqTag items from
+  // silently overwriting each other's `${base}#i` slots.
+  const itemBase = item ? `item:${item.id}` : null;
   // The PERSISTED reqTag is the plan item's true reqTag (or null when it
   // never had one) — NOT spec.reqTag, which generate.ts fills in with the
   // item's own id when a real reqTag is absent (`item.reqTag ?? item.id`),
@@ -2981,6 +3768,16 @@ function registerSpecRows(
       specCode: spec.contents,
     });
     testIdByKey.set(`${base}#${i}`, test.id);
+    if (itemBase) testIdByKey.set(`${itemBase}#${i}`, test.id);
+    // Best-effort KB link — never blocks spec registration. A carried-forward
+    // spec (items=[], item undefined) never reaches this branch, so it's
+    // simply never linked, which is correct: it isn't new generation for
+    // THIS run's own KB tracking.
+    try {
+      store.linkPlanKbScenarioTest(runId, item.id, i, test.id);
+    } catch (err) {
+      noteStoreFailure('linkPlanKbScenarioTest', err);
+    }
   });
 }
 
@@ -3001,7 +3798,7 @@ function persistResults(
   noteStoreOk: () => void,
   noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
-  const scenarioIndexByReqTag = new Map<string, number>();
+  const scenarioIndexByKey = new Map<string, number>();
 
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
@@ -3010,30 +3807,45 @@ function persistResults(
     // it keys directly onto the rows inserted in GENERATE — and only fall back to
     // normalized-title matching when no tag survived.
     const tagFromTitle = extractReqTag(r.title);
-    const matched = specs.find(
-      (s) =>
-        (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
-        stableKey(undefined, s.title) === stableKey(undefined, r.title),
-    );
-    // registerSpecRows keyed every row purely off the plan item's own reqTag
-    // (`req:<tag>#<i>` — see stableKey), so the title's own "[REQ:<tag>]" is
-    // ALREADY enough to rebuild that key. Deriving `base` from `matched`
-    // instead (as before) made positional matching depend on `specs.find()`
-    // succeeding first — any mismatch between THIS call's `specs` and the
-    // original GENERATE-time list (a narrower/stale batch, a validation
-    // rewrite, ...) silently defeated matching for an otherwise-findable row,
-    // forking a same-titled orphan instead of reusing the one already reserved.
-    const base = tagFromTitle
-      ? stableKey(tagFromTitle, r.title)
-      : matched
-        ? stableKey(matched.reqTag, matched.title)
-        : null;
+    // Prefer the longest spec title that PREFIXES this result's title (every
+    // scenario row's title is `${spec.title} — ${kind}: ${description}`, see
+    // registerSpecRows) over a bare reqTag/title match — reqTag alone is
+    // ambiguous whenever two items share one (see registerSpecRows' item-
+    // lookup comment); a spec's own title embeds its originating item's
+    // title text, which is effectively unique per item. Longest-prefix
+    // (not first-found) avoids one item's title being a textual prefix of
+    // another's. Falls back to reqTag/title-only matching for a result with
+    // no real spec behind it (synthetic/fallback rows).
+    const titlePrefixMatches = specs.filter((s) => r.title.startsWith(s.title));
+    const matched =
+      titlePrefixMatches.reduce<GeneratedSpec | undefined>(
+        (best, s) => (!best || s.title.length > best.title.length ? s : best),
+        undefined,
+      ) ??
+      specs.find(
+        (s) =>
+          (tagFromTitle !== null && (s.reqTag ?? '').trim() === tagFromTitle) ||
+          stableKey(undefined, s.title) === stableKey(undefined, r.title),
+      );
+    // Mirrors registerSpecRows' `item:<id>` key when the matched spec carries
+    // one — reqTag-only keying would let two same-reqTag items share this
+    // positional keyspace and silently route one's results onto the other's
+    // rows. Falling back to reqTag/title matching (as before) covers a
+    // carried-forward spec or a result with no matched spec at all.
+    const itemKey = matched?.planItemId ? `item:${matched.planItemId}` : null;
+    const base =
+      itemKey ??
+      (tagFromTitle
+        ? stableKey(tagFromTitle, r.title)
+        : matched
+          ? stableKey(matched.reqTag, matched.title)
+          : null);
 
     let testId: string | undefined;
     if (base) {
-      const reqTagKey = tagFromTitle ?? matched?.reqTag ?? base;
-      const scenarioIndex = scenarioIndexByReqTag.get(reqTagKey) ?? 0;
-      scenarioIndexByReqTag.set(reqTagKey, scenarioIndex + 1);
+      const counterKey = itemKey ?? tagFromTitle ?? matched?.reqTag ?? base;
+      const scenarioIndex = scenarioIndexByKey.get(counterKey) ?? 0;
+      scenarioIndexByKey.set(counterKey, scenarioIndex + 1);
       testId =
         testIdByKey.get(`${base}#${scenarioIndex}`) ??
         (scenarioIndex === 0 ? testIdByKey.get(base) : undefined);
@@ -3082,6 +3894,7 @@ function persistResults(
         details: parentTest?.details ?? null,
         stepsJson: r.steps && r.steps.length > 0 ? JSON.stringify(r.steps) : null,
         skipReason: r.skipReason ?? null,
+        videoUnavailableReason: r.videoUnavailableReason ?? null,
       });
       noteStoreOk();
     } catch (err) {
@@ -3097,6 +3910,17 @@ function persistResults(
       noteStoreOk();
     } catch (err) {
       noteStoreFailure('updateTestStatus', err);
+    }
+    try {
+      // Mirror onto whichever KB scenario row is linked to this test (by the
+      // testId just resolved above, not by re-deriving position) — a no-op
+      // for a test with no KB link (predates the KB, or a carried-forward/
+      // fallback row that was never seeded). See
+      // docs/design/retry-pass-coverage-kb-redesign.md.
+      store.updatePlanKbScenarioStatusByTestId(testId, r.status as TestStatus);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('updatePlanKbScenarioStatusByTestId', err);
     }
   }
 }

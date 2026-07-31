@@ -501,7 +501,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).not.toContain(runRoot);
   });
 
-  it('given a reportDir, an API test with only a trace (no page, so no screenshot/video) still links it', () => {
+  it('given a reportDir, an API test with only a trace (no page, so no screenshot/video) still links it and explains the missing video', () => {
     const runRoot = join('runs', 'r2');
     const reportDir = join(runRoot, 'reports');
     const testResultsDir = join(runRoot, 'suite', 'test-results', 'bar');
@@ -517,6 +517,8 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
           durationMs: 5,
           error: 'expect(response.status()).toBe(401)',
           artifacts: [join(testResultsDir, 'trace.zip')],
+          videoUnavailableReason:
+            'This test only used the API request context — no browser page was opened, so no video could be recorded.',
         },
       ],
     };
@@ -526,6 +528,57 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
     expect(html).toContain('trace.zip');
     expect(html).not.toContain('class="ev-thumb"');
     expect(html).not.toContain('class="ev-video"');
+    expect(html).toContain('class="video-unavailable"');
+    expect(html).toContain('no browser page was opened');
+  });
+
+  it('never renders a video-unavailable note when a real video IS present', () => {
+    const runRoot = join('runs', 'r3');
+    const reportDir = join(runRoot, 'reports');
+    const testResultsDir = join(runRoot, 'suite', 'test-results', 'baz');
+    const outcome: ExecOutcome = {
+      passed: 1,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      results: [
+        {
+          title: '[REQ:REQ-3] positive: succeeds',
+          status: 'passed',
+          durationMs: 5,
+          artifacts: [join(testResultsDir, 'video.webm')],
+          // Should never happen together in practice, but proves the note is
+          // suppressed whenever a real video is present regardless.
+          videoUnavailableReason: 'should not render',
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report, { reportDir });
+    expect(html).toContain('class="ev-video"');
+    expect(html).not.toContain('class="video-unavailable"');
+  });
+
+  it('never shows a video-unavailable note for a skipped result even if one leaked through', () => {
+    const outcome: ExecOutcome = {
+      passed: 0,
+      failed: 0,
+      blocked: 0,
+      flaky: 0,
+      skipped: 1,
+      results: [
+        {
+          title: '[REQ:REQ-4] edge: skipped scenario',
+          status: 'skipped',
+          durationMs: 0,
+          skipReason: 'unobserved element',
+          videoUnavailableReason: 'should not render for a skipped test',
+        },
+      ],
+    };
+    const report = buildReport({ run, project, plan, outcome, triage: [] });
+    const html = renderReportHtml(report);
+    expect(html).not.toContain('class="video-unavailable"');
   });
 
   it('renders an app-bug recommendation as prose under "Recommended fix", not a <code> test-patch block', () => {
@@ -550,6 +603,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
             confidence: 0.8,
             rationale: 'Assertion failed on a real element.',
             suggestedPatch: 'Fix the missing aria-label on the submit button.',
+            verdictSource: 'ai_reviewed',
           },
         },
       ],
@@ -585,6 +639,7 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
             confidence: 0.7,
             rationale: 'The selector no longer matches the live UI.',
             suggestedPatch: "await page.getByRole('button', { name: 'Submit' }).click();",
+            verdictSource: 'ai_reviewed',
           },
         },
       ],
@@ -660,7 +715,12 @@ describe('report — failure diagnostics, coverage, artifacts', () => {
         {
           title: '[REQ:REQ-1] positive: fails',
           error: 'boom',
-          triage: { verdict: 'app_is_wrong', confidence: 0.9, rationale: 'Real defect.' },
+          triage: {
+            verdict: 'app_is_wrong',
+            confidence: 0.9,
+            rationale: 'Real defect.',
+            verdictSource: 'ai_reviewed',
+          },
         },
       ],
     });
@@ -995,12 +1055,22 @@ describe('groupingSummary — round-trips through buildReport/renderReportHtml',
     {
       title: 'A',
       error: 'boom',
-      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+      triage: {
+        verdict: 'app_is_wrong' as const,
+        confidence: 0.8,
+        rationale: 'x',
+        verdictSource: 'ai_reviewed' as const,
+      },
     },
     {
       title: 'B',
       error: 'boom',
-      triage: { verdict: 'app_is_wrong' as const, confidence: 0.8, rationale: 'x' },
+      triage: {
+        verdict: 'app_is_wrong' as const,
+        confidence: 0.8,
+        rationale: 'x',
+        verdictSource: 'ai_reviewed' as const,
+      },
     },
   ];
 

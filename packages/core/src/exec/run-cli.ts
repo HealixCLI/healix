@@ -148,6 +148,7 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
       if (timedOut) return;
       timedOut = true;
       timeoutKind = 'hard';
+      if (idleTimer) clearTimeout(idleTimer);
       killTree();
     }, timeoutMs);
 
@@ -159,10 +160,11 @@ export function runCli(cmd: string, args: string[], opts: RunOptions = {}): Prom
     let idleTimer: NodeJS.Timeout | undefined;
     const armIdleTimer = (): void => {
       if (opts.idleTimeoutMs === undefined) return;
-      // Once a timeout has already been recorded (e.g. hardTimer fired and
-      // killTree() is still in flight), don't arm a new idle window that
-      // could later fire and clobber the real verdict — see hardTimer's
-      // matching guard above.
+      // Once a timeout has already fired (e.g. the hard backstop), the killed
+      // process may still emit a few buffered data chunks before it actually
+      // dies. Without this guard, those late chunks would re-arm the idle
+      // timer and its eventual fire would clobber timeoutKind from 'hard'
+      // back to 'idle', even though the hard timer won the race first.
       if (timedOut) return;
       if (idleTimer) clearTimeout(idleTimer);
       idleTimer = setTimeout(() => {

@@ -224,6 +224,31 @@ paths:
       expect(ctx.units.map((u) => u.key)).toContain('endpoint:GET /health');
     });
   });
+
+  it('surfaces statically-detected region/locale codes from an i18n config file on regionCodes', () => {
+    const dir = makeRepo();
+    write(
+      dir,
+      'src/i18n/regions.ts',
+      `
+        export const REGIONS = {
+          SK: { currency: 'EUR', locale: 'sk-SK' },
+          CZ: { currency: 'CZK', locale: 'cs-CZ' },
+        };
+      `,
+    );
+    return indexSource(dir).then((ctx) => {
+      expect(ctx.regionCodes?.sort()).toEqual(['CZ', 'SK']);
+    });
+  });
+
+  it('leaves regionCodes empty when no source file has a recognizable region/locale registry', () => {
+    const dir = makeRepo();
+    write(dir, 'src/App.tsx', 'export default function App() { return null; }');
+    return indexSource(dir).then((ctx) => {
+      expect(ctx.regionCodes).toEqual([]);
+    });
+  });
 });
 
 // --- Isolated check against the real RBAC repo, combining backend + frontend + Postman (Item D1) --

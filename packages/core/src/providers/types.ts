@@ -31,7 +31,8 @@ export type TaskType =
   | 'mock-response'
   | 'triage'
   | 'triage-summary'
-  | 'health-probe';
+  | 'health-probe'
+  | 'explore-gapfill';
 
 export interface DetectResult {
   installed: boolean;

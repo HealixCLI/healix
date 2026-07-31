@@ -553,6 +553,25 @@ async function waitForSubmitEnabled(button, timeoutMs) {
 }
 
 /**
+ * Prefers \`groundedSelector\` — the exact element EXPLORE's own crawl-time login attempt
+ * actually typed into/clicked, and therefore PROVED works (see browser/login.ts,
+ * browser/crawler.ts's \`verifiedLogin\`) — over the independent generic guess this fixture
+ * would otherwise make on its own. Falls back to \`fallbackLocator\` unchanged whenever no
+ * grounded selector was captured, or it no longer resolves to a visible element (stale
+ * exploration data, app markup changed since the crawl) — so behavior is byte-identical to
+ * today whenever grounding isn't available or doesn't hold up.
+ */
+async function preferGrounded(page, groundedSelector, fallbackLocator, timeoutMs) {
+  if (groundedSelector) {
+    const grounded = page.locator(groundedSelector).first();
+    if (await grounded.isVisible({ timeout: timeoutMs }).catch(() => false)) {
+      return grounded;
+    }
+  }
+  return fallbackLocator;
+}
+
+/**
  * One username/password form login against \`page\`, saving storageState to
  * \`path\` on success. Throws on failure — including when the submit click
  * "succeeded" (no exception) but the page never actually left the login
@@ -563,6 +582,15 @@ async function waitForSubmitEnabled(button, timeoutMs) {
  */
 async function loginForm(page, email, password, loginUrl, path) {
   await page.goto(loginUrl);
+
+  // If EXPLORE's own crawl-time login proved the form sits behind a same-URL client-side
+  // toggle, replay that click before anything else — neither the grounded nor the guessed
+  // field locators below resolve to anything until this fires. Best-effort: a stale/absent
+  // toggle selector just leaves the reveal-guess further down to handle it, same as today.
+  const groundedToggle = process.env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR;
+  if (groundedToggle) {
+    await page.locator(groundedToggle).first().click({ timeout: 5000 }).catch(() => {});
+  }
 
   // Locale-aware matchers (English + common Slovak forms observed in the
   // field, e.g. "e-mailová adresa" / "Heslo" / "Prihlásiť sa") — not a full
@@ -576,23 +604,38 @@ async function loginForm(page, email, password, loginUrl, path) {
   // environment/target problem rather than a selector gap. Matching
   // "username" (label/placeholder text) and the standards-based
   // autocomplete="username" attribute alongside email covers both shapes.
-  const identifierField = fieldLocator(
+  const guessIdentifierField = fieldLocator(
     page,
     /e-?mail|user\\s*name/i,
     /e-?mail|user\\s*name/i,
     'input[type="email"], input[autocomplete="username"], input[name*="email" i], input[name*="user" i], input[id*="email" i], input[id*="user" i]',
   );
-  const passwordField = fieldLocator(
+  const guessPasswordField = fieldLocator(
     page,
     /heslo|password/i,
     /heslo|password/i,
     'input[type="password"]',
   );
+  // Prefer the exact fields EXPLORE's login attempt actually typed into and proved work —
+  // see preferGrounded(); falls back to the generic guess above whenever unset or stale.
+  const identifierField = await preferGrounded(
+    page,
+    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR,
+    guessIdentifierField,
+    3000,
+  );
+  const passwordField = await preferGrounded(
+    page,
+    process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR,
+    guessPasswordField,
+    3000,
+  );
   const loginRevealRe = /prihl|sign in|log ?in/i;
 
   // Some apps gate the login form behind a reveal button/link (e.g. a
   // "Prihlásiť sa" click before the identifier/password fields even render) —
-  // click through it before searching for the form.
+  // click through it before searching for the form. A no-op when the grounded
+  // toggle above already revealed it.
   const hasIdentifierField = await identifierField
     .first()
     .isVisible()
@@ -619,23 +662,43 @@ async function loginForm(page, email, password, loginUrl, path) {
   }
 
   const beforeUrl = page.url();
-  const submitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i);
+  // EXPLORE's own login attempt is grounded when it captured identifier/password selectors —
+  // and when it's grounded AND captured no submit selector, that's not "unknown", it's a
+  // PROVEN fact: the real submit control was disabled/unusable at fill-time and the app was
+  // actually driven by pressing Enter (see login.ts's submitLoginAttempt — Enter is the
+  // fallback there too). Guessing a button to click in that case would repeat exactly the
+  // mismatch this grounding exists to prevent, so ground the SUBMIT MECHANISM itself rather
+  // than only the element: only fall back to the generic guess-and-click when there's no
+  // grounded form data at all (no exploration data, or a stale cache from before this field
+  // was added).
+  const hasGroundedForm = !!(
+    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR || process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR
+  );
+  const groundedSubmitSelector = process.env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR;
 
-  if (!(await waitForSubmitEnabled(submitButton, 8000))) {
-    // Never interpolate the credential VALUES here — this text reaches the AI triage
-    // provider (see triage/prompt.ts). Lengths/booleans only.
-    const identifierFilled = (await identifierField.first().inputValue().catch(() => '')).length > 0;
-    const passwordFilled = (await passwordField.first().inputValue().catch(() => '')).length > 0;
-    throw new Error(
-      \`Login submit button never became enabled within 8s of filling both credential fields (still on \${page.url()}). \` +
-        \`Both fields were located (identifier field non-empty: \${identifierFilled}, password field non-empty: \${passwordFilled}), \` +
-        "so this is not a selector gap — the app's own client-side validation is still refusing to enable submit. " +
-        "Check that the configured test credentials are valid and match the app's format rules, and that the form has no " +
-        'additional required field (tenant/company code, consent checkbox, captcha, OTP) this fixture does not fill.',
-    );
+  if (hasGroundedForm && !groundedSubmitSelector) {
+    await page.keyboard.press('Enter');
+  } else {
+    const guessSubmitButton = await submitButtonLocator(page, /prihl|sign in|log ?in|continue|submit/i);
+    // Prefer the exact submit control EXPLORE's login attempt actually clicked, when captured.
+    const submitButton = await preferGrounded(page, groundedSubmitSelector, guessSubmitButton, 3000);
+
+    if (!(await waitForSubmitEnabled(submitButton, 8000))) {
+      // Never interpolate the credential VALUES here — this text reaches the AI triage
+      // provider (see triage/prompt.ts). Lengths/booleans only.
+      const identifierFilled = (await identifierField.first().inputValue().catch(() => '')).length > 0;
+      const passwordFilled = (await passwordField.first().inputValue().catch(() => '')).length > 0;
+      throw new Error(
+        \`Login submit button never became enabled within 8s of filling both credential fields (still on \${page.url()}). \` +
+          \`Both fields were located (identifier field non-empty: \${identifierFilled}, password field non-empty: \${passwordFilled}), \` +
+          "so this is not a selector gap — the app's own client-side validation is still refusing to enable submit. " +
+          "Check that the configured test credentials are valid and match the app's format rules, and that the form has no " +
+          'additional required field (tenant/company code, consent checkbox, captcha, OTP) this fixture does not fill.',
+      );
+    }
+
+    await submitButton.click({ timeout: 15_000 });
   }
-
-  await submitButton.click({ timeout: 15_000 });
 
   const { navigatedAway, stillHasPasswordField } = await waitForLoginOutcome(page, beforeUrl);
   if (stillHasPasswordField && !navigatedAway) {

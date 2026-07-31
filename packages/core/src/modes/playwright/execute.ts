@@ -126,16 +126,29 @@ export function suiteEnv(ctx: TestModeContext): NodeJS.ProcessEnv {
     env.HEALIX_TIERB_EMAIL = defaultCredential.username;
     env.HEALIX_TIERB_PASSWORD = defaultCredential.password;
     // The auth fixture requires all three of email/password/loginUrl to
-    // attempt a real login (see authSetupContents() in templates.ts). Prefer
-    // EXPLORE's discovered/scored login candidate (hash- and region-prefix
-    // aware — see browser/crawler.ts scoreLoginCandidates) over the naive
-    // `/login` path join, which 404s or falls back to the app's default
-    // route on a HashRouter + region-prefixed app (the RCA's Branch 2).
-    const discovered = ctx.exploration?.loginCandidates?.[0]?.url;
+    // attempt a real login (see authSetupContents() in templates.ts). Prefer,
+    // in order: (1) the exact page/selectors EXPLORE's own login attempt
+    // PROVED work (crawl/verifiedLogin — see browser/crawler.ts crawlWithAuth),
+    // since it demonstrably worked and a re-derived score can't see that;
+    // (2) EXPLORE's discovered/scored login candidate (hash- and
+    // region-prefix aware — see browser/crawler.ts scoreLoginCandidates) over
+    // the naive `/login` path join, which 404s or falls back to the app's
+    // default route on a HashRouter + region-prefixed app (the RCA's Branch 2).
+    const verified = ctx.exploration?.crawl?.verifiedLogin;
+    const discovered = verified?.pageUrl ?? ctx.exploration?.loginCandidates?.[0]?.url;
     if (discovered) {
       env.HEALIX_TIERB_LOGIN_URL = discovered;
     } else if (ctx.baseUrl) {
       env.HEALIX_TIERB_LOGIN_URL = new URL('/login', ctx.baseUrl).toString();
+    }
+    // Grounds the generated fixture's field/submit locators in the selectors EXPLORE actually
+    // typed into/clicked, rather than letting it re-guess independently (see loginForm() in
+    // templates.ts, which falls back to its own guessing when these are unset).
+    if (verified) {
+      env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR = verified.identifierSelector;
+      env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR = verified.passwordSelector;
+      if (verified.submitSelector) env.HEALIX_TIERB_LOGIN_SUBMIT_SELECTOR = verified.submitSelector;
+      if (verified.toggleSelector) env.HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR = verified.toggleSelector;
     }
   }
   return env;

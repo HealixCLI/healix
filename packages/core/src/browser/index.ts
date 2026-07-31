@@ -1,5 +1,13 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Response } from 'playwright';
-import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
+
+/** Playwright has no standalone exported name for this shape — derived from the method itself
+ * so this stays in sync with whatever version of Playwright is installed. */
+export type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
+import {
+  collectContentElements,
+  collectInteractiveElements,
+  INTERACTIVE_ELEMENT_SELECTOR,
+} from './selectors.js';
 import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
 import { FrameMirror } from './mirror.js';
 import type {
@@ -18,6 +26,21 @@ const DEFAULT_VIEWPORT = { width: 1280, height: 800 } as const;
 const SETTLE_TIMEOUT_MS = 8000;
 /** Poll interval for the same-document content-settle check below. */
 const SAME_DOC_POLL_MS = 150;
+/**
+ * Upper bound on how long click() waits for the page to settle after a click, before the caller's
+ * next snapshot(). Much shorter than SETTLE_TIMEOUT_MS: unlike a full navigation, a click-driven
+ * reveal (a modal, an inline edit form) is a client-side re-render with no network round trip to
+ * wait for, so it settles fast when it settles at all — this just needs to be longer than one
+ * React render tick, not longer than a page load.
+ *
+ * Added because click() previously returned as soon as Playwright dispatched the click event,
+ * with no wait for the app's reaction to it — `discoverClickRoutes` (crawler.ts) then snapshotted
+ * on the very next line. Confirmed live against the C&A app: clicking a dashboard "zmeniť" trigger
+ * does open a real edit form (a manual click-then-inspect reproduces it every time), but the
+ * automated crawl's click-immediately-snapshot sequence raced the render and saw the pre-click
+ * DOM, so the reveal was silently treated as a no-op dropdown instead of a recorded state.
+ */
+const CLICK_SETTLE_TIMEOUT_MS = 800;
 /** Per-body character cap on captured request/response bodies — mirrors
  * generate.ts's MAX_MOCK_BODY_CHARS so captured ground truth and the prompt
  * budget it eventually feeds stay the same order of magnitude. */
@@ -74,6 +97,31 @@ function isSameDocumentNav(from: string, to: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * SPAs (esp. hash-routed) often finish DOMContentLoaded before client-side hydration renders real
+ * content, so a snapshot taken immediately after a navigation/reload can see 0 interactive
+ * elements on an otherwise content-rich page. Race two settle signals instead of betting on a
+ * fixed delay: as soon as a real interactive element appears, stop waiting (fast for the common
+ * case); otherwise fall back to networkidle. Both are capped so a genuinely thin page (no
+ * interactive elements, ever) still falls through in bounded time rather than hanging. Shared by
+ * `goto()` and `reload()` so both settle the same way after their respective navigation.
+ */
+async function waitForSettle(p: Page): Promise<void> {
+  await Promise.race([
+    p
+      .waitForFunction(
+        (selector) =>
+          (
+            globalThis as unknown as { document: { querySelectorAll(s: string): ArrayLike<unknown> } }
+          ).document.querySelectorAll(selector).length > 0,
+        INTERACTIVE_ELEMENT_SELECTOR,
+        { timeout: SETTLE_TIMEOUT_MS },
+      )
+      .catch(() => {}),
+    p.waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS }).catch(() => {}),
+  ]);
 }
 
 /** Cheap per-page signature (title + interactive-element count) used to detect that a
@@ -193,7 +241,10 @@ export function createBrowserSurface(): BrowserSurface {
           browser = await chromium.launch({ headless });
         }
         try {
-          context = await browser.newContext({ viewport });
+          context = await browser.newContext({
+            viewport,
+            storageState: opts.storageState as StorageState | undefined,
+          });
           page = await context.newPage();
           page.on('response', onResponse);
         } catch (err) {
@@ -221,27 +272,7 @@ export function createBrowserSurface(): BrowserSurface {
       }
 
       const response = await p.goto(target, { waitUntil: 'domcontentloaded' });
-      // SPAs (esp. hash-routed) often finish DOMContentLoaded before client-side
-      // hydration renders real content, so a snapshot taken immediately after
-      // goto() can see 0 interactive elements on an otherwise content-rich page.
-      // Race two settle signals instead of betting on a fixed delay: as soon as
-      // a real interactive element appears, stop waiting (fast for the common
-      // case); otherwise fall back to networkidle. Both are capped so a
-      // genuinely thin page (no interactive elements, ever) still falls through
-      // in bounded time rather than hanging.
-      await Promise.race([
-        p
-          .waitForFunction(
-            (selector) =>
-              (
-                globalThis as unknown as { document: { querySelectorAll(s: string): ArrayLike<unknown> } }
-              ).document.querySelectorAll(selector).length > 0,
-            INTERACTIVE_ELEMENT_SELECTOR,
-            { timeout: SETTLE_TIMEOUT_MS },
-          )
-          .catch(() => {}),
-        p.waitForLoadState('networkidle', { timeout: SETTLE_TIMEOUT_MS }).catch(() => {}),
-      ]);
+      await waitForSettle(p);
 
       // A same-document navigation (only the hash/query changed — a client-side SPA route
       // change) never unloads the page, so the race above can resolve instantly on the PREVIOUS
@@ -272,6 +303,12 @@ export function createBrowserSurface(): BrowserSurface {
       }
     },
 
+    async reload(): Promise<void> {
+      const p = requireStarted(page, 'reload');
+      await p.reload({ waitUntil: 'domcontentloaded' });
+      await waitForSettle(p);
+    },
+
     async screenshot(): Promise<Buffer> {
       const p = requireStarted(page, 'screenshot');
       return (await p.screenshot({ type: 'png' })) as Buffer;
@@ -290,18 +327,31 @@ export function createBrowserSurface(): BrowserSurface {
       } catch {
         axTree = undefined;
       }
-      const [title, interactiveElements] = await Promise.all([p.title(), collectInteractiveElements(p)]);
+      const [title, interactiveElements, contentElements] = await Promise.all([
+        p.title(),
+        collectInteractiveElements(p),
+        collectContentElements(p),
+      ]);
       return {
         url: p.url(),
         title,
         interactiveElements,
+        contentElements,
         axTree,
       };
     },
 
     async click(selector: string): Promise<void> {
       const p = requireStarted(page, 'click');
+      const before = await contentSignature(p).catch(() => undefined);
       await p.locator(selector).first().click();
+      if (before === undefined) return;
+      const deadline = Date.now() + CLICK_SETTLE_TIMEOUT_MS;
+      for (;;) {
+        const after: string = await contentSignature(p).catch(() => before);
+        if (after !== before || Date.now() >= deadline) break;
+        await new Promise((resolve) => setTimeout(resolve, SAME_DOC_POLL_MS));
+      }
     },
 
     async clickAt(point: Point): Promise<void> {
@@ -327,6 +377,11 @@ export function createBrowserSurface(): BrowserSurface {
       const drained = networkBuffer;
       networkBuffer = [];
       return drained;
+    },
+
+    async exportStorageState(): Promise<StorageState> {
+      const ctx = requireStarted(context, 'exportStorageState');
+      return ctx.storageState();
     },
 
     async stop(): Promise<void> {

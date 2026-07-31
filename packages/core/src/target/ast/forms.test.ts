@@ -80,6 +80,105 @@ describe('extractFormsAst', () => {
     expect(email?.widgetLike).toBeUndefined();
   });
 
+  it('recognizes required from an inline `{...register("x", { required: true })}` spread (GAP-068)', () => {
+    // Mirrors RegisterPage.tsx:444/452/460's real shape: register() spread directly onto the
+    // element with no intermediate variable.
+    const source = `
+      function RegisterForm() {
+        return (
+          <form>
+            <input type="radio" value="MRS" data-testid="salutation-mrs" {...register("salutation", { required: true })} />
+            <input type="checkbox" data-testid="newsletter" {...register("newsletter", { required: false })} />
+          </form>
+        );
+      }
+    `;
+    const forms = extractFormsAst('RegisterForm.tsx', source);
+    const fields = forms![0].fields;
+    expect(fields.find((f) => f.testId === 'salutation-mrs')?.required).toBe(true);
+    // required: false must not be treated as truthy just because the key is present.
+    expect(fields.find((f) => f.testId === 'newsletter')?.required).toBe(false);
+  });
+
+  it('recognizes required from a const-then-spread `{...xReg}` via validate.required (GAP-068)', () => {
+    // Mirrors RegisterPage.tsx's emailReg (validate.required present) vs. passwordReg (only a
+    // bare custom `validate.all` fn, no `required`-named key) real-world shapes.
+    const source = `
+      function RegisterForm() {
+        const emailReg = register('email', { validate: { required: requiredFn, pattern: patternFn } });
+        const passwordReg = register('password', { validate: { all(v) { return true; } } });
+        return (
+          <form>
+            <MatInput type="email" data-testid="reg-email" {...emailReg} />
+            <MatInput type="password" data-testid="reg-password" {...passwordReg} />
+          </form>
+        );
+      }
+    `;
+    const forms = extractFormsAst('RegisterForm.tsx', source);
+    const fields = forms![0].fields;
+    expect(fields.find((f) => f.testId === 'reg-email')?.required).toBe(true);
+    // A single custom validate fn with no `required`-named key is a documented, accepted
+    // static-analysis limitation (can't tell "this validator implies required" without
+    // evaluating its body) — not a regression, mirrors the ternary-`type` limitation below.
+    expect(fields.find((f) => f.testId === 'reg-password')?.required).toBe(false);
+  });
+
+  it("propagates a Controller's rules.validate.required to its rendered widget field (GAP-068)", () => {
+    const source = `
+      function RegisterForm() {
+        return (
+          <form>
+            <input name="email" type="email" required />
+            <Controller
+              name="dob"
+              control={control}
+              rules={{ validate: { required: requiredFn } }}
+              render={({ field }) => (
+                <MatDatepicker {...field} data-testid="register-dob" />
+              )}
+            />
+          </form>
+        );
+      }
+    `;
+    const forms = extractFormsAst('RegisterForm.tsx', source);
+    const fields = forms![0].fields;
+    const dob = fields.find((f) => f.testId === 'register-dob');
+    expect(dob?.required).toBe(true);
+    expect(dob?.widgetLike).toBe(true);
+    // A sibling native field's required-ness is unaffected by the Controller stack.
+    expect(fields.find((f) => f.name === 'email')?.required).toBe(true);
+  });
+
+  it("propagates a Controller's literal rules.required, without leaking across sibling Controllers (GAP-068)", () => {
+    const source = `
+      function RegisterForm() {
+        return (
+          <form>
+            <Controller
+              name="dob"
+              control={control}
+              rules={{ required: true }}
+              render={({ field }) => <MatDatepicker {...field} data-testid="register-dob" />}
+            />
+            <Controller
+              name="notes"
+              control={control}
+              render={({ field }) => <MatDatepicker {...field} data-testid="register-notes" />}
+            />
+          </form>
+        );
+      }
+    `;
+    const forms = extractFormsAst('RegisterForm.tsx', source);
+    const fields = forms![0].fields;
+    expect(fields.find((f) => f.testId === 'register-dob')?.required).toBe(true);
+    // A Controller with no `rules` prop at all must default to false, and must not inherit the
+    // preceding sibling Controller's required-ness.
+    expect(fields.find((f) => f.testId === 'register-notes')?.required).toBe(false);
+  });
+
   it('does NOT tag a plain native <input> as widgetLike', () => {
     const source = `<form><input name="name" type="text" /></form>;`;
     const forms = extractFormsAst('Plain.tsx', source);
@@ -114,6 +213,74 @@ const PSV_LOGIN_PAGE = path.join(
   'pages',
   'login',
   'LoginPage.tsx',
+);
+
+const PSV_REGISTER_PAGE = path.join(
+  FIXTURES_ROOT,
+  'psv-ui-c-and-a-react-latest-development',
+  'src',
+  'pages',
+  'register',
+  'RegisterPage.tsx',
+);
+const PSV_RESET_PASSWORD_PAGE = path.join(
+  FIXTURES_ROOT,
+  'psv-ui-c-and-a-react-latest-development',
+  'src',
+  'pages',
+  'resetpassword',
+  'ResetPasswordPage.tsx',
+);
+
+describe.skipIf(!fs.existsSync(PSV_REGISTER_PAGE))(
+  'extractFormsAst against psv-ui-c-and-a RegisterPage.tsx (isolated check, GAP-068)',
+  () => {
+    it('recognizes required fields driven by register()/Controller.rules validate.required', () => {
+      const source = fs.readFileSync(PSV_REGISTER_PAGE, 'utf-8');
+      const forms = extractFormsAst('src/pages/register/RegisterPage.tsx', source);
+      expect(forms).toHaveLength(1);
+      const fields = forms![0].fields;
+
+      // register('x', { validate: { required: ... } }) const-then-spread fields.
+      expect(fields.find((f) => f.testId === 'register-email')?.required).toBe(true);
+      expect(fields.find((f) => f.testId === 'register-firstname')?.required).toBe(true);
+      expect(fields.find((f) => f.testId === 'register-surname')?.required).toBe(true);
+
+      // Controller + rules.validate.required wrapping a MatDatepicker widget — both GAP-066's
+      // widgetLike tagging and GAP-068's required propagation must hold simultaneously.
+      const dob = fields.find((f) => f.testId === 'register-dob');
+      expect(dob?.required).toBe(true);
+      expect(dob?.widgetLike).toBe(true);
+
+      // The real fixture's passwordReg uses only a bare custom `validate.all` fn with no
+      // `required`-named key — a documented, accepted static-analysis limitation, not a
+      // regression (mirrors the login-page type-ternary limitation asserted below).
+      expect(fields.find((f) => f.testId === 'register-password')?.required).toBe(false);
+
+      // Note: the salutation radios are intentionally not asserted here — the real fixture gives
+      // them no `name`/`data-testid` (only `value`+`type`), so they resolve to positional
+      // `field-N` names; that inline-spread `required: true` shape is already covered by the
+      // synthetic test above.
+    });
+  },
+);
+
+describe.skipIf(!fs.existsSync(PSV_RESET_PASSWORD_PAGE))(
+  'extractFormsAst against psv-ui-c-and-a ResetPasswordPage.tsx (isolated check, GAP-068)',
+  () => {
+    it('recognizes required fields driven by register() validate.required', () => {
+      const source = fs.readFileSync(PSV_RESET_PASSWORD_PAGE, 'utf-8');
+      const forms = extractFormsAst('src/pages/resetpassword/ResetPasswordPage.tsx', source);
+      expect(forms).toHaveLength(1);
+      const fields = forms![0].fields;
+
+      expect(fields.find((f) => f.testId === 'reset-email')?.required).toBe(true);
+      expect(fields.find((f) => f.testId === 'reset-confirm-password')?.required).toBe(true);
+      // Same accepted limitation as RegisterPage's passwordReg: a bare custom `validate.all` fn,
+      // no `required`-named key.
+      expect(fields.find((f) => f.testId === 'reset-password')?.required).toBe(false);
+    });
+  },
 );
 
 describe.skipIf(!fs.existsSync(PSV_LOGIN_PAGE))(

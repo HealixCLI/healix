@@ -2253,6 +2253,121 @@ describe('generate — prompt trimming (per-item route filtering)', () => {
   });
 });
 
+// ---- content inventory: non-interactive content (barcodes/images/status text) grounding --------
+
+describe('generate — non-interactive content inventory (formatContentInventory)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-content-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function explorationWithContent(
+    contentElements: NonNullable<
+      TestModeContext['exploration']
+    >['crawl']['routes'][number]['snapshot']['contentElements'],
+  ): NonNullable<TestModeContext['exploration']> {
+    const routes = [
+      {
+        url: 'https://app.acme.test/vouchers',
+        title: 'Vouchers',
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        snapshot: {
+          url: 'https://app.acme.test/vouchers',
+          title: 'Vouchers',
+          interactiveElements: [],
+          contentElements,
+        },
+        networkEvents: [],
+      },
+    ];
+    return {
+      crawl: {
+        routes,
+        visitedCount: routes.length,
+        budgetExhausted: false,
+        redirectLoopsDetected: [],
+        shellCollapsed: false,
+        degenerateRedirectsSkipped: [],
+        authAttempted: false,
+        authVerified: false,
+      },
+      routing: { hashRouted: false },
+      loginCandidates: [],
+      useful: true,
+      observedEndpoints: [],
+    };
+  }
+
+  function ctxWith(exploration: NonNullable<TestModeContext['exploration']>): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration,
+    };
+  }
+
+  it('includes a labeled, non-clickable content section when contentElements are present', async () => {
+    const ctx = ctxWith(
+      explorationWithContent([
+        { kind: 'svg', selector: '[data-testid="voucher-barcode"]', description: 'Voucher barcode: 123456' },
+      ]),
+    );
+    await generate(ctx, PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('Non-interactive content observed during exploration');
+    expect(prompt).toContain('NOT clickable');
+    expect(prompt).toContain('[data-testid="voucher-barcode"]');
+    expect(prompt).toContain('Voucher barcode: 123456');
+  });
+
+  it('omits the content section entirely when no route has contentElements', async () => {
+    const ctx = ctxWith(explorationWithContent(undefined));
+    await generate(ctx, PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('Non-interactive content observed during exploration');
+  });
+
+  it('omits the content section entirely when there is no exploration data at all', async () => {
+    const ctx: TestModeContext = {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+    };
+    await generate(ctx, PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('Non-interactive content observed during exploration');
+  });
+
+  it('never emits the content section for a tierC-api item', async () => {
+    const ctx = ctxWith(
+      explorationWithContent([
+        { kind: 'status-text', selector: '[role="status"]', description: 'Saved successfully' },
+      ]),
+    );
+    const apiPlan: TestPlan = {
+      summary: 'one api item',
+      items: [{ ...PLAN.items[0], tier: 'tierC-api' }],
+    };
+    await generate(ctx, apiPlan);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('Non-interactive content observed during exploration');
+  });
+});
+
 // ---- source-context grounding: ctx.sourceContext feeds real file/schema/form citations --------
 
 const SRC_CITED_SPEC = `import { test, expect } from '@playwright/test';

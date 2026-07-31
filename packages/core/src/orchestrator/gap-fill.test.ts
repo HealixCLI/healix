@@ -216,6 +216,30 @@ describe('identifyExplorationGaps()', () => {
     expect(gaps[0]).toMatchObject({ targetName: 'Voucher barcode', relatedPlanItemId: 'p1' });
   });
 
+  it('correlates an affordance against the plan item with the MOST shared significant words, not the first item sharing any word', () => {
+    // Regression guard for the "google wallet" mis-attribution: a naive first-match scan would
+    // pick whichever of these two plan items happened to iterate first, since both titles share
+    // the word "google" with the candidate name. Best-overlap must pick the wallet item, since it
+    // additionally shares "wallet".
+    const dashboard = route('https://a.test/#/SK/dashboard', {
+      role: 'authenticated',
+      unattemptedClickCandidates: [{ selector: '[data-testid=google-wallet]', name: 'google wallet' }],
+    });
+    const gaps = identifyExplorationGaps({
+      crawlResult: crawlResult([dashboard]),
+      routing: HASH_ROUTING,
+      baseUrl: 'https://a.test/',
+      planItems: [
+        { id: 'social-login', title: 'Social login entry points (Google, Facebook via Cognito)' },
+        { id: 'wallet', title: 'Digital wallet integration (Apple Wallet, Google Wallet)' },
+      ],
+      observedEndpoints: [],
+    });
+
+    const walletGap = gaps.find((g) => g.targetName === 'google wallet');
+    expect(walletGap?.relatedPlanItemId).toBe('wallet');
+  });
+
   it('does not misclassify a brand-named affordance on an AUTHENTICATED route as low-value, even though the same brand name is a social/OAuth signal on an anonymous route', () => {
     // Regression guard: a naive brand-name regex would catch "Apple Wallet"/"Google Wallet" the
     // same way it (correctly) catches an anonymous-page Facebook/Google OAuth button.

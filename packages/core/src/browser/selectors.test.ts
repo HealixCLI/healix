@@ -1181,3 +1181,121 @@ describe('selectors.duplicate-target capture dedup (mirrored)', () => {
     expect(result).toHaveLength(2);
   });
 });
+
+// --- Mirrored collectContentElements() ---
+//
+// Same rationale/convention as collectGenericClickCandidatesMirror above: the real function runs
+// inside page.evaluate against a live DOM, so this mirrors its exact branch structure over the
+// same fake element tree instead.
+
+interface ContentElementResult {
+  kind: 'svg' | 'canvas' | 'image' | 'status-text';
+  description: string;
+}
+
+/** Mirrors `collectContentElements()`'s per-node classification: svg/canvas -> label fallback
+ * chain, img -> non-empty alt only, [role="status"]/[aria-live] -> non-empty text only. */
+function collectContentElementsMirror(root: FakeEl): ContentElementResult[] {
+  const out: ContentElementResult[] = [];
+  for (const el of descendantsInDocumentOrder(root)) {
+    if (el.hidden) continue;
+    const tag = el.tagName.toLowerCase();
+
+    if (tag === 'svg' || tag === 'canvas') {
+      const label = el.attrs['aria-label'] || el.attrs['title'] || (el.parentElement?.textContent ?? '');
+      out.push({
+        kind: tag === 'svg' ? 'svg' : 'canvas',
+        description: clamp(label) || `a rendered <${tag}> element (no label/title/nearby text found)`,
+      });
+      continue;
+    }
+
+    if (tag === 'img') {
+      const alt = el.attrs['alt'];
+      if (!alt || !alt.trim()) continue;
+      out.push({ kind: 'image', description: clamp(alt) });
+      continue;
+    }
+
+    if (el.attrs['role'] === 'status' || el.attrs['aria-live'] !== undefined) {
+      const text = (el.textContent ?? '').trim();
+      if (!text) continue;
+      out.push({ kind: 'status-text', description: clamp(text) });
+    }
+  }
+  return out;
+}
+
+describe('selectors.collectContentElements (mirrored)', () => {
+  it('captures a barcode-shaped <svg> with a nearby label as its description', () => {
+    const wrapper = fakeEl('div', { textContent: 'Voucher barcode: 123456' });
+    const svg = fakeEl('svg');
+    appendChild(wrapper, svg);
+
+    const result = collectContentElementsMirror(wrapper);
+
+    expect(result).toEqual([{ kind: 'svg', description: 'Voucher barcode: 123456' }]);
+  });
+
+  it('prefers aria-label over nearby parent text for an svg/canvas description', () => {
+    const wrapper = fakeEl('div', { textContent: 'unrelated wrapper text' });
+    const canvas = fakeEl('canvas', { attrs: { 'aria-label': 'QR code for check-in' } });
+    appendChild(wrapper, canvas);
+
+    const result = collectContentElementsMirror(wrapper);
+
+    expect(result).toEqual([{ kind: 'canvas', description: 'QR code for check-in' }]);
+  });
+
+  it('falls back to a generic description when an svg has no label/title and no parent text', () => {
+    const svg = fakeEl('svg');
+    // No parent, so parentElement?.textContent is undefined -> falls through to the generic note.
+    const result = collectContentElementsMirror(svg);
+    expect(result).toEqual([
+      { kind: 'svg', description: 'a rendered <svg> element (no label/title/nearby text found)' },
+    ]);
+  });
+
+  it('captures an <img> with meaningful alt text', () => {
+    const img = fakeEl('img', { attrs: { alt: 'Membership barcode' } });
+    const result = collectContentElementsMirror(img);
+    expect(result).toEqual([{ kind: 'image', description: 'Membership barcode' }]);
+  });
+
+  it('excludes a decorative <img> with empty alt text', () => {
+    const img = fakeEl('img', { attrs: { alt: '' } });
+    expect(collectContentElementsMirror(img)).toEqual([]);
+  });
+
+  it('excludes an <img> with no alt attribute at all', () => {
+    const img = fakeEl('img');
+    expect(collectContentElementsMirror(img)).toEqual([]);
+  });
+
+  it('captures a role="status" node\'s own text', () => {
+    const status = fakeEl('div', { attrs: { role: 'status' }, textContent: 'Your changes were saved' });
+    const result = collectContentElementsMirror(status);
+    expect(result).toEqual([{ kind: 'status-text', description: 'Your changes were saved' }]);
+  });
+
+  it('captures an aria-live node even when role is absent', () => {
+    const live = fakeEl('div', { attrs: { 'aria-live': 'polite' }, textContent: 'Item added to cart' });
+    const result = collectContentElementsMirror(live);
+    expect(result).toEqual([{ kind: 'status-text', description: 'Item added to cart' }]);
+  });
+
+  it('excludes an empty role="status" node', () => {
+    const status = fakeEl('div', { attrs: { role: 'status' }, textContent: '' });
+    expect(collectContentElementsMirror(status)).toEqual([]);
+  });
+
+  it('excludes a hidden content element regardless of shape', () => {
+    const img = fakeEl('img', { attrs: { alt: 'Hidden icon' }, hidden: true });
+    expect(collectContentElementsMirror(img)).toEqual([]);
+  });
+
+  it('does not classify a plain <div> with no matching shape as content', () => {
+    const plain = fakeEl('div', { textContent: 'Just a wrapper' });
+    expect(collectContentElementsMirror(plain)).toEqual([]);
+  });
+});

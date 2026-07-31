@@ -1513,13 +1513,22 @@ async function runPipeline(
             // session Tier B also falls back to) over a role-tagged one.
             const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
             // No structured project-config field for supported regions/locales exists yet (see
-            // the enrichment plan's "region-code sourcing is a design TBD") — this scans the
-            // approved plan's own item text as a last-resort heuristic (e.g. a requirement that
-            // literally names "CZ/HU-specific home page copy"). Prefer a real project-config
-            // field or static analysis of the target's i18n/locale config once either exists.
-            const knownRegionCodes = deriveRegionCodesFromText(
-              planForGeneration.items.flatMap((it) => [it.title, it.intent, it.reqTag ?? '']),
-            );
+            // the enrichment plan's "region-code sourcing is a design TBD"). Union two sources:
+            // sourceContext.regionCodes (static analysis of the target's own i18n/regions config,
+            // see target/region-index.ts — catches real sibling regions a PRD never mentions by
+            // name) and the plan-text heuristic below (catches the opposite case: a real
+            // project-config field or recognizable i18n file doesn't exist, but the plan text
+            // itself names a region). Neither alone was sufficient — confirmed live that a PRD
+            // scoped to one region ("SK") never surfaces its app's other real regions via text
+            // alone (docs/c-and-a-exploration-gap-analysis.md §6.3).
+            const knownRegionCodes = [
+              ...new Set([
+                ...(sourceContext?.regionCodes ?? []),
+                ...deriveRegionCodesFromText(
+                  planForGeneration.items.flatMap((it) => [it.title, it.intent, it.reqTag ?? '']),
+                ),
+              ]),
+            ];
             exploration = await runExplorePhase({
               browser,
               baseUrl: effectiveBaseUrl,

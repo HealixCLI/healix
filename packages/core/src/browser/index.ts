@@ -3,7 +3,11 @@ import { chromium, type Browser, type BrowserContext, type Page, type Response }
 /** Playwright has no standalone exported name for this shape — derived from the method itself
  * so this stays in sync with whatever version of Playwright is installed. */
 export type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
-import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
+import {
+  collectContentElements,
+  collectInteractiveElements,
+  INTERACTIVE_ELEMENT_SELECTOR,
+} from './selectors.js';
 import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
 import { FrameMirror } from './mirror.js';
 import type {
@@ -323,11 +327,16 @@ export function createBrowserSurface(): BrowserSurface {
       } catch {
         axTree = undefined;
       }
-      const [title, interactiveElements] = await Promise.all([p.title(), collectInteractiveElements(p)]);
+      const [title, interactiveElements, contentElements] = await Promise.all([
+        p.title(),
+        collectInteractiveElements(p),
+        collectContentElements(p),
+      ]);
       return {
         url: p.url(),
         title,
         interactiveElements,
+        contentElements,
         axTree,
       };
     },

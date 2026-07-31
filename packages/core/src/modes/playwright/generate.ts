@@ -1008,6 +1008,46 @@ Interactive elements observed during exploration across ${ordered.length} route(
 ${lines.join('\n')}${more}`;
 }
 
+/** Cap on content elements shown per route — this is grounding for the occasional "X is visibly
+ * rendered" assertion, not a primary inventory; a handful per route keeps it from crowding the
+ * (far more heavily used) click-candidate inventory it's appended after. */
+const MAX_CONTENT_ELEMENTS_PER_ROUTE = 5;
+
+/**
+ * Render the non-interactive content inventory (barcodes/QR codes, meaningful images, status/label
+ * text — see browser/types.ts's `ContentElement`) captured alongside the click-candidate inventory
+ * during EXPLORE. Kept as its own labeled section, never merged into `formatSnapshotInventory`'s
+ * output, so the model can't mistake a content node for something clickable — these elements
+ * were deliberately excluded from `rankRouteElements`'s budget/ranking (unscored content would
+ * otherwise compete with, and lose to, actual click candidates for the same capped slots), so this
+ * gets its own small fixed per-route cap instead. Returns '' when there's nothing to show, exactly
+ * like `formatSnapshotInventory`.
+ */
+function formatContentInventory(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): string {
+  if (tier === 'tierC-api') return '';
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return '';
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
+  const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
+  const ordered = [...routes].sort(
+    (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
+  );
+
+  const lines: string[] = [];
+  for (const route of ordered) {
+    const elements = route.snapshot.contentElements ?? [];
+    for (const el of elements.slice(0, MAX_CONTENT_ELEMENTS_PER_ROUTE)) {
+      lines.push(`- [${route.role}] ${el.kind} on ${route.url} -> ${el.selector}: ${el.description}`);
+    }
+  }
+  if (lines.length === 0) return '';
+
+  return `
+
+Non-interactive content observed during exploration (${lines.length} item(s)) — these are NOT clickable and must NEVER be used as a click/fill target or with getByRole('button'/'link'/etc.). Use them ONLY to ground an assert-visible or assert-text-content check (e.g. \`await expect(page.locator(SELECTOR)).toBeVisible()\` or \`.toContainText(...)\`) when a scenario needs to confirm something is rendered (a barcode, a status message, a meaningful image) rather than click it:
+${lines.join('\n')}`;
+}
+
 /**
  * Hash-routed SPAs (React Router HashRouter etc.) often gate content behind
  * an invariant locale/region segment (e.g. "#/SK") observed via the app's own
@@ -1140,6 +1180,7 @@ function buildPrompt(
   // extension of attempt 1's; that's an accepted, deliberate tradeoff, not a bug.
   const strictNote = retryNote ? `\n\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier, item, opts);
+  const contentInventory = formatContentInventory(ctx, tier, item);
   const routingGuidance = formatRoutingGuidance(ctx);
   const observedRoutes = formatObservedRoutes(ctx, item);
   const sourceGrounding = formatSourceGrounding(ctx, item, tier);
@@ -1218,7 +1259,7 @@ Requirements:
   remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
   path itself should still register their own fresh unique value first, then reuse THAT same value for
   the collision attempt within the same test.
-- ${tierGuidance}${mockNote}${inventory}${routingGuidance}${observedRoutes}${sourceGrounding}
+- ${tierGuidance}${mockNote}${inventory}${contentInventory}${routingGuidance}${observedRoutes}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -1893,6 +1934,7 @@ Requirements that apply to EVERY feature's spec below:
       item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
     const scenarioList = formatScenarios(scenarios);
     const inventory = formatSnapshotInventory(ctx, tier, item);
+    const contentInventory = formatContentInventory(ctx, tier, item);
     const observedRoutes = formatObservedRoutes(ctx, item);
     const sourceGrounding = formatSourceGrounding(ctx, item, tier);
     return `
@@ -1901,7 +1943,7 @@ Requirements that apply to EVERY feature's spec below:
 Feature: ${item.title}
 Feature intent: ${item.intent}
 Scenarios to cover, one test(...) each, in this order:
-${scenarioList}${inventory}${observedRoutes}${sourceGrounding}
+${scenarioList}${inventory}${contentInventory}${observedRoutes}${sourceGrounding}
 Output this feature's spec between:
 ${batchMarkerStart(reqTag)}
 ...

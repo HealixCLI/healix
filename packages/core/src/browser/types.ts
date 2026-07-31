@@ -77,10 +77,34 @@ export interface InteractiveElement {
   repeatedGroupSize?: number;
 }
 
+/**
+ * A visibly-rendered but NON-clickable piece of content — a barcode/QR `<svg>`/`<canvas>`, an
+ * `<img>` with meaningful `alt` text, or a status/label text node (`role="status"`/`aria-live`) —
+ * that `InteractiveElement`'s click-candidate model has no way to represent. Added so GENERATE can
+ * ground an "X is visibly rendered" assertion (e.g. "the voucher's barcode is shown") without
+ * falling back to an escape hatch just because nothing on the page is clickable evidence of it.
+ *
+ * Deliberately kept as its OWN array on `DomSnapshot` (see `contentElements` below), never merged
+ * into `interactiveElements` — several crawl heuristics (`STATE_REVEAL_MIN_NEW_ELEMENTS`'s
+ * before/after element-count diff in browser/crawler.ts, most notably) assume that array means
+ * "interactive," and mixing in non-interactive content would silently change what counts as a
+ * state reveal.
+ */
+export interface ContentElement {
+  kind: 'svg' | 'canvas' | 'image' | 'status-text';
+  selector: string;
+  /** Short human-readable description grounding what this content is (e.g. an image's alt text,
+   * a status node's own text, or a barcode/canvas's nearby label). */
+  description: string;
+}
+
 export interface DomSnapshot {
   url: string;
   title: string;
   interactiveElements: InteractiveElement[];
+  /** See `ContentElement`'s doc comment. Optional so existing hand-built snapshot fixtures that
+   * predate this field (tests, cached exploration artifacts) stay valid. */
+  contentElements?: ContentElement[];
   axTree?: unknown;
 }
 

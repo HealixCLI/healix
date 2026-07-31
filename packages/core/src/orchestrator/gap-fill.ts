@@ -155,6 +155,15 @@ function significantWords(text: string): Set<string> {
  * name captured in the target app's own locale (e.g. Slovak "zmeniť") won't correlate against an
  * English plan title, so this is a secondary signal — `parentRouteRole` tiering below is the
  * primary, language-agnostic lever for prioritizing gaps that matter.
+ *
+ * Picks the plan item with the MOST shared significant words, not the first item that shares ANY
+ * word — confirmed live to matter: a "google wallet" candidate shares exactly one word ("google")
+ * with an unrelated "Social login entry points (Google, Facebook via Cognito)" plan item, but
+ * would share TWO words ("google", "wallet") with the actual "Digital wallet integration (Apple,
+ * Google Wallet)" item — first-match-wins picked whichever item happened to iterate first,
+ * silently misattributing the gap regardless of which title was the better match. Ties (equal
+ * overlap count, including the common single-shared-word case) keep first-seen-in-`planItems`-
+ * order, preserving prior behavior when there's no stronger signal to prefer one over the other.
  */
 function correlatePlanItem(
   targetName: string,
@@ -162,13 +171,20 @@ function correlatePlanItem(
 ): string | undefined {
   const nameWords = significantWords(targetName);
   if (nameWords.size === 0) return undefined;
+  let bestId: string | undefined;
+  let bestOverlap = 0;
   for (const item of planItems) {
     const itemWords = significantWords(item.title);
+    let overlap = 0;
     for (const w of nameWords) {
-      if (itemWords.has(w)) return item.id;
+      if (itemWords.has(w)) overlap += 1;
+    }
+    if (overlap > bestOverlap) {
+      bestOverlap = overlap;
+      bestId = item.id;
     }
   }
-  return undefined;
+  return bestId;
 }
 
 /**
@@ -397,9 +413,13 @@ export interface GapFillResult {
  */
 const MICRO_AGENT_MAX_ACTIONS = 10;
 /** Measured live against the real Claude CLI (not a mocked provider): a single micro-agent turn —
- * subprocess spin-up + a cheap/low-effort completion — took ~8-9s round-trip, so 10s/turn is a
- * realistic per-step allowance, not an arbitrary number. */
-const MICRO_AGENT_SECONDS_PER_ACTION = 10;
+ * subprocess spin-up + a cheap/low-effort completion — took ~8-9s round-trip, so 10s/turn was the
+ * original realistic per-step allowance. Raised to 15s/turn (§6.2 of
+ * docs/c-and-a-exploration-gap-analysis.md): a live re-crawl showed 7 of 11 gap-fill attempts
+ * stopping via "Gap-fill micro-agent per-gap budget elapsed" — including plan-linked wallet-icon
+ * gaps that are exempt from MAX_GAPS_PER_RUN specifically because they matter — with turns
+ * overrunning the too-tight 10s/action allowance being the observed cause, not too few turns. */
+const MICRO_AGENT_SECONDS_PER_ACTION = 15;
 /**
  * Ceiling on a SINGLE gap's micro-agent escalation, derived from the two constants above rather
  * than set independently — keeps "how many turns it gets" and "how long each turn is allotted"

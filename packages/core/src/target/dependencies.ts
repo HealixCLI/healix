@@ -384,6 +384,17 @@ const MAX_ENDPOINTS_PER_DEP = 40;
 const MAX_AUTH_ENDPOINTS_PER_DEP = 8;
 
 /**
+ * HTTP verbs for which a relative-path literal (no leading '/') is safe to accept from
+ * CALL_SITE_RE without the leading-slash false-positive guard: `.post(`/`.put(`/`.patch(` are
+ * essentially never a non-HTTP Map/Storage/collection method in real code, unlike `.get(`/
+ * `.delete(`, which collide with common getter/collection-deletion methods. This matters because
+ * a very common, standard axios pattern is an instance with its own `baseURL` and a *relative*
+ * call site (e.g. `authApi.post('v1/web/token/generate', body)`) — without this, that endpoint
+ * (frequently the login handshake) is invisible to mock-endpoint detection entirely (GAP-064).
+ */
+const RELATIVE_PATH_OK_METHODS = new Set(['post', 'put', 'patch']);
+
+/**
  * Any string/template literal that LOOKS like a path — needed because CALL_SITE_RE and
  * CONFIG_CALL_RE miss the common `fetch(`${base}/auth/token/generate`)` shape (no
  * `.post(`, no `{ url: ... }`). Deliberately feeds ONLY the auth-endpoint list further
@@ -444,7 +455,8 @@ function extractEndpointCallSites(files: WalkFile[]): {
   };
 
   const tryAdd = (method: string | undefined, raw: string | undefined): void => {
-    if (!method || raw === undefined || !raw.startsWith('/')) return;
+    if (!method || raw === undefined) return;
+    if (!raw.startsWith('/') && !RELATIVE_PATH_OK_METHODS.has(method.toLowerCase())) return;
     const pathPattern = normalizeEndpointPath(raw);
     const isAuth = isAuthEndpointPath(pathPattern);
     const key = `${method.toUpperCase()} ${pathPattern}`;

@@ -49,6 +49,43 @@ describe('extractFormsAst', () => {
     expect(forms![0].submitLabel).toBe('Sign in');
   });
 
+  it('tags a Controller-wrapped custom picker/calendar widget field as widgetLike (GAP-066)', () => {
+    // Mirrors RegisterPage.tsx:504-533's real shape: a react-hook-form Controller rendering a
+    // MatDatepicker (react-datepicker customInput) — .fill() on this field's underlying input
+    // never triggers the widget's own onChange.
+    const source = `
+      function RegisterForm() {
+        return (
+          <form>
+            <input name="email" type="email" required />
+            <Controller
+              name="dob"
+              control={control}
+              render={({ field }) => (
+                <MatDatepicker {...field} data-testid="register-dob" />
+              )}
+            />
+            <button type="submit">Register</button>
+          </form>
+        );
+      }
+    `;
+    const forms = extractFormsAst('RegisterForm.tsx', source);
+    const fields = forms![0].fields;
+    const dob = fields.find((f) => f.testId === 'register-dob');
+    expect(dob).toBeDefined();
+    expect(dob?.widgetLike).toBe(true);
+    // A plain native input in the same form must not be tagged.
+    const email = fields.find((f) => f.name === 'email');
+    expect(email?.widgetLike).toBeUndefined();
+  });
+
+  it('does NOT tag a plain native <input> as widgetLike', () => {
+    const source = `<form><input name="name" type="text" /></form>;`;
+    const forms = extractFormsAst('Plain.tsx', source);
+    expect(forms![0].fields[0].widgetLike).toBeUndefined();
+  });
+
   it('falls back to a positional name when no name/label/testid/id is present', () => {
     const source = `<form><input type="text" /></form>;`;
     const forms = extractFormsAst('Anon.tsx', source);

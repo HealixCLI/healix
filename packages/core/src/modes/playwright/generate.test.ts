@@ -2433,6 +2433,66 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     expect(calls[0].prompt).toContain('email (email, required)');
   });
 
+  it('warns against .fill() for a widgetLike field and tags it WIDGET in the field list (GAP-066)', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'email', type: 'email', required: true },
+            { name: 'dob', type: 'text', required: true, testId: 'register-dob', widgetLike: true },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('dob (text, required, WIDGET)');
+    expect(prompt).toContain('email (email, required)');
+    expect(prompt).not.toContain('email (email, required, WIDGET)');
+    expect(prompt).toContain('WARNING');
+    expect(prompt).toContain('calling `.fill()` on them sets the DOM value directly');
+  });
+
+  it('adds no widget warning when no field is widgetLike', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [{ name: 'email', type: 'email', required: true }],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('WIDGET');
+  });
+
   it('rejects and retries a spec missing its mandatory [SRC:...] citation, accepting a corrected retry', async () => {
     const sourceContext: TestModeContext['sourceContext'] = {
       units: [

@@ -9,6 +9,13 @@ export interface FormField {
   type: string;
   required: boolean;
   testId?: string;
+  /** True when this field is rendered by a controlled third-party widget component (a
+   * calendar/picker/autocomplete-style component, e.g. react-datepicker's customInput) rather
+   * than a plain native/design-system input — such a widget only updates its bound value
+   * through its own onChange callback, so a plain `.fill()` sets the DOM value directly without
+   * ever invoking it (GAP-066). Consumers (e.g. GENERATE's prompt) should warn against `.fill()`
+   * for these and point at widget-appropriate interaction instead. */
+  widgetLike?: boolean;
 }
 
 export interface FormInfo {
@@ -35,6 +42,11 @@ const KNOWN_INPUT_TYPES = new Set([
 /** Custom component name shapes commonly used for form inputs, when no recognized `type` value is present either. */
 const INPUT_COMPONENT_NAME_RE = /(Input|Field)$/;
 const SUBMIT_COMPONENT_NAME_RE = /Button$/;
+/** Custom component name shapes for controlled third-party calendar/picker/autocomplete-style
+ * widgets (react-datepicker's customInput being the canonical case) — these don't end in
+ * Input/Field so INPUT_COMPONENT_NAME_RE alone would miss them, and they need a distinct
+ * `widgetLike` tag rather than being treated as an ordinary input (GAP-066). */
+const WIDGET_COMPONENT_NAME_RE = /Picker|Calendar|Datepicker|Autocomplete|Combobox|Typeahead/i;
 
 function attrString(el: JSXOpeningElement, name: string): string | undefined {
   const attr = el.attributes.find(
@@ -68,10 +80,12 @@ function isSubmitControl(el: JSXOpeningElement, tagName: string): boolean {
 function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number): FormField | null {
   const isNative = NATIVE_INPUT_TAGS.has(tagName);
   const declaredType = attrString(el, 'type');
+  const isWidget = WIDGET_COMPONENT_NAME_RE.test(tagName);
   const isInputLike =
     isNative ||
     (declaredType && KNOWN_INPUT_TYPES.has(declaredType)) ||
-    INPUT_COMPONENT_NAME_RE.test(tagName);
+    INPUT_COMPONENT_NAME_RE.test(tagName) ||
+    isWidget;
   if (!isInputLike) return null;
 
   const testId = attrString(el, 'data-testid');
@@ -85,7 +99,7 @@ function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number
     declaredType ?? (tagName === 'select' ? 'select' : tagName === 'textarea' ? 'textarea' : 'text');
   const required = hasTruthyAttr(el, 'required');
 
-  return { name, type, required, ...(testId ? { testId } : {}) };
+  return { name, type, required, ...(testId ? { testId } : {}), ...(isWidget ? { widgetLike: true } : {}) };
 }
 
 /**
@@ -93,8 +107,12 @@ function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number
  * `<input>/<select>/<textarea>` fields AND custom input-like components (a `type` attribute
  * matching a known HTML input type, or a component name ending in Input/Field — covers common
  * design-system components like MUI's TextField or a bespoke MatInput that wrap a native input
- * with no native tag of their own). Returns null on parse failure so callers can skip the file
- * rather than crash the whole repo scan (there is no regex fallback for this new capability).
+ * with no native tag of their own), plus controlled third-party calendar/picker/autocomplete-style
+ * widgets (a component name matching WIDGET_COMPONENT_NAME_RE, e.g. a react-hook-form
+ * `Controller`'s rendered `MatDatepicker`/react-datepicker `customInput` — tagged `widgetLike` so
+ * downstream consumers know `.fill()` won't drive it, see GAP-066). Returns null on parse failure
+ * so callers can skip the file rather than crash the whole repo scan (there is no regex fallback
+ * for this new capability).
  */
 export function extractFormsAst(rel: string, source: string): FormInfo[] | null {
   const ast: File | null = parseModule(source, rel);

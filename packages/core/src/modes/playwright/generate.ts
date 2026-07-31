@@ -1162,7 +1162,9 @@ function formatRoutingGuidance(ctx: TestModeContext): string {
     : '';
   return `
 
-This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
+This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.
+
+RULE: a page.goto() to a URL that differs only in its hash fragment is a SAME-DOCUMENT navigation — it does NOT unload/reload the page. Any component that reads its auth/session state only once at mount (e.g. \`useState(readInitialAuthFromStorage)\` with no reactive listener) keeps its already-mounted in-memory value untouched by such a navigation, even after you clear localStorage/cookies. If a scenario needs a genuine "no active session"/logged-out precondition on this app, clearing storage alone is NOT sufficient — you MUST also force a real full-document reload (e.g. \`page.reload()\`) after clearing storage and BEFORE navigating to or asserting against the target route, so the app's in-memory auth state actually gets recomputed against the now-cleared storage. Skipping this produces a test that never exercises the precondition its own title claims to test, in either direction.`;
 }
 
 /** Cap on distinct route URLs listed, so a large crawl can't blow up the prompt. */

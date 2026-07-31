@@ -1709,9 +1709,18 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
     expect(prompt).toContain('#/SK');
   });
 
+  it('warns that a hash-only goto is a same-document navigation that needs a real reload to test a logged-out precondition (GAP-065)', async () => {
+    await generate(ctxWith(makeExploration(1, { hashRouted: true })), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('SAME-DOCUMENT navigation');
+    expect(prompt).toContain('page.reload()');
+    expect(prompt).toContain('no active session');
+  });
+
   it('omits hash-routing guidance for a non-hash app', async () => {
     await generate(ctxWith(makeExploration(1, { hashRouted: false })), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+    expect(calls[0].prompt).not.toContain('SAME-DOCUMENT navigation');
   });
 
   it('omits hash-routing guidance when there is no exploration artifact at all', async () => {

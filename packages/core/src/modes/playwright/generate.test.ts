@@ -377,6 +377,27 @@ test('[REQ:FR-AUTH-01] positive: logs in', async ({ page }) => {
     expect(result).toMatch(/test\.fixme\('\[REQ:FR-AUTH-01\] positive: logs in', \{ annotation:/);
   });
 
+  it('carries the FULL reason through when the model word-wraps it across multiple // lines (GAP-062)', () => {
+    // Mirrors the real generated shape from
+    // suite/tests/tierB-auth/profile-field-editing-name-dob-salutation.spec.ts:24-26 — a
+    // naturally word-wrapped multi-line comment, not a single long line.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain(
+      'unobserved element — a dedicated success toast selector was not captured in the ' +
+        'interactive-element inventory; verifying the persisted field values as a coarser ' +
+        'observable outcome of a successful save instead.',
+    );
+  });
+
   it('falls back to a generic reason when the marker carries no explanation', () => {
     const source = `import { test, expect } from '@playwright/test';
 

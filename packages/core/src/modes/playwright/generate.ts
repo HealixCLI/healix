@@ -423,8 +423,11 @@ const TEST_OPEN_AT_RE = /test(?:\.(?:only|skip|fixme))?\(/y;
  * genuinely useful half ("the login form fields were not captured in the inventory for the
  * login route itself") rather than just the fact that something was unobserved. */
 // Every gap is [ \t] rather than \s so the capture can never cross the newline and pick up the
-// following line of test code as if it were the explanation.
+// following line of test code as if it were the explanation. Continuation lines (the model's
+// reason word-wrapped across multiple `//` comment lines) are picked up separately below.
 const ESCAPE_HATCH_REASON_RE = /\/\/[ \t]*TODO:[ \t]*unobserved element[ \t]*[-–—:]?[ \t]*([^\r\n]*)/;
+/** Matches one continuation `//` comment line immediately following the TODO line. */
+const REASON_CONTINUATION_RE = /^\/\/[ \t]*(.*)$/;
 /** Keeps one long model comment from dominating a report cell. */
 const SKIP_REASON_MAX_LENGTH = 300;
 
@@ -436,9 +439,29 @@ const SKIP_REASON_MAX_LENGTH = 300;
  * marker leaves the report's "why was this skipped" column blank — for what is, in practice,
  * the most common skip cause there is. `JSON.stringify` does the embedding because the text is
  * model-authored and can hold quotes, backslashes, or newlines.
+ *
+ * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
+ * than one long line. ESCAPE_HATCH_REASON_RE only ever captures the first line (deliberately, so
+ * it can't cross into following test code) — so once it matches, this walks forward through the
+ * remaining `//`-prefixed lines directly below it and appends them, stopping at the first
+ * non-comment line. Without this, everything past the first line was silently dropped with no
+ * indication truncation happened (GAP-062).
  */
 function escapeHatchDetails(body: string): string {
-  const detail = ESCAPE_HATCH_REASON_RE.exec(body)?.[1]?.trim() ?? '';
+  const match = ESCAPE_HATCH_REASON_RE.exec(body);
+  const firstLine = match?.[1]?.trim() ?? '';
+  const continuationLines: string[] = [];
+  if (match) {
+    const rest = body.slice(match.index + match[0].length);
+    // The first split segment is the (already-empty) remainder of the TODO line itself, up to
+    // its own trailing newline — real continuation lines start at index 1.
+    for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
+      const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
+      if (!contMatch) break;
+      continuationLines.push(contMatch[1].trim());
+    }
+  }
+  const detail = [firstLine, ...continuationLines].filter(Boolean).join(' ');
   const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
   const description =
     full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;

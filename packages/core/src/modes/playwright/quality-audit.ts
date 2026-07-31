@@ -233,6 +233,13 @@ const LOCATOR_CLASS_OR_TAG_RE = /\.locator\(\s*['"](?:\.[a-zA-Z][\w-]*|[a-zA-Z][
 const AMBIGUOUS_LOCATOR_SAFETY_RE =
   /\.(?:first|last|nth)\(|\{\s*(?:name|exact)\s*:|getByTestId\(|\[(?:data-testid|id)=/;
 
+/** Title explicitly calls out a blur-triggered validation scenario — a narrow, high-precision signal (vs. a general negative-title hint) since blur's own async-appearance risk only applies here. */
+const BLUR_TITLE_HINT_RE = /\bblur\b/i;
+/** An explicit blur trigger — the fix this finding recommends. */
+const BLUR_TRIGGER_RE = /\.blur\(\s*\)|\.press\(\s*['"]Tab['"]\s*\)/;
+/** A visibility/text assertion — the shape most likely to time out against a never-observed, possibly-hallucinated selector for a blur-only message. Matches the method call alone (not the full expect(...) wrapper), since the locator expression itself commonly contains its own nested parens (e.g. getByText('...')) that would break a naive expect\([^)]*\) match. */
+const VISIBLE_OR_TEXT_ASSERTION_RE = /\.(?:not\.)?(?:toBeVisible|toHaveText)\(/;
+
 /**
  * A second, independent real-data-traced false-failure shape: a tierC-api negative/error-path
  * scenario asserting a fixed "success-shaped" status code (200/201/204) with no grounding —
@@ -324,6 +331,33 @@ export function auditSpecQuality(source: string): QualityFinding[] {
         testTitle: block.title,
         blockRange: [block.start, block.end],
       });
+    }
+
+    // A blur-triggered validation message never appears in EXPLORE's default-state snapshot
+    // (see generate.ts's own guidance on this), so a `.fill(...)` immediately followed by a
+    // visibility/text assertion with no explicit blur trigger in between is the exact shape
+    // that times out against a message the app renders correctly but the test never actually
+    // triggered (or targets with a hallucinated selector) — a false "app defect", not a real one.
+    if (BLUR_TITLE_HINT_RE.test(block.title) && HAS_FILL_RE.test(block.body)) {
+      const lines = block.body.split('\n');
+      const fillLineIdx = lines.findIndex((l) => HAS_FILL_RE.test(l));
+      if (fillLineIdx !== -1) {
+        const after = lines.slice(fillLineIdx + 1);
+        const assertionOffset = after.findIndex((l) => VISIBLE_OR_TEXT_ASSERTION_RE.test(l));
+        if (assertionOffset !== -1) {
+          const between = after.slice(0, assertionOffset + 1);
+          const hasBlurTrigger = between.some((l) => BLUR_TRIGGER_RE.test(l));
+          if (!hasBlurTrigger) {
+            findings.push({
+              code: 'unblurred-validation-assertion',
+              severity: 'warn',
+              message: `Test "${block.title}" reads as a blur-triggered validation scenario but fills the field and asserts the message's visibility/text with no explicit blur trigger (\`.blur()\` or \`.press('Tab')\`) in between — the message may never actually render, and its selector was never observed by EXPLORE (which only snapshots the page's default state), so this is a common source of a false "app defect" timeout rather than a real one. Trigger blur explicitly right after the fill, and assert the message with a text-based locator grounded in its real expected wording.`,
+              testTitle: block.title,
+              blockRange: [block.start, block.end],
+            });
+          }
+        }
+      }
     }
 
     for (const line of block.body.split('\n')) {

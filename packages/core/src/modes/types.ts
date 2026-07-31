@@ -193,7 +193,8 @@ export type QualityFindingCode =
   | 'disabled-button-race-risk'
   | 'disabled-button-click-race'
   | 'ambiguous-locator-risk'
-  | 'unvalidated-status-code-assumption';
+  | 'unvalidated-status-code-assumption'
+  | 'unblurred-validation-assertion';
 
 export interface QualityFinding {
   code: QualityFindingCode;

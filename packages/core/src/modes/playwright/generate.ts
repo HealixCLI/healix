@@ -1310,6 +1310,18 @@ Requirements:
   correctly disable that control on invalid input, and clicking a disabled control hangs until
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
+- A field-level validation message that appears "on blur" / "after leaving the field" only exists
+  in the DOM once blur actually fires — the exploration snapshot above was captured on the page's
+  DEFAULT state, so it can NEVER contain a real selector for this message; one is NOT in the
+  inventory. Two rules follow: (1) explicitly TRIGGER the blur yourself — \`await locator.blur()\`
+  or \`await page.keyboard.press('Tab')\` — immediately after the \`.fill(...)\`, rather than assuming
+  a later action (e.g. a submit click) happens to blur the field; a click on a still-disabled
+  control never fires at all, and even a successful one may blur too late or not at all depending
+  on the app. (2) Since this message's exact markup was never observed, assert it with a
+  TEXT-based locator (\`getByText(...)\`/\`getByRole(..., { name: ... })\`) against the message's real
+  expected wording (from the scenario/feature intent), NOT an invented CSS class/id/data-testid —
+  a hallucinated structural selector for an element you never saw will simply never match, timing
+  out and reading as a false "app defect" when the app's validation actually works correctly.
 - Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
   \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
   (CI machines, headless vs. headed, network conditions) vary widely in speed, making this
@@ -1989,6 +2001,18 @@ Requirements that apply to EVERY feature's spec below:
   correctly disable that control on invalid input, and clicking a disabled control hangs until
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
+- A field-level validation message that appears "on blur" / "after leaving the field" only exists
+  in the DOM once blur actually fires — the exploration snapshot above was captured on the page's
+  DEFAULT state, so it can NEVER contain a real selector for this message; one is NOT in the
+  inventory. Two rules follow: (1) explicitly TRIGGER the blur yourself — \`await locator.blur()\`
+  or \`await page.keyboard.press('Tab')\` — immediately after the \`.fill(...)\`, rather than assuming
+  a later action (e.g. a submit click) happens to blur the field; a click on a still-disabled
+  control never fires at all, and even a successful one may blur too late or not at all depending
+  on the app. (2) Since this message's exact markup was never observed, assert it with a
+  TEXT-based locator (\`getByText(...)\`/\`getByRole(..., { name: ... })\`) against the message's real
+  expected wording (from the scenario/feature intent), NOT an invented CSS class/id/data-testid —
+  a hallucinated structural selector for an element you never saw will simply never match, timing
+  out and reading as a false "app defect" when the app's validation actually works correctly.
 - Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
   \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
   (CI machines, headless vs. headed, network conditions) vary widely in speed, making this

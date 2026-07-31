@@ -319,7 +319,7 @@ async function regenerateDroppedAndExecutePending(params: {
       items: droppedItems,
     });
     for (const spec of newSpecs)
-      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey);
+      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure);
   }
 
   // Reconstruct still-pending (generated but never executed) specs from
@@ -2358,9 +2358,9 @@ async function runPipeline(
         // Carried-forward specs (copied bytes from a prior run, already at
         // whatever granularity that run used) get a single row, as before.
         for (const spec of newSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey);
+          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey, noteStoreFailure);
         for (const spec of carriedSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey);
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
@@ -3549,6 +3549,7 @@ function registerSpecRows(
   spec: GeneratedSpec,
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
+  noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
   // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
   // deliberately never persists the per-run synthetic tag — see persistedReqTag
@@ -3646,8 +3647,8 @@ function registerSpecRows(
     // THIS run's own KB tracking.
     try {
       store.linkPlanKbScenarioTest(runId, item.id, i, test.id);
-    } catch {
-      /* best-effort */
+    } catch (err) {
+      noteStoreFailure('linkPlanKbScenarioTest', err);
     }
   });
 }

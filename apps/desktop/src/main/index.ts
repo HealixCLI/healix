@@ -777,6 +777,20 @@ async function retryPassRun(
   return summary;
 }
 
+// Retry-pass only ever recovers a run that has already finished (dropped
+// items to regenerate, pending scenarios to execute) — 'paused' is
+// deliberately excluded even though it has no live activeRuns entry, since a
+// paused run still has a checkpoint that resumeRun can act on, and letting
+// both mechanisms write into the same run's tests/results concurrently would
+// race.
+const RETRY_PASS_ELIGIBLE_STATUSES: ReadonlySet<string> = new Set([
+  'passed',
+  'failed',
+  'blocked',
+  'error',
+  'cancelled',
+]);
+
 ipcMain.handle(
   'run:retryPass',
   async (
@@ -789,6 +803,12 @@ ipcMain.handle(
     const store = await requireStore();
     const run = store.getRun(runId);
     if (!run) return { ok: false, reason: `No run found with id ${runId}.` };
+    if (!RETRY_PASS_ELIGIBLE_STATUSES.has(run.status)) {
+      return {
+        ok: false,
+        reason: `Run is ${run.status}; retry-pass only applies to a completed run.`,
+      };
+    }
     // Same "one run executes at a time" gate run:start/run:resume enforce.
     if (activeRuns.size > 0) {
       return { ok: false, reason: 'Another run is currently active. Try again once it finishes.' };

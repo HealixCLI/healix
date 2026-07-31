@@ -133,12 +133,6 @@ export function RunsView({
   // dropdown pre-selected on a disabled option.
   const [testingScope, setTestingScope] = useState<TestingScope>('frontend');
   const [suiteMode, setSuiteMode] = useState<SuiteMode>('fresh');
-  // Off by default — each iteration of the coverage feedback loop can add a
-  // full extra plan+generate+execute cycle (up to 4). coverageTargetPct is the
-  // user-facing 0-100 override; empty means "use the backend's own default"
-  // (80% fresh / 98% top-up) rather than duplicating those constants here.
-  const [coverageLoopEnabled, setCoverageLoopEnabled] = useState(false);
-  const [coverageTargetPct, setCoverageTargetPct] = useState('');
   const [prd, setPrd] = useState('');
   // Set once a PRD file is successfully uploaded; cleared if the user edits the
   // textarea by hand, since the displayed text no longer matches the file.
@@ -188,6 +182,11 @@ export function RunsView({
   // to a different project's run panel, or any other remount of this view,
   // resets back to expanded rather than remembering a previous collapse.
   const [formCollapsed, setFormCollapsed] = useState(false);
+  // Set to the target runId the instant Retry-pass is dispatched, cleared once
+  // the engine settles — lets RunDetailPanel show "Retrying…" for the actual
+  // duration of the call instead of relying on its own local `busy` flag,
+  // which clears synchronously right after the fire-and-forget dispatch.
+  const [retryPassRunId, setRetryPassRunId] = useState<string | null>(null);
 
   const { detail, loading: detailLoading, reload: reloadDetail } = useRunDetail(selectedRunId);
   const { run: lastSuccessfulRun, reload: reloadLastSuccessful } = useLastSuccessfulRun(projectId || null);
@@ -199,11 +198,6 @@ export function RunsView({
   useEffect(() => {
     if (!hasSuite && suiteMode !== 'fresh') setSuiteMode('fresh');
   }, [hasSuite, suiteMode]);
-  // 'reuse' never plans/generates at all, so the coverage loop has nothing to
-  // retry — force the toggle off rather than showing it inertly enabled.
-  useEffect(() => {
-    if (suiteMode === 'reuse' && coverageLoopEnabled) setCoverageLoopEnabled(false);
-  }, [suiteMode, coverageLoopEnabled]);
   // Refresh "last successful run" once a run just settled, so the toggle picks
   // up a run that only just became eligible as a top-up/reuse base.
   useEffect(() => {
@@ -329,6 +323,7 @@ export function RunsView({
       // here too.
       setCancelling(false);
       setPausing(false);
+      setRetryPassRunId((prev) => (prev === engine.runId ? null : prev));
       const settledId = engine.runId;
       void refreshRuns().then(() => {
         // Stale by the time this resolves: the user already moved on (e.g.
@@ -435,10 +430,6 @@ export function RunsView({
       prdSourceKind: prd.trim() ? (prdSourceKind ?? 'text') : undefined,
       prdFileName: prd.trim() ? (prdFileName ?? undefined) : undefined,
       prdSelectedSheets: prd.trim() ? (prdSelectedSheets ?? undefined) : undefined,
-      // No effect in 'reuse' mode (never plans/generates), but harmless to send.
-      coverageLoopEnabled,
-      coverageTarget:
-        coverageLoopEnabled && coverageTargetPct.trim() ? Number(coverageTargetPct) / 100 : undefined,
     };
     if (isActive) {
       // Explicit: the button reads "Queue run" whenever a run is already
@@ -494,6 +485,7 @@ export function RunsView({
     }
     setSelectedRunId(null);
     setFormCollapsed(true);
+    setRetryPassRunId(runId);
     void engine.retryPass(runId);
   };
 
@@ -703,8 +695,6 @@ export function RunsView({
     // Only 'frontend' is user-selectable right now (see TESTING_SCOPES.map).
     setTestingScope('frontend');
     setSuiteMode('fresh');
-    setCoverageLoopEnabled(false);
-    setCoverageTargetPct('');
     setFormCollapsed(false);
   }, []);
 
@@ -1206,6 +1196,7 @@ export function RunsView({
                 loading={detailLoading}
                 onSelectRun={setSelectedRunId}
                 onRetryPass={startRetryPass}
+                retryPassInProgress={detail?.run?.id === retryPassRunId}
                 onRepair={startRepairRun}
               />
             </div>

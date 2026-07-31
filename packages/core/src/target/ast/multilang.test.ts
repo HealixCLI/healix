@@ -169,36 +169,41 @@ describe.skipIf(!fs.existsSync(FLASK_APP_PY))(
 // Root-cause regression for a real gap found via manual coverage-loop testing: a Java/Spring Boot
 // backend (TODOAPP) produced ZERO functionality units, permanently disabling the coverage loop for
 // it regardless of the configured target — `.java` had no extractor at all until this fix.
-const TODOAPP_AUTH_CONTROLLER = path.join(
-  'C:',
-  'Users',
-  'GarimaKhatiyan',
-  'OneDrive - ZapCom Solutions Pvt. ltd',
-  'Desktop',
-  'TODOAPP',
-  'backend',
-  'src',
-  'main',
-  'java',
-  'com',
-  'healixtest',
-  'todoapp',
-  'controller',
-  'AuthController.java',
-);
-const TODOAPP_TODO_CONTROLLER = path.join(path.dirname(TODOAPP_AUTH_CONTROLLER), 'TodoController.java');
+//
+// The real TODOAPP/backend checkout isn't committed to this repo, so this test only runs when
+// TODOAPP_FIXTURE_PATH points at a local checkout (set it to the project's root directory) — it's
+// skipped everywhere else, including CI, exactly as it always has been.
+const TODOAPP_ROOT = process.env.TODOAPP_FIXTURE_PATH;
+const TODOAPP_AUTH_CONTROLLER = TODOAPP_ROOT
+  ? path.join(
+      TODOAPP_ROOT,
+      'backend',
+      'src',
+      'main',
+      'java',
+      'com',
+      'healixtest',
+      'todoapp',
+      'controller',
+      'AuthController.java',
+    )
+  : undefined;
+const TODOAPP_TODO_CONTROLLER = TODOAPP_AUTH_CONTROLLER
+  ? path.join(path.dirname(TODOAPP_AUTH_CONTROLLER), 'TodoController.java')
+  : undefined;
 
-describe.skipIf(!fs.existsSync(TODOAPP_AUTH_CONTROLLER))(
+describe.skipIf(!TODOAPP_AUTH_CONTROLLER || !fs.existsSync(TODOAPP_AUTH_CONTROLLER))(
   'extractMultiLangEndpoints against TODOAPP/backend (isolated check, real Spring Boot fixture)',
   () => {
     it('extracts every real endpoint from AuthController.java and TodoController.java', () => {
+      // Non-null: describe.skipIf above already guarantees both paths exist.
       const authUnits = extractMultiLangEndpoints(
         'AuthController.java',
-        fs.readFileSync(TODOAPP_AUTH_CONTROLLER, 'utf-8'),
+        fs.readFileSync(TODOAPP_AUTH_CONTROLLER!, 'utf-8'),
       );
       const todoUnits = extractMultiLangEndpoints(
         'TodoController.java',
-        fs.readFileSync(TODOAPP_TODO_CONTROLLER, 'utf-8'),
+        fs.readFileSync(TODOAPP_TODO_CONTROLLER!, 'utf-8'),
       );
       const keys = [...authUnits, ...todoUnits].map((u) => u.key);
 

@@ -58,6 +58,7 @@ export function RunDetailPanel({
   loading,
   onSelectRun,
   onRetryPass,
+  retryPassInProgress,
   onRepair,
 }: {
   detail: RunDetail | null;
@@ -73,6 +74,14 @@ export function RunDetailPanel({
    * there's no StartRunArgs to build anymore. Omit to hide the Retry-pass button.
    */
   onRetryPass?: (runId: string) => void;
+  /**
+   * True while this SAME run's Retry-pass is actually in flight (tracked by
+   * the caller via its run engine's live phase, not this component's own
+   * `busy` state — `onRetryPass` is fire-and-forget from here, so `busy`
+   * alone only pulses for the synchronous dispatch tick). Drives the
+   * "Retrying…" label/disabled state for the real duration of the call.
+   */
+  retryPassInProgress?: boolean;
   /**
    * Start a targeted regeneration run for Repair: given a ready StartRunArgs
    * (suiteMode 'topup', baseRunId this run, retryItemIds set), the caller
@@ -280,11 +289,11 @@ export function RunDetailPanel({
               size="sm"
               variant="outline"
               onClick={() => void startRetryPass()}
-              disabled={busy !== null}
+              disabled={busy !== null || retryPassInProgress === true}
               title="Regenerate only the plan items from this run that never got a test, or never got executed"
             >
               <RotateCcw className="h-4 w-4" />
-              {busy === 'retry' ? 'Retrying…' : 'Retry-pass'}
+              {busy === 'retry' || retryPassInProgress ? 'Retrying…' : 'Retry-pass'}
             </Button>
           )}
           {/* Held back for a later release — see feature-flags.ts's SHOW_REPAIR_ACTION doc comment. */}

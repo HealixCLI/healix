@@ -324,6 +324,16 @@ export interface ExecOutcome {
    * no entry.
    */
   apiEvidence?: Record<string, string>;
+  /**
+   * Compact evidence that a test's own request(s) fell through the generated mock fixture
+   * uninterecepted — hostname matched no detected dependency and no `mockOverride` matched
+   * either — keyed the same way `apiEvidence` is, from execute.ts's readMockPassthroughLog().
+   * A request that falls through hits the real (often unreachable, sandboxed) backend and
+   * hangs to the outer Playwright test timeout, producing a bare "Test timeout exceeded" with
+   * no other signal; this is what lets triage tell that apart from a genuinely slow app.
+   * Optional: a test with no unintercepted call simply has no entry.
+   */
+  mockPassthrough?: Record<string, string>;
 }
 
 export interface SuiteBundle {

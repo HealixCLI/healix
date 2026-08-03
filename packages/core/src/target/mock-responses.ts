@@ -33,6 +33,16 @@ const MOCK_JWT = [
  * commonly read. No nested `data` wrapper: with axios `res.data` IS the body, so
  * `res.data.token` already resolves.
  */
+/**
+ * The one synthetic identity every purely-invented (no real capture) mocked endpoint should
+ * use for "the logged-in user," so a name/email/id shown by one endpoint's mock always
+ * matches another endpoint's — see `extractCanonicalIdentity`/`applyCanonicalIdentity` for
+ * the complementary real-capture-aware reconciliation.
+ */
+export const MOCK_IDENTITY_ID = 'healix-mock-user';
+export const MOCK_IDENTITY_EMAIL = 'healix.mock@example.test';
+export const MOCK_IDENTITY_NAME = 'Healix Mock User';
+
 const AUTH_MOCK_BODY = {
   status: { success: true, code: 200, message: 'Success' },
   success: true,
@@ -45,7 +55,7 @@ const AUTH_MOCK_BODY = {
   expiresIn: 3600,
   refresh_token: 'healix-mock-refresh-token',
   refreshToken: 'healix-mock-refresh-token',
-  user: { id: 'healix-mock-user', email: 'healix.mock@example.test', name: 'Healix Mock User' },
+  user: { id: MOCK_IDENTITY_ID, email: MOCK_IDENTITY_EMAIL, name: MOCK_IDENTITY_NAME },
 };
 
 /** Plausible canned success response per category — used until/unless the AI pass overrides it. */
@@ -74,10 +84,243 @@ export function staticMockResponse(category: ExternalDependencyCategory): MockRe
  * as a second line of defense for endpoints reaching here by any other route, else the
  * parent dependency's own category.
  */
-function endpointCategory(dep: ExternalDependency, endpoint: EndpointMock): ExternalDependencyCategory {
+export function endpointCategory(
+  dep: ExternalDependency,
+  endpoint: EndpointMock,
+): ExternalDependencyCategory {
   if (endpoint.category) return endpoint.category;
   if (isAuthEndpointPath(endpoint.pathPattern)) return 'auth';
   return dep.category;
+}
+
+function isPlainObject(value: unknown): value is Record<string, unknown> {
+  return !!value && typeof value === 'object' && !Array.isArray(value);
+}
+
+/** A redaction/sanitize.ts placeholder left in place of a real secret value (see
+ * `export/sanitize.ts`'s `redactSecrets()`) — real captured traffic that had its
+ * token/secret fields scrubbed before ever reaching this module. */
+const REDACTED_LEAF_RE = /^(?:Bearer )?<REDACTED>$/;
+
+function isRedactedLeaf(value: unknown): boolean {
+  return typeof value === 'string' && REDACTED_LEAF_RE.test(value);
+}
+
+/**
+ * Deep-merges `observed` over `staticValue`, field by field, so real captured traffic can
+ * ground a statically-detected/AI-guessed body without regressing it wholesale. A redacted
+ * leaf (see `isRedactedLeaf`) is always skipped — falling back to whatever `staticValue` had
+ * at that path (possibly nothing) — since serving the literal string "<REDACTED>" as a token
+ * is exactly as broken as the flat-shape mismatch this module exists to fix. Arrays are
+ * replaced wholesale by the observed value (no element-wise merge); plain objects merge
+ * recursively so a static `user.id`/`user.email` field survives even when only `user.name`
+ * was actually observed on the wire, or vice versa.
+ */
+function mergeObservedOverStatic(staticValue: unknown, observedValue: unknown): unknown {
+  if (isRedactedLeaf(observedValue)) return staticValue;
+  if (isPlainObject(observedValue)) {
+    const staticObj = isPlainObject(staticValue) ? staticValue : {};
+    const merged: Record<string, unknown> = { ...staticObj };
+    for (const [key, value] of Object.entries(observedValue)) {
+      merged[key] = mergeObservedOverStatic(staticObj[key], value);
+    }
+    return merged;
+  }
+  return observedValue;
+}
+
+/**
+ * Grounds `staticResponse` in a real captured response for the SAME (method, path) call,
+ * field by field, instead of the two all-or-nothing options this module used to have
+ * (either the static/AI-guessed body wins outright, or the observed body replaces it
+ * wholesale — losing any static field the observed sample happened not to include, e.g. an
+ * auth token whose value was redacted before capture). A non-empty STRING `observedBody`
+ * (real non-JSON traffic — XML/SOAP, see GAP-069 — passed through as-is by
+ * scaffold.ts's `parseObservedBody`) is genuine captured data even though it isn't
+ * mergeable field-by-field, so it's served wholesale rather than discarded in favor of the
+ * static default. Falls back to `withAuthFloor(category, staticResponse)` unchanged when
+ * `observedBody` is neither a usable plain object nor a non-empty string (parse failure
+ * degraded to `{}` per GAP-063, or no capture at all). `observedHeaders` (e.g. a captured
+ * `content-type`, GAP-063 follow-up) takes precedence over the static response's own headers
+ * when present. The final auth-floor pass still runs even when a merge happened, so the
+ * guaranteed-baseline contract (token/access_token/... always present) holds regardless of
+ * which fields observed traffic actually supplied.
+ */
+export function mergeGroundedResponse(
+  category: ExternalDependencyCategory,
+  staticResponse: MockResponse,
+  observedBody: unknown,
+  observedStatus?: number,
+  observedHeaders?: Record<string, string>,
+): MockResponse {
+  const status =
+    typeof observedStatus === 'number' && observedStatus < 400 ? observedStatus : staticResponse.status;
+  const headers = observedHeaders ?? staticResponse.headers;
+
+  if (typeof observedBody === 'string' && observedBody.length > 0) {
+    return withAuthFloor(category, { ...staticResponse, status, body: observedBody, headers });
+  }
+  if (!isPlainObject(observedBody)) {
+    return withAuthFloor(category, staticResponse);
+  }
+  const body = mergeObservedOverStatic(staticResponse.body, observedBody);
+  return withAuthFloor(category, { ...staticResponse, status, body, headers });
+}
+
+/** A person-identity value pulled from real captured traffic, to reconcile across sibling
+ * synthetic (no-real-capture) mocked endpoints — see `extractCanonicalIdentity`. */
+export interface CanonicalIdentity {
+  id?: string;
+  email?: string;
+  name?: string;
+}
+
+// Matched case-insensitively against an object's OWN keys. Deliberately EXACT key names
+// (not a substring check) — a substring match on "id" would false-positive on `couponId`/
+// `seriesId`/`transactionId`, which are not person-identity fields.
+const IDENTITY_ID_KEYS = new Set(['id', 'userid', 'customerid', 'username']);
+const IDENTITY_EMAIL_KEYS = new Set(['email']);
+const IDENTITY_NAME_KEYS = new Set(['name', 'fullname', 'displayname']);
+const IDENTITY_FIRST_NAME_KEYS = new Set(['firstname']);
+const IDENTITY_LAST_NAME_KEYS = new Set(['lastname']);
+
+function stringLeaf(value: unknown): string | undefined {
+  if (typeof value === 'string' && value.length > 0) return value;
+  if (typeof value === 'number' && Number.isFinite(value)) return String(value);
+  return undefined;
+}
+
+/**
+ * Scans a plain object's own keys for identity-shaped fields (name/email/id-like). Qualifies
+ * as a person-identity record ONLY when `email` co-occurs with at least one other
+ * identity-shaped field, OR both `firstname`/`lastname` are present — deliberately NOT on a
+ * generic `name`+`id` pair alone, since that combination is common on all sorts of non-person
+ * entities (a coupon, a region, a product all typically have `id`+`name`). `email` and a
+ * first+last name pair are comparatively rare, reliable "this is a person" signals; a bare
+ * `id` (e.g. `{ couponId: '...' }`, `{ id: 526233086 }` on a coupon record) is never mistaken
+ * for one just because one field happens to be named `id`.
+ */
+function identityFromObject(obj: Record<string, unknown>): CanonicalIdentity | null {
+  let id: string | undefined;
+  let email: string | undefined;
+  let name: string | undefined;
+  let firstName: string | undefined;
+  let lastName: string | undefined;
+  for (const [rawKey, value] of Object.entries(obj)) {
+    const key = rawKey.toLowerCase();
+    if (!id && IDENTITY_ID_KEYS.has(key)) {
+      id = stringLeaf(value) ?? id;
+    } else if (!email && IDENTITY_EMAIL_KEYS.has(key)) {
+      email = stringLeaf(value) ?? email;
+    } else if (!name && IDENTITY_NAME_KEYS.has(key)) {
+      name = stringLeaf(value) ?? name;
+    } else if (!firstName && IDENTITY_FIRST_NAME_KEYS.has(key)) {
+      firstName = stringLeaf(value) ?? firstName;
+    } else if (!lastName && IDENTITY_LAST_NAME_KEYS.has(key)) {
+      lastName = stringLeaf(value) ?? lastName;
+    }
+  }
+  const hasFullName = !!firstName && !!lastName;
+  const qualifies = (!!email && !!(id || name || firstName || lastName)) || hasFullName;
+  if (!qualifies) return null;
+  const resolvedName = name ?? (hasFullName ? `${firstName} ${lastName}`.trim() : undefined);
+  const identity: CanonicalIdentity = {};
+  if (id) identity.id = id;
+  if (email) identity.email = email;
+  if (resolvedName) identity.name = resolvedName;
+  return Object.keys(identity).length > 0 ? identity : null;
+}
+
+const MAX_IDENTITY_SEARCH_DEPTH = 6;
+
+/** Depth-first search for the first identity-shaped object in a parsed response body,
+ * preferring one nested directly under a `user` key (the common wrapper an auth/profile
+ * response uses) before falling through to an arbitrary sibling field. */
+function findIdentityIn(value: unknown, depth = 0): CanonicalIdentity | null {
+  if (depth > MAX_IDENTITY_SEARCH_DEPTH || !isPlainObject(value)) return null;
+  const direct = identityFromObject(value);
+  if (direct) return direct;
+  if (isPlainObject(value.user)) {
+    const nested = identityFromObject(value.user);
+    if (nested) return nested;
+  }
+  for (const child of Object.values(value)) {
+    if (Array.isArray(child)) {
+      for (const item of child) {
+        const found = findIdentityIn(item, depth + 1);
+        if (found) return found;
+      }
+    } else {
+      const found = findIdentityIn(child, depth + 1);
+      if (found) return found;
+    }
+  }
+  return null;
+}
+
+/**
+ * Scans real observed traffic for a canonical "who is the logged-in user" identity, so it can
+ * be reused (via `applyCanonicalIdentity`) across sibling SYNTHETIC mocked endpoints that would
+ * otherwise each invent their own inconsistent name/email/id (Cluster B: one endpoint showing
+ * real captured "adroy tester" while another shows generic "Healix Mock User"). Prefers a match
+ * found in an auth/login-shaped endpoint's body (most authoritative — it's literally "who just
+ * logged in"), else the first match across any observed endpoint, in order. Returns `null` when
+ * no real capture exists yet (the common PLAN-time-only case), or nothing observed looked like a
+ * person record — the prompt-level identity-consistency rule in `buildPrompt` is what keeps
+ * purely-synthetic endpoints consistent with each other in that case.
+ */
+export function extractCanonicalIdentity(
+  observedEndpoints: Array<{ pathPattern: string; sampleResponseBody?: string }>,
+): CanonicalIdentity | null {
+  let firstMatch: CanonicalIdentity | null = null;
+  for (const observed of observedEndpoints) {
+    if (!observed.sampleResponseBody) continue;
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(observed.sampleResponseBody);
+    } catch {
+      continue;
+    }
+    const found = findIdentityIn(parsed);
+    if (!found) continue;
+    if (isAuthEndpointPath(observed.pathPattern)) return found;
+    firstMatch ??= found;
+  }
+  return firstMatch;
+}
+
+/**
+ * Overwrites identity-shaped fields in a purely SYNTHETIC (static/AI-guessed) body with
+ * `canonical`'s values, so it agrees with whatever real identity `extractCanonicalIdentity`
+ * found elsewhere in the same run. Only rewrites keys already recognized by
+ * `identityFromObject`'s co-occurrence rule (never touches a lone `id`-shaped field in
+ * isolation), and only ever narrows toward the canonical value the caller already resolved —
+ * never invents an identity object where none existed. No-op when `canonical` is null (nothing
+ * observed yet) or the body isn't a plain object.
+ */
+export function applyCanonicalIdentity(body: unknown, canonical: CanonicalIdentity | null): unknown {
+  if (!canonical || !isPlainObject(body)) return body;
+  // Same co-occurrence gate as identityFromObject/extractCanonicalIdentity: only an object
+  // that itself qualifies as an identity record gets its id/email/name-shaped keys rewritten
+  // — a lone "name" field on an unrelated nested object (e.g. a voucher's display name) is
+  // never touched just because the key happens to match.
+  const qualifies = identityFromObject(body) !== null;
+  const result: Record<string, unknown> = {};
+  for (const [rawKey, value] of Object.entries(body)) {
+    const key = rawKey.toLowerCase();
+    if (qualifies && canonical.id !== undefined && IDENTITY_ID_KEYS.has(key)) {
+      result[rawKey] = canonical.id;
+    } else if (qualifies && canonical.email !== undefined && IDENTITY_EMAIL_KEYS.has(key)) {
+      result[rawKey] = canonical.email;
+    } else if (qualifies && canonical.name !== undefined && IDENTITY_NAME_KEYS.has(key)) {
+      result[rawKey] = canonical.name;
+    } else if (isPlainObject(value)) {
+      result[rawKey] = applyCanonicalIdentity(value, canonical);
+    } else {
+      result[rawKey] = value;
+    }
+  }
+  return result;
 }
 
 /**
@@ -150,6 +393,16 @@ function buildPrompt(deps: ExternalDependency[]): string {
   lines.push('}');
   lines.push('```');
   lines.push(
+    'Before answering, use your read-only file access at the given repo path to actually investigate how each ' +
+      "endpoint's response is consumed by the app, instead of guessing a shape purely from the path name: search " +
+      'for the client call (the dependency\'s "seen in" file above is a starting point, but the code that reads ' +
+      'fields off the response is often a DIFFERENT file/component that calls or awaits it) and look for how the ' +
+      'result is destructured or checked — e.g. `response.data.user.someFlag`, `if (!result.auth?.token)`, ' +
+      "`res.status?.success`. Use the EXACT field names and nesting the app's own code reads when you can find " +
+      "them; only fall back to guessing from the path/dependency label when the source genuinely isn't " +
+      'inspectable or reachable.',
+  );
+  lines.push(
     'Produce exactly one entry per dependency id (or, when endpoints are listed, one entry per endpoint key — ' +
       'endpoint keys take priority over a single dependency-level entry). Use realistic field names and values ' +
       'appropriate to what that specific endpoint path suggests it does — e.g. a path containing "login"/"auth" ' +
@@ -157,10 +410,22 @@ function buildPrompt(deps: ExternalDependency[]): string {
       'a POST "redeem"/"create" returns a confirmation id.',
   );
   lines.push(
+    "Any field across ANY endpoint's response that represents a person's identity (a name, email, or " +
+      'id/username field for "the logged-in user") MUST use the exact same value everywhere you emit it — ' +
+      `name="${MOCK_IDENTITY_NAME}", email="${MOCK_IDENTITY_EMAIL}", id="${MOCK_IDENTITY_ID}" — never invent a ` +
+      "different name/email/id for one endpoint's user object than another's; a UI showing one endpoint's " +
+      "identity while a test asserts on a different endpoint's identity is exactly the kind of bug this " +
+      'consistency rule exists to prevent.',
+  );
+  lines.push(
     'An endpoint marked "category: auth (LOGIN HANDSHAKE)" is the app\'s LOGIN/TOKEN handshake — return a ' +
       'successful session response (a token plus whatever envelope the path suggests), never an error or a ' +
-      'health-check-style {status,service,version} body. Healix merges your body over a guaranteed baseline, so ' +
-      'ADD fields rather than replacing the shape.',
+      'health-check-style {status,service,version} body. Pay special attention to any app-specific "gate" field ' +
+      'the login code checks before treating the session as valid (e.g. a boolean like ' +
+      "`userRegisteredForPassword`, `isVerified`, `accountActive`) — a login mock that's missing exactly that " +
+      'field looks like a success response but still fails login, since the app treats the missing/falsy gate ' +
+      'field as a rejection. Healix merges your body over a guaranteed baseline, so ADD fields rather than ' +
+      'replacing the shape.',
   );
   return lines.join('\n');
 }

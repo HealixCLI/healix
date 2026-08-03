@@ -216,12 +216,31 @@ function readPackageJson(repoPath: string): PackageJson | null {
   }
 }
 
-/** Env files consulted for a var's value, in precedence order (mirrors detector.ts's ENV_FILES). */
-const ENV_FILES = ['.env.local', '.env.development', '.env'];
+/**
+ * Env files consulted for a var's value, in precedence order (mirrors detector.ts's
+ * ENV_FILES — see the drift note there; kept independent on purpose since the two
+ * constants serve different consumers). Widened beyond the original three (Cluster F) so a
+ * dependency's recorded hostnames (see readEnvVarAllValues below) cover a dev/prod split
+ * defined across more than one file, not just whichever one precedence would pick alone.
+ */
+const ENV_FILES = ['.env.local', '.env.development', '.env', '.env.production', '.env.test', '.env.staging'];
 
-function readEnvVar(repoPath: string, varName: string): string | null {
+/**
+ * Every DISTINCT value `varName` resolves to across all of ENV_FILES (deduped,
+ * precedence-first order preserved) — not just the single highest-precedence value. A
+ * dependency's detected hostname is normally taken from just the first of these;
+ * recording every candidate lets the mock fixture also recognize a
+ * request whose ACTUAL runtime value came from a different `.env*` file than the one this
+ * detection pass happened to read first (e.g. a `.env.production` value used by the real
+ * running app while `.env`/`.env.local` define a different one for local dev) — see
+ * Cluster F: an unrecognized hostname silently falls through to the real network with no
+ * mock at all.
+ */
+function readEnvVarAllValues(repoPath: string, varName: string): string[] {
   const escaped = varName.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
   const re = new RegExp(`^\\s*${escaped}\\s*=\\s*['"]?([^'"\\r\\n]*)['"]?\\s*$`, 'm');
+  const seen = new Set<string>();
+  const values: string[] = [];
   for (const file of ENV_FILES) {
     let content: string;
     try {
@@ -230,9 +249,13 @@ function readEnvVar(repoPath: string, varName: string): string | null {
       continue;
     }
     const m = content.match(re);
-    if (m && m[1] && m[1].trim().length > 0) return m[1].trim();
+    const v = m?.[1]?.trim();
+    if (v && !seen.has(v)) {
+      seen.add(v);
+      values.push(v);
+    }
   }
-  return null;
+  return values;
 }
 
 /** Any hardcoded `https?://<host>` literal in source, excluding local dev hosts. */
@@ -695,7 +718,8 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
       // dependency and there is nothing to mock.
       if (/REDIRECT|CALLBACK/i.test(varName)) continue;
 
-      const value = readEnvVar(root, varName);
+      const allValues = readEnvVarAllValues(root, varName);
+      const value = allValues[0];
       if (!value) continue;
       const parsed = parseHttpUrl(value);
       if (!parsed) continue;
@@ -738,6 +762,16 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
 
       const category = classifyEnvUrlVar(varName, parsed);
 
+      // Cluster F: also recognize a hostname from any OTHER .env* file's value for this
+      // same var, in case the app's real running instance resolves it differently than
+      // whichever file this detection pass read first (see readEnvVarAllValues) —
+      // otherwise a request to that other hostname matches nothing and silently falls
+      // through to the real network with no mock at all.
+      const extraHosts = allValues
+        .slice(1)
+        .map((v) => parseHttpUrl(v)?.host)
+        .filter((h): h is string => !!h && h !== host);
+
       addDep({
         id,
         category,
@@ -745,12 +779,20 @@ export async function detectExternalDependencies(repoPath: string): Promise<Exte
         source: 'env-var',
         envVar: varName,
         mockStrategy: 'both',
-        hostnames: [host],
+        hostnames: [host, ...extraHosts],
         file: f.rel,
         reachable,
         note: reachable
-          ? `Reads ${varName}=${value} (currently reachable).`
-          : `Reads ${varName}=${value}; not reachable at detection time.`,
+          ? `Reads ${varName}=${value} (currently reachable).${
+              extraHosts.length
+                ? ` Also recorded ${extraHosts.length} additional hostname(s) from other .env files for this var, to reduce runtime hostname mismatches.`
+                : ''
+            }`
+          : `Reads ${varName}=${value}; not reachable at detection time.${
+              extraHosts.length
+                ? ` Also recorded ${extraHosts.length} additional hostname(s) from other .env files for this var, to reduce runtime hostname mismatches.`
+                : ''
+            }`,
       });
       // A non-empty, non-root path prefix (e.g. "/v2") means a relative call-site path
       // like "/auth/token/generate" won't equal the REAL request path

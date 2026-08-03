@@ -10,6 +10,7 @@ import {
   checkpointReporterContents,
   EXEC_CHECKPOINT_FILENAME,
   mockFixtureContents,
+  MOCK_PASSTHROUGH_LOG_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
   playwrightConfigContents,
   stepsReporterContents,
@@ -471,12 +472,22 @@ describe('mockFixtureContents', () => {
     function loadMatchAnyRoute(
       src: string,
       overrides: Array<{ method: string; pathPattern: string; response: unknown }>,
-    ): (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown } {
+    ): (
+      routes: unknown[],
+      method: string,
+      path: string,
+      opts?: { allowGenericFallback?: boolean },
+    ) => { id?: string; response?: unknown } {
       const pathMatchesSrc = extractFunctionSource(src, 'pathMatches');
       const matchSrc = extractFunctionSource(src, 'matchAnyRoute');
       const factory = new Function('overrides', `${pathMatchesSrc}\n${matchSrc}\nreturn matchAnyRoute;`) as (
         o: unknown,
-      ) => (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown };
+      ) => (
+        routes: unknown[],
+        method: string,
+        path: string,
+        opts?: { allowGenericFallback?: boolean },
+      ) => { id?: string; response?: unknown };
       return factory(overrides);
     }
 
@@ -534,6 +545,44 @@ describe('mockFixtureContents', () => {
       expect(src).not.toMatch(/const route = MOCKED_ROUTES\[0\]/);
     });
 
+    describe('Cluster F — allowGenericFallback opt-out (page.route no-hostname-match branch)', () => {
+      it('with allowGenericFallback: false, resolves a request matching an endpoint on a DIFFERENT route (known call, misdetected/stale host)', () => {
+        const src = mockFixtureContents([depA, depB]);
+        const match = loadMatchAnyRoute(src, []);
+        const result = match([depA, depB], 'POST', '/v3/oauth/token/generate', {
+          allowGenericFallback: false,
+        });
+        expect(result.response).toEqual({ status: 200, body: { token: 'real-token' } });
+        expect(result.id).toBe('dep-a');
+      });
+
+      it('with allowGenericFallback: false, returns an undefined response (never a generic default) when NO route anywhere has a matching endpoint — the regression guard against wrongly mocking a genuinely different third-party host', () => {
+        const src = mockFixtureContents([depA, depB]);
+        const match = loadMatchAnyRoute(src, []);
+        const result = match([depA, depB], 'GET', '/totally/unrelated/analytics/beacon', {
+          allowGenericFallback: false,
+        });
+        expect(result.response).toBeUndefined();
+      });
+
+      it('with allowGenericFallback: false, an override still resolves (an explicitly-registered override is never "an unrelated third party")', () => {
+        const src = mockFixtureContents([depA, depB]);
+        const overrideResponse = { status: 500, body: { error: 'forced' } };
+        const match = loadMatchAnyRoute(src, [
+          { method: 'GET', pathPattern: '/x', response: overrideResponse },
+        ]);
+        const result = match([depA, depB], 'GET', '/x', { allowGenericFallback: false });
+        expect(result.response).toEqual(overrideResponse);
+      });
+
+      it("omitting opts (the `request`-fixture call site) keeps today's behavior — generic fallback still allowed", () => {
+        const src = mockFixtureContents([depA, depB]);
+        const match = loadMatchAnyRoute(src, []);
+        const result = match([depA, depB], 'GET', '/unmatched/path');
+        expect(result.response).toEqual(depA.response);
+      });
+    });
+
     it('F-14: page.route() registers ONE catch-all interceptor and decides per-request whether a host OR an override matches, instead of one predicate per hostname', () => {
       const src = mockFixtureContents([depA]);
       expect(src).toContain("page.route('**/*', async (r) => {");
@@ -542,12 +591,18 @@ describe('mockFixtureContents', () => {
       // path has no hostname to match against at all (a same-origin fetch).
       expect(src).toContain('const hostRoute = MOCKED_ROUTES.find(');
       expect(src).toContain('const overrideMatches = overrides.some(');
-      expect(src).toContain('if (!hostRoute && !overrideMatches) {');
-      expect(src).toContain('await r.continue();');
       // When there's no host match, resolution still goes through the
       // any-route resolver (which checks overrides) instead of skipping the
-      // override-only, same-origin case.
-      expect(src).toContain('matchAnyRoute(MOCKED_ROUTES, method, requestPath)');
+      // override-only, same-origin case — but (Cluster F) it must NOT allow
+      // the any-route resolver's generic-default fallback unless an override
+      // actually matched, so a genuinely unrelated third-party host isn't
+      // wrongly mocked with some other dependency's default response.
+      expect(src).toContain(
+        'matchAnyRoute(MOCKED_ROUTES, method, requestPath, { allowGenericFallback: overrideMatches })',
+      );
+      // Only falls through to the real network (and logs it) when nothing resolved a response.
+      expect(src).toContain('if (!response) {');
+      expect(src).toContain('await r.continue();');
     });
   });
 
@@ -572,6 +627,41 @@ describe('mockFixtureContents', () => {
     it('a logging failure never blocks or throws through the actual mocked response (best-effort contract)', () => {
       const src = mockFixtureContents([]);
       const fnSrc = /async function logMockHit\(id\) \{[\s\S]*?\n\}/.exec(src)?.[0];
+      expect(fnSrc).toBeDefined();
+      expect(fnSrc).toMatch(/catch\s*\{/);
+    });
+  });
+
+  describe('Cluster F — unmocked-passthrough logging (mockPassthrough)', () => {
+    it('logs a passthrough entry (key, method, url) right before falling through to the real network', () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      expect(src).toContain('await logMockPassthrough(key, method, url);');
+      // Must be called BEFORE r.continue(), not after (order matters for the log to be
+      // written even if the continued request itself later hangs).
+      const idx = src.indexOf('if (!response) {');
+      const block = src.slice(idx, idx + 200);
+      expect(block.indexOf('logMockPassthrough')).toBeGreaterThan(-1);
+      expect(block.indexOf('logMockPassthrough')).toBeLessThan(block.indexOf('r.continue()'));
+    });
+
+    it('writes to a dedicated sidecar file, distinct from the mock-hit log', () => {
+      const src = mockFixtureContents([]);
+      expect(src).toContain('MOCK_PASSTHROUGH_LOG_PATH');
+      expect(src).toContain(JSON.stringify(MOCK_PASSTHROUGH_LOG_FILENAME));
+      expect(MOCK_PASSTHROUGH_LOG_FILENAME).not.toBe(MOCK_REQUEST_LOG_FILENAME);
+    });
+
+    it('keys the passthrough entry the same way API evidence is keyed, so it can be joined back to a test', () => {
+      const src = mockFixtureContents([]);
+      expect(src).toContain('const key = evidenceKey(testInfo);');
+      expect(src).toContain('page: async ({ page, mockOverride }, use, testInfo) => {');
+    });
+
+    it('a logging failure never blocks or throws through the passthrough itself (best-effort contract)', () => {
+      const src = mockFixtureContents([]);
+      const fnSrc = /async function logMockPassthrough\(key, method, url\) \{[\s\S]*?\n\}/.exec(src)?.[0];
       expect(fnSrc).toBeDefined();
       expect(fnSrc).toMatch(/catch\s*\{/);
     });

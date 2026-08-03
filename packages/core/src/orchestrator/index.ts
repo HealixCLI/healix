@@ -2736,6 +2736,11 @@ async function runPipeline(
             // assertion happened to print.
             const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
             const apiEvidence = execOutcome.apiEvidence?.[apiEvidenceKey];
+            // Same key/rationale as apiEvidence above — see execute.ts's
+            // readMockPassthroughLog() and ExecOutcome.mockPassthrough (Cluster F): real
+            // evidence that this test's own request fell through the generated mock fixture
+            // unintercepted, the likely cause of an otherwise-unexplained bare timeout.
+            const mockPassthroughEvidence = execOutcome.mockPassthrough?.[apiEvidenceKey];
             // Recover the plan item this spec was generated from, to find the source-context unit
             // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
             // candidates below, since most failures never reach that stage.
@@ -2752,6 +2757,7 @@ async function runPipeline(
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
               ...(apiEvidence ? { apiEvidence } : {}),
+              ...(mockPassthroughEvidence ? { mockPassthroughEvidence } : {}),
               ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;

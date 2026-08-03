@@ -374,6 +374,53 @@ describe('detectExternalDependencies', () => {
     expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
   });
 
+  describe('Cluster F — multi-.env-file hostname detection', () => {
+    it('records hostnames from BOTH .env.local and .env when they define the same var differently (dev/prod split)', async () => {
+      const dir = makeRepo();
+      write(dir, 'package.json', JSON.stringify({}));
+      write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+      // .env.local takes precedence (used for note/reachable), but .env's DIFFERENT
+      // hostname must ALSO be recorded — the real running app may resolve this var from
+      // either file depending on how it was built/deployed.
+      write(dir, '.env.local', 'VITE_API_URL=https://dev.api.example-partner.test\n');
+      write(dir, '.env', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+      expect(dep).toBeDefined();
+      expect(dep?.hostnames).toEqual(
+        expect.arrayContaining(['dev.api.example-partner.test', 'eu.api.example-partner.test']),
+      );
+      expect(dep?.hostnames).toHaveLength(2);
+      // Precedence for note/reachable is still the highest-precedence (.env.local) value.
+      expect(dep?.note).toContain('dev.api.example-partner.test');
+    });
+
+    it('does not record a duplicate hostname when the same value is repeated across files', async () => {
+      const dir = makeRepo();
+      write(dir, 'package.json', JSON.stringify({}));
+      write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+      write(dir, '.env.local', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+      write(dir, '.env', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+      expect(dep?.hostnames).toEqual(['eu.api.example-partner.test']);
+    });
+
+    it('picks up a hostname from a newly-recognized env file (.env.production) when higher-precedence files do not define the var', async () => {
+      const dir = makeRepo();
+      write(dir, 'package.json', JSON.stringify({}));
+      write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+      write(dir, '.env.production', 'VITE_API_URL=https://prod.api.example-partner.test\n');
+
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+      expect(dep).toBeDefined();
+      expect(dep?.hostnames).toEqual(['prod.api.example-partner.test']);
+    });
+  });
+
   it('does not attribute an auth path to a non-network-call plain string constant', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({}));

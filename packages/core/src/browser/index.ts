@@ -1,5 +1,5 @@
 import { chromium, type Browser, type BrowserContext, type Page, type Response } from 'playwright';
-import { collectInteractiveElements, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
+import { collectInteractiveElements, collectModalText, INTERACTIVE_ELEMENT_SELECTOR } from './selectors.js';
 import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
 import { FrameMirror } from './mirror.js';
 import type {
@@ -460,12 +460,24 @@ export function createBrowserSurface(): BrowserSurface {
       } catch {
         axTree = undefined;
       }
+      // Best-effort, same posture as ariaSnapshot() above — a failure here (e.g. the page
+      // navigated away mid-evaluate) must never fail the whole snapshot.
+      let modalText: string | undefined;
+      let bodyText: string | undefined;
+      try {
+        ({ modalText, bodyText } = await collectModalText(p));
+      } catch {
+        modalText = undefined;
+        bodyText = undefined;
+      }
       const [title, interactiveElements] = await Promise.all([p.title(), collectInteractiveElements(p)]);
       return {
         url: p.url(),
         title,
         interactiveElements,
         axTree,
+        modalText,
+        bodyText,
       };
     },
 

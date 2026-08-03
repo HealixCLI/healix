@@ -33,6 +33,7 @@ interface DomElement {
 interface DomDocument {
   querySelectorAll(selector: string): ArrayLike<DomElement>;
   getElementById(id: string): DomElement | null;
+  readonly body: DomElement | null;
 }
 
 interface DomWindow {
@@ -132,6 +133,60 @@ const NON_CLICKABLE_TAGS = [
   'desc',
   'foreignobject',
 ];
+
+/** Cap on captured modal/body text so one huge page can't blow up a snapshot's memory footprint. */
+const MODAL_TEXT_MAX_CHARS = 2000;
+const BODY_TEXT_MAX_CHARS = 4000;
+
+/** ARIA signals recognized as a real modal/dialog container — see DomSnapshot.modalText's doc
+ * comment for why this stays a precise, narrow selector rather than a fuzzy z-index/class guess. */
+const DIALOG_CONTAINER_SELECTOR = '[role="dialog"], [role="alertdialog"], [aria-modal="true"]';
+
+/**
+ * Best-effort capture of (a) every visible modal/dialog container's own text, and (b) the whole
+ * page's body text — the two corpora Cluster E's modal-scoping check (generate.ts's GroundTruth)
+ * needs to tell "text that's genuinely modal-exclusive" apart from "text that's also permanent
+ * static page copy elsewhere." A separate, cheap `page.evaluate()` from `collectInteractiveElements`
+ * (not folded into that call) so a change here can't destabilize the interactive-element inventory;
+ * wrapped in try/catch by the caller (browser/index.ts's snapshot()) the same way `ariaSnapshot()`
+ * already is, so a failure here never blocks a snapshot.
+ */
+export async function collectModalText(page: Page): Promise<{ modalText?: string; bodyText?: string }> {
+  return page.evaluate<
+    { modalText?: string; bodyText?: string },
+    { dialogSelector: string; modalMax: number; bodyMax: number }
+  >(
+    ({ dialogSelector, modalMax, bodyMax }) => {
+      const win = globalThis as unknown as DomWindow;
+      const doc = win.document;
+
+      function isVisible(el: DomElement): boolean {
+        if (el.hidden) return false;
+        if (el.getClientRects().length === 0) return false;
+        const style = win.getComputedStyle(el);
+        return style.visibility !== 'hidden' && style.display !== 'none';
+      }
+
+      function clampTo(text: string, max: number): string {
+        const trimmed = text.trim();
+        return trimmed.length > max ? trimmed.slice(0, max) : trimmed;
+      }
+
+      const dialogs = Array.prototype.slice.call(doc.querySelectorAll(dialogSelector)) as DomElement[];
+      const modalParts = dialogs.filter(isVisible).map((el) => el.textContent ?? '');
+      const modalText = modalParts.length > 0 ? clampTo(modalParts.join(' '), modalMax) : undefined;
+
+      const bodyText = doc.body ? clampTo(doc.body.textContent ?? '', bodyMax) : undefined;
+
+      return { modalText, bodyText };
+    },
+    {
+      dialogSelector: DIALOG_CONTAINER_SELECTOR,
+      modalMax: MODAL_TEXT_MAX_CHARS,
+      bodyMax: BODY_TEXT_MAX_CHARS,
+    },
+  );
+}
 
 /**
  * Extract interactive elements (buttons, links, inputs, selects, textareas and

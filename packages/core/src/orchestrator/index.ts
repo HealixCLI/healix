@@ -53,6 +53,7 @@ import {
   buildBatchPlanPrompt,
   parsePlanWithDiagnostics,
   synthesizePlan,
+  applyAuthGuardTierOverrides,
   type PlanRepoContext,
   type PlanParseFailureReason,
 } from './plan.js';
@@ -3398,7 +3399,22 @@ export async function runPlanPhase(
       recordUsage,
       'initial',
     );
-    if (result.plan) return { ...result.plan, planSource: 'ai' };
+    if (result.plan) {
+      const correctedItems = applyAuthGuardTierOverrides(
+        result.plan.items,
+        units,
+        opts.testingScope ?? 'both',
+      );
+      const overrideCount = correctedItems.filter((it) => it.tierOverride).length;
+      if (overrideCount > 0) {
+        emit(
+          'plan',
+          'info',
+          `Corrected ${overrideCount} item(s) to tierB-auth based on detected route guards.`,
+        );
+      }
+      return { ...result.plan, items: correctedItems, planSource: 'ai' };
+    }
     emit('plan', 'warn', `Synthesizing fallback plan (reason: ${result.reason}).`);
     return {
       ...synthesizePlan(project, opts.testingScope ?? 'both'),
@@ -3520,9 +3536,15 @@ export async function runPlanPhase(
     };
   }
 
+  const correctedItems = applyAuthGuardTierOverrides(items, units, opts.testingScope ?? 'both');
+  const overrideCount = correctedItems.filter((it) => it.tierOverride).length;
+  if (overrideCount > 0) {
+    emit('plan', 'info', `Corrected ${overrideCount} item(s) to tierB-auth based on detected route guards.`);
+  }
+
   return {
     summary: `Planned ${items.length} item(s) across ${batches.length} batch(es) covering ${units.length} detected unit(s).`,
-    items,
+    items: correctedItems,
     planSource: 'ai',
     ...(failedBatches.length > 0
       ? {

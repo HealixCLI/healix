@@ -51,6 +51,16 @@ export interface DomSnapshot {
   title: string;
   interactiveElements: InteractiveElement[];
   axTree?: unknown;
+  /** Clamped, concatenated textContent of every visible `[role="dialog"]`/`[role="alertdialog"]`/
+   * `[aria-modal="true"]` container present at snapshot time — see selectors.ts's
+   * collectModalText(). Deliberately scoped to this precise ARIA signal only (not a fuzzy
+   * z-index/class heuristic), to keep false positives low; silently absent on an app with no
+   * semantic dialog markup (a known, accepted limitation — see Cluster E). */
+  modalText?: string;
+  /** Clamped `document.body.textContent` at snapshot time — the "rest of the page" corpus a
+   * modal-scoping check (generate.ts's GroundTruth) compares `modalText` against, to tell
+   * "permanent static page copy" apart from content that only exists once a modal is open. */
+  bodyText?: string;
 }
 
 /** A single XHR/fetch request/response pair observed while the page was live. */

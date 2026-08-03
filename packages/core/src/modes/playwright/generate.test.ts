@@ -153,6 +153,8 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
       hasEndpointLevelMocks: true,
       inventoryTruncated: false,
       attributes: new Map([['type', new Set(['email'])]]),
+      modalText: '',
+      underlyingPageText: '',
       ...overrides,
     };
   }
@@ -314,6 +316,48 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
     // The base gt() fixture's "moje kupóny" name has only one observed role ('generic').
     const source = `await page.getByText('Moje kupóny').click();`;
     expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
+  });
+
+  // F-11 (Cluster E): an unscoped getByText(...) matching text observed both inside a captured
+  // modal AND on the underlying page outside it can't reliably prove the modal shows it.
+  const modalGt = () =>
+    gt({
+      modalText: 'delete your account? this cannot be undone.',
+      underlyingPageText: 'delete your account? this cannot be undone. footer: contact us.',
+    });
+
+  it('warns on an unscoped getByText whose text is both inside a captured modal and on the underlying page', () => {
+    const source = `await expect(page.getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, modalGt());
+    expect(warn.some((w) => w.includes('modal') && w.includes('dialog'))).toBe(true);
+  });
+
+  it('does not flag the same text when the locator is already dialog-scoped', () => {
+    const source = `await expect(page.getByRole('dialog').getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, modalGt());
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag genuinely modal-exclusive text (absent from the underlying page)', () => {
+    const gtExclusive = gt({
+      modalText: 'delete your account? this cannot be undone.',
+      underlyingPageText: 'unrelated homepage copy entirely.',
+    });
+    const source = `await expect(page.getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, gtExclusive);
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag a short getByText below the minimum length threshold (covered by F-07 instead)', () => {
+    const gtShort = gt({ modalText: 'ok', underlyingPageText: 'ok' });
+    const source = `await expect(page.getByText('ok')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, gtShort);
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag anything when no modal was ever captured (modalText empty)', () => {
+    const source = `await expect(page.getByText('Some long enough page copy here')).toBeVisible();`;
+    expect(findUngroundedReferences(source, gt()).warn.some((w) => w.includes('modal'))).toBe(false);
   });
 });
 
@@ -1726,6 +1770,65 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
   it('omits hash-routing guidance when there is no exploration artifact at all', async () => {
     await generate(ctxWith(undefined), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+  });
+});
+
+describe('generate — unautomatable-step gating (Cluster C: OTP + destructive actions)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-unautomatable-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWith(exploration: TestModeContext['exploration']): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration,
+    };
+  }
+
+  it('includes an OTP-gate notice with test.fixme guidance when a route has otpGateReached', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].otpGateReached = true;
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('OTP/verification-code gate detected');
+    expect(prompt).toContain('test.fixme');
+    expect(prompt).toContain('cannot observe or synthesize');
+  });
+
+  it('includes a destructive-action notice naming the control when a route has destructiveActionsSeen', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].destructiveActionsSeen = ['Delete account'];
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('Destructive/irreversible action(s) detected');
+    expect(prompt).toContain('"Delete account"');
+    expect(prompt).toContain('run manually');
+  });
+
+  it('omits both notices when neither signal is present on any relevant route', async () => {
+    await generate(ctxWith(makeExploration(1)), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('OTP/verification-code gate detected');
+    expect(prompt).not.toContain('Destructive/irreversible action(s) detected');
+  });
+
+  it('omits both notices when there is no exploration artifact at all', async () => {
+    await generate(ctxWith(undefined), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('OTP/verification-code gate detected');
+    expect(prompt).not.toContain('Destructive/irreversible action(s) detected');
   });
 });
 

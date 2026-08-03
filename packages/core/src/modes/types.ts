@@ -118,6 +118,12 @@ export interface TestPlanItem {
   edits?: PlanItemEdit[];
   /** Audit trail of revise-with-suggestion calls, oldest first. */
   revisions?: PlanItemRevision[];
+  /**
+   * Set only when a code-detected route-guard forced this item's tier post-hoc, overriding
+   * whatever the model itself proposed — see orchestrator/plan.ts's applyAuthGuardTierOverrides.
+   * Never set by the model; absent means no override was applied (including "none was needed").
+   */
+  tierOverride?: { from: Tier; to: Tier; reason: string };
 }
 
 export interface TestPlan {
@@ -193,7 +199,9 @@ export type QualityFindingCode =
   | 'disabled-button-race-risk'
   | 'disabled-button-click-race'
   | 'ambiguous-locator-risk'
-  | 'unvalidated-status-code-assumption';
+  | 'unvalidated-status-code-assumption'
+  | 'unattended-destructive-action'
+  | 'unscoped-modal-assertion';
 
 export interface QualityFinding {
   code: QualityFindingCode;

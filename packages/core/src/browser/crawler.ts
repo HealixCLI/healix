@@ -51,6 +51,20 @@ export interface CrawledRoute {
    * fact visible to GENERATE instead of silently discarding it (see Cluster C). Absent/empty when
    * none were observed. */
   destructiveActionsSeen?: string[];
+  /** Diagnostic-only provenance: the region/locale code (or other seed label) this route was
+   * reached through, when it came from a derived/config-driven seed rather than ordinary link
+   * discovery from the primary crawl — see `browser/seed-discovery.ts`. Never used for
+   * identity/dedup, which stays keyed by `url`/`stateKey` as always. */
+  seedLabel?: string;
+  /** Click candidates on this route that survived the safety filter but were never actually
+   * attempted (budget ran out first) — see `ClickDiscoveryResult.unattemptedClickCandidates`.
+   * Primary source for a gap-fill pass's "unclicked-affordance" gaps. */
+  unattemptedClickCandidates?: {
+    selector: string;
+    name: string;
+    selectorTier?: 1 | 2 | 3 | 4;
+    repeatedRowText?: string;
+  }[];
 }
 
 export interface CrawlResult {
@@ -79,6 +93,47 @@ export interface CrawlResult {
   shellCollapsed: boolean;
   /** Requested URLs whose resolution was skipped as a runaway/degenerate redirect — see isDegenerateUrl. Likely an app-side routing defect, not a Healix bug; never a confirmed triage verdict. */
   degenerateRedirectsSkipped: string[];
+  /**
+   * How many times click-probing gave up on a route because the page couldn't be reliably reset
+   * after a click even after a forced reload — see `resetAfterProbe` and
+   * docs/click-probe-reset-corruption.md. Distinct from `budgetExhausted`/`unvisitedQueuedCount`:
+   * this means candidates were left unattempted because the page was stuck, not because time ran
+   * out. Callers surface this as a warning; see explore.ts.
+   *
+   * Optional for the same reason as `unvisitedQueuedCount` above — avoids a mechanical touch to
+   * every pre-existing `CrawlResult` literal. Always populated by `crawl()`; treat an absent value
+   * as 0.
+   */
+  resetFailures?: number;
+}
+
+/**
+ * Combine two `CrawlResult`s from independent `crawl()` calls into one. Every caller that
+ * stitches together a second pass (auth re-crawl, static-analysis-seeded follow-up, region-seed
+ * fan-out, gap-fill) needs the exact same field-by-field union — extracted once so a third/fourth
+ * caller doesn't hand-write it again and risk missing a field the others already account for.
+ *
+ * `roleOverride`, when given, is stamped onto every route in `addition` before merging (e.g. the
+ * post-login re-crawl's routes are all `'authenticated'` regardless of what `crawl()` itself set).
+ */
+export function mergeCrawlResults(
+  base: CrawlResult,
+  addition: CrawlResult,
+  roleOverride?: CrawledRoute['role'],
+): CrawlResult {
+  const additionRoutes = roleOverride
+    ? addition.routes.map((r) => ({ ...r, role: roleOverride }))
+    : addition.routes;
+  return {
+    routes: [...base.routes, ...additionRoutes],
+    visitedCount: base.visitedCount + additionRoutes.length,
+    budgetExhausted: base.budgetExhausted || addition.budgetExhausted,
+    unvisitedQueuedCount: (base.unvisitedQueuedCount ?? 0) + (addition.unvisitedQueuedCount ?? 0),
+    redirectLoopsDetected: [...base.redirectLoopsDetected, ...addition.redirectLoopsDetected],
+    shellCollapsed: base.shellCollapsed || addition.shellCollapsed,
+    degenerateRedirectsSkipped: [...base.degenerateRedirectsSkipped, ...addition.degenerateRedirectsSkipped],
+    resetFailures: (base.resetFailures ?? 0) + (addition.resetFailures ?? 0),
+  };
 }
 
 export interface CrawlOptions {
@@ -88,6 +143,12 @@ export interface CrawlOptions {
   wallClockBudgetMs?: number;
   /** Extra URLs to seed the BFS queue alongside `baseUrl` (e.g. known routes from static analysis). */
   seedRoutes?: string[];
+  /** Overrides MAX_STATE_PROBES_PER_CRAWL for this call only. Defaults to it when unset, a no-op
+   * for every existing caller. Lets `crawlWithAuth` give its anonymous and authenticated passes
+   * different-sized deep-probe pools — each `crawl()` call already gets its own independent
+   * budget (see GAP-060), so this is purely an allocation knob between the two calls, not a
+   * change to how a single call spends its own budget. */
+  stateProbeBudget?: number;
 }
 
 const DEFAULT_MAX_ROUTES = 60;
@@ -97,18 +158,6 @@ const DEFAULT_MAX_ROUTES = 60;
 // MAX_CLICKS_PER_PAGE/MAX_CLICK_PROBES_PER_CRAWL so the larger candidate pool has
 // room to actually run instead of hitting budgetExhausted mid-page.
 const DEFAULT_BUDGET_MS = 240_000;
-/**
- * Fraction of the wall-clock budget after which a deep probe will no longer be STARTED while
- * unvisited routes are still queued. Deep-probe is enrichment (it re-discovers a state that
- * only exists behind a click); ordinary route discovery is a prerequisite for everything
- * downstream, so when the two compete for the tail of the budget, discovery has to win —
- * otherwise budget exhaustion costs whole routes instead of merely costing detail. Note this
- * gates on the BUDGET, not on the route's own element count: GAP-056's finding that every
- * route deserves deep-probe eligibility (a well-populated page can still hide an ungrounded
- * same-URL form) is untouched — probes still run on every route, just not once they'd be
- * spending time the queue still needs.
- */
-const DEEP_PROBE_BUDGET_FRACTION = 0.5;
 /** Once a DOM fingerprint has repeated this many times, stop following that page's links. */
 const SHELL_REPEAT_THRESHOLD = 3;
 /** Share of visited routes sharing the dominant fingerprint that counts as "collapsed". */
@@ -161,7 +210,7 @@ export function normalizeUrl(url: string): string {
   }
 }
 
-function sameOrigin(url: string, originUrl: string): boolean {
+export function sameOrigin(url: string, originUrl: string): boolean {
   try {
     return new URL(url).origin === new URL(originUrl).origin;
   } catch {
@@ -213,9 +262,37 @@ function extractLinks(snapshot: DomSnapshot, origin: string): string[] {
  * === 'submit'` click, already excluded above); blocking the nav click by
  * name too would hide a real route on any SPA whose primary "Register" entry
  * point happens to be a `<button onClick>` rather than a real `<a href>`.
+ *
+ * The list carries LOCALIZED terms alongside the English ones, because an
+ * English-only list is not a safety filter on a localized app — it just
+ * silently stops filtering. Observed live on a Slovak app: "Odhlásiť sa" (log
+ * out) was the FIRST click candidate on the authenticated dashboard, so the
+ * crawl's own opening click destroyed the session it had just established, and
+ * every later candidate on that page — including the profile-edit triggers this
+ * pass exists to find — then fired against a logged-out page and revealed
+ * nothing. One row further down sat "odstrániť" (delete account), outside the
+ * per-page click slice by nothing more than luck of DOM order. Same
+ * locale-awareness the login matchers already have (see `LOGIN_TEXT_RE` and
+ * quality-audit.ts's `SUBMIT_CLICK_RE`). Only Slovak is covered because that is
+ * what has actually been observed; this stays a known gap for other locales
+ * rather than a pretence of full i18n.
+ *
+ * Note "zmeniť" (change/edit) is deliberately NOT here: it reveals an edit form
+ * rather than mutating anything, and the form's own submit is already excluded
+ * by `buttonType === 'submit'`. Blocking it would re-hide exactly the states
+ * GAP-060's reveal detection was added to capture.
  */
-const UNSAFE_CLICK_TEXT_RE =
-  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|add to cart|clear|cancel/i;
+export const UNSAFE_CLICK_TEXT_RE =
+  /delete|remove|logout|log out|sign out|submit|save|create|update|checkout|pay|purchase|add to cart|clear|cancel|odhl[aá]si|odstr[aá]ni|vymaza|zru[sš]i|ulo[zž]i|potvrdi|zaplati/i;
+/** A logo/brand element's accessible name — clicking one is almost always a "go home"
+ * navigation affordance, not a real feature, so it's low value to click-probe on its own.
+ * Worse, observed live (C&A app) to actively corrupt exploration: clicking it inside a
+ * deep-probed reveal resets the whole SPA view rather than undoing just that one click, which
+ * `resetAfterProbe` correctly detects as an unrecoverable mismatch and gives up on — discarding
+ * whatever real candidates were left in that reveal (see docs/click-probe-reset-corruption.md).
+ * Filtering it out here avoids ever paying that cost. Distinct from `UNSAFE_CLICK_TEXT_RE`
+ * above, which is about destructive/mutating actions, not low-value navigation chrome. */
+const LOGO_CLICK_TEXT_RE = /\blogo\b/i;
 /** An accessible name that reads as a login/sign-in action — used both to score crawled login
  * candidates (see `scoreLoginCandidates`) and, during click-probing, to recognize a same-URL
  * toggle that reveals a login view (see `discoverClickRoutes`). */
@@ -259,21 +336,37 @@ const LINK_QUEUE_THIN_THRESHOLD = 5;
 /** How many levels deep a single revealed state (modal -> tab-inside-modal -> ...) may be chased. */
 const MAX_STATE_DEPTH = 2;
 /**
- * Total deep-probe budget across a whole crawl() call — a separate pool from
+ * Total deep-probe CLICKS across a whole crawl() call — a separate pool from
  * MAX_CLICK_PROBES_PER_CRAWL so multi-step-flow probing (click + fill + recurse, materially
  * pricier than a single discovery click) never cannibalizes ordinary route-discovery budget.
- * Deliberately NOT gated on the parent route's own element count: a live audit of the real C&A
- * app found a healthy, well-populated "My account" page (~15 elements) whose "change password"
- * button reveals a same-URL form via exactly this mechanism — gating on route-thinness alone
- * would silently keep missing it, since a page can be well-populated overall and STILL hide an
- * important modal behind one specific button. STATE_REVEAL_MIN_NEW_ELEMENTS is what keeps this
- * targeted instead (an ordinary dropdown/menu reveals too few elements to qualify), and this
- * crawl-wide cap is what keeps the cost bounded on every page, healthy or not.
+ *
+ * Held at 20 deliberately, and it is NOT enough to reach every route's states on a multi-route
+ * authenticated pass — raising it was tried and made things worse. Measured on the real
+ * authenticated crawl: /dashboard/vouchers and /dashboard/points each spend 8 on ordinary
+ * navigation clicks, leaving /dashboard 4 — one short of its four `zmenit` profile-edit
+ * triggers, which a dashboard-only probe confirmed DO record their forms (dob, newemail,
+ * currentpswd/password/confirm_password) once clicks actually reach them. But at 45 the extra
+ * clicks simply consumed the wall clock instead and /dashboard was never VISITED at all (route
+ * coverage 8 -> 7, budgetExhausted false -> true). Charging per recorded state rather than per
+ * click regressed it the same way, for the same underlying reason.
+ *
+ * The real constraint was structural, not a number: interleaving deep-probe with discovery let
+ * the FIRST routes visited in a pass spend the whole pool before the pass's own interesting
+ * route (often visited last) got a turn. Fixed by deferring deep-probe to a genuine second pass
+ * over the routes discovery already collected, probed in reverse visit order so the routes that
+ * were structurally starved before now go first — see GAP-060 (Fixed) and `crawl()`'s pass-2
+ * loop below.
  */
 const MAX_STATE_PROBES_PER_CRAWL = 20;
 /** A same-URL click only counts as "revealed a real state" (worth recording/recursing into),
  * not just a small dropdown/menu, when it adds at least this many interactive elements. */
-const STATE_REVEAL_MIN_NEW_ELEMENTS = 5;
+export const STATE_REVEAL_MIN_NEW_ELEMENTS = 5;
+/**
+ * ...OR when it brings this many previously-absent INPUT fields on screen — see
+ * `revealedInputFields`. One is enough: a single input that wasn't there before is a form, and
+ * a form is exactly the state worth recording.
+ */
+export const STATE_REVEAL_MIN_NEW_INPUTS = 1;
 /** Input name/id/selector hints that read as a one-time/verification code — never auto-filled,
  * since a real OTP requires a code delivered over an external channel (email/SMS) that a crawl
  * has no way to observe or synthesize. Flows gated behind this remain a `test.fixme()` case by
@@ -340,6 +433,7 @@ function extractClickCandidates(snapshot: DomSnapshot): InteractiveElement[] {
       .filter((el) => !el.disabled)
       .filter((el) => el.buttonType !== 'submit')
       .filter((el) => !UNSAFE_CLICK_TEXT_RE.test(el.name))
+      .filter((el) => !LOGO_CLICK_TEXT_RE.test(el.name))
       .filter((el) => el.role !== 'generic' || el.name.length <= GENERIC_CANDIDATE_NAME_MAX_LENGTH)
       .slice(0, CLICK_CANDIDATES_PER_PAGE)
   );
@@ -355,12 +449,27 @@ export interface ClickDiscoveryResult {
   /** New states revealed and recorded during deep-probing (see `DeepProbeOpts`), each carrying
    * its own `stateKey` — see `CrawledRoute.stateKey`. Empty unless `opts.deepProbe` was set. */
   discoveredStates: CrawledRoute[];
+  /** Click candidates that survived the safety filter (extractClickCandidates) but were never
+   * actually attempted this page visit — the loop stopped early on budget exhaustion. Surfaced
+   * so a later gap-fill pass can specifically target the ones ordinary discovery ran out of time
+   * for, rather than a page simply looking (falsely) fully explored. */
+  unattemptedClickCandidates: {
+    selector: string;
+    name: string;
+    selectorTier?: 1 | 2 | 3 | 4;
+    repeatedRowText?: string;
+  }[];
+  /** Number of times this call gave up on a page because `resetAfterProbe` couldn't reliably
+   * restore it even after a forced reload — distinct from ordinary budget exhaustion. See
+   * `CrawlResult.resetFailures`. */
+  resetFailures: number;
 }
 
 /** Enables the deep-probe behavior in `discoverClickRoutes` — engaged on every route (see
  * GAP-056; NOT gated on the route's own element count), bounded instead by
- * MAX_STATE_PROBES_PER_CRAWL/MAX_STATE_DEPTH and by STATE_REVEAL_MIN_NEW_ELEMENTS only ever
- * recording a click that reveals a real, materially larger state. */
+ * MAX_STATE_PROBES_PER_CRAWL/MAX_STATE_DEPTH and by only ever recording a click that reveals a
+ * real state: one that is materially larger (STATE_REVEAL_MIN_NEW_ELEMENTS) or brings new input
+ * fields on screen (STATE_REVEAL_MIN_NEW_INPUTS — see `revealedInputFields`). */
 interface DeepProbeOpts {
   /** This state's identity so far: the route URL plus every selector clicked to reach it. */
   stateKeyPrefix: string;
@@ -370,6 +479,34 @@ interface DeepProbeOpts {
   parentDepth: number;
   /** Shared, mutable across the whole recursion tree for this page — see MAX_STATE_PROBES_PER_CRAWL. */
   budget: { remaining: number };
+  /**
+   * Shared across the WHOLE crawl (every route, not just this page's recursion tree) — keyed by
+   * the reveal's route-path segment plus its post-reveal fingerprint, so a shared component (a
+   * cookie-consent modal, a generic upsell dialog) that reveals identically from many different
+   * routes is recognized after STATE_REPEAT_THRESHOLD occurrences instead of being re-descended
+   * into on every single route it happens to appear on. Keyed with the route path INCLUDED
+   * (not fingerprint alone) so two genuinely different same-shaped modals on different pages
+   * (e.g. an "edit email" form and an "edit password" form that happen to render the same
+   * element count/roles) are never conflated as the same repeated state.
+   */
+  stateFingerprints: Map<string, number>;
+}
+
+/** Once a deep-probe reveal's (route, post-reveal fingerprint) pair has recurred this many times
+ * across the crawl, it's still recorded (the inventory keeps knowing it exists) but no longer
+ * recursed into or charged further probe budget — see `DeepProbeOpts.stateFingerprints`. */
+const STATE_REPEAT_THRESHOLD = 2;
+
+/** The first hash-route path segment (or the pathname, for a non-hash-routed app) — used as part
+ * of a deep-probe state's fingerprint key so identical-shaped reveals on DIFFERENT pages are kept
+ * distinct (see `DeepProbeOpts.stateFingerprints`). */
+function routePathSegment(url: string): string {
+  try {
+    const u = new URL(url);
+    return u.hash || u.pathname;
+  } catch {
+    return url;
+  }
 }
 
 /**
@@ -395,9 +532,11 @@ interface DeepProbeOpts {
  * registration form instead (the exact bug this guards against).
  *
  * When `opts.deepProbe` is set (engaged on every route, see GAP-056), a same-URL click that
- * reveals a MATERIALLY LARGER DOM state (>= STATE_REVEAL_MIN_NEW_ELEMENTS more interactive
- * elements than a small dropdown/menu — those still fall through to the ordinary harvest-and-
- * revert branch) is instead recorded as its own `CrawledRoute` (keyed by `stateKey`, not `url`,
+ * reveals a REAL STATE — either a materially larger DOM (>= STATE_REVEAL_MIN_NEW_ELEMENTS more
+ * interactive elements than a small dropdown/menu) or new input fields regardless of net size
+ * (>= STATE_REVEAL_MIN_NEW_INPUTS; see `revealedInputFields` for why a net-growth test alone
+ * cannot see an inline-edit view swap) — is instead recorded as its own `CrawledRoute` (keyed by
+ * `stateKey`, not `url`,
  * see `CrawledRoute.stateKey`) and, budget/depth permitting, probed one level deeper via a
  * recursive call after a best-effort `fillSafeInputs` pass — the one piece deliberately missing
  * from ordinary route discovery: a wallet/subscription-management modal, or a filter panel, needs
@@ -408,6 +547,53 @@ interface DeepProbeOpts {
  * OTP_HINT_RE) — a real code requires an external channel no crawl can observe, so those flows
  * correctly remain ungrounded for GENERATE's escape hatch.
  */
+/** Shared `.catch()` fallback for both `crawl()` passes' `discoverClickRoutes` calls — a failed
+ * click-probe attempt (page navigated away unexpectedly, browser error) should never abort the
+ * whole crawl, just contribute nothing this round. */
+function emptyClickDiscoveryResult(): ClickDiscoveryResult {
+  return {
+    attempted: 0,
+    discoveredUrls: [],
+    loginToggleSelectors: [],
+    discoveredStates: [],
+    unattemptedClickCandidates: [],
+    resetFailures: 0,
+  };
+}
+
+/**
+ * Restore the page to `originalSnapshot`'s state after a click-probe, verifying the reset
+ * actually worked instead of trusting it blindly — see docs/click-probe-reset-corruption.md.
+ * `pressKey('Escape')` alone doesn't close every modal (custom in-app modals that don't listen
+ * for Escape), and `goto(originalUrl)` is a silent no-op for a same-URL hash-routed SPA (Playwright
+ * reports a real `Response` even though nothing actually reloaded). Left unrecovered, either
+ * failure poisons every click candidate that follows on the same page.
+ *
+ * Escalates only as far as needed: Escape + a cheap re-snapshot resolves the common real-dropdown
+ * case with no extra cost; `goto()` is skipped when we're already sitting on `originalUrl` (a
+ * known no-op there) and a genuine `reload()` — the one primitive that can't suffer the same-URL
+ * no-op problem — is used instead, but only when the cheaper steps didn't already succeed.
+ */
+async function resetAfterProbe(
+  browser: BrowserSurface,
+  originalSnapshot: DomSnapshot,
+  originalUrl: string,
+): Promise<boolean> {
+  await browser.pressKey('Escape').catch(() => undefined);
+  let current = await snapshotClean(browser).catch(() => undefined);
+  if (current && fingerprintOf(current) === fingerprintOf(originalSnapshot)) return true;
+
+  if (current && normalizeUrl(current.url) !== normalizeUrl(originalUrl)) {
+    await browser.goto(originalUrl).catch(() => undefined);
+    current = await snapshotClean(browser).catch(() => undefined);
+    if (current && fingerprintOf(current) === fingerprintOf(originalSnapshot)) return true;
+  }
+
+  await browser.reload().catch(() => undefined);
+  current = await snapshotClean(browser).catch(() => undefined);
+  return !!current && fingerprintOf(current) === fingerprintOf(originalSnapshot);
+}
+
 async function discoverClickRoutes(
   browser: BrowserSurface,
   snapshot: DomSnapshot,
@@ -422,28 +608,48 @@ async function discoverClickRoutes(
   const loginToggleSelectors: string[] = [];
   const discoveredStates: CrawledRoute[] = [];
   let attempted = 0;
+  let resetFailures = 0;
   const deepProbe = opts.deepProbe;
 
   for (const candidate of candidates) {
+    // Charged per ATTEMPTED click, not per recorded state. That looks like a misnomer next to
+    // MAX_STATE_PROBES_PER_CRAWL's name, and charging per state was tried — it starved the
+    // crawl of TIME instead: with no per-click ceiling every route spent its full click slice,
+    // the authenticated pass blew its wall clock, and route coverage regressed (8 routes ->
+    // 7, budgetExhausted false -> true) without recording a single extra state. The per-click
+    // charge is doing double duty as a cost throttle, and the fix for the starvation it caused
+    // is a bigger pool (see MAX_STATE_PROBES_PER_CRAWL), not a different charging rule.
     if (deepProbe && deepProbe.budget.remaining <= 0) break;
     attempted += 1;
     if (deepProbe) deepProbe.budget.remaining -= 1;
     try {
       await browser.click(candidate.selector);
-      const after = await browser.snapshot();
+      const after = await snapshotClean(browser);
       if (normalizeUrl(after.url) !== normalizeUrl(originalUrl)) {
         if (sameOrigin(after.url, origin)) discoveredUrls.push(after.url);
         discoveredUrls.push(...extractLinks(after, origin));
-        await browser.goto(originalUrl).catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       } else if (LOGIN_TEXT_RE.test(candidate.name) && hasPasswordField(after)) {
         loginToggleSelectors.push(candidate.selector);
-        await browser.pressKey('Escape').catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       } else if (
         deepProbe &&
-        after.interactiveElements.length - beforeCount >= STATE_REVEAL_MIN_NEW_ELEMENTS
+        (after.interactiveElements.length - beforeCount >= STATE_REVEAL_MIN_NEW_ELEMENTS ||
+          revealedInputFields(snapshot, after) >= STATE_REVEAL_MIN_NEW_INPUTS)
       ) {
         const stateKey = `${deepProbe.stateKeyPrefix}>>${candidate.selector}`;
         const destructiveNames = destructiveActionsSeen(after);
+        const stateFingerprint = `${routePathSegment(originalUrl)}::${fingerprintOf(after)}`;
+        const priorOccurrences = deepProbe.stateFingerprints.get(stateFingerprint) ?? 0;
+        deepProbe.stateFingerprints.set(stateFingerprint, priorOccurrences + 1);
+        const isRepeatedState = priorOccurrences >= STATE_REPEAT_THRESHOLD;
+
         discoveredStates.push({
           url: originalUrl,
           stateKey,
@@ -462,38 +668,65 @@ async function discoverClickRoutes(
         // MAX_STATE_DEPTH counts recorded hops: this candidate's reveal is hop `deepProbe.depth +
         // 1`. Only recurse (look for one more hop past it) while that count still has room —
         // e.g. MAX_STATE_DEPTH=2 records hop1 and hop2, but never explores INSIDE hop2 looking
-        // for a hop3, so a hop3 candidate is simply never clicked at all.
-        if (deepProbe.depth + 1 < MAX_STATE_DEPTH && deepProbe.budget.remaining > 0) {
+        // for a hop3, so a hop3 candidate is simply never clicked at all. A reveal recognized as
+        // one we've already descended into STATE_REPEAT_THRESHOLD+ times elsewhere in this crawl
+        // (see `stateFingerprints`) is skipped here too — it's still recorded above, just not
+        // spent budget re-exploring.
+        if (!isRepeatedState && deepProbe.depth + 1 < MAX_STATE_DEPTH && deepProbe.budget.remaining > 0) {
           await fillSafeInputs(browser, after).catch(() => 0);
-          const settled = await browser.snapshot().catch(() => after);
+          const settled = await snapshotClean(browser).catch(() => after);
           const nested = await discoverClickRoutes(browser, settled, origin, MAX_CLICKS_PER_PAGE, {
             deepProbe: {
               stateKeyPrefix: stateKey,
               depth: deepProbe.depth + 1,
               parentDepth: deepProbe.parentDepth,
               budget: deepProbe.budget,
+              stateFingerprints: deepProbe.stateFingerprints,
             },
           });
           discoveredUrls.push(...nested.discoveredUrls);
           loginToggleSelectors.push(...nested.loginToggleSelectors);
           discoveredStates.push(...nested.discoveredStates);
+          resetFailures += nested.resetFailures;
         }
 
-        await browser.pressKey('Escape').catch(() => undefined);
-        await browser.goto(originalUrl).catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       } else {
         // Click likely opened a menu/dropdown in place rather than navigating
         // — collect any newly revealed anchors, then close it.
         discoveredUrls.push(...extractLinks(after, origin));
-        await browser.pressKey('Escape').catch(() => undefined);
+        if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+          resetFailures += 1;
+          break;
+        }
       }
     } catch {
       // Dead click target or click failed — best-effort reset, keep probing the rest.
-      await browser.goto(originalUrl).catch(() => undefined);
+      if (!(await resetAfterProbe(browser, snapshot, originalUrl))) {
+        resetFailures += 1;
+        break;
+      }
     }
   }
 
-  return { attempted, discoveredUrls, loginToggleSelectors, discoveredStates };
+  const unattemptedClickCandidates = candidates.slice(attempted).map((c) => ({
+    selector: c.selector,
+    name: c.name,
+    selectorTier: c.selectorTier,
+    repeatedRowText: c.repeatedRowText,
+  }));
+
+  return {
+    attempted,
+    discoveredUrls,
+    loginToggleSelectors,
+    discoveredStates,
+    unattemptedClickCandidates,
+    resetFailures,
+  };
 }
 
 /**
@@ -539,8 +772,141 @@ function fingerprintOf(snapshot: DomSnapshot): string {
     .join('|');
 }
 
+/**
+ * Minimum size of a group of same-role, same-selector-SHAPE elements before they're collapsed to
+ * one representative (see `collapseRepeatedSiblings`). Set above an ordinary small run of same-
+ * shaped nav items (2-3 real, distinct controls) so genuine UI survives, while a calendar's ~30
+ * day-cells or a table's many rows still collapse.
+ */
+const REPEATED_GROUP_MIN_SIZE = 4;
+
+/**
+ * Strips a positional `nth-of-type` index so e.g. `div:nth-of-type(3) > span` and
+ * `div:nth-of-type(9) > span` compare equal — same shape, different index. Selectors that
+ * already carry a stable identifier (tier 1-3: data-testid/name/aria-label/id) never contain
+ * `nth-of-type` at all, so this only ever merges the already-lowest-confidence tier-4 fallback
+ * selectors — a real, individually-identified form field is never at risk of collapsing into
+ * a neighbor.
+ */
+function selectorShape(selector: string): string {
+  return selector.replace(/:nth-of-type\(\d+\)/g, ':nth-of-type(*)');
+}
+
+/**
+ * Collapses runs of near-identical sibling elements (grouped by role + selector shape, ignoring
+ * the nth-of-type index) down to one representative plus a `repeatedGroupSize` count. A real run
+ * against the C&A app captured a date-picker's 27 day-cells as 27 separate `InteractiveElement`s
+ * from a single reveal — pure noise that both bloats the inventory GENERATE grounds against and
+ * crowds real click candidates out of `CLICK_CANDIDATES_PER_PAGE`. Applied at snapshot time (see
+ * `snapshotClean`) so every downstream consumer — click-candidate extraction, deep-probe reveal
+ * sizing, the recorded route itself — sees the collapsed view uniformly, rather than patching
+ * each consumer separately.
+ *
+ * The shape key alone isn't enough: a live run against the same app found the account page's
+ * "zmeniť" (change name/DOB/email/password) x4 plus "odstrániť" (delete account) x1 — 5 `generic`
+ * `<p>` elements sharing one DOM shape — collapsing into ONE entry named "zmeniť", silently
+ * erasing the delete-account trigger rather than deduping it. So within a shape-group that meets
+ * the threshold, elements are also split by accessible NAME first: a minority name too small to
+ * be "real repetition" on its own (odstrániť x1) is never swallowed by a same-shaped majority.
+ * A same-name subgroup that itself meets the threshold (zmeniť x4) is then checked against
+ * `repeatedRowText` (the nearest repeated-DOM-ancestor's own text — see selectors.ts) before
+ * collapsing: each "zmeniť" trigger sits in its own profile section, so their surrounding row
+ * text differs even though their own name doesn't, distinguishing 4 functionally different
+ * triggers from a genuinely repeated list (e.g. 50 identically-labeled "Delete" row buttons,
+ * whose row text is far more likely to repeat, or not be tier-4/present at all).
+ */
+function collapseRepeatedSiblings(snapshot: DomSnapshot): DomSnapshot {
+  const shapeGroups = new Map<string, InteractiveElement[]>();
+  for (const el of snapshot.interactiveElements) {
+    const key = `${el.role}:${selectorShape(el.selector)}`;
+    const group = shapeGroups.get(key);
+    if (group) group.push(el);
+    else shapeGroups.set(key, [el]);
+  }
+
+  const collapsed: InteractiveElement[] = [];
+  for (const shapeGroup of shapeGroups.values()) {
+    if (shapeGroup.length < REPEATED_GROUP_MIN_SIZE) {
+      collapsed.push(...shapeGroup);
+      continue;
+    }
+
+    const distinctNames = new Set(shapeGroup.map((el) => el.name));
+    if (distinctNames.size >= REPEATED_GROUP_MIN_SIZE) {
+      // Mostly/all-unique names sharing one shape (a date-picker's day cells, an enumerated
+      // list) — the name carries no distinguishing signal here, collapse as one unit.
+      collapsed.push({ ...shapeGroup[0], repeatedGroupSize: shapeGroup.length });
+      continue;
+    }
+
+    const nameGroups = new Map<string, InteractiveElement[]>();
+    for (const el of shapeGroup) {
+      const group = nameGroups.get(el.name);
+      if (group) group.push(el);
+      else nameGroups.set(el.name, [el]);
+    }
+    for (const nameGroup of nameGroups.values()) {
+      if (nameGroup.length < REPEATED_GROUP_MIN_SIZE) {
+        collapsed.push(...nameGroup);
+        continue;
+      }
+
+      const rowTexts = nameGroup.map((el) => el.repeatedRowText);
+      const distinctRowTexts = new Set(rowTexts);
+      const allDistinct =
+        rowTexts.every((text) => text !== undefined) && distinctRowTexts.size === nameGroup.length;
+      if (allDistinct) {
+        collapsed.push(...nameGroup);
+      } else {
+        collapsed.push({ ...nameGroup[0], repeatedGroupSize: nameGroup.length });
+      }
+    }
+  }
+
+  return { ...snapshot, interactiveElements: collapsed };
+}
+
+/** Every `browser.snapshot()` call site routes through here so repeated-sibling collapse (see
+ * `collapseRepeatedSiblings`) applies uniformly, rather than risking a call site that forgets it. */
+export async function snapshotClean(browser: BrowserSurface): Promise<DomSnapshot> {
+  return collapseRepeatedSiblings(await browser.snapshot());
+}
+
 function hasPasswordField(snapshot: DomSnapshot): boolean {
   return snapshot.interactiveElements.some((el) => el.inputType === 'password');
+}
+
+function isInputField(el: InteractiveElement): boolean {
+  return el.role === 'textbox' || el.inputType !== undefined;
+}
+
+/**
+ * How many input fields are on screen in `after` that were not there in `before`, compared BY
+ * SELECTOR.
+ *
+ * This exists because `STATE_REVEAL_MIN_NEW_ELEMENTS` measures NET element growth, which is
+ * structurally blind to a same-URL view SWAP — and a swap is how real apps implement inline
+ * editing. C&A's dashboard drives all four profile-edit flows off one `subpage` state: clicking
+ * "zmeniť" REPLACES a list of ~5 edit links with a form of 3 inputs plus a submit, a net change of
+ * about MINUS ONE. No value of a net-growth threshold can ever fire on that, so every one of those
+ * forms was clicked, judged a dropdown, Escape-reverted and discarded — and 38 generated Tier B
+ * specs then shipped as ungrounded `test.fixme` asking for precisely those fields ("the DOB
+ * date-picker input revealed by this zmeniť trigger", "the password-change form fields are not in
+ * the provided inventory", and so on).
+ *
+ * Counting inputs is what makes a swap visible: it is insensitive to whatever the swap REMOVED,
+ * and "new inputs appeared" is a much truer description of "a form opened" than "the element count
+ * went up" ever was. Compared by selector rather than by count for the same reason — a swap that
+ * trades three inputs for three DIFFERENT inputs (name form -> DOB form) nets zero on a count and
+ * must still register.
+ *
+ * This does not replace the element-count test, it joins it: a date-picker or a modal that piles
+ * new controls on top of an intact form is still caught by the original signal even when it adds
+ * no inputs at all (a calendar is buttons).
+ */
+export function revealedInputFields(before: DomSnapshot, after: DomSnapshot): number {
+  const seen = new Set(before.interactiveElements.filter(isInputField).map((el) => el.selector));
+  return after.interactiveElements.filter((el) => isInputField(el) && !seen.has(el.selector)).length;
 }
 
 /** Recognizable "this route rendered a crash" shapes: a framework error-boundary fallback
@@ -552,7 +918,7 @@ const CRASH_MARKER_RE =
 /** `snapshot.axTree` (Playwright's `ariaSnapshot()`) is a YAML string when present — see
  * `browser/index.ts`'s `snapshot()`. Checked alongside the title since a crash fallback page
  * commonly carries a generic/blank title but a distinctive accessible tree (or vice versa). */
-function looksCrashed(snapshot: DomSnapshot): boolean {
+export function looksCrashed(snapshot: DomSnapshot): boolean {
   const axText = typeof snapshot.axTree === 'string' ? snapshot.axTree : '';
   return CRASH_MARKER_RE.test(axText) || CRASH_MARKER_RE.test(snapshot.title);
 }
@@ -571,7 +937,7 @@ const DEGENERATE_REPEAT_SEGMENT_THRESHOLD = 4;
  * never repeats a prior URL, so it needs its own guard. Recording the
  * eventual (huge) URL as a "discovered route" would be pure garbage.
  */
-function isDegenerateUrl(url: string): boolean {
+export function isDegenerateUrl(url: string): boolean {
   if (url.length > DEGENERATE_URL_MAX_LENGTH) return true;
   let resolved: URL;
   try {
@@ -607,8 +973,6 @@ export async function crawl(
   const maxRoutes = opts.maxRoutes ?? DEFAULT_MAX_ROUTES;
   const budgetMs = opts.wallClockBudgetMs ?? DEFAULT_BUDGET_MS;
   const deadline = Date.now() + budgetMs;
-  // See DEEP_PROBE_BUDGET_FRACTION: past this point, enrichment yields to discovery.
-  const deepProbeCutoff = Date.now() + budgetMs * DEEP_PROBE_BUDGET_FRACTION;
 
   // baseUrl stays unconditionally first — it's the crawl root, and visiting it first is what
   // seeds link discovery and the route-prefix detection every later URL is reconciled
@@ -626,10 +990,13 @@ export async function crawl(
   const redirectLoopsDetected: string[] = [];
   const degenerateRedirectsSkipped: string[] = [];
   const fingerprintCounts = new Map<string, number>();
+  // Crawl-scoped (not per-route) — see DeepProbeOpts.stateFingerprints.
+  const stateFingerprints = new Map<string, number>();
   const routes: CrawledRoute[] = [];
   let budgetExhausted = false;
   let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
-  let remainingStateProbes = MAX_STATE_PROBES_PER_CRAWL;
+  let remainingStateProbes = opts.stateProbeBudget ?? MAX_STATE_PROBES_PER_CRAWL;
+  let resetFailures = 0;
 
   // Discard anything buffered before this crawl started so it doesn't leak into route 0.
   browser.drainNetworkEvents();
@@ -654,7 +1021,7 @@ export async function crawl(
       // the exact trailing-slash directory URL (e.g. Vite's `base` config) —
       // see GAP-052.
       await browser.goto(item.url);
-      snapshot = await browser.snapshot();
+      snapshot = await snapshotClean(browser);
     } catch {
       // Dead link or navigation failure — discard whatever traffic that attempt
       // triggered (it can't be attributed to a route we're about to record) and
@@ -725,39 +1092,18 @@ export async function crawl(
     // GAP-042). Only probe once the link queue is running thin — following a
     // real link is cheaper and safer than guessing at a click target.
     const wantsClickProbe = remainingClickProbes > 0 && queue.length < LINK_QUEUE_THIN_THRESHOLD;
-    // Every route is deep-probe eligible (see GAP-056) — NOT gated on this route's own element
-    // count. A live audit of the real C&A app found a healthy, well-populated "My account" page
-    // whose "change password" button still reveals an un-grounded same-URL form; gating on
-    // route-thinness would keep missing exactly that shape. STATE_REVEAL_MIN_NEW_ELEMENTS (only a
-    // click that reveals a real, materially larger state ever gets recorded) and the separate
-    // MAX_STATE_PROBES_PER_CRAWL budget below are what keep this bounded instead.
-    // ...but past DEEP_PROBE_BUDGET_FRACTION of the budget, only when nothing is left to
-    // discover — see that constant for why enrichment yields to discovery at the tail.
-    const wantsStateProbe = remainingStateProbes > 0 && (queue.length === 0 || Date.now() < deepProbeCutoff);
-    if (wantsClickProbe || wantsStateProbe) {
-      const maxClicks = wantsClickProbe
-        ? Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes)
-        : MAX_CLICKS_PER_PAGE;
-      const stateBudget = wantsStateProbe ? { remaining: remainingStateProbes } : undefined;
-      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks, {
-        deepProbe: stateBudget
-          ? { stateKeyPrefix: resolvedUrl, depth: 0, parentDepth: item.depth, budget: stateBudget }
-          : undefined,
-      }).catch(
-        (): ClickDiscoveryResult => ({
-          attempted: 0,
-          discoveredUrls: [],
-          loginToggleSelectors: [],
-          discoveredStates: [],
-        }),
+    if (wantsClickProbe) {
+      const maxClicks = Math.min(MAX_CLICKS_PER_PAGE, remainingClickProbes);
+      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, maxClicks).catch(
+        emptyClickDiscoveryResult,
       );
-      if (wantsClickProbe) remainingClickProbes -= clickResult.attempted;
-      if (stateBudget) remainingStateProbes = stateBudget.remaining;
+      remainingClickProbes -= clickResult.attempted;
+      resetFailures += clickResult.resetFailures;
       if (clickResult.loginToggleSelectors.length > 0) {
         routes[routes.length - 1].loginToggleSelector = clickResult.loginToggleSelectors[0];
       }
-      if (clickResult.discoveredStates.length > 0) {
-        routes.push(...clickResult.discoveredStates);
+      if (clickResult.unattemptedClickCandidates.length > 0) {
+        routes[routes.length - 1].unattemptedClickCandidates = clickResult.unattemptedClickCandidates;
       }
       for (const discovered of clickResult.discoveredUrls) {
         const norm = normalizeUrl(discovered);
@@ -767,6 +1113,70 @@ export async function crawl(
         }
       }
     }
+  }
+
+  // Deep-probe (state-reveal) pass — deliberately deferred until discovery (above) is fully
+  // done, rather than interleaved with it (see GAP-060, Fixed). Interleaving let whichever
+  // routes were dequeued FIRST in a pass spend the whole shared MAX_STATE_PROBES_PER_CRAWL pool
+  // on their own click candidates, starving a route visited later in the same pass — on the real
+  // target app, that was the authenticated dashboard itself, holding the actual edit-reveal
+  // triggers the run needed. Probing pass-1's routes in REVERSE of their visit order flips that:
+  // the routes structurally starved before now go first against the full pool. Bounded by the
+  // same `deadline` as pass 1 — never runs past the crawl's own overall wall-clock budget.
+  // Deliberately does NOT re-enqueue `discoveredUrls` from these probes: reopening BFS this late
+  // would reintroduce the interleaving this restructure removes, and the common case (SPA nav via
+  // onClick) is already covered by pass 1's own click-probing above.
+  if (remainingStateProbes > 0) {
+    const stateBudget = { remaining: remainingStateProbes };
+    const pass1Routes = [...routes];
+    // Tracks wherever the browser was actually left by the previous iteration (or, for the first
+    // iteration, by pass 1 itself — pass 2 visits in REVERSE of pass1Routes, so its first route is
+    // exactly the last route pass 1 visited). A route matching this is a same-URL no-op for
+    // goto() on a hash-routed SPA (see resetAfterProbe/docs/click-probe-reset-corruption.md) —
+    // force a genuine reload() instead so a stuck page can't poison this route's own
+    // discoverClickRoutes call from the very first snapshot it takes.
+    let lastVisitedUrl = pass1Routes[pass1Routes.length - 1]?.url;
+    for (let i = pass1Routes.length - 1; i >= 0; i -= 1) {
+      if (stateBudget.remaining <= 0 || Date.now() >= deadline) break;
+      const route = pass1Routes[i];
+
+      let snapshot: DomSnapshot;
+      try {
+        if (lastVisitedUrl !== undefined && normalizeUrl(lastVisitedUrl) === normalizeUrl(route.url)) {
+          await browser.reload();
+        } else {
+          await browser.goto(route.url);
+        }
+        snapshot = await snapshotClean(browser);
+      } catch {
+        browser.drainNetworkEvents();
+        continue;
+      }
+      browser.drainNetworkEvents();
+      lastVisitedUrl = route.url;
+
+      const clickResult = await discoverClickRoutes(browser, snapshot, baseUrl, MAX_CLICKS_PER_PAGE, {
+        deepProbe: {
+          stateKeyPrefix: route.url,
+          depth: 0,
+          parentDepth: route.depth,
+          budget: stateBudget,
+          stateFingerprints,
+        },
+      }).catch(emptyClickDiscoveryResult);
+      resetFailures += clickResult.resetFailures;
+
+      if (clickResult.loginToggleSelectors.length > 0) {
+        route.loginToggleSelector = clickResult.loginToggleSelectors[0];
+      }
+      if (clickResult.unattemptedClickCandidates.length > 0) {
+        route.unattemptedClickCandidates = clickResult.unattemptedClickCandidates;
+      }
+      if (clickResult.discoveredStates.length > 0) {
+        routes.push(...clickResult.discoveredStates);
+      }
+    }
+    remainingStateProbes = stateBudget.remaining;
   }
 
   const dominant = fingerprintCounts.size > 0 ? Math.max(...fingerprintCounts.values()) : 0;
@@ -782,12 +1192,138 @@ export async function crawl(
     redirectLoopsDetected,
     shellCollapsed,
     degenerateRedirectsSkipped,
+    resetFailures,
   };
+}
+
+export interface ManySeedsOptions {
+  /** Absolute ceiling on concurrent seed crawls, regardless of any dynamic sizing below — never
+   * truly unbounded. Default 5. */
+  maxConcurrentSeeds?: number;
+  perSeedMaxRoutes?: number;
+  perSeedBudgetMs?: number;
+  /** Hard ceiling for the whole fan-out phase, regardless of seed count/concurrency. */
+  totalBudgetMs?: number;
+}
+
+const DEFAULT_MANY_SEEDS_MAX_CONCURRENCY = 5;
+const DEFAULT_PER_SEED_MAX_ROUTES = 8;
+const DEFAULT_PER_SEED_BUDGET_MS = 25_000;
+const DEFAULT_MANY_SEEDS_TOTAL_BUDGET_MS = 90_000;
+
+/** Best-effort empty CrawlResult for a seed whose own browser session never got off the ground —
+ * never lets one bad seed abort the rest of the fan-out. */
+function emptyCrawlResult(): CrawlResult {
+  return {
+    routes: [],
+    visitedCount: 0,
+    budgetExhausted: false,
+    redirectLoopsDetected: [],
+    shellCollapsed: false,
+    degenerateRedirectsSkipped: [],
+  };
+}
+
+/**
+ * Crawls multiple independent seed URLs concurrently, each in its OWN fresh `BrowserSurface` (own
+ * Chromium process — separate origins can't share a `BrowserContext`), pre-authenticated from
+ * `storageState` (a prior session's exported cookies/localStorage — see
+ * `BrowserSurface.exportStorageState`) so no seed needs its own login attempt. This is the
+ * FALLBACK path for a target whose regions/sections are genuinely separate deployments/origins.
+ * Same-origin hash-route siblings should use `deriveRegionSeeds` (seed-discovery.ts) plus ordinary
+ * `seedRoutes` injection into a single already-authenticated crawl instead — reusing one context
+ * directly is both simpler and cheaper, and is the common case (see that module's doc comment).
+ *
+ * Concurrency is derived from a quick single-seed timing probe (the first seed, crawled alone)
+ * rather than a flat constant: a seed that runs slow/near its own budget means this target is
+ * heavy or rate-sensitive, so the rest run with LESS concurrency, not more — always clamped to
+ * `maxConcurrentSeeds` (default 5) regardless of what the probe suggests, so a very fast target
+ * can never trigger dozens of concurrent Chromium processes.
+ */
+export async function crawlManySeeds(
+  seeds: string[],
+  browserFactory: () => BrowserSurface,
+  storageState: unknown,
+  opts: ManySeedsOptions = {},
+): Promise<CrawlResult> {
+  if (seeds.length === 0) return emptyCrawlResult();
+
+  const perSeedMaxRoutes = opts.perSeedMaxRoutes ?? DEFAULT_PER_SEED_MAX_ROUTES;
+  const perSeedBudgetMs = opts.perSeedBudgetMs ?? DEFAULT_PER_SEED_BUDGET_MS;
+  const absoluteMaxConcurrency = opts.maxConcurrentSeeds ?? DEFAULT_MANY_SEEDS_MAX_CONCURRENCY;
+  const totalDeadline = Date.now() + (opts.totalBudgetMs ?? DEFAULT_MANY_SEEDS_TOTAL_BUDGET_MS);
+
+  async function crawlOneSeed(seedUrl: string, budgetMs: number): Promise<CrawlResult> {
+    const browser = browserFactory();
+    try {
+      await browser.start({ headless: true, baseUrl: seedUrl, storageState });
+      const result = await crawl(browser, seedUrl, {
+        maxRoutes: perSeedMaxRoutes,
+        wallClockBudgetMs: budgetMs,
+      });
+      let label: string | undefined;
+      try {
+        label = new URL(seedUrl).origin;
+      } catch {
+        label = undefined;
+      }
+      return { ...result, routes: result.routes.map((r) => ({ ...r, seedLabel: r.seedLabel ?? label })) };
+    } catch {
+      // A seed whose own browser process never got off the ground (launch failure, bad URL) is
+      // just an empty contribution — never lets one bad seed abort the rest of the fan-out.
+      return emptyCrawlResult();
+    } finally {
+      await browser.stop().catch(() => undefined);
+    }
+  }
+
+  // Calibration probe: crawl the first seed alone, timed, before deciding concurrency for the
+  // rest.
+  const probeStart = Date.now();
+  const probeResult = await crawlOneSeed(seeds[0], perSeedBudgetMs);
+  const probeElapsedMs = Date.now() - probeStart;
+
+  const results: CrawlResult[] = [probeResult];
+  const rest = seeds.slice(1);
+  if (rest.length > 0 && Date.now() < totalDeadline) {
+    const dynamicConcurrency =
+      probeElapsedMs > perSeedBudgetMs * 0.8
+        ? 1 // probe nearly exhausted its own budget — this target is slow/heavy, stay serial
+        : probeElapsedMs < perSeedBudgetMs * 0.25
+          ? absoluteMaxConcurrency // fast target — safe to use the full ceiling
+          : Math.max(1, Math.floor(absoluteMaxConcurrency / 2));
+    const concurrency = Math.min(dynamicConcurrency, absoluteMaxConcurrency, rest.length);
+
+    let nextIndex = 0;
+    const worker = async (): Promise<void> => {
+      for (;;) {
+        if (Date.now() >= totalDeadline) return;
+        const i = nextIndex;
+        nextIndex += 1;
+        if (i >= rest.length) return;
+        const remainingMs = Math.max(1_000, Math.min(perSeedBudgetMs, totalDeadline - Date.now()));
+        results.push(await crawlOneSeed(rest[i], remainingMs));
+      }
+    };
+    await Promise.all(Array.from({ length: concurrency }, () => worker()));
+  }
+
+  return results.reduce((acc, r) => mergeCrawlResults(acc, r));
 }
 
 export interface CrawlWithAuthOptions extends CrawlOptions {
   credentials?: { username: string; password: string };
+  /** Overrides the anonymous pass's own `stateProbeBudget` (see GAP-060). Defaults to
+   * ANONYMOUS_STATE_PROBE_RESERVE — small on purpose: the authenticated, behind-login surface is
+   * consistently the higher-value deep-probe target (measured evidence in GAP-060's gap-tracker
+   * entry), so the anonymous pass gets just enough reserve to still catch an anonymous-page state
+   * (e.g. a date-picker) without crowding out the budget the authenticated pass gets via its own,
+   * independent `crawl()` call (`opts.stateProbeBudget` below, unaffected by this field). */
+  anonymousStateProbeBudget?: number;
 }
+
+/** See `CrawlWithAuthOptions.anonymousStateProbeBudget`'s doc comment. */
+const ANONYMOUS_STATE_PROBE_RESERVE = 5;
 
 export interface CrawlWithAuthResult extends CrawlResult {
   /** Whether a login candidate was found and a login was actually attempted. */
@@ -796,6 +1332,26 @@ export interface CrawlWithAuthResult extends CrawlResult {
   authVerified: boolean;
   /** Set whenever auth wasn't attempted or wasn't verified — never blocks the crawl. */
   authReason?: string;
+  /**
+   * The exact login page/selectors that were just PROVEN to work, present only when
+   * `authVerified: true` — distinct from (and more authoritative than) `scoreLoginCandidates`'s
+   * independently re-derived ranking, which doesn't know which route this crawl actually
+   * authenticated through and can rank a toggle-gated route below a URL that never worked.
+   * Downstream codegen (see modes/playwright/execute.ts) should prefer this over
+   * `loginCandidates` whenever present.
+   */
+  verifiedLogin?: VerifiedLoginInfo;
+}
+
+export interface VerifiedLoginInfo {
+  /** The exact URL the login form/toggle was on — not re-derived by scoring. */
+  pageUrl: string;
+  /** Present only when the login view was behind a same-URL client-side toggle. */
+  toggleSelector?: string;
+  identifierSelector: string;
+  passwordSelector: string;
+  /** Absent when submission fell back to pressing Enter (no submit button was found). */
+  submitSelector?: string;
 }
 
 /**
@@ -835,7 +1391,10 @@ export async function crawlWithAuth(
   baseUrl: string,
   opts: CrawlWithAuthOptions = {},
 ): Promise<CrawlWithAuthResult> {
-  const anonymous = await crawl(browser, baseUrl, opts);
+  const anonymous = await crawl(browser, baseUrl, {
+    ...opts,
+    stateProbeBudget: opts.anonymousStateProbeBudget ?? ANONYMOUS_STATE_PROBE_RESERVE,
+  });
 
   const creds = opts.credentials;
   if (!creds || !creds.username || !creds.password) {
@@ -871,21 +1430,20 @@ export async function crawlWithAuth(
   }
 
   const authCrawl = await crawl(browser, attempt.landingUrl ?? candidate.url, opts);
-  const authenticatedRoutes = authCrawl.routes.map((r) => ({ ...r, role: 'authenticated' as const }));
 
   return {
-    routes: [...anonymous.routes, ...authenticatedRoutes],
-    visitedCount: anonymous.visitedCount + authenticatedRoutes.length,
-    budgetExhausted: anonymous.budgetExhausted || authCrawl.budgetExhausted,
-    unvisitedQueuedCount: (anonymous.unvisitedQueuedCount ?? 0) + (authCrawl.unvisitedQueuedCount ?? 0),
-    redirectLoopsDetected: [...anonymous.redirectLoopsDetected, ...authCrawl.redirectLoopsDetected],
-    shellCollapsed: anonymous.shellCollapsed || authCrawl.shellCollapsed,
-    degenerateRedirectsSkipped: [
-      ...anonymous.degenerateRedirectsSkipped,
-      ...authCrawl.degenerateRedirectsSkipped,
-    ],
+    ...mergeCrawlResults(anonymous, authCrawl, 'authenticated'),
     authAttempted: true,
     authVerified: true,
+    verifiedLogin: attempt.selectors
+      ? {
+          pageUrl: candidate.url,
+          toggleSelector: candidate.loginToggleSelector,
+          identifierSelector: attempt.selectors.identifier,
+          passwordSelector: attempt.selectors.password,
+          submitSelector: attempt.selectors.submit,
+        }
+      : undefined,
   };
 }
 

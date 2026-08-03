@@ -8,6 +8,11 @@ import { ProviderUnavailableError } from '../types.js';
 import { ABSOLUTE_BACKSTOP_MS } from '../../providers/types.js';
 import { TIERS, tierLabel } from './templates.js';
 import { splitTestBlocks } from './quality-audit.js';
+import {
+  buildRequirementTokens,
+  NON_SEMANTIC_ROLES,
+  rankRouteElements,
+} from '../../util/requirement-tokens.js';
 
 // Re-exported for call sites/tests that import it alongside generate() —
 // the class itself lives in modes/types.ts since it's shared across modes,
@@ -898,12 +903,6 @@ const MAX_ELEMENT_NAME_LEN = 80;
 interface InventoryOpts {
   expand?: boolean;
 }
-/**
- * Roles the DOM doesn't natively expose as `link`/`button` even though the element is
- * clickable (e.g. a `<div>` with a click handler and no `role` attribute) — the single
- * biggest source of `getByRole('link'/'button', ...)` hallucination in production.
- */
-const NON_SEMANTIC_ROLES = new Set(['generic']);
 
 type CrawledRouteLike = NonNullable<TestModeContext['exploration']>['crawl']['routes'][number];
 type InventoryElementLike = CrawledRouteLike['snapshot']['interactiveElements'][number];
@@ -912,138 +911,6 @@ interface SelectedElement {
   el: InventoryElementLike;
 }
 
-/** Words too common/generic to carry any relevance signal on their own. */
-const STOPWORD_TOKENS = new Set([
-  'the',
-  'a',
-  'an',
-  'and',
-  'or',
-  'to',
-  'of',
-  'in',
-  'on',
-  'for',
-  'is',
-  'are',
-  'with',
-  'that',
-  'this',
-  'it',
-  'be',
-  'as',
-  'by',
-  'at',
-  'from',
-  'renders',
-  'page',
-]);
-
-/** Lowercase, split on non-alphanumeric runs, drop stopwords and single characters. */
-function tokenize(text: string): string[] {
-  return text
-    .toLowerCase()
-    .split(/[^a-z0-9]+/)
-    .filter((t) => t.length > 1 && !STOPWORD_TOKENS.has(t));
-}
-
-/**
- * Tokenizes a plan item's requirement text (title, intent, every scenario description, unitKey)
- * into a lowercased/stopword-stripped token set, computed once per selectInventoryElements() call
- * and used by scoreElement() to rank DOM elements by relevance to THIS item rather than truncating
- * by blind positional order.
- */
-function buildRequirementTokens(item?: TestPlanItem): Set<string> {
-  const tokens = new Set<string>();
-  if (!item) return tokens;
-  const parts = [item.title, item.intent, item.unitKey ?? '', ...item.scenarios.map((s) => s.description)];
-  for (const part of parts) {
-    for (const t of tokenize(part)) tokens.add(t);
-  }
-  return tokens;
-}
-
-/**
- * Action-verb requirement token -> element predicate. When the requirement text names an action
- * (e.g. "submit", "upload") and an element's role/type matches what that action implies, the
- * element is very likely the one the scenario means to target, even if its accessible name shares
- * no literal words with the requirement text.
- */
-const ACTION_VERB_BONUSES: Record<string, (el: InventoryElementLike) => boolean> = {
-  submit: (el) => el.role === 'button',
-  login: (el) => el.role === 'button',
-  signin: (el) => el.role === 'button',
-  register: (el) => el.role === 'button',
-  signup: (el) => el.role === 'button',
-  save: (el) => el.role === 'button',
-  delete: (el) => el.role === 'button',
-  select: (el) => el.role === 'combobox',
-  choose: (el) => el.role === 'combobox',
-  upload: (el) => el.inputType === 'file',
-  search: (el) => el.role === 'searchbox',
-};
-
-/**
- * Weighted relevance score for one crawled element against a plan item's requirement tokens:
- * keyword overlap with the accessible name, an action-verb -> role/type bonus, a penalty for
- * non-semantic roles (NON_SEMANTIC_ROLES — the single biggest hallucination source), a route-role
- * match bonus, and a stability bonus/penalty from the element's locator tier (selectors.ts's
- * selectorFor tiering) so a fragile positional selector must clear a higher relevance bar than a
- * stable testid to make the cut. Higher is more relevant.
- */
-function scoreElement(
-  el: InventoryElementLike,
-  route: CrawledRouteLike,
-  reqTokens: Set<string>,
-  preferredRole: string,
-): number {
-  let score = 0;
-  for (const t of tokenize(el.name)) {
-    if (reqTokens.has(t)) score += 2;
-  }
-  for (const [verb, matches] of Object.entries(ACTION_VERB_BONUSES)) {
-    if (reqTokens.has(verb) && matches(el)) score += 3;
-  }
-  if (NON_SEMANTIC_ROLES.has(el.role)) score -= 2;
-  if (route.role === preferredRole) score += 1;
-  const tierBonus: Record<1 | 2 | 3 | 4, number> = { 1: 2, 2: 1, 3: 0, 4: -2 };
-  if (el.selectorTier !== undefined) score += tierBonus[el.selectorTier];
-  return score;
-}
-
-/**
- * Ranks one route's interactive elements by relevance (see scoreElement), applying a small
- * proximity bonus for an element sitting next to another keyword-matching element (form fields
- * cluster near their submit button, table cells near a matching header) and a duplicate-suppression
- * penalty for a (role, name) pair repeated later in the same route (the first occurrence keeps its
- * full score; a later, redundant duplicate is de-prioritized in favor of something new). Ties break
- * on the ORIGINAL DOM-order index, ascending — required so a uniform-score fixture (no keyword
- * signal at all) degrades to exactly today's first-K-by-DOM-order behavior.
- */
-function rankRouteElements(
-  route: CrawledRouteLike,
-  reqTokens: Set<string>,
-  preferredRole: string,
-): InventoryElementLike[] {
-  const elements = route.snapshot.interactiveElements;
-  const matchedKeyword = elements.map((el) => tokenize(el.name).some((t) => reqTokens.has(t)));
-  const seenRoleName = new Map<string, number>();
-  const scored = elements.map((el, index) => {
-    let score = scoreElement(el, route, reqTokens, preferredRole);
-    if (!matchedKeyword[index] && (matchedKeyword[index - 1] || matchedKeyword[index + 1])) {
-      score += 0.5;
-    }
-    if (el.name) {
-      const key = `${el.role} ${el.name}`;
-      const priorCount = seenRoleName.get(key) ?? 0;
-      seenRoleName.set(key, priorCount + 1);
-      if (priorCount > 0) score -= 1.5;
-    }
-    return { el, index, score };
-  });
-  scored.sort((a, b) => b.score - a.score || a.index - b.index);
-  return scored.map((s) => s.el);
-}
 interface InventorySelection {
   ordered: CrawledRouteLike[];
   selected: SelectedElement[];
@@ -1170,13 +1037,31 @@ function formatSnapshotInventory(
     const ambiguousNote = el.ambiguousMatch
       ? ' (⚠ AMBIGUOUS: another element on this page shares this exact role+name — a plain getByRole/getByText by role+name WILL throw a strict-mode violation here; use the selector shown, narrow it further, or chain .first()/.nth())'
       : '';
+    // A positional path encodes where the element sat on the ONE route it was captured from, so
+    // it silently resolves to nothing (or worse, to something else) on any other route. The same
+    // logical control genuinely appears in this inventory more than once with DIFFERENT paths —
+    // observed live: one "apple wallet" control listed as `div:nth-of-type(2) > …` on the vouchers
+    // route and `div:nth-of-type(6) > …` on the dashboard. A generated test picked one path and
+    // used it on the other route, so `toBeVisible()` failed on an element that was really there.
+    // Stating the route restriction inline is what the plain "prefer a better anchor" advice was
+    // missing, since the route is printed on every line but never flagged as a constraint.
+    const routeScopedNote =
+      el.selectorTier === 4
+        ? ` — this path is valid ONLY on ${el.name ? `this route (${route.url})` : route.url}; if another line lists the same element on a different route, its path differs and is NOT interchangeable`
+        : '';
     const tierNote =
       el.selectorTier === 4
         ? el.repeatedRowText
-          ? ` (⚠ POSITIONAL selector among repeated rows — prefer anchoring on this row's own text instead, e.g. .filter({ hasText: "${el.repeatedRowText.slice(0, 60)}" }), rather than trusting the index if the list can reorder)`
-          : " (⚠ POSITIONAL selector — fragile if this element's position among its siblings can change; prefer a more specific attribute/text anchor when one is available above)"
+          ? ` (⚠ POSITIONAL selector among repeated rows — prefer anchoring on this row's own text instead, e.g. .filter({ hasText: "${el.repeatedRowText.slice(0, 60)}" }), rather than trusting the index if the list can reorder${routeScopedNote})`
+          : ` (⚠ POSITIONAL selector — fragile if this element's position among its siblings can change; prefer a more specific attribute/text anchor when one is available above${routeScopedNote})`
         : '';
-    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}${tierNote}`;
+    // A readonly field is visible and enabled, so nothing else in this line hints that filling
+    // it is impossible — and a .fill() against one does not fail fast, it retries "element is
+    // not editable" until the test's whole timeout is gone.
+    const readOnlyNote = el.readOnly
+      ? ' (⚠ READONLY — this field cannot be typed into; a .fill()/.type() here will retry until the test times out. It is gated by the app (a precondition elsewhere in the flow unlocks it), so drive that precondition first, or assert its value/state instead of writing to it)'
+      : '';
+    return `- [${route.role}] ${el.role} "${name}" on ${route.url} -> ${el.selector}${genericNote}${ambiguousNote}${tierNote}${readOnlyNote}`;
   });
 
   const omitted = totalCount - selected.length;
@@ -1192,6 +1077,46 @@ function formatSnapshotInventory(
 
 Interactive elements observed during exploration across ${ordered.length} route(s). ${completeness}. RULE: you MUST target only selectors, roles, and accessible names that appear in this list — inventing a data-testid, id, role, or accessible name that is not listed here is a HALLUCINATED SELECTOR and is FORBIDDEN, exactly as serious a violation as importing a forbidden module. This also means using the selector shown EXACTLY as given — do NOT modify it, combine it with your own guessed parent/child CSS combinator (e.g. turning a real "#checkbox" into an invented "#checkbox > input"), or otherwise assume a DOM nesting relationship you were not shown; the string after "->" is already the complete, correct selector for that exact element. Elements tagged [authenticated] require the logged-in session (tierB-auth already assumes storageState applies). ESCAPE HATCH: if a scenario needs an element that genuinely isn't in this inventory (e.g. a state only reachable via a mocked error response), do NOT invent a selector — instead use a text-based locator (getByText/:has-text against real visible copy) or, if even that's undeterminable, add a "// TODO: unobserved element" comment and assert a coarser observable signal (URL/status/title) instead:
 ${lines.join('\n')}${more}`;
+}
+
+/** Cap on content elements shown per route — this is grounding for the occasional "X is visibly
+ * rendered" assertion, not a primary inventory; a handful per route keeps it from crowding the
+ * (far more heavily used) click-candidate inventory it's appended after. */
+const MAX_CONTENT_ELEMENTS_PER_ROUTE = 5;
+
+/**
+ * Render the non-interactive content inventory (barcodes/QR codes, meaningful images, status/label
+ * text — see browser/types.ts's `ContentElement`) captured alongside the click-candidate inventory
+ * during EXPLORE. Kept as its own labeled section, never merged into `formatSnapshotInventory`'s
+ * output, so the model can't mistake a content node for something clickable — these elements
+ * were deliberately excluded from `rankRouteElements`'s budget/ranking (unscored content would
+ * otherwise compete with, and lose to, actual click candidates for the same capped slots), so this
+ * gets its own small fixed per-route cap instead. Returns '' when there's nothing to show, exactly
+ * like `formatSnapshotInventory`.
+ */
+function formatContentInventory(ctx: TestModeContext, tier: Tier, item?: TestPlanItem): string {
+  if (tier === 'tierC-api') return '';
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return '';
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
+  const preferredRole = tier === 'tierB-auth' ? 'authenticated' : 'anonymous';
+  const ordered = [...routes].sort(
+    (a, b) => Number(b.role === preferredRole) - Number(a.role === preferredRole),
+  );
+
+  const lines: string[] = [];
+  for (const route of ordered) {
+    const elements = route.snapshot.contentElements ?? [];
+    for (const el of elements.slice(0, MAX_CONTENT_ELEMENTS_PER_ROUTE)) {
+      lines.push(`- [${route.role}] ${el.kind} on ${route.url} -> ${el.selector}: ${el.description}`);
+    }
+  }
+  if (lines.length === 0) return '';
+
+  return `
+
+Non-interactive content observed during exploration (${lines.length} item(s)) — these are NOT clickable and must NEVER be used as a click/fill target or with getByRole('button'/'link'/etc.). Use them ONLY to ground an assert-visible or assert-text-content check (e.g. \`await expect(page.locator(SELECTOR)).toBeVisible()\` or \`.toContainText(...)\`) when a scenario needs to confirm something is rendered (a barcode, a status message, a meaningful image) rather than click it:
+${lines.join('\n')}`;
 }
 
 /**
@@ -1390,6 +1315,7 @@ function buildPrompt(
   // extension of attempt 1's; that's an accepted, deliberate tradeoff, not a bug.
   const strictNote = retryNote ? `\n\nIMPORTANT: ${retryNote}` : '';
   const inventory = formatSnapshotInventory(ctx, tier, item, opts);
+  const contentInventory = formatContentInventory(ctx, tier, item);
   const routingGuidance = formatRoutingGuidance(ctx);
   const observedRoutes = formatObservedRoutes(ctx, item);
   const unautomatableStepNotice = formatUnautomatableStepNotice(ctx, item);
@@ -1446,6 +1372,18 @@ Requirements:
   correctly disable that control on invalid input, and clicking a disabled control hangs until
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
+- A field-level validation message that appears "on blur" / "after leaving the field" only exists
+  in the DOM once blur actually fires — the exploration snapshot above was captured on the page's
+  DEFAULT state, so it can NEVER contain a real selector for this message; one is NOT in the
+  inventory. Two rules follow: (1) explicitly TRIGGER the blur yourself — \`await locator.blur()\`
+  or \`await page.keyboard.press('Tab')\` — immediately after the \`.fill(...)\`, rather than assuming
+  a later action (e.g. a submit click) happens to blur the field; a click on a still-disabled
+  control never fires at all, and even a successful one may blur too late or not at all depending
+  on the app. (2) Since this message's exact markup was never observed, assert it with a
+  TEXT-based locator (\`getByText(...)\`/\`getByRole(..., { name: ... })\`) against the message's real
+  expected wording (from the scenario/feature intent), NOT an invented CSS class/id/data-testid —
+  a hallucinated structural selector for an element you never saw will simply never match, timing
+  out and reading as a false "app defect" when the app's validation actually works correctly.
 - Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
   \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
   (CI machines, headless vs. headed, network conditions) vary widely in speed, making this
@@ -1476,7 +1414,7 @@ Requirements:
   remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
   path itself should still register their own fresh unique value first, then reuse THAT same value for
   the collision attempt within the same test.
-- ${tierGuidance}${mockNote}${inventory}${routingGuidance}${observedRoutes}${unautomatableStepNotice}${sourceGrounding}
+- ${tierGuidance}${mockNote}${inventory}${contentInventory}${routingGuidance}${observedRoutes}${unautomatableStepNotice}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -2132,6 +2070,18 @@ Requirements that apply to EVERY feature's spec below:
   correctly disable that control on invalid input, and clicking a disabled control hangs until
   timeout. Either assert the control STAYS disabled (\`await expect(locator).toBeDisabled()\`), or
   assert the inline validation message directly without depending on a successful click.
+- A field-level validation message that appears "on blur" / "after leaving the field" only exists
+  in the DOM once blur actually fires — the exploration snapshot above was captured on the page's
+  DEFAULT state, so it can NEVER contain a real selector for this message; one is NOT in the
+  inventory. Two rules follow: (1) explicitly TRIGGER the blur yourself — \`await locator.blur()\`
+  or \`await page.keyboard.press('Tab')\` — immediately after the \`.fill(...)\`, rather than assuming
+  a later action (e.g. a submit click) happens to blur the field; a click on a still-disabled
+  control never fires at all, and even a successful one may blur too late or not at all depending
+  on the app. (2) Since this message's exact markup was never observed, assert it with a
+  TEXT-based locator (\`getByText(...)\`/\`getByRole(..., { name: ... })\`) against the message's real
+  expected wording (from the scenario/feature intent), NOT an invented CSS class/id/data-testid —
+  a hallucinated structural selector for an element you never saw will simply never match, timing
+  out and reading as a false "app defect" when the app's validation actually works correctly.
 - Do NOT assert a tight, arbitrary hardcoded duration/performance threshold (e.g.
   \`expect(elapsedMs).toBeLessThan(200)\`) for how fast an action completes — real environments
   (CI machines, headless vs. headed, network conditions) vary widely in speed, making this
@@ -2170,6 +2120,7 @@ Requirements that apply to EVERY feature's spec below:
       item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
     const scenarioList = formatScenarios(scenarios);
     const inventory = formatSnapshotInventory(ctx, tier, item);
+    const contentInventory = formatContentInventory(ctx, tier, item);
     const observedRoutes = formatObservedRoutes(ctx, item);
     const unautomatableStepNotice = formatUnautomatableStepNotice(ctx, item);
     const sourceGrounding = formatSourceGrounding(ctx, item, tier);
@@ -2179,7 +2130,7 @@ Requirements that apply to EVERY feature's spec below:
 Feature: ${item.title}
 Feature intent: ${item.intent}
 Scenarios to cover, one test(...) each, in this order:
-${scenarioList}${inventory}${observedRoutes}${unautomatableStepNotice}${sourceGrounding}
+${scenarioList}${inventory}${contentInventory}${observedRoutes}${unautomatableStepNotice}${sourceGrounding}
 Output this feature's spec between:
 ${batchMarkerStart(reqTag)}
 ...

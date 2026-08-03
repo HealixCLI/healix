@@ -1,5 +1,5 @@
 import type { Page } from 'playwright';
-import type { InteractiveElement } from './types.js';
+import type { ContentElement, InteractiveElement } from './types.js';
 
 /*
  * NOTE ON TYPING
@@ -304,11 +304,19 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           }
         }
 
-        // Build an nth-of-type path that uniquely identifies the node.
+        // Build an nth-of-type path that uniquely identifies the node. Capped generously (not at a
+        // small fixed depth): climbing to <body> is enough to guarantee uniqueness in practice, since
+        // nth-of-type at every level fixes exactly one path down from a singular root. A real run
+        // against a deeply-nested SPA (six wrapper divs before reaching anything distinguishing)
+        // found the OLD fixed 6-level cap returning a path that matched TWO different elements
+        // elsewhere on the page (two same-shaped subtrees six levels apart) — silently pointing a
+        // click at the wrong one, since every earlier tier already verifies uniqueness before
+        // accepting a candidate but this fallback never did.
+        const MAX_TIER4_ANCESTOR_LEVELS = 25;
         const parts: string[] = [];
         let repeatedRowText: string | undefined;
         let node: DomElement | null = el;
-        while (node && node.nodeType === 1 && parts.length < 6) {
+        while (node && node.nodeType === 1 && parts.length < MAX_TIER4_ANCESTOR_LEVELS) {
           const current: DomElement = node;
           let part = current.tagName.toLowerCase();
           const parent = current.parentElement;
@@ -339,6 +347,9 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
             parts[0] = `#${cssEscape(current.id)}`;
             break;
           }
+          // Stop climbing as soon as the path built so far is actually unique — mirrors the
+          // uniqueness check every earlier tier already performs before accepting a candidate.
+          if (doc.querySelectorAll(parts.join(' > ')).length === 1) break;
           node = parent;
         }
         return {
@@ -462,6 +473,12 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
         return el.hasAttribute('disabled') || el.getAttribute('aria-disabled') === 'true';
       }
 
+      /** See `InteractiveElement.readOnly` — kept independent of isDisabled on purpose: a
+       * readonly input is still visible and clickable, it just can't be typed into. */
+      function isReadOnly(el: DomElement): boolean {
+        return el.hasAttribute('readonly') || el.getAttribute('aria-readonly') === 'true';
+      }
+
       type ComputedStyleLike = { visibility: string; display: string; cursor: string };
 
       /** Shared by both passes so a node's `getComputedStyle()` is fetched at most once — pass 2
@@ -559,6 +576,11 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
           buttonType: tag === 'button' ? rawButtonType || (inForm ? 'submit' : '') : undefined,
           inForm,
           disabled: isDisabled(el),
+          // Only when true, and only on this (semantic) pass: `readonly` is meaningful for form
+          // fields, so emitting `readOnly: false` on every button/link — or on pass 2's
+          // cursor:pointer divs, where the attribute has no meaning at all — would be pure
+          // inventory noise for the model to read past.
+          ...(isReadOnly(el) ? { readOnly: true } : {}),
           selectorTier: tier,
           ...(repeatedRowText ? { repeatedRowText } : {}),
         });
@@ -639,5 +661,142 @@ export async function collectInteractiveElements(page: Page): Promise<Interactiv
       genericSelector: GENERIC_CLICK_CANDIDATE_SELECTOR,
       nonClickableTags: NON_CLICKABLE_TAGS,
     },
+  );
+}
+
+/** Selector for content elements — kept narrow and deliberately NOT `'*'`-based like
+ * `GENERIC_CLICK_CANDIDATE_SELECTOR`: unlike a click candidate (any element could plausibly be
+ * one), a "meaningful rendered content" candidate only ever takes one of these three shapes. */
+const CONTENT_CANDIDATE_SELECTOR = 'svg, canvas, img, [role="status"], [aria-live]';
+
+/** Cap on content elements returned per route — this is grounding for assertions, not an
+ * exhaustive content dump; a handful of the most meaningful nodes is enough, and keeps the
+ * prompt-formatting side (generate.ts's own per-route cap) from ever needing to actually trim. */
+const MAX_CONTENT_ELEMENTS_PER_PAGE = 20;
+
+/**
+ * Collects visibly-rendered, NON-clickable content the click-candidate model in
+ * `collectInteractiveElements` has no way to represent — a barcode/QR `<svg>`/`<canvas>`, an
+ * `<img>` with meaningful `alt` text, or a status/label text node — so GENERATE can ground an
+ * "X is visibly rendered" assertion. See `ContentElement`'s doc comment (browser/types.ts) for why
+ * this is a separate pass/array rather than folded into `collectInteractiveElements`.
+ *
+ * Deliberately narrow, not a general text-scrape: flooding the inventory with every visible text
+ * node would swamp the far more valuable click-candidate list it sits alongside in the generation
+ * prompt. Scoped to three concrete shapes: an `<svg>`/`<canvas>` (a barcode, QR code, chart, or
+ * other rendered-not-typed content), an `<img>` whose `alt` text is real content rather than
+ * decorative (empty `alt` is explicitly excluded), and a `role="status"`/`aria-live` node (the
+ * shape a status/toast/label message reliably takes when an app wants it to be announced).
+ */
+export async function collectContentElements(page: Page): Promise<ContentElement[]> {
+  return page.evaluate<ContentElement[], { selector: string; maxPerPage: number }>(
+    ({ selector: SELECTOR, maxPerPage }) => {
+      const win = globalThis as unknown as DomWindow;
+      const doc = win.document;
+
+      function cssEscape(value: string): string {
+        if (win.CSS && typeof win.CSS.escape === 'function') {
+          return win.CSS.escape(value);
+        }
+        let result = '';
+        for (let i = 0; i < value.length; i += 1) {
+          const ch = value.charAt(i);
+          if (i === 0 && ch >= '0' && ch <= '9') {
+            result += `\\${ch.charCodeAt(0).toString(16)} `;
+          } else if (/[a-zA-Z0-9_-]/.test(ch)) {
+            result += ch;
+          } else {
+            result += `\\${ch}`;
+          }
+        }
+        return result;
+      }
+
+      /** Deliberately simpler than collectInteractiveElements's 4-tier selectorFor(): a content
+       * element is grounding for an assertion, not a click target, so a single reasonably-stable
+       * path is enough — id/data-testid when present and unique, else an nth-of-type climb. */
+      function selectorFor(el: DomElement): string {
+        if (el.id) {
+          const idCandidate = `#${cssEscape(el.id)}`;
+          if (doc.querySelectorAll(idCandidate).length === 1) return idCandidate;
+        }
+        const tag = el.tagName.toLowerCase();
+        for (const attr of ['data-testid', 'data-test']) {
+          const val = el.getAttribute(attr);
+          if (val) {
+            const candidate = `${tag}[${attr}="${val.replace(/"/g, '\\"')}"]`;
+            if (doc.querySelectorAll(candidate).length === 1) return candidate;
+          }
+        }
+        const parts: string[] = [];
+        let node: DomElement | null = el;
+        let depth = 0;
+        while (node && node.nodeType === 1 && depth < 25) {
+          const current: DomElement = node;
+          let part = current.tagName.toLowerCase();
+          const parent = current.parentElement;
+          if (parent) {
+            const siblings = Array.prototype.slice.call(parent.children) as DomElement[];
+            const sameTag = siblings.filter((c) => c.tagName === current.tagName);
+            if (sameTag.length > 1) {
+              part += `:nth-of-type(${sameTag.indexOf(current) + 1})`;
+            }
+          }
+          parts.unshift(part);
+          if (doc.querySelectorAll(parts.join(' > ')).length === 1) break;
+          node = parent;
+          depth += 1;
+        }
+        return parts.join(' > ');
+      }
+
+      function isVisible(el: DomElement): boolean {
+        if (el.hidden) return false;
+        if (el.getClientRects().length === 0) return false;
+        const style = win.getComputedStyle(el);
+        return style.visibility !== 'hidden' && style.display !== 'none';
+      }
+
+      function clamp(value: string): string {
+        return value.trim().replace(/\s+/g, ' ').slice(0, 200).trim();
+      }
+
+      const out: ContentElement[] = [];
+      const nodes = Array.prototype.slice.call(doc.querySelectorAll(SELECTOR)) as DomElement[];
+
+      for (const el of nodes) {
+        if (out.length >= maxPerPage) break;
+        if (!isVisible(el)) continue;
+        const tag = el.tagName.toLowerCase();
+
+        if (tag === 'svg' || tag === 'canvas') {
+          const label =
+            el.getAttribute('aria-label') ||
+            el.getAttribute('title') ||
+            (el.parentElement?.textContent ?? '');
+          out.push({
+            kind: tag === 'svg' ? 'svg' : 'canvas',
+            selector: selectorFor(el),
+            description: clamp(label) || `a rendered <${tag}> element (no label/title/nearby text found)`,
+          });
+          continue;
+        }
+
+        if (tag === 'img') {
+          const alt = el.getAttribute('alt');
+          if (!alt || !alt.trim()) continue; // empty/decorative alt — not meaningful content
+          out.push({ kind: 'image', selector: selectorFor(el), description: clamp(alt) });
+          continue;
+        }
+
+        // role="status" / [aria-live] text node.
+        const text = (el.textContent ?? '').trim();
+        if (!text) continue;
+        out.push({ kind: 'status-text', selector: selectorFor(el), description: clamp(text) });
+      }
+
+      return out;
+    },
+    { selector: CONTENT_CANDIDATE_SELECTOR, maxPerPage: MAX_CONTENT_ELEMENTS_PER_PAGE },
   );
 }

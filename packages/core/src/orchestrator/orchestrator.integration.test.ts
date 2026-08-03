@@ -193,6 +193,7 @@ const fakeTarget: TargetAdapter = {
 const fakeBrowser: BrowserSurface = {
   async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
   async goto(_url: string): Promise<void> {},
+  async reload(): Promise<void> {},
   async screenshot(): Promise<Buffer> {
     return Buffer.alloc(0);
   },
@@ -208,6 +209,9 @@ const fakeBrowser: BrowserSurface = {
   },
   drainNetworkEvents() {
     return [];
+  },
+  async exportStorageState() {
+    return {};
   },
   async stop(): Promise<void> {},
 };

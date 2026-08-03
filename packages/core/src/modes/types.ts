@@ -22,6 +22,13 @@ export interface ExplorationArtifact {
   /** Real endpoints observed on the wire during the crawl — see GAP-046 and
    * `browser/network-capture.ts`'s `collectObservedEndpoints()`. */
   observedEndpoints: ObservedEndpoint[];
+  /** Diagnostic summary of any region/config-driven seed fan-out performed beyond the primary
+   * crawl — see `browser/seed-discovery.ts`. Absent when no additional seeds were derived. */
+  seedsCrawled?: { url: string; label?: string; routeCount: number }[];
+  /** Diagnostic record of the plan/endpoint-targeted gap-filling pass (see
+   * `orchestrator/gap-fill.ts`), run once against whichever crawl came out of this artifact
+   * (fresh or cache-reused). Absent when gap-fill found nothing to do or didn't run. */
+  gapFillAttempts?: import('../orchestrator/gap-fill.js').GapFillAttempt[];
 }
 
 export type ExplorationMode = 'computer-use' | 'codegen';
@@ -201,7 +208,8 @@ export type QualityFindingCode =
   | 'ambiguous-locator-risk'
   | 'unvalidated-status-code-assumption'
   | 'unattended-destructive-action'
-  | 'unscoped-modal-assertion';
+  | 'unscoped-modal-assertion'
+  | 'unblurred-validation-assertion';
 
 export interface QualityFinding {
   code: QualityFindingCode;

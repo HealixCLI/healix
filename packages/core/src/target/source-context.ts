@@ -19,4 +19,9 @@ export interface SourceContext {
   /** Short natural-language summary for prompt grounding, same shape as FunctionalityIndex.summary. */
   summary: string;
   truncated: boolean;
+  /** Region/locale codes statically detected from an i18n/regions config file, if any (see
+   * target/region-index.ts). Feeds exploration's region-seed fan-out alongside (not instead of)
+   * the plan-text heuristic in orchestrator/index.ts's `deriveRegionCodesFromText` call. Optional
+   * so existing test fixtures/hand-built SourceContext objects that predate this field stay valid. */
+  regionCodes?: string[];
 }

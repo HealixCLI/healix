@@ -30,6 +30,7 @@ const TASK_LABELS: Record<keyof ModelEffortConfig, string> = {
   triage: 'Failure triage/analysis',
   'triage-summary': 'End-of-run failure grouping summary',
   'health-probe': 'Health probe (auth check)',
+  'explore-gapfill': 'Exploration gap-fill micro-agent',
 };
 
 const TASK_ORDER = Object.keys(TASK_LABELS) as (keyof ModelEffortConfig)[];

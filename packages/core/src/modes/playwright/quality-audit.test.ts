@@ -143,6 +143,41 @@ describe('auditSpecQuality', () => {
     expect(auditSpecQuality(source)).toEqual([]);
   });
 
+  it("flags a blur-titled scenario that fills a field and asserts the message's visibility with no explicit blur trigger", () => {
+    const source = block(
+      'Empty password on blur shows Password is required',
+      `  await page.getByLabel('Password').fill('');\n  await expect(page.getByText('Password is required')).toBeVisible();`,
+    );
+    const findings = auditSpecQuality(source);
+    expect(findings).toEqual([
+      expect.objectContaining({ code: 'unblurred-validation-assertion', severity: 'warn' }),
+    ]);
+  });
+
+  it('does not flag the blur shape when the test explicitly triggers blur before asserting', () => {
+    const source = block(
+      'Empty password on blur shows Password is required',
+      `  await page.getByLabel('Password').fill('');\n  await page.getByLabel('Password').blur();\n  await expect(page.getByText('Password is required')).toBeVisible();`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('does not flag the blur shape when blur is triggered via Tab instead', () => {
+    const source = block(
+      'Empty password on blur shows Password is required',
+      `  await page.getByLabel('Password').fill('');\n  await page.keyboard.press('Tab');\n  await expect(page.getByText('Password is required')).toBeVisible();`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
+  it('does not flag a fill+visibility-assertion test whose title has no blur mention', () => {
+    const source = block(
+      'shows an inline error for an invalid coupon code',
+      `  await page.getByLabel('Coupon code').fill('bad-code');\n  await expect(page.getByText('Invalid code')).toBeVisible();`,
+    );
+    expect(auditSpecQuality(source)).toEqual([]);
+  });
+
   it('flags a click on a bare repeatable-role locator with no name filter as an ambiguous-locator-risk warn', () => {
     const source = block(
       'navigates via the baz link',

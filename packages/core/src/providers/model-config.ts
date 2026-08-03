@@ -46,6 +46,9 @@ export const DEFAULT_MODEL_CONFIG: ModelEffortConfig = {
   triage: { model: 'haiku', effort: 'high' },
   'triage-summary': { model: 'haiku', effort: 'high' },
   'health-probe': { model: 'haiku', effort: 'low' },
+  // Bounded, mechanical per-turn action selection (click/type/pressKey/done) from a fixed
+  // vocabulary over a small text summary — not open-ended reasoning, so the cheap tier fits.
+  'explore-gapfill': { model: 'haiku', effort: 'low' },
 };
 
 /** Merge the user's last-used per-task setting over the recommended seed for that one task type. */

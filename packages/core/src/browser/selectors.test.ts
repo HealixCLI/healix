@@ -83,6 +83,33 @@ function inferButtonType(rawType: string, inForm: boolean): string {
   return rawType || (inForm ? 'submit' : '');
 }
 
+/** Minimal structural view of the attribute reads `isDisabled`/`isReadOnly` perform. */
+interface AttrEl {
+  attrs: Record<string, string>;
+}
+
+function attrEl(attrs: Record<string, string> = {}): AttrEl {
+  return { attrs };
+}
+
+function hasAttribute(el: AttrEl, name: string): boolean {
+  return Object.prototype.hasOwnProperty.call(el.attrs, name);
+}
+
+function getAttribute(el: AttrEl, name: string): string | null {
+  return hasAttribute(el, name) ? el.attrs[name]! : null;
+}
+
+/** `isDisabled`, copied verbatim from the `page.evaluate` callback. */
+function isDisabled(el: AttrEl): boolean {
+  return hasAttribute(el, 'disabled') || getAttribute(el, 'aria-disabled') === 'true';
+}
+
+/** `isReadOnly`, copied verbatim from the `page.evaluate` callback. */
+function isReadOnly(el: AttrEl): boolean {
+  return hasAttribute(el, 'readonly') || getAttribute(el, 'aria-readonly') === 'true';
+}
+
 /**
  * Dynamic-id filter, copied verbatim from `selectorFor`'s `isLikelyDynamicId` in
  * selectors.ts. These id shapes are reassigned per render tree (React's useId(), MUI's mui-N) or
@@ -162,6 +189,37 @@ describe('selectors.buttonType inference (implicit HTML submit semantics)', () =
   it('never overrides an explicit type attribute, in or out of a form', () => {
     expect(inferButtonType('button', true)).toBe('button');
     expect(inferButtonType('reset', false)).toBe('reset');
+  });
+});
+
+describe('selectors.isReadOnly (gated-field detection, mirrored)', () => {
+  it('detects the readonly attribute and aria-readonly="true"', () => {
+    expect(isReadOnly(attrEl({ readonly: '' }))).toBe(true);
+    expect(isReadOnly(attrEl({ 'aria-readonly': 'true' }))).toBe(true);
+  });
+
+  it('is false for an ordinary field, and for aria-readonly="false"', () => {
+    expect(isReadOnly(attrEl())).toBe(false);
+    expect(isReadOnly(attrEl({ 'aria-readonly': 'false' }))).toBe(false);
+  });
+
+  it('is INDEPENDENT of isDisabled in both directions', () => {
+    // The distinction has teeth: `disabled` removes an element from click-probe candidates
+    // entirely, while `readonly` must leave it clickable and merely un-fillable. Collapsing the
+    // two would silently drop gated fields out of the inventory instead of flagging them.
+    const readonlyOnly = attrEl({ readonly: '' });
+    expect(isReadOnly(readonlyOnly)).toBe(true);
+    expect(isDisabled(readonlyOnly)).toBe(false);
+
+    const disabledOnly = attrEl({ disabled: '' });
+    expect(isDisabled(disabledOnly)).toBe(true);
+    expect(isReadOnly(disabledOnly)).toBe(false);
+  });
+
+  it('reports both when a field is genuinely readonly AND disabled', () => {
+    const both = attrEl({ readonly: '', disabled: '' });
+    expect(isReadOnly(both)).toBe(true);
+    expect(isDisabled(both)).toBe(true);
   });
 });
 
@@ -426,7 +484,39 @@ function appendChild(parent: FakeEl, child: FakeEl): void {
   parent.children.push(child);
 }
 
-/** A tiny querySelectorAll sufficient for selectorFor's uniqueness checks: #id and tag[attr="val"]. */
+/** Matches one `>`-joined segment of a combinator chain (`tag`, `tag:nth-of-type(n)`, or `#id`)
+ * against a single fake element — see `matchesChain` below. */
+function matchesSimpleSelector(el: FakeEl, simple: string): boolean {
+  const idMatch = /^#(.+)$/.exec(simple);
+  if (idMatch) return el.id === idMatch[1];
+  const nthMatch = /^([a-z0-9]+):nth-of-type\((\d+)\)$/i.exec(simple);
+  if (nthMatch) {
+    const [, tag, indexStr] = nthMatch;
+    if (el.tagName !== tag) return false;
+    if (!el.parentElement) return false;
+    const sameTag = el.parentElement.children.filter((c) => c.tagName === el.tagName);
+    return sameTag.indexOf(el) + 1 === Number(indexStr);
+  }
+  return el.tagName === simple;
+}
+
+/** Matches a full `>`-joined combinator chain (as `selectorFor`'s tier-4 path builder produces)
+ * against a candidate element: the LAST segment must match `el` itself, and each preceding
+ * segment must match `el`'s immediate ancestors in order — strict parent-child, since the real
+ * selector only ever joins with `>`, never a descendant-combinator space. */
+function matchesChain(el: FakeEl, simples: string[]): boolean {
+  let current: FakeEl | null = el;
+  for (let i = simples.length - 1; i >= 0; i -= 1) {
+    if (!current || !matchesSimpleSelector(current, simples[i]!)) return false;
+    current = current.parentElement;
+  }
+  return true;
+}
+
+/** A tiny querySelectorAll sufficient for selectorFor's uniqueness checks: #id, tag[attr="val"],
+ * and a `>`-joined nth-of-type combinator chain (the tier-4 path builder's own shape) — needed so
+ * the mirrored uniqueness check below behaves like the real `doc.querySelectorAll` instead of
+ * always seeing zero matches for any joined path. */
 function fakeQuerySelectorAll(root: FakeEl[], selector: string): FakeEl[] {
   const all: FakeEl[] = [];
   const visit = (el: FakeEl) => {
@@ -445,6 +535,10 @@ function fakeQuerySelectorAll(root: FakeEl[], selector: string): FakeEl[] {
   if (attrMatch) {
     const [, tag, attr, val] = attrMatch;
     return all.filter((el) => el.tagName === tag && el.attrs[attr!] === val);
+  }
+  if (selector.includes(' > ') || /^[a-z0-9]+(:nth-of-type\(\d+\))?$/i.test(selector)) {
+    const simples = selector.split(' > ');
+    return all.filter((el) => matchesChain(el, simples));
   }
   return [];
 }
@@ -493,10 +587,11 @@ function selectorForMirror(root: FakeEl[], el: FakeEl): SelectorResult {
     }
   }
 
+  const MAX_TIER4_ANCESTOR_LEVELS = 25;
   const parts: string[] = [];
   let repeatedRowText: string | undefined;
   let node: FakeEl | null = el;
-  while (node && node.nodeType === 1 && parts.length < 6) {
+  while (node && node.nodeType === 1 && parts.length < MAX_TIER4_ANCESTOR_LEVELS) {
     const current: FakeEl = node;
     let part = current.tagName.toLowerCase();
     const parent = current.parentElement;
@@ -518,6 +613,10 @@ function selectorForMirror(root: FakeEl[], el: FakeEl): SelectorResult {
       parts[0] = `#${current.id}`;
       break;
     }
+    // Stop climbing as soon as the path built so far is actually unique — mirrors the real
+    // selectorFor()'s fix for a tier-4 path that silently matched >1 element when capped at a
+    // small fixed depth.
+    if (qsa(parts.join(' > ')).length === 1) break;
     node = parent;
   }
   return { selector: parts.join(' > '), tier: 4, ...(repeatedRowText ? { repeatedRowText } : {}) };
@@ -557,6 +656,10 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
     const row2 = fakeEl('tr', { textContent: 'Bob   User' });
     appendChild(table, row1);
     appendChild(table, row2);
+    // A `td` sibling in row1 too — otherwise this fixture's single `td` would already be
+    // globally unique by tag alone, and the new uniqueness early-exit would stop the walk
+    // before ever climbing to the disambiguating `tr:nth-of-type(2)` level.
+    appendChild(row1, fakeEl('td'));
     const cell = fakeEl('td');
     appendChild(row2, cell);
 
@@ -576,6 +679,18 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
     const card2 = fakeEl('div', { textContent: 'id: 2 Title: Task Beta Update Delete' });
     appendChild(list, card1);
     appendChild(list, card2);
+
+    // card1 gets the same button-column/link shape as card2 — otherwise this fixture's single
+    // `<a>` (or single button-column div) would already be globally unique on its own, and the
+    // new uniqueness early-exit would stop the walk before ever climbing to the card level whose
+    // text this test exists to pin.
+    const infoCol1 = fakeEl('div');
+    const buttonCol1a = fakeEl('div', { textContent: 'Update' });
+    const buttonCol1b = fakeEl('div', { textContent: 'Delete' });
+    appendChild(card1, infoCol1);
+    appendChild(card1, buttonCol1a);
+    appendChild(card1, buttonCol1b);
+    appendChild(buttonCol1a, fakeEl('a', { textContent: 'Update' }));
 
     const infoCol = fakeEl('div');
     const buttonCol1 = fakeEl('div', { textContent: 'Update' });
@@ -639,6 +754,53 @@ describe('selectors.selectorFor tiering + repeatedRowText (mirrored)', () => {
 
     const result = selectorForMirror([list], row1);
     expect(result.tier).toBe(4);
+  });
+
+  it('climbs past a coincidentally-matching shallow shape instead of returning a selector that matches >1 element', () => {
+    // Reproduces the exact live collision found against the C&A dashboard: two unrelated
+    // sections (a summary-tile row and a profile-edit row) happen to share the same LOCAL
+    // nth-of-type shape a couple of levels up ("div:nth-of-type(3) > p"), so a walk that stopped
+    // there (as the old fixed-depth cap could) would return a selector matching both — and
+    // Playwright's `.first()` would then click whichever came first in DOM order, not
+    // necessarily the intended one. The two branches only diverge one level further up (their
+    // own position under `root`), which is where uniqueness is actually reached.
+    const root = fakeEl('div');
+    const wrapperA = fakeEl('div'); // summary-tile section — 1st div child of root
+    const wrapperB = fakeEl('div'); // profile-edit section — 2nd div child of root
+    appendChild(root, wrapperA);
+    appendChild(root, wrapperB);
+
+    const midA = fakeEl('div');
+    appendChild(wrapperA, midA);
+    const rowA1 = fakeEl('div');
+    const rowA2 = fakeEl('div');
+    const rowA3 = fakeEl('div');
+    appendChild(midA, rowA1);
+    appendChild(midA, rowA2);
+    appendChild(midA, rowA3);
+    const decoy = fakeEl('p', { textContent: 'Môj účet' });
+    appendChild(rowA3, decoy);
+
+    const midB = fakeEl('div');
+    appendChild(wrapperB, midB);
+    const rowB1 = fakeEl('div');
+    const rowB2 = fakeEl('div');
+    const rowB3 = fakeEl('div');
+    appendChild(midB, rowB1);
+    appendChild(midB, rowB2);
+    appendChild(midB, rowB3);
+    const target = fakeEl('p', { textContent: 'zmeniť' });
+    appendChild(rowB3, target);
+
+    // Sanity-check the collision this test exists to pin: the shallow local shape alone really
+    // is ambiguous, so the fix has something real to climb past.
+    expect(fakeQuerySelectorAll([root], 'div:nth-of-type(3) > p')).toHaveLength(2);
+
+    const result = selectorForMirror([root], target);
+    expect(result.tier).toBe(4);
+    const matches = fakeQuerySelectorAll([root], result.selector);
+    expect(matches).toHaveLength(1);
+    expect(matches[0]).toBe(target);
   });
 });
 
@@ -1094,5 +1256,123 @@ describe('selectors.collectModalText (Cluster E, mirrored)', () => {
     const dialog = fakeEl('div', { attrs: { role: 'dialog' }, textContent: longText });
     appendChild(root, dialog);
     expect(collectModalTextMirror(root)?.length).toBe(MODAL_TEXT_MAX_CHARS_MIRROR);
+  });
+});
+
+// --- Mirrored collectContentElements() ---
+//
+// Same rationale/convention as collectGenericClickCandidatesMirror above: the real function runs
+// inside page.evaluate against a live DOM, so this mirrors its exact branch structure over the
+// same fake element tree instead.
+
+interface ContentElementResult {
+  kind: 'svg' | 'canvas' | 'image' | 'status-text';
+  description: string;
+}
+
+/** Mirrors `collectContentElements()`'s per-node classification: svg/canvas -> label fallback
+ * chain, img -> non-empty alt only, [role="status"]/[aria-live] -> non-empty text only. */
+function collectContentElementsMirror(root: FakeEl): ContentElementResult[] {
+  const out: ContentElementResult[] = [];
+  for (const el of descendantsInDocumentOrder(root)) {
+    if (el.hidden) continue;
+    const tag = el.tagName.toLowerCase();
+
+    if (tag === 'svg' || tag === 'canvas') {
+      const label = el.attrs['aria-label'] || el.attrs['title'] || (el.parentElement?.textContent ?? '');
+      out.push({
+        kind: tag === 'svg' ? 'svg' : 'canvas',
+        description: clamp(label) || `a rendered <${tag}> element (no label/title/nearby text found)`,
+      });
+      continue;
+    }
+
+    if (tag === 'img') {
+      const alt = el.attrs['alt'];
+      if (!alt || !alt.trim()) continue;
+      out.push({ kind: 'image', description: clamp(alt) });
+      continue;
+    }
+
+    if (el.attrs['role'] === 'status' || el.attrs['aria-live'] !== undefined) {
+      const text = (el.textContent ?? '').trim();
+      if (!text) continue;
+      out.push({ kind: 'status-text', description: clamp(text) });
+    }
+  }
+  return out;
+}
+
+describe('selectors.collectContentElements (mirrored)', () => {
+  it('captures a barcode-shaped <svg> with a nearby label as its description', () => {
+    const wrapper = fakeEl('div', { textContent: 'Voucher barcode: 123456' });
+    const svg = fakeEl('svg');
+    appendChild(wrapper, svg);
+
+    const result = collectContentElementsMirror(wrapper);
+
+    expect(result).toEqual([{ kind: 'svg', description: 'Voucher barcode: 123456' }]);
+  });
+
+  it('prefers aria-label over nearby parent text for an svg/canvas description', () => {
+    const wrapper = fakeEl('div', { textContent: 'unrelated wrapper text' });
+    const canvas = fakeEl('canvas', { attrs: { 'aria-label': 'QR code for check-in' } });
+    appendChild(wrapper, canvas);
+
+    const result = collectContentElementsMirror(wrapper);
+
+    expect(result).toEqual([{ kind: 'canvas', description: 'QR code for check-in' }]);
+  });
+
+  it('falls back to a generic description when an svg has no label/title and no parent text', () => {
+    const svg = fakeEl('svg');
+    // No parent, so parentElement?.textContent is undefined -> falls through to the generic note.
+    const result = collectContentElementsMirror(svg);
+    expect(result).toEqual([
+      { kind: 'svg', description: 'a rendered <svg> element (no label/title/nearby text found)' },
+    ]);
+  });
+
+  it('captures an <img> with meaningful alt text', () => {
+    const img = fakeEl('img', { attrs: { alt: 'Membership barcode' } });
+    const result = collectContentElementsMirror(img);
+    expect(result).toEqual([{ kind: 'image', description: 'Membership barcode' }]);
+  });
+
+  it('excludes a decorative <img> with empty alt text', () => {
+    const img = fakeEl('img', { attrs: { alt: '' } });
+    expect(collectContentElementsMirror(img)).toEqual([]);
+  });
+
+  it('excludes an <img> with no alt attribute at all', () => {
+    const img = fakeEl('img');
+    expect(collectContentElementsMirror(img)).toEqual([]);
+  });
+
+  it('captures a role="status" node\'s own text', () => {
+    const status = fakeEl('div', { attrs: { role: 'status' }, textContent: 'Your changes were saved' });
+    const result = collectContentElementsMirror(status);
+    expect(result).toEqual([{ kind: 'status-text', description: 'Your changes were saved' }]);
+  });
+
+  it('captures an aria-live node even when role is absent', () => {
+    const live = fakeEl('div', { attrs: { 'aria-live': 'polite' }, textContent: 'Item added to cart' });
+    const result = collectContentElementsMirror(live);
+    expect(result).toEqual([{ kind: 'status-text', description: 'Item added to cart' }]);
+  });
+
+  it('excludes an empty role="status" node', () => {
+    const status = fakeEl('div', { attrs: { role: 'status' }, textContent: '' });
+    expect(collectContentElementsMirror(status)).toEqual([]);
+  });
+
+  it('excludes a hidden content element regardless of shape', () => {
+    const img = fakeEl('img', { attrs: { alt: 'Hidden icon' }, hidden: true });
+    expect(collectContentElementsMirror(img)).toEqual([]);
+  });
+
+  it('does not classify a plain <div> with no matching shape as content', () => {
+    const plain = fakeEl('div', { textContent: 'Just a wrapper' });
+    expect(collectContentElementsMirror(plain)).toEqual([]);
   });
 });

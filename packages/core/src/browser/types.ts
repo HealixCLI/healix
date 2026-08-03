@@ -7,6 +7,13 @@ export interface BrowserSurfaceOptions {
   headless?: boolean;
   viewport?: { width: number; height: number };
   baseUrl?: string;
+  /**
+   * Pre-seeds the new context's cookies/localStorage from a prior session's exported state (see
+   * `BrowserSurface.exportStorageState`) — lets a fresh browser process start already
+   * authenticated, without repeating a login. Used by the separate-origin seed fan-out path
+   * (multiple Chromium processes can't share one `BrowserContext`, but they can share one login).
+   */
+  storageState?: unknown;
 }
 
 export interface InteractiveElement {
@@ -23,6 +30,22 @@ export interface InteractiveElement {
   inForm?: boolean;
   /** True when the element is disabled (`disabled` attribute or `aria-disabled="true"`). */
   disabled?: boolean;
+  /**
+   * True when the element is `readonly` (the `readonly` attribute or `aria-readonly="true"`).
+   *
+   * Deliberately SEPARATE from `disabled`, because the two mean different things to a generated
+   * test: a disabled control can't be clicked, while a readonly input is perfectly clickable and
+   * visible but cannot be typed into. Conflating them would drop readonly fields from
+   * click-probe candidates rather than merely stopping GENERATE filling them.
+   *
+   * Captured because its absence has a specific, expensive failure mode: an app that gates a
+   * field until its precondition is met (this one makes the password-reset confirm field
+   * `readonly` until the first password validates) looked perfectly fillable in the inventory,
+   * so GENERATE emitted a `.fill()` and Playwright retried "element is not editable" for the
+   * FULL 60s test timeout — a whole test's budget spent on a signal we could see and simply
+   * weren't recording.
+   */
+  readOnly?: boolean;
   /**
    * True when another visible element on the SAME page shares this exact (role, name) pair —
    * e.g. two links both named "foo". A generated `getByRole(role, { name })` locator would
@@ -44,12 +67,44 @@ export interface InteractiveElement {
    * raw index path, which breaks when the list/table reorders.
    */
   repeatedRowText?: string;
+  /**
+   * Set when this element represents a group of `repeatedGroupSize` near-identical siblings
+   * (same role, same selector shape ignoring the nth-of-type index — e.g. a date-picker's day
+   * cells, a table's rows) that were collapsed to this one representative — see
+   * `collapseRepeatedSiblings` in browser/crawler.ts. Absent for an ordinary, non-repeated
+   * element.
+   */
+  repeatedGroupSize?: number;
+}
+
+/**
+ * A visibly-rendered but NON-clickable piece of content — a barcode/QR `<svg>`/`<canvas>`, an
+ * `<img>` with meaningful `alt` text, or a status/label text node (`role="status"`/`aria-live`) —
+ * that `InteractiveElement`'s click-candidate model has no way to represent. Added so GENERATE can
+ * ground an "X is visibly rendered" assertion (e.g. "the voucher's barcode is shown") without
+ * falling back to an escape hatch just because nothing on the page is clickable evidence of it.
+ *
+ * Deliberately kept as its OWN array on `DomSnapshot` (see `contentElements` below), never merged
+ * into `interactiveElements` — several crawl heuristics (`STATE_REVEAL_MIN_NEW_ELEMENTS`'s
+ * before/after element-count diff in browser/crawler.ts, most notably) assume that array means
+ * "interactive," and mixing in non-interactive content would silently change what counts as a
+ * state reveal.
+ */
+export interface ContentElement {
+  kind: 'svg' | 'canvas' | 'image' | 'status-text';
+  selector: string;
+  /** Short human-readable description grounding what this content is (e.g. an image's alt text,
+   * a status node's own text, or a barcode/canvas's nearby label). */
+  description: string;
 }
 
 export interface DomSnapshot {
   url: string;
   title: string;
   interactiveElements: InteractiveElement[];
+  /** See `ContentElement`'s doc comment. Optional so existing hand-built snapshot fixtures that
+   * predate this field (tests, cached exploration artifacts) stay valid. */
+  contentElements?: ContentElement[];
   axTree?: unknown;
   /** Clamped, concatenated textContent of every visible `[role="dialog"]`/`[role="alertdialog"]`/
    * `[aria-modal="true"]` container present at snapshot time — see selectors.ts's
@@ -86,6 +141,10 @@ export interface CapturedNetworkEvent {
 export interface BrowserSurface {
   start(opts?: BrowserSurfaceOptions): Promise<void>;
   goto(url: string): Promise<void>;
+  /** Force a genuine reload of the current page — unlike `goto()`, this always re-fetches and
+   * re-parses the document from scratch, so it can't suffer `goto()`'s same-URL SPA no-op
+   * problem (see `browser/index.ts`'s `goto()` and `crawler.ts`'s `resetAfterProbe`). */
+  reload(): Promise<void>;
   screenshot(): Promise<Buffer>;
   snapshot(): Promise<DomSnapshot>;
   click(selector: string): Promise<void>;
@@ -96,5 +155,8 @@ export interface BrowserSurface {
   onFrame(cb: (png: Buffer) => void): () => void;
   /** Return and clear the XHR/fetch traffic observed since the last drain (or since start()). */
   drainNetworkEvents(): CapturedNetworkEvent[];
+  /** Snapshot this session's cookies/localStorage so a separate `BrowserSurface` can start
+   * pre-authenticated from it via `BrowserSurfaceOptions.storageState` — see there for why. */
+  exportStorageState(): Promise<unknown>;
   stop(): Promise<void>;
 }

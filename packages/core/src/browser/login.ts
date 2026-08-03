@@ -7,6 +7,15 @@ export interface LoginAttemptResult {
   landingUrl?: string;
   /** Set whenever `ok: false` — why the attempt wasn't trusted. */
   reason?: string;
+  /**
+   * The exact selectors just proven to work, present only when `ok: true` — the FINAL
+   * identifier/password elements actually typed into (post toggle-swap re-fill, if that
+   * kicked in) and the submit control actually clicked. `submit` is absent when submission
+   * fell back to pressing Enter (no submit button was found). Lets a caller ground a
+   * downstream, independently-generated login flow in what demonstrably worked here instead
+   * of re-guessing from scratch.
+   */
+  selectors?: { identifier: string; password: string; submit?: string };
 }
 
 /** Matches a submit-ish `selector` — built from `data-testid`/`data-test`/`name`/`aria-label`/`#id`,
@@ -225,6 +234,12 @@ async function submitLoginAttempt(
     };
   }
 
+  // Tracks the elements ACTUALLY typed into/clicked, reassigned below if the toggle-swap
+  // re-fill branch kicks in — this is what a successful attempt reports back in `selectors`.
+  let finalIdentifierSelector = usernameEl.selector;
+  let finalPasswordSelector = passwordEl.selector;
+  let finalSubmitSelector: string | undefined;
+
   try {
     await browser.type(usernameEl.selector, username);
     await browser.type(passwordEl.selector, password);
@@ -237,24 +252,27 @@ async function submitLoginAttempt(
     // element identity rather than by reading back the values (BrowserSurface exposes no
     // value read, and a swapped-in field is empty either way): if the password field we typed
     // into is gone, the form was replaced, so re-fill the replacement once.
-    const after = await browser.snapshot();
-    const stillSameForm = after.interactiveElements.some(
+    const afterFill = await browser.snapshot();
+    const stillSameForm = afterFill.interactiveElements.some(
       (el) => el.inputType === 'password' && el.selector === passwordEl.selector,
     );
     if (!stillSameForm) {
-      const newPasswordIndex = after.interactiveElements.findIndex((el) => el.inputType === 'password');
-      const newPasswordEl = after.interactiveElements[newPasswordIndex];
-      const newUsernameEl = findNearestUsernameField(after.interactiveElements, newPasswordIndex);
+      const newPasswordIndex = afterFill.interactiveElements.findIndex((el) => el.inputType === 'password');
+      const newPasswordEl = afterFill.interactiveElements[newPasswordIndex];
+      const newUsernameEl = findNearestUsernameField(afterFill.interactiveElements, newPasswordIndex);
       if (newPasswordEl && newUsernameEl) {
         await browser.type(newUsernameEl.selector, username);
         await browser.type(newPasswordEl.selector, password);
-        before = after;
+        before = afterFill;
+        finalIdentifierSelector = newUsernameEl.selector;
+        finalPasswordSelector = newPasswordEl.selector;
       }
     }
 
     const submit = findLoginSubmitButton(before.interactiveElements);
     if (submit) {
       await browser.click(submit.selector);
+      finalSubmitSelector = submit.selector;
     } else {
       await browser.pressKey('Enter');
     }
@@ -276,7 +294,15 @@ async function submitLoginAttempt(
     };
   }
 
-  return { ok: true, landingUrl: after.url };
+  return {
+    ok: true,
+    landingUrl: after.url,
+    selectors: {
+      identifier: finalIdentifierSelector,
+      password: finalPasswordSelector,
+      submit: finalSubmitSelector,
+    },
+  };
 }
 
 /** Fill and submit a login form at a dedicated `loginUrl`. See `submitLoginAttempt`. */

@@ -709,7 +709,7 @@ describe('authSetupContents — locale-aware login fixture', () => {
 
   it('F-16: matches a plain "Submit" button label — the RBAC live-run gap (an MUI <Button> with no type="submit" and no data-testid)', () => {
     const fixture = authSetupContents();
-    const match = /submitButton = await submitButtonLocator\(page, (\/[^/]+\/i)\)/.exec(fixture);
+    const match = /guessSubmitButton = await submitButtonLocator\(page, (\/[^/]+\/i)\)/.exec(fixture);
     expect(match).not.toBeNull();
     const re = new Function(`return ${match![1]}`)();
     for (const label of ['Submit', 'SUBMIT', 'submit']) {
@@ -719,6 +719,38 @@ describe('authSetupContents — locale-aware login fixture', () => {
     for (const label of ['Sign in', 'Log in', 'Continue', 'Prihlásiť']) {
       expect(re.test(label)).toBe(true);
     }
+  });
+
+  it('prefers EXPLORE-grounded login selectors over the generic guesses, falling back when unset', () => {
+    const fixture = authSetupContents();
+    expect(fixture).toContain('function preferGrounded(page, groundedSelector, fallbackLocator, timeoutMs)');
+    expect(fixture).toContain('HEALIX_TIERB_LOGIN_TOGGLE_SELECTOR');
+    expect(fixture).toContain(
+      'const identifierField = await preferGrounded(\n    page,\n    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR,\n    guessIdentifierField,\n    3000,\n  );',
+    );
+    expect(fixture).toContain(
+      'const passwordField = await preferGrounded(\n    page,\n    process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR,\n    guessPasswordField,\n    3000,\n  );',
+    );
+    expect(fixture).toContain(
+      'const submitButton = await preferGrounded(page, groundedSubmitSelector, guessSubmitButton, 3000);',
+    );
+  });
+
+  it('presses Enter instead of guessing a submit button when the form is grounded but EXPLORE captured no submit selector (proven Enter-driven login)', () => {
+    const fixture = authSetupContents();
+    // A grounded form with no submit selector is a PROVEN fact (see login.ts's own Enter-key
+    // fallback), not a gap to guess at — must not fall through to guessSubmitButton in that case.
+    expect(fixture).toContain(
+      'const hasGroundedForm = !!(\n    process.env.HEALIX_TIERB_LOGIN_IDENTIFIER_SELECTOR || process.env.HEALIX_TIERB_LOGIN_PASSWORD_SELECTOR\n  );',
+    );
+    const ifIdx = fixture.indexOf('if (hasGroundedForm && !groundedSubmitSelector) {');
+    expect(ifIdx).toBeGreaterThan(-1);
+    const enterIdx = fixture.indexOf("await page.keyboard.press('Enter');", ifIdx);
+    expect(enterIdx).toBeGreaterThan(ifIdx);
+    const elseIdx = fixture.indexOf('} else {', enterIdx);
+    expect(elseIdx).toBeGreaterThan(enterIdx);
+    const guessIdx = fixture.indexOf('guessSubmitButton', elseIdx);
+    expect(guessIdx).toBeGreaterThan(elseIdx);
   });
 
   it('still writes performedLogin:false before attempting login and true only after storageState is captured', () => {

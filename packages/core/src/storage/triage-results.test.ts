@@ -299,7 +299,7 @@ describe('HealixStore triage_results', () => {
     const s = await store();
 
     const info = await dbInfo();
-    expect(info.version).toBe(18);
+    expect(info.version).toBe(21);
     expect(info.tables).toContain('triage_results');
 
     // The pre-existing row survived, untouched, with spec_code defaulting to null.

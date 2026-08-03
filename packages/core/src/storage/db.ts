@@ -168,6 +168,18 @@ function migrate(db: DatabaseSync): void {
     // Knowledge Base) — brand-new tables, no ensureColumn needed; same
     // reasoning as v11's usage table: CREATE TABLE IF NOT EXISTS already
     // retrofits them onto an existing DB.
+    // v19: kb_test_scripts (per-KB-item source file path) — brand-new table,
+    // no ensureColumn needed; same reasoning as v11/v18.
+    // v20: kb_execution_artifacts (per-KB-scenario error/trace/steps/network
+    // logs) — brand-new table, no ensureColumn needed; same reasoning as
+    // v11/v18/v19.
+    // v21: KB foundation (requirements/mock_responses/test_mock_usage/
+    // exploration_summaries/escape_hatch_gaps) — all brand-new tables, no
+    // ensureColumn needed for them; same reasoning as v11/v18/v19/v20. Two
+    // columns on EXISTING tables do need ensureColumn, since CREATE TABLE IF
+    // NOT EXISTS can't retrofit a column onto a table that already exists:
+    ensureColumn(db, 'plan_kb_items', 'requirement_id', 'TEXT');
+    ensureColumn(db, 'results', 'evidence_json', 'TEXT');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

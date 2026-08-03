@@ -31,6 +31,7 @@ function makeResult(overrides: Partial<TestResult> = {}): TestResult {
     stepsJson: null,
     skipReason: null,
     videoUnavailableReason: null,
+    evidenceJson: null,
     ...overrides,
   };
 }

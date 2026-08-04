@@ -26,10 +26,12 @@ import {
   clearGenerateCheckpoint,
   collectGroundTruth,
   demoteEscapeHatchBlocks,
+  extractEscapeHatchReasons,
   findDominantPrefixes,
   findForbiddenApis,
   findUngroundedReferences,
   filterRoutesForItem,
+  forgetGenerateCheckpointEntries,
   formatMockContent,
   generate,
   GEN_CHECKPOINT_FILENAME,
@@ -400,6 +402,91 @@ test('[REQ:REQ-1] shows the user\\'s current email', async ({ page }) => {
 `;
     const result = demoteEscapeHatchBlocks(source);
     expect(result).toContain("test.fixme('[REQ:REQ-1] shows the user\\'s current email', { annotation:");
+  });
+});
+
+describe('extractEscapeHatchReasons — surfaces unresolved-selector gaps for directed re-exploration', () => {
+  it('returns an empty array when no escape-hatch marker is present', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([]);
+  });
+
+  it("captures the enclosing test's title and the model's own trailing explanation", () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-AUTH-01] positive: resets password', async ({ page }) => {
+  // TODO: unobserved element - the forgot-password link was never clicked during exploration.
+  await expect(page).toHaveURL(/reset/);
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      {
+        testTitle: '[REQ:FR-AUTH-01] positive: resets password',
+        reason: 'the forgot-password link was never clicked during exploration.',
+      },
+    ]);
+  });
+
+  it('falls back to a generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([{ testTitle: '[REQ:REQ-1] guessed', reason: 'needs review' }]);
+  });
+
+  it('returns one entry per escape-hatched block, skipping blocks with no marker', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+});
+
+test('[REQ:REQ-1] edge: guessed consent checkbox', async ({ page }) => {
+  // TODO: unobserved element - consent modal never appeared during crawl.
+  await page.locator('input[type="checkbox"]').check();
+});
+
+test('[REQ:REQ-1] negative: rejects bad input', async ({ page }) => {
+  // TODO: unobserved element - validation error text never observed.
+  await page.locator('form').first().click();
+});
+`;
+    const reasons = extractEscapeHatchReasons(source);
+    expect(reasons).toHaveLength(2);
+    expect(reasons.map((r) => r.testTitle)).toEqual([
+      '[REQ:REQ-1] edge: guessed consent checkbox',
+      '[REQ:REQ-1] negative: rejects bad input',
+    ]);
+    expect(reasons.map((r) => r.reason)).toEqual([
+      'consent modal never appeared during crawl.',
+      'validation error text never observed.',
+    ]);
+  });
+
+  it('still finds the marker after demoteEscapeHatchBlocks has already rewritten the block to test.fixme', () => {
+    // Directed re-exploration reads escapeHatchReasons from a spec's PERSISTED contents (post-
+    // demotion), so extraction must keep working even once the enclosing call is test.fixme(...).
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element - reason survives demotion.
+  await page.locator('button').click();
+});
+`;
+    const demoted = demoteEscapeHatchBlocks(source);
+    expect(extractEscapeHatchReasons(demoted)).toEqual([
+      { testTitle: '[REQ:REQ-1] guessed', reason: 'reason survives demotion.' },
+    ]);
   });
 });
 
@@ -1452,6 +1539,107 @@ describe('generate — write-through per-item checkpoint (resume mid-phase witho
     await clearGenerateCheckpoint(projectDir);
     expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
     await expect(clearGenerateCheckpoint(projectDir)).resolves.toBeUndefined();
+  });
+
+  it('forgetGenerateCheckpointEntries removes only the named item id, leaving every other entry byte-identical', async () => {
+    const a: GenCheckpointEntry = {
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    };
+    const b: GenCheckpointEntry = {
+      itemId: 'b',
+      title: 'Feature B',
+      reqTag: 'REQ-B',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/b.spec.ts'),
+      specTitle: '[REQ:REQ-B] Feature B',
+    };
+    await writeFile(join(projectDir, GEN_CHECKPOINT_FILENAME), `${JSON.stringify(a)}\n${JSON.stringify(b)}\n`, 'utf-8');
+
+    await forgetGenerateCheckpointEntries(projectDir, ['a']);
+
+    const entries = await readGenerateCheckpointEntries(projectDir);
+    expect(entries).toEqual([b]);
+  });
+
+  it('forgetGenerateCheckpointEntries is a true no-op when none of the given ids are present', async () => {
+    const a: GenCheckpointEntry = {
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    };
+    await seedEntry(a);
+
+    await forgetGenerateCheckpointEntries(projectDir, ['does-not-exist']);
+
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([a]);
+  });
+
+  it('forgetGenerateCheckpointEntries removes the file entirely when every entry is forgotten', async () => {
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    });
+
+    await forgetGenerateCheckpointEntries(projectDir, ['a']);
+
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
+    expect(existsSync(join(projectDir, GEN_CHECKPOINT_FILENAME))).toBe(false);
+  });
+
+  it('forgetGenerateCheckpointEntries is a no-op when given an empty id set', async () => {
+    await forgetGenerateCheckpointEntries(projectDir, []);
+    expect(existsSync(join(projectDir, GEN_CHECKPOINT_FILENAME))).toBe(false);
+  });
+
+  it('an item forgotten via forgetGenerateCheckpointEntries actually re-invokes the provider on the next generate() call — proves the checkpoint-skip gotcha is fixed', async () => {
+    // Regression test for the exact gotcha directed re-exploration exists to work around: without
+    // forgetGenerateCheckpointEntries, calling generate() again for an already-'generated' item id
+    // silently regenerates nothing (readGenerateCheckpointEntries' doneIds filter skips it).
+    const specPath = join(projectDir, 'tests/tierA-public/req-a.spec.ts');
+    await mkdir(join(projectDir, 'tests/tierA-public'), { recursive: true });
+    await writeFile(specPath, specFor('REQ-A', 'first attempt, guessed a selector'), 'utf-8');
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature REQ-A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath,
+      specTitle: '[REQ:REQ-A] Feature REQ-A',
+    });
+
+    const plan: TestPlan = { summary: 'regenerate item a', items: [planItem('a', 'REQ-A')] };
+
+    // Without forgetting, generate() would skip item "a" entirely (restored from disk, provider
+    // never called) — confirm that's still true before the fix under test runs.
+    const skippedSpecs = await generate(makeCtx(makeProvider([specFor('REQ-A', 'should not be used')], calls)), plan);
+    expect(calls).toHaveLength(0);
+    expect(skippedSpecs[0]?.contents).toContain('first attempt, guessed a selector');
+
+    await forgetGenerateCheckpointEntries(projectDir, ['a']);
+
+    const regeneratedReply = specFor('REQ-A', 'second attempt, real selector found');
+    const specs = await generate(makeCtx(makeProvider([regeneratedReply], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt).toContain('REQ-A');
+    expect(specs[0]?.contents).toContain('second attempt, real selector found');
   });
 
   it('resume skips an already-generated item, restoring its spec from disk without re-invoking the provider', async () => {

@@ -457,6 +457,19 @@ export class HealixStore {
   }
 
   /**
+   * Overwrite a regenerated spec's title/path/code onto an EXISTING row — used by directed
+   * re-exploration (orchestrator/directed-reexplore.ts's reregisterSpecRows) when a scenario that
+   * already has a row from this same GENERATE pass gets re-generated after a targeted re-crawl.
+   * Leaves status/req_tag/tier untouched: re-registration happens before EXECUTE ever runs
+   * against this row, so there's nothing to reconcile there yet.
+   */
+  updateTestSpec(id: string, fields: { title: string; specPath: string; specCode: string }): void {
+    this.db
+      .prepare('UPDATE tests SET title = ?, spec_path = ?, spec_code = ? WHERE id = ?')
+      .run(fields.title, fields.specPath, fields.specCode, id);
+  }
+
+  /**
    * Upsert-by-test: a test row maps to exactly one result (see updateTestStatus's
    * doc comment), so any prior result for this testId is deleted before the new
    * one is inserted. Without this, re-persisting a test's outcome — e.g. a

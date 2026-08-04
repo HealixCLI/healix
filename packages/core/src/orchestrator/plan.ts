@@ -112,9 +112,21 @@ export function buildPlanPrompt(project: Project, opts: RunOptions, repoIndex?: 
     lines.push(
       `Detected routes/endpoints (${shownUnits.length}${units.length > shownUnits.length ? ` of ${units.length}` : ''}) — produce one plan item per unit below that is testable within the in-scope tier(s), unless it is clearly not user/API-facing:`,
     );
-    for (const u of shownUnits) lines.push(`- [${u.kind}] ${u.label} (unitKey: "${u.key}")`);
+    for (const u of shownUnits) {
+      const guardNote = u.authGuardName
+        ? ` [route-guard detected: ${u.authGuardName} — MUST be tierB-auth]`
+        : '';
+      lines.push(`- [${u.kind}] ${u.label} (unitKey: "${u.key}")${guardNote}`);
+    }
     const remainingUnits = units.length - shownUnits.length;
     if (remainingUnits > 0) lines.push(`... and ${remainingUnits} more unit(s) not listed.`);
+    if (shownUnits.some((u) => u.authGuardName) && tiers.includes('tierB-auth')) {
+      lines.push(
+        'Any unit above annotated "[route-guard detected: ...]" MUST be planned as tierB-auth, never ' +
+          'tierA-public — a code-level route-guard component was found wrapping it (or an ancestor route) in ' +
+          "the app's own router configuration; this is not a guess.",
+      );
+    }
     if (tiers.includes('tierC-api')) {
       lines.push(
         'RULE for tierC-api items: only pair a tierC-api item with a "[endpoint]"-kind unit above — never a ' +
@@ -698,6 +710,45 @@ function normalizeTier(value: unknown, scope: TestingScope): Tier {
   // preserve — for that (and only that) case, clamp to the first in-scope
   // tier so the item survives as a usable guess instead of being dropped.
   return tiersForScope(scope)[0];
+}
+
+/**
+ * Deterministically corrects any plan item whose target unit carries a code-detected
+ * `authGuardName` (see target/ast/routes.ts) but whose model-assigned tier isn't tierB-auth —
+ * the prompt already asks the model to get this right (see buildPlanPrompt's route-guard
+ * annotation), but AST evidence of a real route-guard wrapper is strictly more reliable than an
+ * LLM guess, so it wins outright when they disagree. Never mutates in place; the correction is
+ * recorded on the returned item's `tierOverride` (not silently applied) so a reviewer can see
+ * WHY a tier changed, mirroring this codebase's existing PlanItemEdit/PlanItemRevision audit
+ * pattern. A no-op (returns items unchanged, `tierOverride` never set) when tierB-auth isn't in
+ * scope, the item has no matching unit, or the unit isn't guarded.
+ */
+export function applyAuthGuardTierOverrides(
+  items: TestPlanItem[],
+  units: FunctionalityUnit[],
+  scope: TestingScope,
+): TestPlanItem[] {
+  if (!tiersForScope(scope).includes('tierB-auth')) return items;
+  const guardedUnitKeys = new Map<string, string>();
+  for (const u of units) {
+    if (u.authGuardName) guardedUnitKeys.set(u.key, u.authGuardName);
+  }
+  if (guardedUnitKeys.size === 0) return items;
+
+  return items.map((item) => {
+    if (!item.unitKey) return item;
+    const guardName = guardedUnitKeys.get(item.unitKey);
+    if (!guardName || item.tier === 'tierB-auth') return item;
+    return {
+      ...item,
+      tier: 'tierB-auth',
+      tierOverride: {
+        from: item.tier,
+        to: 'tierB-auth',
+        reason: `Route is wrapped by a detected route-guard component ('${guardName}') in the app's own router configuration — overriding the model's proposed tier ('${item.tier}').`,
+      },
+    };
+  });
 }
 
 interface BalancedResult {

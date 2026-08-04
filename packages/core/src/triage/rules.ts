@@ -217,7 +217,14 @@ function mk(verdict: Verdict, confidence: number, rationale: string): TriageResu
  *     Suppressed when assertion signals (expect(), Expected/Received,
  *     toHaveText/toBeVisible …) are present.
  * 12. flaky         — visibility/detached/instability.
- * 13. timeout       — residual bare timeouts → environment/slowness.
+ * 13. unmocked_passthrough_hang — the test's own captured mockPassthroughEvidence
+ *     (see ExecOutcome.mockPassthrough) shows one of ITS OWN requests fell through the
+ *     generated mock fixture unintercepted (hostname matched no detected dependency, no
+ *     mockOverride registered) — real, captured corroboration that a bare timeout is a
+ *     mock-configuration gap, not the app/environment being slow. Must run before the
+ *     generic bare_timeout rule below so this corroborated signal isn't swallowed by its
+ *     lower-confidence, uncorroborated "could be either" verdict.
+ * 14. timeout       — residual bare timeouts → environment/slowness.
  */
 // Runs FIRST on a "blocked" test's error text — before it even asks "did the
 // setup fixture fail, or were credentials missing" — because execute.ts's own
@@ -421,6 +428,18 @@ const RULES: readonly Rule[] = [
         'flaky',
         0.55,
         'The element was present but not interactable (not visible, detached, unstable, or pointer-intercepted) at the moment of the action — a classic timing/flakiness signature that often passes on retry.',
+      );
+    },
+  },
+  {
+    id: 'unmocked_passthrough_hang',
+    match(error, _title, input) {
+      if (typeof input.mockPassthroughEvidence !== 'string' || !input.mockPassthroughEvidence) return null;
+      if (!RE_TIMEOUT.test(error)) return null;
+      return mk(
+        'environment',
+        0.85,
+        `The captured evidence shows this test's own request fell through the generated mock fixture unintercepted (${input.mockPassthroughEvidence}) — its hostname matched no detected dependency and no mockOverride was registered, so it hit the real (unreachable, in this sandboxed run) backend and hung until Playwright's timeout. This is very likely the cause of this bare timeout, not a slow app; check whether the dependency's detected hostname matches what the app actually requests at runtime.`,
       );
     },
   },

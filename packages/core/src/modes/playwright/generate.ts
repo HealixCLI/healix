@@ -428,8 +428,11 @@ const TEST_OPEN_AT_RE = /test(?:\.(?:only|skip|fixme))?\(/y;
  * genuinely useful half ("the login form fields were not captured in the inventory for the
  * login route itself") rather than just the fact that something was unobserved. */
 // Every gap is [ \t] rather than \s so the capture can never cross the newline and pick up the
-// following line of test code as if it were the explanation.
+// following line of test code as if it were the explanation. Continuation lines (the model's
+// reason word-wrapped across multiple `//` comment lines) are picked up separately below.
 const ESCAPE_HATCH_REASON_RE = /\/\/[ \t]*TODO:[ \t]*unobserved element[ \t]*[-–—:]?[ \t]*([^\r\n]*)/;
+/** Matches one continuation `//` comment line immediately following the TODO line. */
+const REASON_CONTINUATION_RE = /^\/\/[ \t]*(.*)$/;
 /** Keeps one long model comment from dominating a report cell. */
 const SKIP_REASON_MAX_LENGTH = 300;
 
@@ -441,9 +444,29 @@ const SKIP_REASON_MAX_LENGTH = 300;
  * marker leaves the report's "why was this skipped" column blank — for what is, in practice,
  * the most common skip cause there is. `JSON.stringify` does the embedding because the text is
  * model-authored and can hold quotes, backslashes, or newlines.
+ *
+ * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
+ * than one long line. ESCAPE_HATCH_REASON_RE only ever captures the first line (deliberately, so
+ * it can't cross into following test code) — so once it matches, this walks forward through the
+ * remaining `//`-prefixed lines directly below it and appends them, stopping at the first
+ * non-comment line. Without this, everything past the first line was silently dropped with no
+ * indication truncation happened (GAP-062).
  */
 function escapeHatchDetails(body: string): string {
-  const detail = ESCAPE_HATCH_REASON_RE.exec(body)?.[1]?.trim() ?? '';
+  const match = ESCAPE_HATCH_REASON_RE.exec(body);
+  const firstLine = match?.[1]?.trim() ?? '';
+  const continuationLines: string[] = [];
+  if (match) {
+    const rest = body.slice(match.index + match[0].length);
+    // The first split segment is the (already-empty) remainder of the TODO line itself, up to
+    // its own trailing newline — real continuation lines start at index 1.
+    for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
+      const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
+      if (!contMatch) break;
+      continuationLines.push(contMatch[1].trim());
+    }
+  }
+  const detail = [firstLine, ...continuationLines].filter(Boolean).join(' ');
   const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
   const description =
     full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
@@ -512,6 +535,15 @@ export interface GroundTruth {
    * selector path never surfaced `type` textually.
    */
   attributes: Map<string, Set<string>>;
+  /** Lowercased, whitespace-collapsed text observed inside an open modal/dialog container during
+   * EXPLORE (from DomSnapshot.modalText — see Cluster E). Empty when no modal was ever captured
+   * for the selected inventory's routes — never a hard signal that no modal exists, since capture
+   * is best-effort and scoped to a precise ARIA signal only (see that field's own doc comment). */
+  modalText: string;
+  /** Same routes' underlying page body text (DomSnapshot.bodyText), captured independent of
+   * modal state — lets a check tell "this text is ALSO permanent page copy" apart from "this text
+   * only exists once the modal is open" (see the F-11 check in findUngroundedReferences below). */
+  underlyingPageText: string;
 }
 
 /** Pull a `data-testid="..."` (or `data-test="..."`) value out of a selectorFor()-style CSS selector string, if present. */
@@ -545,7 +577,7 @@ export function collectGroundTruth(
   item?: TestPlanItem,
   opts?: InventoryOpts,
 ): GroundTruth {
-  const { selected, truncated } = selectInventoryElements(ctx, tier, item, opts);
+  const { ordered, selected, truncated } = selectInventoryElements(ctx, tier, item, opts);
 
   const testids = new Set<string>();
   const selectors = new Set<string>();
@@ -585,6 +617,13 @@ export function collectGroundTruth(
     endpoints.push({ method: o.method, pathPattern: o.pathPattern });
   }
 
+  const modalTextParts: string[] = [];
+  const underlyingPageTextParts: string[] = [];
+  for (const route of ordered) {
+    if (route.snapshot.modalText) modalTextParts.push(route.snapshot.modalText.toLowerCase());
+    if (route.snapshot.bodyText) underlyingPageTextParts.push(route.snapshot.bodyText.toLowerCase());
+  }
+
   return {
     testids,
     selectors,
@@ -594,6 +633,8 @@ export function collectGroundTruth(
     hasEndpointLevelMocks,
     inventoryTruncated: truncated,
     attributes,
+    modalText: modalTextParts.join(' '),
+    underlyingPageText: underlyingPageTextParts.join(' '),
   };
 }
 
@@ -606,6 +647,13 @@ const ROLE_CALL_RE =
 const MOCK_OVERRIDE_RE = /mockOverride\(\s*['"](\w+)['"]\s*,\s*['"]([^'"]+)['"]/g;
 /** Matches `getByText('literal')` or `getByText(/regex/flags)` — the two forms generation actually produces. */
 const TEXT_CALL_RE = /getByText\(\s*(?:\/((?:[^/\\]|\\.)+)\/[a-z]*|['"]([^'"]*)['"])/g;
+/** A `getByRole('dialog'|'alertdialog', ...)` or `[role="dialog"|"alertdialog"]` locator preceding
+ * a getByText(...) on the same chain — see F-11 below (Cluster E). */
+const DIALOG_SCOPED_PREFIX_RE = /getByRole\(\s*['"](?:alert)?dialog['"]|\[role=["'](?:alert)?dialog["']\]/;
+/** Minimum getByText(...) length checked by F-11 — short common words ("OK", "Cancel") coincide
+ * across a page too often to be a useful modal-scoping signal; F-07 already covers those via role
+ * ambiguity instead. */
+const MIN_SCOPED_TEXT_LEN = 15;
 
 /** Collapse whitespace/case so a `getByText` argument compares fairly against the observed accessible-name corpus. */
 function normalizeText(value: string): string {
@@ -767,6 +815,29 @@ export function findUngroundedReferences(
       const label = `getByText("${alt}") is ambiguous — shared by multiple elements with different roles (${[...roles].join('/')}) and WILL throw a Playwright strict-mode violation unless narrowed (e.g. .filter({ hasText: ... }).first(), a role-qualified locator, or .first()/.nth())`;
       if (!hasEscapeHatch) hard.push(label);
       else warn.push(label);
+    }
+  }
+
+  // F-11: an assertion's getByText(...) matching text observed BOTH inside a captured modal/dialog
+  // AND on the underlying page outside it can't reliably prove "the modal specifically shows this
+  // text" — the same string could be permanent static copy elsewhere on the page, so the
+  // assertion's outcome wouldn't actually depend on the modal being open (see Cluster E). WARN
+  // only: modalText/underlyingPageText capture is best-effort and scoped to a narrow ARIA signal
+  // (see DomSnapshot.modalText's doc comment), so absence of evidence must never become a hard
+  // failure. Scoped to text >= MIN_SCOPED_TEXT_LEN chars to avoid noise on short common words
+  // ("OK", "Cancel") that coincidentally appear everywhere — those are already covered by F-07's
+  // role-ambiguity check for that concern instead.
+  for (const m of source.matchAll(TEXT_CALL_RE)) {
+    const alternatives = m[1] ? splitTextAlternatives(m[1]) : [normalizeText(m[2] ?? '')];
+    const precedingStart = Math.max(0, (m.index ?? 0) - 80);
+    const preceding = source.slice(precedingStart, m.index ?? 0);
+    if (DIALOG_SCOPED_PREFIX_RE.test(preceding)) continue;
+    for (const alt of alternatives) {
+      if (!alt || alt.length < MIN_SCOPED_TEXT_LEN) continue;
+      if (!gt.modalText.includes(alt) || !gt.underlyingPageText.includes(alt)) continue;
+      warn.push(
+        `getByText("${alt}") matches text observed both inside a captured modal/dialog and on the underlying page outside it — this assertion can't reliably prove the modal specifically shows this text (the same copy could exist regardless of the modal being open); scope it to the dialog container (e.g. page.getByRole('dialog').getByText(...)) or assert modal-exclusive text instead`,
+      );
     }
   }
 
@@ -1064,7 +1135,9 @@ function formatRoutingGuidance(ctx: TestModeContext): string {
     : '';
   return `
 
-This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.`;
+This app uses hash-based routing${prefixNote}. Preserve any hash URLs shown in the interactive-element inventory above verbatim in page.goto() calls — never replace or guess a different path unless proven by that inventory.
+
+RULE: a page.goto() to a URL that differs only in its hash fragment is a SAME-DOCUMENT navigation — it does NOT unload/reload the page. Any component that reads its auth/session state only once at mount (e.g. \`useState(readInitialAuthFromStorage)\` with no reactive listener) keeps its already-mounted in-memory value untouched by such a navigation, even after you clear localStorage/cookies. If a scenario needs a genuine "no active session"/logged-out precondition on this app, clearing storage alone is NOT sufficient — you MUST also force a real full-document reload (e.g. \`page.reload()\`) after clearing storage and BEFORE navigating to or asserting against the target route, so the app's in-memory auth state actually gets recomputed against the now-cleared storage. Skipping this produces a test that never exercises the precondition its own title claims to test, in either direction.`;
 }
 
 /** Cap on distinct route URLs listed, so a large crawl can't blow up the prompt. */
@@ -1089,6 +1162,45 @@ function formatObservedRoutes(ctx: TestModeContext, item?: TestPlanItem): string
   return `
 
 Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), use one of these real observed URLs/paths, or a regex scoped only to what you're sure of (e.g. that the path changed away from the current one) — do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
+}
+
+/**
+ * Surfaces a real "Healix will not complete this step" gate observed during EXPLORE for a plan
+ * item's routes (see browser/crawler.ts's `CrawledRoute.otpGateReached`/`destructiveActionsSeen`,
+ * Cluster C) — an OTP/verification-code screen (can't be observed/synthesized) or a
+ * destructive/irreversible action (deleting an account, making a payment — real side effects on
+ * a real app/account). Both get the same treatment: the model must stop short of the gate rather
+ * than assume it completes. Returns '' when no relevant route carries either signal.
+ */
+function formatUnautomatableStepNotice(ctx: TestModeContext, item?: TestPlanItem): string {
+  const allRoutes = ctx.exploration?.crawl.routes ?? [];
+  if (allRoutes.length === 0) return '';
+  const routes = filterRoutesForItem(allRoutes, routePathForItem(ctx, item));
+
+  const otpUrls = Array.from(new Set(routes.filter((r) => r.otpGateReached).map((r) => r.url)));
+  const destructive = new Map<string, Set<string>>();
+  for (const r of routes) {
+    for (const name of r.destructiveActionsSeen ?? []) {
+      const urls = destructive.get(name) ?? new Set<string>();
+      urls.add(r.url);
+      destructive.set(name, urls);
+    }
+  }
+  if (otpUrls.length === 0 && destructive.size === 0) return '';
+
+  const parts: string[] = [];
+  if (otpUrls.length > 0) {
+    parts.push(
+      `OTP/verification-code gate detected at ${otpUrls.join(', ')}: exploration reached a screen requiring a one-time code (SMS/email/authenticator) that Healix cannot observe or synthesize — a real code is never guessable and must never be invented. If this scenario's flow passes through that screen, do NOT assert the flow completes past it. Instead either (a) write it as test.fixme('<title> — blocked by an OTP/verification step Healix cannot complete', async () => { ... }) covering only the steps up to the gate, or (b) assert only the observable pre-gate state (e.g. the code-input field becomes visible, or a "code sent" confirmation appears) rather than asserting the end-to-end outcome.`,
+    );
+  }
+  if (destructive.size > 0) {
+    const named = [...destructive.entries()].map(([name, urls]) => `"${name}" (on ${[...urls].join(', ')})`);
+    parts.push(
+      `Destructive/irreversible action(s) detected: ${named.join(', ')}. These delete real data or trigger a real payment against the app under test, so Healix never clicks them during exploration and a generated test must not either. If this scenario's flow would require actually completing one of these, do NOT click it or assert it succeeded — instead write it as test.fixme('<title> — requires a destructive/irreversible action Healix will not execute automatically; run manually', async () => { ... }) covering only the steps up to (but not including) that click.`,
+    );
+  }
+  return `\n\n${parts.join('\n\n')}`;
 }
 
 /** Render a plan item's scenarios as a numbered list for the generation prompt. */
@@ -1153,9 +1265,32 @@ function formatSourceGrounding(ctx: TestModeContext, item: TestPlanItem, tier: T
   const form = ctx.sourceContext?.forms.find((f) => f.file === unit.file);
   if (form && form.fields.length > 0) {
     const fieldList = form.fields
-      .map((f) => `${f.name} (${f.type}${f.required ? ', required' : ''})`)
+      .map((f) => `${f.name} (${f.type}${f.required ? ', required' : ''}${f.widgetLike ? ', WIDGET' : ''})`)
       .join(', ');
     lines.push(`Real form fields observed in ${unit.file}: ${fieldList}.`);
+
+    // GAP-066: a field tagged WIDGET (react-datepicker-style calendar/picker/autocomplete
+    // component) only updates its bound value through its own onChange callback — .fill() sets
+    // the DOM value directly and never invokes it, so the field never actually changes and any
+    // `required` validation gating a submit control never clears.
+    const widgetFields = form.fields.filter((f) => f.widgetLike);
+    if (widgetFields.length > 0) {
+      lines.push(
+        `WARNING: field(s) tagged WIDGET above (${widgetFields.map((f) => f.name).join(', ')}) are backed by a custom calendar/picker/autocomplete-style widget component, not a plain input — calling \`.fill()\` on them sets the DOM value directly and will NOT trigger the widget's own change handler, so the underlying form value stays empty/unset. Interact via the widget's own UI instead (click to open it, then select the value from its own picker/calendar/list), or otherwise use whatever interaction its real behavior requires — do not assume \`.fill()\` alone is sufficient for these fields.`,
+      );
+    }
+
+    // GAP-067: a submit control gated on a form's overall validity (e.g. React Hook Form's
+    // `disabled={!isValid}`) never enables until EVERY required field is satisfied — including a
+    // confirm/repeat field cross-validated against another one. A test that fills only some of a
+    // multi-required-field form before clicking/asserting that submit control will hang or fail
+    // for a reason that has nothing to do with the app itself.
+    const requiredFields = form.fields.filter((f) => f.required);
+    if (requiredFields.length > 1) {
+      lines.push(
+        `RULE: this form has multiple required fields (${requiredFields.map((f) => f.name).join(', ')}) — before clicking or asserting against its validity-gated submit control, you MUST fill/select EVERY field listed as required above, including any confirm/repeat field cross-validated against another field. Filling only some of them leaves the submit control's disabled/gating condition permanently unmet, causing the interaction to hang or the assertion to fail for a reason that has nothing to do with the app itself.`,
+      );
+    }
   }
 
   return lines.join('\n');
@@ -1183,6 +1318,7 @@ function buildPrompt(
   const contentInventory = formatContentInventory(ctx, tier, item);
   const routingGuidance = formatRoutingGuidance(ctx);
   const observedRoutes = formatObservedRoutes(ctx, item);
+  const unautomatableStepNotice = formatUnautomatableStepNotice(ctx, item);
   const sourceGrounding = formatSourceGrounding(ctx, item, tier);
   const scenarios =
     item.scenarios.length > 0 ? item.scenarios : [{ kind: 'positive' as const, description: item.intent }];
@@ -1262,6 +1398,13 @@ Requirements:
   \`{ name: ... }\`/\`{ exact: true }\` filter, a more specific visible text/data-testid/id, or chain
   \`.first()\`/\`.nth()\` when you intend a specific match — only rely on an unscoped locator when the
   inventory above shows it is the sole element of that role/name on the page.
+- When asserting content a modal/dialog is expected to show (e.g. confirmation text, an inline
+  error inside a dialog), do NOT use a bare page-level \`getByText(...)\` — if the same text is also
+  permanent static copy elsewhere on the page (a banner, a hidden template, footer boilerplate), the
+  assertion can pass or fail without the modal actually being open, proving nothing about the modal
+  itself. Scope the locator to the dialog container instead, e.g.
+  \`page.getByRole('dialog').getByText('...')\` (or \`'alertdialog'\`) — only assert unscoped page-level
+  text when you're confident it's unique to the modal's own presence.
 - Be self-contained and runnable; do not import any other local helpers beyond the one import above.
 - When a scenario CREATES a new resource that the app enforces as unique (e.g. registering a user
   by email, creating an account/username), do NOT hardcode a fixed literal value for that unique
@@ -1271,7 +1414,7 @@ Requirements:
   remembers what earlier runs already created. Scenarios that deliberately test the duplicate/conflict
   path itself should still register their own fresh unique value first, then reuse THAT same value for
   the collision attempt within the same test.
-- ${tierGuidance}${mockNote}${inventory}${contentInventory}${routingGuidance}${observedRoutes}${sourceGrounding}
+- ${tierGuidance}${mockNote}${inventory}${contentInventory}${routingGuidance}${observedRoutes}${unautomatableStepNotice}${sourceGrounding}
 
 Scenarios to cover, one test(...) each, in this order:
 ${scenarioList}
@@ -1953,6 +2096,13 @@ Requirements that apply to EVERY feature's spec below:
   \`{ name: ... }\`/\`{ exact: true }\` filter, a more specific visible text/data-testid/id, or chain
   \`.first()\`/\`.nth()\` when you intend a specific match — only rely on an unscoped locator when that
   feature's own inventory below shows it is the sole element of that role/name on the page.
+- When asserting content a modal/dialog is expected to show (e.g. confirmation text, an inline
+  error inside a dialog), do NOT use a bare page-level \`getByText(...)\` — if the same text is also
+  permanent static copy elsewhere on the page (a banner, a hidden template, footer boilerplate), the
+  assertion can pass or fail without the modal actually being open, proving nothing about the modal
+  itself. Scope the locator to the dialog container instead, e.g.
+  \`page.getByRole('dialog').getByText('...')\` (or \`'alertdialog'\`) — only assert unscoped page-level
+  text when you're confident it's unique to the modal's own presence.
 - Be self-contained and runnable; do not import any other local helpers beyond the one import above.
 - When a scenario CREATES a new resource that the app enforces as unique (e.g. registering a user
   by email, creating an account/username), do NOT hardcode a fixed literal value for that unique
@@ -1972,6 +2122,7 @@ Requirements that apply to EVERY feature's spec below:
     const inventory = formatSnapshotInventory(ctx, tier, item);
     const contentInventory = formatContentInventory(ctx, tier, item);
     const observedRoutes = formatObservedRoutes(ctx, item);
+    const unautomatableStepNotice = formatUnautomatableStepNotice(ctx, item);
     const sourceGrounding = formatSourceGrounding(ctx, item, tier);
     return `
 
@@ -1979,7 +2130,7 @@ Requirements that apply to EVERY feature's spec below:
 Feature: ${item.title}
 Feature intent: ${item.intent}
 Scenarios to cover, one test(...) each, in this order:
-${scenarioList}${inventory}${contentInventory}${observedRoutes}${sourceGrounding}
+${scenarioList}${inventory}${contentInventory}${observedRoutes}${unautomatableStepNotice}${sourceGrounding}
 Output this feature's spec between:
 ${batchMarkerStart(reqTag)}
 ...

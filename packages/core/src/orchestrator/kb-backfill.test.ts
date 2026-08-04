@@ -27,6 +27,7 @@ function result(overrides: Partial<TestResult> & Pick<TestResult, 'id' | 'testId
     stepsJson: null,
     skipReason: null,
     videoUnavailableReason: null,
+    evidenceJson: null,
     ...overrides,
   };
 }

@@ -98,6 +98,22 @@ function buildEvidenceBlock(input: TriageInput): string[] {
       ]
     : [];
 
+  // Real evidence that this test's OWN request(s) fell through the generated mock fixture
+  // unintercepted (see ExecOutcome.mockPassthrough / triage/rules.ts's unmocked_passthrough_hang)
+  // — its hostname matched no detected dependency and no mockOverride matched either, so it hit
+  // the real (often unreachable, sandboxed) backend and hung. This is the concrete signal that
+  // separates "mock configuration gap" from "the app/environment was genuinely slow" for an
+  // otherwise-unexplained bare timeout; app/mock-derived, so fenced as untrusted like the error text.
+  const hasMockPassthroughEvidence =
+    typeof input.mockPassthroughEvidence === 'string' && input.mockPassthroughEvidence.trim().length > 0;
+  const mockPassthroughBlock = hasMockPassthroughEvidence
+    ? [
+        '',
+        '--- UNMOCKED PASSTHROUGH DETECTED (untrusted) ---',
+        fenceUntrusted(truncate(input.mockPassthroughEvidence, MAX_SOURCE_CHARS)),
+      ]
+    : [];
+
   return [
     '--- FAILED TEST ---',
     `Title: ${title}${reqLine}${traceLine}`,
@@ -106,6 +122,7 @@ function buildEvidenceBlock(input: TriageInput): string[] {
     fenceUntrusted(error),
     ...traceBlock,
     ...apiEvidenceBlock,
+    ...mockPassthroughBlock,
     '',
     '--- TEST SPEC SOURCE ---',
     specSource,
@@ -130,6 +147,11 @@ const HYPOTHESIS_PREAMBLE = [
   '    use this when an ACTUAL API RESPONSE block below is marked [HEALIX',
   "    MOCK] and it's missing/malformed exactly the field the assertion",
   "    needed — that is Healix's OWN mock being incomplete, not the app.",
+  '    Also use this when an UNMOCKED PASSTHROUGH DETECTED block is present',
+  '    alongside a bare timeout with no other selector/assertion signal — that',
+  "    is a mock-configuration gap (the test's own request's hostname wasn't",
+  '    recognized, so it hit the real backend and hung), not a genuinely slow',
+  '    app or infrastructure problem.',
   '  flaky — non-deterministic timing/visibility issue likely to pass on retry.',
   '  ambiguous — genuinely insufficient evidence to attribute fault.',
   '',

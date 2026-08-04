@@ -147,6 +147,86 @@ describe.skipIf(!fs.existsSync(PSV_ROUTES_FILE))(
       expect(keys).not.toContain('route:passwordupdate');
       expect(keys).not.toContain('route:points');
       expect(keys).not.toContain('route:vouchers');
+
+      // The real regression this fixture exists to catch (Cluster C): `dashboard` is wrapped by
+      // <ProtectedRoute>, and that guard must be inherited by every pathless descendant, not just
+      // the node that literally carries the wrapper.
+      const byKey = new Map(units?.map((u) => [u.key, u]));
+      for (const guarded of [
+        'route:/dashboard',
+        'route:/dashboard/points',
+        'route:/dashboard/vouchers',
+        'route:/dashboard/unsubscribepage',
+      ]) {
+        expect(byKey.get(guarded)?.authGuardName).toBe('ProtectedRoute');
+      }
+      for (const unguarded of [
+        'route:/login',
+        'route:/login/resetpassword',
+        'route:/home',
+        'route:/register',
+      ]) {
+        expect(byKey.get(unguarded)?.authGuardName).toBeUndefined();
+      }
     });
   },
 );
+
+describe('route-guard inheritance (Cluster C)', () => {
+  it('flags a <Route> whose own element is wrapped by a recognized guard component', () => {
+    const source = `<Route path="/account" element={<ProtectedRoute><Account /></ProtectedRoute>} />;`;
+    const units = extractReactRouterRoutesAst('src/App.tsx', source);
+    expect(units?.find((u) => u.key === 'route:/account')?.authGuardName).toBe('ProtectedRoute');
+  });
+
+  it('inherits a guard on a parent layout route down to every pathless child', () => {
+    const source = `
+      <Routes>
+        <Route path="dashboard" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+          <Route index element={<Overview />} />
+          <Route path="points" element={<Points />} />
+          <Route path="vouchers" element={<Vouchers />} />
+        </Route>
+      </Routes>
+    `;
+    const units = extractReactRouterRoutesAst('src/App.tsx', source);
+    const byKey = new Map(units?.map((u) => [u.key, u]));
+    expect(byKey.get('route:/dashboard')?.authGuardName).toBe('ProtectedRoute');
+    expect(byKey.get('route:/dashboard/points')?.authGuardName).toBe('ProtectedRoute');
+    expect(byKey.get('route:/dashboard/vouchers')?.authGuardName).toBe('ProtectedRoute');
+  });
+
+  it('leaves a sibling route with no guard ancestor unset', () => {
+    const source = `
+      <Routes>
+        <Route path="dashboard" element={<ProtectedRoute><Layout /></ProtectedRoute>}>
+          <Route path="points" element={<Points />} />
+        </Route>
+        <Route path="login" element={<LoginPage />} />
+      </Routes>
+    `;
+    const units = extractReactRouterRoutesAst('src/App.tsx', source);
+    expect(units?.find((u) => u.key === 'route:/login')?.authGuardName).toBeUndefined();
+  });
+
+  it('detects a guard in a createBrowserRouter object-config element, inherited into nested children', () => {
+    const source = `
+      import { createBrowserRouter } from 'react-router-dom';
+      export const router = createBrowserRouter([
+        {
+          path: '/dashboard',
+          element: <ProtectedRoute><Layout /></ProtectedRoute>,
+          children: [
+            { path: 'settings', element: <Settings /> },
+          ],
+        },
+        { path: '/login', element: <LoginPage /> },
+      ]);
+    `;
+    const units = extractReactRouterRoutesAst('src/routes.tsx', source);
+    const byKey = new Map(units?.map((u) => [u.key, u]));
+    expect(byKey.get('route:/dashboard')?.authGuardName).toBe('ProtectedRoute');
+    expect(byKey.get('route:/dashboard/settings')?.authGuardName).toBe('ProtectedRoute');
+    expect(byKey.get('route:/login')?.authGuardName).toBeUndefined();
+  });
+});

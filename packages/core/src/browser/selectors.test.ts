@@ -1182,6 +1182,83 @@ describe('selectors.duplicate-target capture dedup (mirrored)', () => {
   });
 });
 
+// --- collectModalText (Cluster E) — mirrored -------------------------------
+
+/** Mirrors selectors.ts's DIALOG_CONTAINER_SELECTOR match: role="dialog"/"alertdialog" or
+ * aria-modal="true". */
+function isDialogContainerMirror(el: FakeEl): boolean {
+  const role = el.attrs['role'];
+  return role === 'dialog' || role === 'alertdialog' || el.attrs['aria-modal'] === 'true';
+}
+
+/** Mirrors collectModalText's visibility gate (same shape as isVisibleWithStyle: hidden + a
+ * simulated cursor-free style check — this test file's FakeEl has no getClientRects/display
+ * concept, so `hidden` alone stands in for "not visible" here). */
+function isVisibleMirror(el: FakeEl): boolean {
+  return !el.hidden;
+}
+
+/** Same clamp values as selectors.ts's MODAL_TEXT_MAX_CHARS/BODY_TEXT_MAX_CHARS. */
+const MODAL_TEXT_MAX_CHARS_MIRROR = 2000;
+
+function clampMirror(text: string, max: number): string {
+  const trimmed = text.trim();
+  return trimmed.length > max ? trimmed.slice(0, max) : trimmed;
+}
+
+/** Mirrors collectModalText's modal-half: find every visible dialog-shaped container in
+ * document order, concatenate their textContent, clamp. */
+function collectModalTextMirror(root: FakeEl): string | undefined {
+  const dialogs = descendantsInDocumentOrder(root).filter(isDialogContainerMirror);
+  const visible = dialogs.filter(isVisibleMirror);
+  if (visible.length === 0) return undefined;
+  return clampMirror(visible.map((el) => el.textContent ?? '').join(' '), MODAL_TEXT_MAX_CHARS_MIRROR);
+}
+
+describe('selectors.collectModalText (Cluster E, mirrored)', () => {
+  it('captures text from a visible role="dialog" container', () => {
+    const root = fakeEl('div');
+    const dialog = fakeEl('div', { attrs: { role: 'dialog' }, textContent: 'Delete your account?' });
+    appendChild(root, dialog);
+    expect(collectModalTextMirror(root)).toBe('Delete your account?');
+  });
+
+  it('captures text from a role="alertdialog" container too', () => {
+    const root = fakeEl('div');
+    const dialog = fakeEl('div', { attrs: { role: 'alertdialog' }, textContent: 'Payment failed' });
+    appendChild(root, dialog);
+    expect(collectModalTextMirror(root)).toBe('Payment failed');
+  });
+
+  it('captures text from an aria-modal="true" container with no explicit role', () => {
+    const root = fakeEl('div');
+    const dialog = fakeEl('div', { attrs: { 'aria-modal': 'true' }, textContent: 'Confirm changes' });
+    appendChild(root, dialog);
+    expect(collectModalTextMirror(root)).toBe('Confirm changes');
+  });
+
+  it('returns undefined when no dialog-shaped container is present at all', () => {
+    const root = fakeEl('div');
+    appendChild(root, fakeEl('p', { textContent: 'Just page copy' }));
+    expect(collectModalTextMirror(root)).toBeUndefined();
+  });
+
+  it('ignores a hidden dialog container (not currently open)', () => {
+    const root = fakeEl('div');
+    const dialog = fakeEl('div', { attrs: { role: 'dialog' }, textContent: 'Hidden dialog', hidden: true });
+    appendChild(root, dialog);
+    expect(collectModalTextMirror(root)).toBeUndefined();
+  });
+
+  it('clamps modal text longer than the cap', () => {
+    const root = fakeEl('div');
+    const longText = 'x'.repeat(MODAL_TEXT_MAX_CHARS_MIRROR + 500);
+    const dialog = fakeEl('div', { attrs: { role: 'dialog' }, textContent: longText });
+    appendChild(root, dialog);
+    expect(collectModalTextMirror(root)?.length).toBe(MODAL_TEXT_MAX_CHARS_MIRROR);
+  });
+});
+
 // --- Mirrored collectContentElements() ---
 //
 // Same rationale/convention as collectGenericClickCandidatesMirror above: the real function runs

@@ -487,6 +487,57 @@ describe('classifyByRules / engine.classify', () => {
         expect(result.verdict).not.toBe('app_is_wrong');
       });
     });
+
+    describe('unmocked_passthrough_hang (Cluster F)', () => {
+      const BARE_TIMEOUT_ERROR = 'Test timeout of 60000ms exceeded.';
+      const PASSTHROUGH_EVIDENCE =
+        'POST https://old-host.example.test/auth/login — fell through the mock fixture unintercepted (2026-01-01T00:00:00Z)';
+
+      it('classifies as environment (high confidence) when mockPassthroughEvidence corroborates a bare timeout', () => {
+        const result = engine.classify({
+          title: 't',
+          error: BARE_TIMEOUT_ERROR,
+          mockPassthroughEvidence: PASSTHROUGH_EVIDENCE,
+        });
+        expect(result.verdict).toBe('environment');
+        expect(result.confidence).toBeGreaterThanOrEqual(0.8);
+        expect(result.rationale).toContain('fell through the generated mock fixture unintercepted');
+      });
+
+      it('scores higher confidence than the generic bare_timeout rule (corroborated beats guessed)', () => {
+        const uncorroborated = engine.classify({ title: 't', error: BARE_TIMEOUT_ERROR });
+        const corroborated = engine.classify({
+          title: 't',
+          error: BARE_TIMEOUT_ERROR,
+          mockPassthroughEvidence: PASSTHROUGH_EVIDENCE,
+        });
+        expect(corroborated.confidence).toBeGreaterThan(uncorroborated.confidence);
+      });
+
+      it('does NOT fire when mockPassthroughEvidence is absent (falls through to the generic bare_timeout verdict)', () => {
+        const result = engine.classify({ title: 't', error: BARE_TIMEOUT_ERROR });
+        expect(result.verdict).toBe('environment');
+        expect(result.confidence).toBeLessThan(0.8);
+      });
+
+      it('does NOT fire when the error has assertion context, even with passthrough evidence present (a more specific rule already owns it)', () => {
+        const result = engine.classify({
+          title: 't',
+          error: ASSERTION_ERROR,
+          mockPassthroughEvidence: PASSTHROUGH_EVIDENCE,
+        });
+        expect(result.rationale).not.toContain('fell through the generated mock fixture unintercepted');
+      });
+
+      it('does NOT fire when the error has selector-not-found context, even with passthrough evidence present', () => {
+        const result = engine.classify({
+          title: 't',
+          error: "Error: locator resolved to 0 elements: getByText('Missing')",
+          mockPassthroughEvidence: PASSTHROUGH_EVIDENCE,
+        });
+        expect(result.verdict).toBe('test_is_wrong');
+      });
+    });
   });
 
   describe('suite_url_convention_mismatch', () => {

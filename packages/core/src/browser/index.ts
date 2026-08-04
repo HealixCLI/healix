@@ -6,6 +6,7 @@ export type StorageState = Awaited<ReturnType<BrowserContext['storageState']>>;
 import {
   collectContentElements,
   collectInteractiveElements,
+  collectModalText,
   INTERACTIVE_ELEMENT_SELECTOR,
 } from './selectors.js';
 import { ensurePlaywrightBrowsersInstalled, looksLikeMissingBrowser } from './ensure-browsers.js';
@@ -41,23 +42,189 @@ const SAME_DOC_POLL_MS = 150;
  * DOM, so the reveal was silently treated as a no-op dropdown instead of a recorded state.
  */
 const CLICK_SETTLE_TIMEOUT_MS = 800;
-/** Per-body character cap on captured request/response bodies — mirrors
- * generate.ts's MAX_MOCK_BODY_CHARS so captured ground truth and the prompt
- * budget it eventually feeds stay the same order of magnitude. */
+/** Char-length gate for whether a captured body needs truncating at all. Not a hard
+ * output cap for JSON bodies (see {@link truncateJsonValue}) — those are shrunk
+ * structurally instead, so the result stays valid JSON regardless of final length. Mirrors
+ * generate.ts's MAX_MOCK_BODY_CHARS so captured ground truth and the prompt budget it
+ * eventually feeds stay the same order of magnitude. */
 const MAX_CAPTURED_BODY_CHARS = 400;
+/** Arrays anywhere in a captured JSON body are capped to their first N elements
+ * (GAP-063) — a real API list response can be hundreds of KB; keeping the shape and
+ * a handful of real samples is enough for both prompt grounding and a runtime mock,
+ * without needing to fit an arbitrary char budget. */
+const MAX_ARRAY_ELEMENTS = 5;
+/** Per-string-value cap applied to any JSON string field longer than this (GAP-063) —
+ * e.g. a `description`/`metadata` field carrying embedded HTML/CSS boilerplate can run
+ * to several KB on its own, independent of any array truncation. */
+const STRING_FIELD_MAX_CHARS = 200;
 /** Hard cap on buffered network events between drains, so a chatty page
  * (polling/analytics) can't grow the buffer unbounded during a long crawl. */
 const MAX_BUFFERED_EVENTS = 200;
 
-function truncateBody(text: string): string {
-  return text.length > MAX_CAPTURED_BODY_CHARS ? `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…` : text;
+/** Cuts a long string at its first sentence boundary (`.`/`!`/`?` followed by
+ * whitespace-or-end) when one exists within the cap; otherwise hard-cuts with `…`.
+ * Markup-heavy fields (HTML/CSS boilerplate) rarely have an early sentence boundary
+ * and fall through to the hard cut — expected, not a defect. */
+function truncateStringField(value: string): string {
+  if (value.length <= STRING_FIELD_MAX_CHARS) return value;
+  const window = value.slice(0, STRING_FIELD_MAX_CHARS);
+  const sentenceEnd = window.match(/[.!?](?=\s|$)/);
+  if (sentenceEnd?.index !== undefined) return window.slice(0, sentenceEnd.index + 1);
+  return `${window}…`;
+}
+
+/** Recursively caps array length and long string values within a parsed JSON value
+ * (GAP-063) so a captured body stays valid, representative JSON regardless of how
+ * large the real response was — instead of a flat char-slice that can cut mid-structure
+ * and produce invalid JSON. */
+function truncateJsonValue(value: unknown): unknown {
+  if (Array.isArray(value)) {
+    return value.slice(0, MAX_ARRAY_ELEMENTS).map(truncateJsonValue);
+  }
+  if (typeof value === 'string') {
+    return truncateStringField(value);
+  }
+  if (value && typeof value === 'object') {
+    const result: Record<string, unknown> = {};
+    for (const [key, v] of Object.entries(value as Record<string, unknown>)) {
+      result[key] = truncateJsonValue(v);
+    }
+    return result;
+  }
+  return value;
+}
+
+/** True for `application/xml`, `text/xml`, `application/soap+xml`, and any other
+ * `*+xml` content-type (GAP-069) — the set of types `truncateBody()` routes to the
+ * structural XML truncator instead of the flat char-slice fallback. */
+export function isXmlContentType(contentType: string | undefined): boolean {
+  if (!contentType) return false;
+  return /(?:^|\/)xml\s*(?:;|$)|\+xml\s*(?:;|$)/i.test(contentType);
+}
+
+/** A parsed XML element (`children` holds nested elements/text) or a text run between
+ * tags. Deliberately minimal — only what a captured API response body needs (elements,
+ * attributes carried verbatim, text, CDATA) — not a general/validating XML parser. */
+type XmlNode =
+  | { type: 'element'; tag: string; attrs: string; selfClosing: boolean; children: XmlNode[] }
+  | { type: 'text'; value: string }
+  | { type: 'cdata'; value: string }
+  | { type: 'other'; value: string };
+
+/** Tokenizes and parses `text` into a tree of {@link XmlNode}s, tolerating a single
+ * leading prolog/declaration and comments anywhere. Returns `null` on any structural
+ * inconsistency (unclosed/mismatched tags) — same contract as `JSON.parse` throwing:
+ * the caller falls back to a safe default rather than emitting something malformed. */
+function parseXmlLoose(text: string): XmlNode[] | null {
+  const tokenRe = /<\?[\s\S]*?\?>|<!--[\s\S]*?-->|<!\[CDATA\[[\s\S]*?\]\]>|<\/[^>]+>|<[^>/][^>]*\/?>|[^<]+/g;
+  const root: XmlNode[] = [];
+  const stack: Array<{ tag: string; children: XmlNode[] }> = [];
+  const current = () => (stack.length > 0 ? stack[stack.length - 1].children : root);
+
+  let match: RegExpExecArray | null;
+  while ((match = tokenRe.exec(text)) !== null) {
+    const token = match[0];
+    if (token.startsWith('<?') || token.startsWith('<!--')) {
+      current().push({ type: 'other', value: token });
+    } else if (token.startsWith('<![CDATA[')) {
+      current().push({ type: 'cdata', value: token.slice(9, -3) });
+    } else if (token.startsWith('</')) {
+      const tag = token.slice(2, -1).trim();
+      const top = stack.pop();
+      if (!top || top.tag !== tag) return null;
+    } else if (token.startsWith('<')) {
+      const selfClosing = /\/>$/.test(token);
+      const body = token.slice(1, selfClosing ? -2 : -1).trim();
+      const nameMatch = body.match(/^[^\s/]+/);
+      if (!nameMatch) return null;
+      const tag = nameMatch[0];
+      const attrs = body.slice(tag.length);
+      const node: XmlNode = { type: 'element', tag, attrs, selfClosing, children: [] };
+      current().push(node);
+      if (!selfClosing) stack.push({ tag, children: node.children });
+    } else {
+      current().push({ type: 'text', value: token });
+    }
+  }
+  if (stack.length > 0) return null;
+  return root;
+}
+
+/** Re-emits a parsed {@link XmlNode} tree back into XML text, the inverse of
+ * {@link parseXmlLoose}. */
+function serializeXmlNodes(nodes: XmlNode[]): string {
+  return nodes
+    .map((node) => {
+      switch (node.type) {
+        case 'text':
+        case 'other':
+          return node.value;
+        case 'cdata':
+          return `<![CDATA[${node.value}]]>`;
+        case 'element': {
+          const open = `<${node.tag}${node.attrs}`;
+          if (node.selfClosing) return `${open}/>`;
+          return `${open}>${serializeXmlNodes(node.children)}</${node.tag}>`;
+        }
+      }
+    })
+    .join('');
+}
+
+/** Recursively caps repeated sibling elements and long text runs within a parsed XML
+ * tree (GAP-069) — the XML analogue of {@link truncateJsonValue}: a run of more than
+ * {@link MAX_ARRAY_ELEMENTS} sibling elements sharing the same tag (the XML equivalent
+ * of a JSON array of records, e.g. repeated `<item>`/`<row>` elements) is capped to the
+ * first N, and long text content is cut with {@link truncateStringField} — same caps,
+ * same rationale, applied structurally so the result is well-formed by construction. */
+function truncateXmlNodes(nodes: XmlNode[]): XmlNode[] {
+  const result: XmlNode[] = [];
+  const tagCounts = new Map<string, number>();
+  for (const node of nodes) {
+    if (node.type === 'element') {
+      const count = (tagCounts.get(node.tag) ?? 0) + 1;
+      tagCounts.set(node.tag, count);
+      if (count > MAX_ARRAY_ELEMENTS) continue;
+      result.push({ ...node, children: truncateXmlNodes(node.children) });
+    } else if (node.type === 'text') {
+      result.push({ type: 'text', value: truncateStringField(node.value) });
+    } else {
+      result.push(node);
+    }
+  }
+  return result;
+}
+
+/** Structural, well-formedness-preserving XML/SOAP truncation (GAP-069) — the XML
+ * counterpart to `truncateBody()`'s JSON branch. Parses `text`, caps it via
+ * {@link truncateXmlNodes}, and re-serializes; falls back to the original flat
+ * char-slice when the body doesn't parse with {@link parseXmlLoose}'s loose grammar. */
+export function truncateXmlBody(text: string): string {
+  const nodes = parseXmlLoose(text);
+  if (nodes === null) return `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…`;
+  return serializeXmlNodes(truncateXmlNodes(nodes));
+}
+
+/** Exported for direct unit testing (GAP-063) — otherwise only used internally by
+ * {@link captureNetworkEvent}. `contentType`, when it looks like XML/SOAP (GAP-069),
+ * routes the non-JSON fallback through {@link truncateXmlBody} instead of a flat
+ * char-slice, so a truncated XML body stays well-formed. */
+export function truncateBody(text: string, contentType?: string): string {
+  if (text.length <= MAX_CAPTURED_BODY_CHARS) return text;
+  try {
+    const parsed = JSON.parse(text);
+    return JSON.stringify(truncateJsonValue(parsed));
+  } catch {
+    if (isXmlContentType(contentType)) return truncateXmlBody(text);
+    return `${text.slice(0, MAX_CAPTURED_BODY_CHARS)}…`;
+  }
 }
 
 /** Best-effort capture of one response + its originating request. Only called for
  * xhr/fetch resource types (see caller) — other resource types (images, css, fonts,
  * documents) are irrelevant to mock-endpoint ground truth and are skipped before this
  * is ever invoked. Swallows read errors (binary bodies, aborted/redirected responses). */
-async function captureNetworkEvent(response: Response): Promise<CapturedNetworkEvent> {
+export async function captureNetworkEvent(response: Response): Promise<CapturedNetworkEvent> {
   const request = response.request();
   const event: CapturedNetworkEvent = {
     method: request.method(),
@@ -71,8 +238,14 @@ async function captureNetworkEvent(response: Response): Promise<CapturedNetworkE
     // No readable request body.
   }
   try {
+    const contentType = response.headers()['content-type'];
+    if (contentType) event.contentType = contentType;
+  } catch {
+    // Headers unavailable (redirected/aborted response).
+  }
+  try {
     const text = await response.text();
-    if (text) event.responseBody = truncateBody(text);
+    if (text) event.responseBody = truncateBody(text, event.contentType);
   } catch {
     // Binary, redirected, or otherwise unreadable response body.
   }
@@ -327,6 +500,16 @@ export function createBrowserSurface(): BrowserSurface {
       } catch {
         axTree = undefined;
       }
+      // Best-effort, same posture as ariaSnapshot() above — a failure here (e.g. the page
+      // navigated away mid-evaluate) must never fail the whole snapshot.
+      let modalText: string | undefined;
+      let bodyText: string | undefined;
+      try {
+        ({ modalText, bodyText } = await collectModalText(p));
+      } catch {
+        modalText = undefined;
+        bodyText = undefined;
+      }
       const [title, interactiveElements, contentElements] = await Promise.all([
         p.title(),
         collectInteractiveElements(p),
@@ -338,6 +521,8 @@ export function createBrowserSurface(): BrowserSurface {
         interactiveElements,
         contentElements,
         axTree,
+        modalText,
+        bodyText,
       };
     },
 

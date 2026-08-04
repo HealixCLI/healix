@@ -53,12 +53,14 @@ import {
   playwrightProjectArgs,
   readMockRequestCounts,
   readApiEvidence,
+  readMockPassthroughLog,
   type AuthSignals,
 } from './execute.js';
 import {
   API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_PASSTHROUGH_LOG_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
 } from './templates.js';
 
@@ -1258,6 +1260,15 @@ describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / cl
     await clearExecCheckpoint(dir);
     expect(await readMockRequestCounts(dir)).toEqual({});
   });
+
+  it('Cluster F: clearExecCheckpoint also clears the mock-passthrough log, so a later unrelated execute() call starts fresh', async () => {
+    writeFileSync(
+      join(dir, MOCK_PASSTHROUGH_LOG_FILENAME),
+      `${JSON.stringify({ key: 'f#t', method: 'GET', url: 'https://unmocked.example.test/x', at: '2026-01-01T00:00:00Z' })}\n`,
+    );
+    await clearExecCheckpoint(dir);
+    expect(await readMockPassthroughLog(dir)).toEqual({});
+  });
 });
 
 describe("readMockRequestCounts — F-15: tallies the mock fixture's write-through hit log", () => {
@@ -1367,6 +1378,65 @@ describe('readApiEvidence — per-test summary of actual request-fixture calls',
       ].join('\n') + '\n',
     );
     const out = await readApiEvidence(dir);
+    expect(Object.keys(out)).toEqual(['f#t']);
+    expect(out['f#t']).toContain('/ok');
+  });
+});
+
+describe('readMockPassthroughLog — per-test evidence of unintercepted mock-fixture requests (Cluster F)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-passthrough-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (mocking disabled, or nothing ever fell through)', async () => {
+    expect(await readMockPassthroughLog(dir)).toEqual({});
+  });
+
+  it('groups entries by key and formats a compact summary naming the method/url that fell through', async () => {
+    writeFileSync(
+      join(dir, MOCK_PASSTHROUGH_LOG_FILENAME),
+      `${JSON.stringify({
+        key: 'tests/tierB-auth/x.spec.ts#a',
+        method: 'POST',
+        url: 'https://old-host.example.test/auth/login',
+        at: '2026-01-01T00:00:00.000Z',
+      })}\n`,
+    );
+    const out = await readMockPassthroughLog(dir);
+    const summary = out['tests/tierB-auth/x.spec.ts#a'];
+    expect(summary).toContain('POST https://old-host.example.test/auth/login');
+    expect(summary).toContain('fell through the mock fixture unintercepted');
+  });
+
+  it('keeps only the LAST few calls per key (bounded, so a chatty test cannot blow up the prompt)', async () => {
+    const many = Array.from({ length: 6 }, (_, i) =>
+      JSON.stringify({ key: 'f#t', method: 'GET', url: `/call-${i}`, at: '2026-01-01T00:00:00Z' }),
+    ).join('\n');
+    writeFileSync(join(dir, MOCK_PASSTHROUGH_LOG_FILENAME), `${many}\n`);
+    const summary = (await readMockPassthroughLog(dir))['f#t'];
+    expect(summary).not.toContain('/call-0');
+    expect(summary).not.toContain('/call-2');
+    expect(summary).toContain('/call-3');
+    expect(summary).toContain('/call-5');
+  });
+
+  it('skips a malformed line instead of losing every other entry, and drops lines with no key', async () => {
+    writeFileSync(
+      join(dir, MOCK_PASSTHROUGH_LOG_FILENAME),
+      [
+        JSON.stringify({ key: 'f#t', method: 'GET', url: '/ok', at: '2026-01-01T00:00:00Z' }),
+        'not valid json',
+        JSON.stringify({ method: 'GET', url: '/nokey', at: '2026-01-01T00:00:00Z' }),
+        '',
+      ].join('\n') + '\n',
+    );
+    const out = await readMockPassthroughLog(dir);
     expect(Object.keys(out)).toEqual(['f#t']);
     expect(out['f#t']).toContain('/ok');
   });

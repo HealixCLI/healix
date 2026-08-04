@@ -303,6 +303,42 @@ describe('buildTriagePrompt — actual API response evidence (apiEvidence)', () 
   });
 });
 
+describe('buildTriagePrompt — unmocked passthrough evidence (mockPassthroughEvidence, Cluster F)', () => {
+  const OPEN = '<<<UNTRUSTED_TEST_OUTPUT';
+  const CLOSE = 'UNTRUSTED_TEST_OUTPUT>>>';
+
+  it('includes the mockPassthroughEvidence block, fenced as untrusted, when provided', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'Test timeout of 60000ms exceeded.',
+      mockPassthroughEvidence:
+        'POST https://old-host.example.test/auth/login — fell through the mock fixture unintercepted',
+    });
+    expect(prompt).toContain('--- UNMOCKED PASSTHROUGH DETECTED (untrusted) ---');
+    expect(prompt).toContain('fell through the mock fixture unintercepted');
+
+    const idx = prompt.indexOf('fell through the mock fixture unintercepted');
+    const openIdx = prompt.lastIndexOf(OPEN, idx);
+    const closeIdx = prompt.indexOf(CLOSE, openIdx);
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(idx).toBeGreaterThan(openIdx);
+    expect(idx).toBeLessThan(closeIdx);
+  });
+
+  it('omits the block entirely when mockPassthroughEvidence is absent', () => {
+    // Deliberately checks for the full block HEADER (with its "---" delimiters), not the bare
+    // phrase "UNMOCKED PASSTHROUGH DETECTED" — that phrase also appears in the trusted
+    // HYPOTHESIS_PREAMBLE guidance prose regardless of whether this block is actually present.
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom' });
+    expect(prompt).not.toContain('--- UNMOCKED PASSTHROUGH DETECTED (untrusted) ---');
+  });
+
+  it('omits the block when mockPassthroughEvidence is present but blank/whitespace-only', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom', mockPassthroughEvidence: '   ' });
+    expect(prompt).not.toContain('--- UNMOCKED PASSTHROUGH DETECTED (untrusted) ---');
+  });
+});
+
 describe('buildBatchTriagePrompt / parseBatchTriageReply — batched triage round-trip', () => {
   const ITEMS: TriageBatchItem[] = [
     { id: 'a', input: { title: 'Login works', error: 'expect(locator).toBeVisible() failed' } },

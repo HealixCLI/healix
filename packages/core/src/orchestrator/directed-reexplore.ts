@@ -201,7 +201,9 @@ function errMsg(err: unknown): string {
  * terminating condition fires. Never throws: any internal failure degrades to a warn-level emit
  * and returns `specs` as far as it got.
  */
-export async function runDirectedReexplore(params: DirectedReexploreParams): Promise<DirectedReexploreResult> {
+export async function runDirectedReexplore(
+  params: DirectedReexploreParams,
+): Promise<DirectedReexploreResult> {
   const {
     ctx,
     mode,
@@ -270,11 +272,18 @@ export async function runDirectedReexplore(params: DirectedReexploreParams): Pro
             // existing field (verifiedLogin/authAttempted/authReason/loginCandidates/etc.) so
             // nothing execute.ts reads later (lines 137-138: crawl.verifiedLogin, loginCandidates)
             // changes value — only `routes` is overridden.
-            ctx.exploration = { ...ctx.exploration, crawl: { ...ctx.exploration.crawl, routes: mergedRoutes } };
+            ctx.exploration = {
+              ...ctx.exploration,
+              crawl: { ...ctx.exploration.crawl, routes: mergedRoutes },
+            };
             mergedUrls.add(normalizeUrl(targetUrl));
           }
         } catch (err) {
-          emit('generate', 'warn', `Directed re-exploration crawl failed for ${targetUrl} (continuing): ${errMsg(err)}`);
+          emit(
+            'generate',
+            'warn',
+            `Directed re-exploration crawl failed for ${targetUrl} (continuing): ${errMsg(err)}`,
+          );
         }
       }
       if (mergedUrls.size === 0) break; // no forward progress possible this iteration
@@ -299,12 +308,18 @@ export async function runDirectedReexplore(params: DirectedReexploreParams): Pro
       const validation = mode.validate
         ? await mode.validate(ctx, regenerated)
         : { ok: regenerated, repaired: [], quarantined: [], warnings: [] };
-      const contentsByPath = new Map([...validation.ok, ...validation.repaired].map((s) => [s.path, s.contents]));
+      const contentsByPath = new Map(
+        [...validation.ok, ...validation.repaired].map((s) => [s.path, s.contents]),
+      );
       const accepted = regenerated.flatMap((s) =>
         contentsByPath.has(s.path) ? [{ ...s, contents: contentsByPath.get(s.path)! }] : [],
       );
       if (accepted.length === 0) {
-        emit('generate', 'warn', 'Directed re-exploration: all regenerated spec(s) failed validation; stopping.');
+        emit(
+          'generate',
+          'warn',
+          'Directed re-exploration: all regenerated spec(s) failed validation; stopping.',
+        );
         break;
       }
 
@@ -317,7 +332,11 @@ export async function runDirectedReexplore(params: DirectedReexploreParams): Pro
         try {
           reregisterSpecRows(spec, affectedItems);
         } catch (err) {
-          emit('generate', 'warn', `Directed re-exploration: failed to update DB row(s) for ${spec.path}: ${errMsg(err)}`);
+          emit(
+            'generate',
+            'warn',
+            `Directed re-exploration: failed to update DB row(s) for ${spec.path}: ${errMsg(err)}`,
+          );
         }
       }
 
@@ -328,7 +347,11 @@ export async function runDirectedReexplore(params: DirectedReexploreParams): Pro
       );
       const closed = affectedItems.filter((it) => !stillGapped.has(it.id)).length;
       gapsClosedTotal += closed;
-      emit('generate', 'info', `Directed re-exploration iteration ${iteration}: closed ${closed}/${affectedItems.length} gap(s).`);
+      emit(
+        'generate',
+        'info',
+        `Directed re-exploration iteration ${iteration}: closed ${closed}/${affectedItems.length} gap(s).`,
+      );
       if (closed === 0) break; // no forward progress — mirrors the coverage loop's own break
     }
   } catch (err) {
@@ -341,6 +364,7 @@ export async function runDirectedReexplore(params: DirectedReexploreParams): Pro
     specs,
     iterations: iteration,
     gapsClosed: gapsClosedTotal,
-    gapsRemaining: resolveGapTargets(specs, plan.items, routing, baseUrl, ctx.exploration?.crawl.routes).length,
+    gapsRemaining: resolveGapTargets(specs, plan.items, routing, baseUrl, ctx.exploration?.crawl.routes)
+      .length,
   };
 }

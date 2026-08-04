@@ -250,7 +250,11 @@ afterEach(() => {
 describe('directed re-exploration (offline DI seam, real crawl()/store logic)', () => {
   it('escape-hatch -> targeted re-crawl -> regenerate -> EXECUTE runs the regenerated spec, with no duplicate DB row', async () => {
     const store = (await getStore()) as HealixStore;
-    const project = store.createProject({ name: 'Directed Reexplore', mode: 'playwright', baseUrl: BASE_URL });
+    const project = store.createProject({
+      name: 'Directed Reexplore',
+      mode: 'playwright',
+      baseUrl: BASE_URL,
+    });
 
     const genAttempts = { n: 0 };
     const events: OrchestratorEvent[] = [];
@@ -288,7 +292,11 @@ describe('directed re-exploration (offline DI seam, real crawl()/store logic)', 
 
   it("suiteMode: 'reuse' never triggers directed re-exploration", async () => {
     const store = (await getStore()) as HealixStore;
-    const project = store.createProject({ name: 'Directed Reexplore Reuse Base', mode: 'playwright', baseUrl: BASE_URL });
+    const project = store.createProject({
+      name: 'Directed Reexplore Reuse Base',
+      mode: 'playwright',
+      baseUrl: BASE_URL,
+    });
 
     const genAttemptsBase = { n: 0 };
     const { browser: baseBrowser } = makeFakeBrowser();
@@ -327,7 +335,11 @@ describe('directed re-exploration (offline DI seam, real crawl()/store logic)', 
 
   it('a crawl failure during directed re-exploration does not fail the run — ships the original fixme spec untouched', async () => {
     const store = (await getStore()) as HealixStore;
-    const project = store.createProject({ name: 'Directed Reexplore Crawl Fails', mode: 'playwright', baseUrl: BASE_URL });
+    const project = store.createProject({
+      name: 'Directed Reexplore Crawl Fails',
+      mode: 'playwright',
+      baseUrl: BASE_URL,
+    });
 
     const genAttempts = { n: 0 };
     const events: OrchestratorEvent[] = [];
@@ -362,9 +374,9 @@ describe('directed re-exploration (offline DI seam, real crawl()/store logic)', 
 
     // The run still completes normally (fail-open) despite the crawl failure.
     expect(summary.status).not.toBe('error');
-    expect(events.some((e) => e.level === 'warn' && e.message.toLowerCase().includes('directed re-exploration'))).toBe(
-      true,
-    );
+    expect(
+      events.some((e) => e.level === 'warn' && e.message.toLowerCase().includes('directed re-exploration')),
+    ).toBe(true);
 
     const report = JSON.parse(await readFile(summary.reportPath as string, 'utf8')) as RunReport;
     const testTitles = report.tests?.map((t) => t.title) ?? [];

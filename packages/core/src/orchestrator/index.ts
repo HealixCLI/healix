@@ -2532,7 +2532,11 @@ async function runPipeline(
               );
             }
           } catch (err) {
-            emit('generate', 'warn', `Directed re-exploration failed (continuing without it): ${errMsg(err)}`);
+            emit(
+              'generate',
+              'warn',
+              `Directed re-exploration failed (continuing without it): ${errMsg(err)}`,
+            );
           }
         }
 
@@ -3850,7 +3854,10 @@ function reregisterSpecRows(
     (spec.planItemId ? items.find((it) => it.id === spec.planItemId) : undefined) ??
     (reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined);
   if (!item) {
-    noteStoreFailure('reregisterSpecRows', new Error(`no plan item resolved for regenerated spec ${spec.path}`));
+    noteStoreFailure(
+      'reregisterSpecRows',
+      new Error(`no plan item resolved for regenerated spec ${spec.path}`),
+    );
     return;
   }
   const specPath = relative(projectDir, spec.path);

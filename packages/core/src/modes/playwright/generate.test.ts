@@ -441,7 +441,9 @@ test('[REQ:REQ-1] guessed', async ({ page }) => {
   await page.locator('button').click();
 });
 `;
-    expect(extractEscapeHatchReasons(source)).toEqual([{ testTitle: '[REQ:REQ-1] guessed', reason: 'needs review' }]);
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      { testTitle: '[REQ:REQ-1] guessed', reason: 'needs review' },
+    ]);
   });
 
   it('returns one entry per escape-hatched block, skipping blocks with no marker', () => {
@@ -1560,7 +1562,11 @@ describe('generate — write-through per-item checkpoint (resume mid-phase witho
       specPath: join(projectDir, 'tests/tierA-public/b.spec.ts'),
       specTitle: '[REQ:REQ-B] Feature B',
     };
-    await writeFile(join(projectDir, GEN_CHECKPOINT_FILENAME), `${JSON.stringify(a)}\n${JSON.stringify(b)}\n`, 'utf-8');
+    await writeFile(
+      join(projectDir, GEN_CHECKPOINT_FILENAME),
+      `${JSON.stringify(a)}\n${JSON.stringify(b)}\n`,
+      'utf-8',
+    );
 
     await forgetGenerateCheckpointEntries(projectDir, ['a']);
 
@@ -1628,7 +1634,10 @@ describe('generate — write-through per-item checkpoint (resume mid-phase witho
 
     // Without forgetting, generate() would skip item "a" entirely (restored from disk, provider
     // never called) — confirm that's still true before the fix under test runs.
-    const skippedSpecs = await generate(makeCtx(makeProvider([specFor('REQ-A', 'should not be used')], calls)), plan);
+    const skippedSpecs = await generate(
+      makeCtx(makeProvider([specFor('REQ-A', 'should not be used')], calls)),
+      plan,
+    );
     expect(calls).toHaveLength(0);
     expect(skippedSpecs[0]?.contents).toContain('first attempt, guessed a selector');
 

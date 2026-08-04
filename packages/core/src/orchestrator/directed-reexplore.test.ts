@@ -10,7 +10,14 @@ import { describe, it, expect, vi } from 'vitest';
 import type { BrowserSurfaceOptions, CapturedNetworkEvent, DomSnapshot, Point } from '../browser/types.js';
 import type { BrowserSurface } from '../browser/types.js';
 import { normalizeUrl, type RoutePrefixInfo } from '../browser/crawler.js';
-import type { ExplorationArtifact, GeneratedSpec, TestMode, TestModeContext, TestPlan, TestPlanItem } from '../modes/types.js';
+import type {
+  ExplorationArtifact,
+  GeneratedSpec,
+  TestMode,
+  TestModeContext,
+  TestPlan,
+  TestPlanItem,
+} from '../modes/types.js';
 import {
   dedupGapTargetUrls,
   resolveGapTargets,
@@ -22,7 +29,11 @@ import {
 const NO_HASH: RoutePrefixInfo = { hashRouted: false };
 const BASE_URL = 'https://a.test';
 
-function specWithEscapeHatch(planItemId: string, path = 'tests/x.spec.ts', reason = 'no reason given'): GeneratedSpec {
+function specWithEscapeHatch(
+  planItemId: string,
+  path = 'tests/x.spec.ts',
+  reason = 'no reason given',
+): GeneratedSpec {
   return {
     path,
     title: `[REQ:${planItemId}] guessed`,
@@ -136,7 +147,10 @@ describe('resolveGapTargets — tier-based fallback when unitKey is endpoint:-pr
 
   it('falls back to the AUTHENTICATED landing route (not just any route) for a tierB-auth item', () => {
     const items = [planItem('a', undefined, 'tierB-auth')];
-    const crawledRoutes = [route('https://a.test/', 'anonymous'), route('https://a.test/dashboard', 'authenticated')];
+    const crawledRoutes = [
+      route('https://a.test/', 'anonymous'),
+      route('https://a.test/dashboard', 'authenticated'),
+    ];
     const gaps = resolveGapTargets([specWithEscapeHatch('a')], items, NO_HASH, BASE_URL, crawledRoutes);
     expect(gaps[0]?.targetUrl).toBe('https://a.test/dashboard');
   });
@@ -244,7 +258,10 @@ function makeFakeBrowser(pages: Record<string, FakePage>): {
   return { browser, gotoCalls, clickCalls, typeCalls, startCalls, stopCalls };
 }
 
-function makeExploration(routes: ExplorationArtifact['crawl']['routes'], overrides: Partial<ExplorationArtifact['crawl']> = {}): ExplorationArtifact {
+function makeExploration(
+  routes: ExplorationArtifact['crawl']['routes'],
+  overrides: Partial<ExplorationArtifact['crawl']> = {},
+): ExplorationArtifact {
   return {
     crawl: {
       routes,
@@ -276,7 +293,9 @@ function thinRoute(url: string) {
   };
 }
 
-function makeCtx(overrides: Partial<TestModeContext> & { exploration: ExplorationArtifact }): TestModeContext {
+function makeCtx(
+  overrides: Partial<TestModeContext> & { exploration: ExplorationArtifact },
+): TestModeContext {
   return {
     projectDir: '/tmp/unused',
     baseUrl: BASE_URL,
@@ -317,7 +336,9 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
   it('re-crawls ONLY the resolved route — never the whole app', async () => {
     const target = `${BASE_URL}/forgot-password`;
     const { browser, gotoCalls } = makeFakeBrowser({
-      [target]: { interactiveElements: [{ role: 'button', name: 'Reset', selector: '[data-testid="reset"]' }] },
+      [target]: {
+        interactiveElements: [{ role: 'button', name: 'Reset', selector: '[data-testid="reset"]' }],
+      },
       [BASE_URL]: { interactiveElements: [{ role: 'link', name: 'unrelated', selector: 'a.unrelated' }] },
     });
     const ctx = makeCtx({ browser, exploration: makeExploration([thinRoute(target)]) });
@@ -344,7 +365,9 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
   it('merges the richer route into ctx.exploration.crawl.routes, preserving verifiedLogin/authAttempted untouched', async () => {
     const target = `${BASE_URL}/forgot-password`;
     const { browser } = makeFakeBrowser({
-      [target]: { interactiveElements: [{ role: 'button', name: 'Reset', selector: '[data-testid="reset"]' }] },
+      [target]: {
+        interactiveElements: [{ role: 'button', name: 'Reset', selector: '[data-testid="reset"]' }],
+      },
     });
     const verifiedLogin = {
       pageUrl: `${BASE_URL}/login`,
@@ -354,7 +377,11 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
     };
     const ctx = makeCtx({
       browser,
-      exploration: makeExploration([thinRoute(target)], { authAttempted: true, authVerified: true, verifiedLogin }),
+      exploration: makeExploration([thinRoute(target)], {
+        authAttempted: true,
+        authVerified: true,
+        verifiedLogin,
+      }),
     });
     const plan: TestPlan = { summary: 's', items: [planItem('a', 'route:/forgot-password')] };
     const mode = { generate: vi.fn().mockResolvedValue([cleanSpec('a')]) } as unknown as TestMode;
@@ -406,11 +433,13 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
     };
     // 'a' never resolves (keeps re-triggering the same redirecting re-crawl); 'b' resolves on its
     // very first regeneration (the "forward progress" that keeps the loop going past iteration 1).
-    const generate = vi.fn().mockImplementation(async (_ctx: TestModeContext, calledPlan: TestPlan) =>
-      calledPlan.items.map((it) =>
-        it.id === 'a' ? specWithEscapeHatch('a', 'tests/a.spec.ts', 'still missing') : cleanSpec('b'),
-      ),
-    );
+    const generate = vi
+      .fn()
+      .mockImplementation(async (_ctx: TestModeContext, calledPlan: TestPlan) =>
+        calledPlan.items.map((it) =>
+          it.id === 'a' ? specWithEscapeHatch('a', 'tests/a.spec.ts', 'still missing') : cleanSpec('b'),
+        ),
+      );
     const mode = { generate } as unknown as TestMode;
 
     const result = await runDirectedReexplore({
@@ -504,9 +533,11 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
     const ctx = makeCtx({ browser, exploration: makeExploration(routes) });
     const plan: TestPlan = { summary: 's', items };
     // Fully resolves whatever subset of items it's called with, every time.
-    const generate = vi.fn().mockImplementation(async (_ctx: TestModeContext, calledPlan: TestPlan) =>
-      calledPlan.items.map((it) => cleanSpec(it.id, `tests/${it.id}.spec.ts`)),
-    );
+    const generate = vi
+      .fn()
+      .mockImplementation(async (_ctx: TestModeContext, calledPlan: TestPlan) =>
+        calledPlan.items.map((it) => cleanSpec(it.id, `tests/${it.id}.spec.ts`)),
+      );
     const mode = { generate } as unknown as TestMode;
 
     const result = await runDirectedReexplore({
@@ -531,7 +562,9 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
     const ctx = makeCtx({ browser, exploration: makeExploration([thinRoute(target)]) });
     const plan: TestPlan = { summary: 's', items: [planItem('a', 'route:/forgot-password')] };
     // Regenerating produces the SAME escape hatch every time — zero gaps closed.
-    const generate = vi.fn().mockResolvedValue([specWithEscapeHatch('a', 'tests/x.spec.ts', 'still missing')]);
+    const generate = vi
+      .fn()
+      .mockResolvedValue([specWithEscapeHatch('a', 'tests/x.spec.ts', 'still missing')]);
     const mode = { generate } as unknown as TestMode;
 
     const result = await runDirectedReexplore({

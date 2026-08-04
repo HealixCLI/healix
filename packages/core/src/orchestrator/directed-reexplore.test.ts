@@ -19,7 +19,7 @@ import type {
   TestPlanItem,
 } from '../modes/types.js';
 import {
-  dedupGapTargetUrls,
+  dedupGapTargets,
   resolveGapTargets,
   runDirectedReexplore,
   DIRECTED_REEXPLORE_MAX_ITERATIONS,
@@ -66,14 +66,19 @@ test('[REQ:${planItemId}] resolved', async ({ page }) => {
   };
 }
 
-function planItem(id: string, unitKey?: string, tier: TestPlanItem['tier'] = 'tierA-public'): TestPlanItem {
+function planItem(
+  id: string,
+  unitKey?: string,
+  tier: TestPlanItem['tier'] = 'tierA-public',
+  overrides: { title?: string; scenarios?: TestPlanItem['scenarios'] } = {},
+): TestPlanItem {
   return {
     id,
-    title: `Feature ${id}`,
+    title: overrides.title ?? `Feature ${id}`,
     reqTag: id,
     tier,
     intent: 'test intent',
-    scenarios: [{ kind: 'positive', description: 'does the thing' }],
+    scenarios: overrides.scenarios ?? [{ kind: 'positive', description: 'does the thing' }],
     unitKey,
   };
 }
@@ -177,15 +182,151 @@ describe('resolveGapTargets — tier-based fallback when unitKey is endpoint:-pr
   });
 });
 
-describe('dedupGapTargetUrls — collapses gaps resolving to the same normalized URL', () => {
-  it('keeps only one entry per normalized URL, in first-seen order', () => {
+describe('resolveGapTargets — matches an already-discovered UI state before falling back to the tier landing page', () => {
+  function stateRoute(
+    url: string,
+    stateKey: string,
+    interactiveElements: { role: string; name: string; selector: string }[],
+  ) {
+    return {
+      url,
+      stateKey,
+      title: url,
+      snapshot: { url, title: url, interactiveElements },
+      depth: 0,
+      hasPasswordField: false,
+      role: 'anonymous' as const,
+      networkEvents: [],
+    };
+  }
+  function plainRoute(url: string) {
+    return {
+      url,
+      title: url,
+      snapshot: { url, title: url, interactiveElements: [] },
+      depth: 0,
+      hasPasswordField: false,
+      role: 'anonymous' as const,
+      networkEvents: [],
+    };
+  }
+
+  it('targets a discovered state whose content plausibly matches the item, carrying its stateKey', () => {
+    const items = [
+      planItem('a', undefined, 'tierA-public', {
+        title: 'Switching between Login and Register modes',
+        scenarios: [{ kind: 'positive', description: 'clicking Register switches to the register form' }],
+      }),
+    ];
+    const crawledRoutes = [
+      plainRoute('https://a.test/'),
+      stateRoute('https://a.test/', 'https://a.test/>>button.register', [
+        { role: 'heading', name: 'Register', selector: 'h1' },
+      ]),
+    ];
+    const gaps = resolveGapTargets([specWithEscapeHatch('a')], items, NO_HASH, BASE_URL, crawledRoutes);
+    expect(gaps[0]?.targetUrl).toBe('https://a.test/');
+    expect(gaps[0]?.stateKey).toBe('https://a.test/>>button.register');
+  });
+
+  it('falls back to the tier landing page (no stateKey) when no discovered state matches the item', () => {
+    const items = [
+      planItem('a', undefined, 'tierA-public', {
+        title: 'Switching between Login and Register modes',
+        scenarios: [{ kind: 'positive', description: 'clicking Register switches to the register form' }],
+      }),
+    ];
+    const crawledRoutes = [
+      plainRoute('https://a.test/'),
+      // A `role: 'button'` would false-positive-match the "register" action-verb bonus
+      // regardless of name (see ACTION_VERB_BONUSES) — using a non-actionable role here so this
+      // genuinely tests "no plausible overlap," not an accidental one.
+      stateRoute('https://a.test/', 'https://a.test/>>a.unrelated', [
+        { role: 'link', name: 'Help center', selector: 'a.help' },
+      ]),
+    ];
+    const gaps = resolveGapTargets([specWithEscapeHatch('a')], items, NO_HASH, BASE_URL, crawledRoutes);
+    expect(gaps[0]?.targetUrl).toBe('https://a.test/');
+    expect(gaps[0]?.stateKey).toBeUndefined();
+  });
+
+  it('still prefers a resolvable route:-prefixed unitKey over a matching state', () => {
+    const items = [
+      planItem('a', 'route:/forgot-password', 'tierA-public', {
+        title: 'Register',
+        scenarios: [{ kind: 'positive', description: 'register a new account' }],
+      }),
+    ];
+    const crawledRoutes = [
+      stateRoute('https://a.test/', 'https://a.test/>>button.register', [
+        { role: 'heading', name: 'Register', selector: 'h1' },
+      ]),
+    ];
+    const gaps = resolveGapTargets([specWithEscapeHatch('a')], items, NO_HASH, BASE_URL, crawledRoutes);
+    expect(gaps[0]?.targetUrl).toBe('https://a.test/forgot-password');
+    expect(gaps[0]?.stateKey).toBeUndefined();
+  });
+});
+
+describe('dedupGapTargets — collapses gaps resolving to the same target into one crawl target', () => {
+  it('keeps only one entry per normalized URL, in first-seen order, for plain route targets', () => {
     const gaps: EscapeHatchGap[] = [
       { id: '1', planItemId: 'a', testTitle: 't1', reason: 'r', targetUrl: 'https://a.test/x' },
       { id: '2', planItemId: 'b', testTitle: 't2', reason: 'r', targetUrl: 'https://a.test/x/' },
       { id: '3', planItemId: 'c', testTitle: 't3', reason: 'r', targetUrl: 'https://a.test/y' },
       { id: '4', planItemId: 'd', testTitle: 't4', reason: 'r', targetUrl: undefined },
     ];
-    expect(dedupGapTargetUrls(gaps)).toEqual(['https://a.test/x', 'https://a.test/y']);
+    expect(dedupGapTargets(gaps)).toEqual([
+      { targetUrl: 'https://a.test/x', stateKey: undefined },
+      { targetUrl: 'https://a.test/y', stateKey: undefined },
+    ]);
+  });
+
+  it('keeps two states that share the same URL as SEPARATE targets, keyed by stateKey', () => {
+    const gaps: EscapeHatchGap[] = [
+      {
+        id: '1',
+        planItemId: 'a',
+        testTitle: 't1',
+        reason: 'r',
+        targetUrl: 'https://a.test/',
+        stateKey: 'https://a.test/>>button.register',
+      },
+      {
+        id: '2',
+        planItemId: 'b',
+        testTitle: 't2',
+        reason: 'r',
+        targetUrl: 'https://a.test/',
+        stateKey: 'https://a.test/>>button.forgot-password',
+      },
+    ];
+    expect(dedupGapTargets(gaps)).toEqual([
+      { targetUrl: 'https://a.test/', stateKey: 'https://a.test/>>button.register' },
+      { targetUrl: 'https://a.test/', stateKey: 'https://a.test/>>button.forgot-password' },
+    ]);
+  });
+
+  it('collapses two gaps resolving to the SAME state into one target', () => {
+    const gaps: EscapeHatchGap[] = [
+      {
+        id: '1',
+        planItemId: 'a',
+        testTitle: 't1',
+        reason: 'r1',
+        targetUrl: 'https://a.test/',
+        stateKey: 'https://a.test/>>button.register',
+      },
+      {
+        id: '2',
+        planItemId: 'a',
+        testTitle: 't2',
+        reason: 'r2',
+        targetUrl: 'https://a.test/',
+        stateKey: 'https://a.test/>>button.register',
+      },
+    ];
+    expect(dedupGapTargets(gaps)).toHaveLength(1);
   });
 });
 
@@ -643,5 +784,72 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
 
     expect(startCalls).toHaveLength(1);
     expect(stopCalls).toHaveLength(1);
+  });
+
+  it("replays a matched state's exact click chain (not a generic probe) and merges it in by stateKey", async () => {
+    const { browser, gotoCalls, clickCalls } = makeFakeBrowser({
+      [BASE_URL]: { interactiveElements: [{ role: 'heading', name: 'Register', selector: 'h1' }] },
+    });
+    const stateKey = `${BASE_URL}>>button.register`;
+    const ctx = makeCtx({
+      browser,
+      exploration: makeExploration([
+        thinRoute(BASE_URL),
+        {
+          url: BASE_URL,
+          stateKey,
+          title: BASE_URL,
+          // findMatchingState checks THIS (already-discovered) inventory, not what a fresh crawl
+          // would return — must already carry something that overlaps the item's own requirement
+          // tokens for the match to fire at all.
+          snapshot: {
+            url: BASE_URL,
+            title: BASE_URL,
+            interactiveElements: [{ role: 'heading', name: 'Register', selector: 'h1' }],
+          },
+          depth: 0,
+          hasPasswordField: false,
+          role: 'anonymous',
+          networkEvents: [],
+        },
+      ]),
+    });
+    // No unitKey at all — resolveGapTargets must fall through to the state match, not the plain
+    // tier-landing fallback (BASE_URL has no route: unitKey to resolve to either).
+    const items = [
+      planItem('a', undefined, 'tierA-public', {
+        title: 'Switching between Login and Register modes',
+        scenarios: [{ kind: 'positive', description: 'clicking Register switches to the register form' }],
+      }),
+    ];
+    const plan: TestPlan = { summary: 's', items };
+    const mode = { generate: vi.fn().mockResolvedValue([cleanSpec('a')]) } as unknown as TestMode;
+
+    await runDirectedReexplore({
+      ctx,
+      mode,
+      plan,
+      specs: [specWithEscapeHatch('a')],
+      routing: NO_HASH,
+      baseUrl: BASE_URL,
+      reregisterSpecRows: vi.fn(),
+      emit: noopEmit(),
+      forgetCheckpointEntries: vi.fn().mockResolvedValue(undefined),
+    });
+
+    // Replayed the exact recorded click — never a generic/random probe.
+    expect(gotoCalls).toContain(BASE_URL);
+    expect(clickCalls).toEqual(['button.register']);
+
+    // Merged into the SAME stateKey'd entry (not a duplicate, and not overwriting the unrelated
+    // plain thinRoute(BASE_URL) entry, which shares the same url but a different identity).
+    const routes = ctx.exploration?.crawl.routes ?? [];
+    expect(routes).toHaveLength(2);
+    const stateEntry = routes.find((r) => r.stateKey === stateKey);
+    expect(stateEntry?.snapshot.interactiveElements).toEqual([
+      { role: 'heading', name: 'Register', selector: 'h1' },
+    ]);
+    const plainEntry = routes.find((r) => !r.stateKey);
+    expect(plainEntry?.url).toBe(BASE_URL);
   });
 });

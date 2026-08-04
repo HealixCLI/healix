@@ -15,6 +15,7 @@ import {
   crawl,
   normalizeUrl,
   reconcileStaticRoutePaths,
+  snapshotClean,
   type CrawledRoute,
   type RoutePrefixInfo,
   type VerifiedLoginInfo,
@@ -23,6 +24,7 @@ import type { BrowserSurface } from '../browser/types.js';
 import type { ProjectCredential } from '../storage/types.js';
 import type { GeneratedSpec, TestMode, TestModeContext, TestPlan, TestPlanItem } from '../modes/types.js';
 import { extractEscapeHatchReasons, forgetGenerateCheckpointEntries } from '../modes/playwright/generate.js';
+import { buildRequirementTokens, hasRequirementCoverage } from '../util/requirement-tokens.js';
 
 /** One escape-hatch marker found in a generated spec, resolved (or not) to a route to re-crawl. */
 export interface EscapeHatchGap {
@@ -30,9 +32,14 @@ export interface EscapeHatchGap {
   planItemId: string;
   testTitle: string;
   reason: string;
-  /** Absolute URL this gap's unitKey resolved to via reconcileStaticRoutePaths — undefined
-   *  (deliberately, never "every route") when it can't be resolved. */
+  /** Absolute URL this gap's unitKey resolved to via reconcileStaticRoutePaths, or the tier
+   *  fallback/matched state's own URL — undefined (deliberately, never "every route") when
+   *  nothing resolves at all. */
   targetUrl?: string;
+  /** Set only when `targetUrl` was reached via a matched, already-discovered UI state (see
+   *  findMatchingState) rather than a route/fallback URL — crawler.ts's own CrawledRoute.stateKey
+   *  encoding (`parentUrl>>selector1>>selector2...`), replayed before probing. */
+  stateKey?: string;
 }
 
 export interface DirectedReexploreResult {
@@ -70,13 +77,36 @@ function fallbackTargetForTier(item: TestPlanItem, crawledRoutes: CrawledRoute[]
 }
 
 /**
- * Resolves each escape-hatched spec's plan item to a target route URL, the same way
- * gap-fill.ts's identifyUnmetContentNeeds does (reconcileStaticRoutePaths on a `route:`-prefixed
- * unitKey) — but deliberately WITHOUT that function's fallback cascade (substring match, then
- * "every route" if even that fails). When there's no `route:`-prefixed unitKey to resolve at all,
- * falls back to the item's tier's already-crawled landing route (see fallbackTargetForTier) rather
- * than dropping the gap outright — a real, common case (see that function's doc comment). Only a
- * `tierC-api` item with no resolvable target is genuinely dropped.
+ * Finds an already-discovered UI STATE (not a route — a same-URL configuration EXPLORE's deep
+ * probe reached by clicking, recorded as its own CrawledRoute keyed by `stateKey` rather than
+ * `url`; see crawler.ts's own CrawledRoute.stateKey doc comment) that plausibly matches this
+ * item's own requirement text — e.g. a login/register toggle, an accordion, a modal. A `route:`
+ * unitKey is knowable from STATIC source analysis before the app ever runs, which is why the model
+ * can pick one during PLAN; a state is only knowable by actually running the app, which happens
+ * during EXPLORE, AFTER PLAN — so a state can never be a unitKey the model chooses. Instead it's
+ * matched here, after the fact, against whatever EXPLORE already happened to find. Reuses
+ * `buildRequirementTokens`/`hasRequirementCoverage` — the exact same coarse, false-negative-
+ * tolerant matching gap-fill.ts's own `identifyUnmetContentNeeds` already uses for content
+ * presence, not a new heuristic. Deliberately narrow: the FIRST plausible match, never "every
+ * state" — consistent with this module's "never target every route" principle.
+ */
+function findMatchingState(item: TestPlanItem, crawledRoutes: CrawledRoute[]): CrawledRoute | undefined {
+  const reqTokens = buildRequirementTokens(item);
+  if (reqTokens.size === 0) return undefined;
+  return crawledRoutes.find((r) => r.stateKey && hasRequirementCoverage(r, reqTokens));
+}
+
+/**
+ * Resolves each escape-hatched spec's plan item to a target to re-crawl, in priority order:
+ * 1. A `route:`-prefixed unitKey, resolved the same way gap-fill.ts's identifyUnmetContentNeeds
+ *    does (reconcileStaticRoutePaths) — but deliberately WITHOUT that function's fallback cascade
+ *    (substring match, then "every route" if even that fails).
+ * 2. An already-discovered UI state whose content plausibly matches this item (see
+ *    findMatchingState) — for apps where the relevant UI lives behind a click, not a URL.
+ * 3. The item's tier's already-crawled landing route (see fallbackTargetForTier) — the last
+ *    resort, never for `tierC-api` (a URL re-crawl can't ground a raw API endpoint's shape).
+ * An item that matches none of these is genuinely dropped: "target every route" would defeat the
+ * entire point of a targeted re-crawl.
  */
 export function resolveGapTargets(
   specs: GeneratedSpec[],
@@ -94,9 +124,17 @@ export function resolveGapTargets(
     if (!item) continue;
 
     let targetUrl: string | undefined;
+    let stateKey: string | undefined;
     if (item.unitKey?.startsWith('route:')) {
       const path = item.unitKey.replace(/^route:/, '');
       [targetUrl] = reconcileStaticRoutePaths([path], routing, baseUrl);
+    }
+    if (!targetUrl) {
+      const matchedState = findMatchingState(item, crawledRoutes);
+      if (matchedState) {
+        targetUrl = matchedState.url;
+        stateKey = matchedState.stateKey;
+      }
     }
     if (!targetUrl) {
       targetUrl = fallbackTargetForTier(item, crawledRoutes);
@@ -109,24 +147,37 @@ export function resolveGapTargets(
         testTitle: r.testTitle,
         reason: r.reason,
         targetUrl,
+        stateKey,
       });
     });
   }
   return gaps;
 }
 
-/** Collapses gaps resolving to the same normalized URL into one crawl target. */
-export function dedupGapTargetUrls(gaps: EscapeHatchGap[]): string[] {
+/** Identity a gap's target is deduped/tracked by: the stateKey when present (two states can share
+ *  one URL, e.g. login vs register on the same "/"), otherwise the normalized URL. */
+function targetIdentity(gap: Pick<EscapeHatchGap, 'targetUrl' | 'stateKey'>): string {
+  return gap.stateKey ?? normalizeUrl(gap.targetUrl!);
+}
+
+/** One distinct re-crawl target: a plain URL, or a URL plus a specific state's click-chain to replay first. */
+export interface GapTarget {
+  targetUrl: string;
+  stateKey?: string;
+}
+
+/** Collapses gaps resolving to the same target (see targetIdentity) into one crawl target. */
+export function dedupGapTargets(gaps: EscapeHatchGap[]): GapTarget[] {
   const seen = new Set<string>();
-  const urls: string[] = [];
+  const targets: GapTarget[] = [];
   for (const g of gaps) {
     if (!g.targetUrl) continue;
-    const key = normalizeUrl(g.targetUrl);
+    const key = targetIdentity(g);
     if (seen.has(key)) continue;
     seen.add(key);
-    urls.push(g.targetUrl);
+    targets.push({ targetUrl: g.targetUrl, stateKey: g.stateKey });
   }
-  return urls;
+  return targets;
 }
 
 /**
@@ -151,14 +202,50 @@ async function replayVerifiedLogin(
 }
 
 /**
+ * A CrawledRoute.stateKey encodes the exact path used to reach it: the parent URL, then every
+ * click selector used along the way, joined by `>>` (see crawler.ts's own doc comment on
+ * CrawledRoute.stateKey and the `>>` join at crawler.ts's deep-probe site). The first segment is
+ * the parent URL (already carried separately as the gap's own `targetUrl`), so only the segments
+ * after it are actual click selectors, in the order they must be replayed.
+ */
+function parseStateClickChain(stateKey: string): string[] {
+  return stateKey.split('>>').slice(1);
+}
+
+/**
+ * Deterministically reaches an already-discovered UI state by replaying its exact recorded click
+ * chain (see parseStateClickChain), instead of hoping a fresh, generic deep-probe happens to click
+ * the same thing again — the whole point of matching a state in the first place (see
+ * findMatchingState's doc comment).
+ */
+async function replayStateClickChain(
+  browser: BrowserSurface,
+  targetUrl: string,
+  stateKey: string,
+): Promise<void> {
+  await browser.goto(targetUrl);
+  for (const selector of parseStateClickChain(stateKey)) {
+    await browser.click(selector);
+  }
+}
+
+/**
  * Deep-probes exactly ONE route: `maxRoutes: 1` means crawl()'s BFS visits only `targetUrl`
  * (queue.shift() dequeues it first and the loop breaks immediately after), so the reverse-order
  * deep-probe pass (crawler.ts's GAP-060 restructuring) always has a single-element pass1Routes —
  * the full stateProbeBudget necessarily goes to this one route, never starved by any other.
+ *
+ * When `stateKey` is set (a matched UI state, not a route — see findMatchingState), replays that
+ * state's click chain first and takes a single fresh snapshot from there instead: crawl()'s BFS
+ * primitive has no notion of "start already three clicks deep," so reaching the state has to
+ * happen as its own step before any probing can occur at all. Deliberately a single snapshot, not
+ * a further recursive click-probe from the reached state (crawler.ts's own recursive prober,
+ * discoverClickRoutes, is internal/unexported) — still a large precision win over a generic
+ * full-page probe that has no guarantee of ever clicking the right thing at all.
  */
 async function reCrawlOneRoute(
   ctx: TestModeContext,
-  targetUrl: string,
+  target: GapTarget,
   needsAuth: boolean,
 ): Promise<CrawledRoute | undefined> {
   if (needsAuth) {
@@ -170,7 +257,24 @@ async function reCrawlOneRoute(
     // No verified login on record: proceed anonymously anyway (best-effort, fail-open) — the
     // deep-probe may simply find less than it would have post-login.
   }
-  const result = await crawl(ctx.browser, targetUrl, {
+
+  if (target.stateKey) {
+    await replayStateClickChain(ctx.browser, target.targetUrl, target.stateKey);
+    const snapshot = await snapshotClean(ctx.browser);
+    const networkEvents = ctx.browser.drainNetworkEvents();
+    return {
+      url: target.targetUrl,
+      stateKey: target.stateKey,
+      title: snapshot.title,
+      snapshot,
+      depth: 0,
+      hasPasswordField: snapshot.interactiveElements.some((el) => el.inputType === 'password'),
+      role: needsAuth ? 'authenticated' : 'anonymous',
+      networkEvents,
+    };
+  }
+
+  const result = await crawl(ctx.browser, target.targetUrl, {
     maxRoutes: 1,
     wallClockBudgetMs: DIRECTED_REEXPLORE_PER_ROUTE_BUDGET_MS,
     stateProbeBudget: DIRECTED_REEXPLORE_STATE_PROBE_BUDGET,
@@ -228,11 +332,11 @@ export async function runDirectedReexplore(
       if (targetable.length === 0) break; // nothing left to chase (covers "no gaps" and "nothing resolvable")
 
       iteration += 1;
-      const targetUrls = dedupGapTargetUrls(targetable).slice(0, DIRECTED_REEXPLORE_MAX_ROUTES_PER_ITERATION);
+      const targets = dedupGapTargets(targetable).slice(0, DIRECTED_REEXPLORE_MAX_ROUTES_PER_ITERATION);
       emit(
         'generate',
         'info',
-        `Directed re-exploration iteration ${iteration}/${DIRECTED_REEXPLORE_MAX_ITERATIONS}: re-crawling ${targetUrls.length} route(s) for ${targetable.length} unresolved-selector gap(s).`,
+        `Directed re-exploration iteration ${iteration}/${DIRECTED_REEXPLORE_MAX_ITERATIONS}: re-crawling ${targets.length} route(s)/state(s) for ${targetable.length} unresolved-selector gap(s).`,
       );
 
       if (!browserStarted) {
@@ -240,31 +344,41 @@ export async function runDirectedReexplore(
         browserStarted = true;
       }
 
-      // Only items whose gap resolved to a URL actually re-crawled THIS iteration (i.e. survived
-      // the route cap AND the crawl itself succeeding) get regenerated — never the full
-      // `targetable` set, which may hold more distinct routes than this iteration's cap allows.
-      const mergedUrls = new Set<string>();
-      for (const targetUrl of targetUrls) {
+      // Only items whose gap resolved to a target actually re-crawled THIS iteration (i.e.
+      // survived the route cap AND the crawl itself succeeding) get regenerated — never the full
+      // `targetable` set, which may hold more distinct targets than this iteration's cap allows.
+      const mergedTargets = new Set<string>();
+      for (const target of targets) {
         try {
           const needsAuth = targetable.some(
             (g) =>
-              normalizeUrl(g.targetUrl) === normalizeUrl(targetUrl) &&
+              targetIdentity(g) === targetIdentity(target) &&
               plan.items.find((it) => it.id === g.planItemId)?.tier === 'tierB-auth',
           );
-          const rich = await reCrawlOneRoute(ctx, targetUrl, needsAuth);
+          const rich = await reCrawlOneRoute(ctx, target, needsAuth);
           if (rich && ctx.exploration) {
             const mergedRoutes = [...ctx.exploration.crawl.routes];
-            // The crawl's OWN resolved URL (rich.url, post-redirect) is the right match key — a
-            // route that redirects (e.g. a trailing-slash/locale normalization) would otherwise
-            // never match the pre-redirect `targetUrl`, leaving the stale thin entry in place
-            // AND pushing a second, duplicate rich one alongside it. Falls back to `targetUrl`
-            // itself only if no entry matches the resolved URL, so the originally-thin entry
-            // that triggered this re-crawl still gets replaced rather than duplicated.
-            const richKey = normalizeUrl(rich.url);
-            const targetKey = normalizeUrl(targetUrl);
-            let idx = mergedRoutes.findIndex((r) => normalizeUrl(r.url) === richKey);
-            if (idx < 0 && richKey !== targetKey) {
-              idx = mergedRoutes.findIndex((r) => normalizeUrl(r.url) === targetKey);
+            // A matched-state target is uniquely identified by its stateKey (two states can share
+            // one URL — e.g. login vs register on the same "/"), so it must be matched on that,
+            // never on url alone, or a second state on the same page would overwrite the wrong
+            // entry. A plain route target has no stateKey; matched on its (possibly redirected)
+            // resolved URL instead — see the redirect-handling note below.
+            let idx: number;
+            if (target.stateKey) {
+              idx = mergedRoutes.findIndex((r) => r.stateKey === target.stateKey);
+            } else {
+              // The crawl's OWN resolved URL (rich.url, post-redirect) is the right match key — a
+              // route that redirects (e.g. a trailing-slash/locale normalization) would otherwise
+              // never match the pre-redirect target, leaving the stale thin entry in place AND
+              // pushing a second, duplicate rich one alongside it. Falls back to the target URL
+              // itself only if no entry matches the resolved URL, so the originally-thin entry
+              // that triggered this re-crawl still gets replaced rather than duplicated.
+              const richKey = normalizeUrl(rich.url);
+              const targetKey = normalizeUrl(target.targetUrl);
+              idx = mergedRoutes.findIndex((r) => normalizeUrl(r.url) === richKey);
+              if (idx < 0 && richKey !== targetKey) {
+                idx = mergedRoutes.findIndex((r) => normalizeUrl(r.url) === targetKey);
+              }
             }
             if (idx >= 0) mergedRoutes[idx] = rich;
             else mergedRoutes.push(rich);
@@ -276,20 +390,20 @@ export async function runDirectedReexplore(
               ...ctx.exploration,
               crawl: { ...ctx.exploration.crawl, routes: mergedRoutes },
             };
-            mergedUrls.add(normalizeUrl(targetUrl));
+            mergedTargets.add(targetIdentity(target));
           }
         } catch (err) {
           emit(
             'generate',
             'warn',
-            `Directed re-exploration crawl failed for ${targetUrl} (continuing): ${errMsg(err)}`,
+            `Directed re-exploration crawl failed for ${target.targetUrl}${target.stateKey ? ` (state: ${target.stateKey})` : ''} (continuing): ${errMsg(err)}`,
           );
         }
       }
-      if (mergedUrls.size === 0) break; // no forward progress possible this iteration
+      if (mergedTargets.size === 0) break; // no forward progress possible this iteration
 
       const affectedIds = new Set(
-        targetable.filter((g) => mergedUrls.has(normalizeUrl(g.targetUrl))).map((g) => g.planItemId),
+        targetable.filter((g) => mergedTargets.has(targetIdentity(g))).map((g) => g.planItemId),
       );
       const affectedItems = plan.items.filter((it) => affectedIds.has(it.id));
       if (affectedItems.length === 0) break;

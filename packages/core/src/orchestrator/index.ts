@@ -56,6 +56,7 @@ import {
   buildBatchPlanPrompt,
   parsePlanWithDiagnostics,
   synthesizePlan,
+  applyAuthGuardTierOverrides,
   type PlanRepoContext,
   type PlanParseFailureReason,
 } from './plan.js';
@@ -2864,6 +2865,11 @@ async function runPipeline(
             // assertion happened to print.
             const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
             const apiEvidence = execOutcome.apiEvidence?.[apiEvidenceKey];
+            // Same key/rationale as apiEvidence above — see execute.ts's
+            // readMockPassthroughLog() and ExecOutcome.mockPassthrough (Cluster F): real
+            // evidence that this test's own request fell through the generated mock fixture
+            // unintercepted, the likely cause of an otherwise-unexplained bare timeout.
+            const mockPassthroughEvidence = execOutcome.mockPassthrough?.[apiEvidenceKey];
             // Recover the plan item this spec was generated from, to find the source-context unit
             // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
             // candidates below, since most failures never reach that stage.
@@ -2880,6 +2886,7 @@ async function runPipeline(
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
               ...(apiEvidence ? { apiEvidence } : {}),
+              ...(mockPassthroughEvidence ? { mockPassthroughEvidence } : {}),
               ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;
@@ -3520,7 +3527,22 @@ export async function runPlanPhase(
       recordUsage,
       'initial',
     );
-    if (result.plan) return { ...result.plan, planSource: 'ai' };
+    if (result.plan) {
+      const correctedItems = applyAuthGuardTierOverrides(
+        result.plan.items,
+        units,
+        opts.testingScope ?? 'both',
+      );
+      const overrideCount = correctedItems.filter((it) => it.tierOverride).length;
+      if (overrideCount > 0) {
+        emit(
+          'plan',
+          'info',
+          `Corrected ${overrideCount} item(s) to tierB-auth based on detected route guards.`,
+        );
+      }
+      return { ...result.plan, items: correctedItems, planSource: 'ai' };
+    }
     emit('plan', 'warn', `Synthesizing fallback plan (reason: ${result.reason}).`);
     return {
       ...synthesizePlan(project, opts.testingScope ?? 'both'),
@@ -3642,9 +3664,15 @@ export async function runPlanPhase(
     };
   }
 
+  const correctedItems = applyAuthGuardTierOverrides(items, units, opts.testingScope ?? 'both');
+  const overrideCount = correctedItems.filter((it) => it.tierOverride).length;
+  if (overrideCount > 0) {
+    emit('plan', 'info', `Corrected ${overrideCount} item(s) to tierB-auth based on detected route guards.`);
+  }
+
   return {
     summary: `Planned ${items.length} item(s) across ${batches.length} batch(es) covering ${units.length} detected unit(s).`,
-    items,
+    items: correctedItems,
     planSource: 'ai',
     ...(failedBatches.length > 0
       ? {

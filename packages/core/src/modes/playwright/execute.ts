@@ -18,6 +18,7 @@ import {
   API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_PASSTHROUGH_LOG_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
 } from './templates.js';
 
@@ -960,6 +961,64 @@ export async function readApiEvidence(projectDir: string): Promise<Record<string
   return out;
 }
 
+interface MockPassthroughLogEntry {
+  key: string;
+  method: string;
+  url: string;
+  at: string;
+}
+
+/** How many of a test's own unintercepted passthrough calls get folded into its evidence
+ * string — same bound/rationale as API_EVIDENCE_MAX_CALLS_PER_TEST. */
+const MOCK_PASSTHROUGH_MAX_CALLS_PER_TEST = 3;
+
+/**
+ * Best-effort read of the mock fixture's write-through passthrough log (see
+ * MOCK_PASSTHROUGH_LOG_FILENAME's doc comment in templates.ts) — groups entries by key
+ * (`${specFile}#${title}`, same identity as readApiEvidence/this file's own checkpoint
+ * keyOf()) and formats the LAST few unintercepted calls per key into a compact,
+ * prompt-ready string. This is the concrete evidence that lets triage tell "this test's own
+ * request fell through the mock fixture and hit the real, unreachable backend" apart from "the
+ * app is just slow" for an otherwise-unexplained bare timeout. A missing file (no fixture-level
+ * mocking enabled, or nothing ever fell through) just means "no evidence" (`{}`), same
+ * best-effort contract as readApiEvidence/readMockRequestCounts.
+ */
+export async function readMockPassthroughLog(projectDir: string): Promise<Record<string, string>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_PASSTHROUGH_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const byKey = new Map<string, MockPassthroughLogEntry[]>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as Partial<MockPassthroughLogEntry>;
+      if (typeof entry.key !== 'string' || !entry.key) continue;
+      const list = byKey.get(entry.key) ?? [];
+      list.push({
+        key: entry.key,
+        method: typeof entry.method === 'string' && entry.method ? entry.method : 'GET',
+        url: typeof entry.url === 'string' ? entry.url : '',
+        at: typeof entry.at === 'string' ? entry.at : '',
+      });
+      byKey.set(entry.key, list);
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  const out: Record<string, string> = {};
+  for (const [key, entries] of byKey) {
+    out[key] = entries
+      .slice(-MOCK_PASSTHROUGH_MAX_CALLS_PER_TEST)
+      .map((e) => `${e.method} ${e.url} — fell through the mock fixture unintercepted (${e.at})`)
+      .join('\n');
+  }
+  return out;
+}
+
 /** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
 export async function readCheckpointEntries(projectDir: string): Promise<CheckpointEntry[]> {
   let raw: string;
@@ -1017,6 +1076,9 @@ export async function clearExecCheckpoint(projectDir: string): Promise<void> {
     // readApiEvidence has already run for THIS invocation) so a later,
     // unrelated execute() call reusing this projectDir starts fresh.
     unlink(join(projectDir, API_EVIDENCE_LOG_FILENAME)).catch(() => {}),
+    // Same rationale again: cleared here (after readMockPassthroughLog has already run for
+    // THIS invocation) so a later, unrelated execute() call reusing this projectDir starts fresh.
+    unlink(join(projectDir, MOCK_PASSTHROUGH_LOG_FILENAME)).catch(() => {}),
   ]);
 }
 
@@ -1581,6 +1643,9 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // whether results.json parsed, since the request fixture logs a call the
   // moment it resolves.
   const apiEvidence = await readApiEvidence(ctx.projectDir);
+  // Same rationale again: present regardless of whether results.json parsed, since the
+  // page.route() handler logs a passthrough the moment it decides not to intercept.
+  const mockPassthrough = await readMockPassthroughLog(ctx.projectDir);
 
   const outcome: ExecOutcome = {
     passed: parsed.passed,
@@ -1591,6 +1656,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     results: parsed.results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
     ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
+    ...(Object.keys(mockPassthrough).length > 0 ? { mockPassthrough } : {}),
     raw: {
       exitCode: cmd.code,
       signal: cmd.signal,

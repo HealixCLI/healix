@@ -23,6 +23,10 @@ interface FakePage {
   network?: CapturedNetworkEvent[];
   /** Simulated `ariaSnapshot()` output — a plain string, matching the real DomSnapshot.axTree shape. */
   axTree?: unknown;
+  /** Simulated captured modal/body text (see browser/index.ts's snapshot() — crawler.ts itself
+   * does no modal-text capture; this just confirms it passes both fields through untouched. */
+  modalText?: string;
+  bodyText?: string;
 }
 
 /**
@@ -114,6 +118,8 @@ function makeFakeBrowser(config: {
         title: page.title ?? currentUrl,
         interactiveElements: revealedElements ?? page.elements,
         axTree: page.axTree,
+        modalText: page.modalText,
+        bodyText: page.bodyText,
       };
     },
     async click(selector: string): Promise<void> {
@@ -925,6 +931,10 @@ describe('crawl() deep-probes for modal/multi-step state (GAP-056)', () => {
     expect(recordTypes).toContain('#nick');
     expect(recordTypes).not.toContain('#pw');
     expect(recordTypes).not.toContain('#otp-code');
+    // Cluster C: the OTP field on level1 (where fillSafeInputs actually ran and skipped it) is
+    // recorded as a gate, not silently discarded.
+    const level1Route = stateRoutes.find((r) => sameElements(r.snapshot.interactiveElements, level1));
+    expect(level1Route?.otpGateReached).toBe(true);
   });
 
   it('never exceeds the crawl-wide state-probe budget of 20', async () => {
@@ -1247,6 +1257,125 @@ describe('crawl() click-probe reset corruption (docs/click-probe-reset-corruptio
     expect(dashboardRoute?.unattemptedClickCandidates?.some((c) => c.selector === triggerB.selector)).toBe(
       true,
     );
+  });
+});
+
+describe('otpGateReached / destructiveActionsSeen (Cluster C)', () => {
+  it('flags the OTP gate even when the OTP field is on the DEEPEST discovered hop, where fillSafeInputs never runs to look further', async () => {
+    // fillSafeInputs only ever runs on a state to advance ONE hop deeper — at MAX_STATE_DEPTH's
+    // final hop it never runs against that hop's own snapshot, so an OTP field living there is
+    // never inspected by fillSafeInputs at all. otpGateReached must still catch it independently.
+    const openWallet = button('Manage wallet');
+    const level1 = [
+      button('F'),
+      button('G'),
+      button('H'),
+      button('I'),
+      button('J'),
+      { role: 'textbox', name: 'Card number', selector: '#card-number' } as InteractiveElement,
+    ];
+    // level1 has 6 elements; the nested discoverClickRoutes call measures level2 against THAT
+    // baseline (6), so level2 needs >= 11 elements total to clear STATE_REVEAL_MIN_NEW_ELEMENTS (5).
+    const level2 = [
+      button('Z1'),
+      button('Z2'),
+      button('Z3'),
+      button('Z4'),
+      button('Z5'),
+      button('Z6'),
+      button('Z7'),
+      button('Z8'),
+      button('Z9'),
+      button('Z10'),
+      { role: 'textbox', name: 'Enter verification code', selector: '#otp' } as InteractiveElement,
+    ];
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/reset': { elements: [openWallet] } },
+      onClickSelectorReveal: { [openWallet.selector]: level1, [level1[0]!.selector]: level2 },
+    });
+
+    const result = await crawl(browser, 'https://a.test/reset');
+
+    const stateRoutes = result.routes.filter((r) => r.stateKey);
+    // Compared by content, not reference: snapshotClean() (repeated-sibling collapse) now
+    // returns a fresh array even when nothing actually collapses, so the raw fixture array is
+    // never literally the same object as what gets stored on the route.
+    const sameElements = (a: InteractiveElement[], b: InteractiveElement[]): boolean =>
+      JSON.stringify(a) === JSON.stringify(b);
+    const level1Route = stateRoutes.find((r) => sameElements(r.snapshot.interactiveElements, level1));
+    const level2Route = stateRoutes.find((r) => sameElements(r.snapshot.interactiveElements, level2));
+    expect(level1Route?.otpGateReached).toBeFalsy();
+    expect(level2Route?.otpGateReached).toBe(true);
+  });
+
+  it('flags otpGateReached on a plain top-level route (not just a deep-probed state)', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/verify': {
+          elements: [{ role: 'textbox', name: 'One-time code', selector: '#code' } as InteractiveElement],
+        },
+      },
+    });
+    const result = await crawl(browser, 'https://a.test/verify');
+    expect(result.routes[0]?.otpGateReached).toBe(true);
+  });
+
+  it('leaves otpGateReached falsy when no OTP-shaped field exists anywhere on the route', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [button('Save')] } },
+    });
+    const result = await crawl(browser, 'https://a.test/');
+    expect(result.routes[0]?.otpGateReached).toBeFalsy();
+  });
+
+  it('records destructiveActionsSeen for a visible "Delete account"/"Pay now" control', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/account': { elements: [button('Delete account'), button('Pay now')] },
+      },
+    });
+    const result = await crawl(browser, 'https://a.test/account');
+    expect(result.routes[0]?.destructiveActionsSeen).toEqual(
+      expect.arrayContaining(['Delete account', 'Pay now']),
+    );
+  });
+
+  it('does NOT flag reversible/safe actions ("Save", "Submit", "Logout") as destructive (narrow-scope boundary)', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/settings': { elements: [button('Save'), button('Submit'), button('Logout')] },
+      },
+    });
+    const result = await crawl(browser, 'https://a.test/settings');
+    expect(result.routes[0]?.destructiveActionsSeen ?? []).toHaveLength(0);
+  });
+});
+
+describe('modalText / bodyText pass-through (Cluster E)', () => {
+  it('carries a captured modalText/bodyText from the browser snapshot onto the recorded route, untouched', async () => {
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/account': {
+          elements: [button('Delete account')],
+          modalText: 'Delete your account? This cannot be undone.',
+          bodyText: 'Delete your account? This cannot be undone. Footer: contact us.',
+        },
+      },
+    });
+    const result = await crawl(browser, 'https://a.test/account');
+    expect(result.routes[0]?.snapshot.modalText).toBe('Delete your account? This cannot be undone.');
+    expect(result.routes[0]?.snapshot.bodyText).toBe(
+      'Delete your account? This cannot be undone. Footer: contact us.',
+    );
+  });
+
+  it('leaves modalText/bodyText undefined when the browser snapshot never captured either', async () => {
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/': { elements: [] } },
+    });
+    const result = await crawl(browser, 'https://a.test/');
+    expect(result.routes[0]?.snapshot.modalText).toBeUndefined();
+    expect(result.routes[0]?.snapshot.bodyText).toBeUndefined();
   });
 });
 

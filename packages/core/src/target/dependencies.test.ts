@@ -308,6 +308,56 @@ describe('detectExternalDependencies', () => {
     expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
   });
 
+  it('detects a relative-path (no leading slash) auth call site on an axios instance with its own baseURL (GAP-064)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/authService.ts', "authApi.post('v1/web/token/generate', body);\n");
+    write(dir, '.env', 'AUTH_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = process.env.AUTH_API_URL;\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'AUTH_API_URL');
+    expect(dep).toBeDefined();
+    expect(
+      dep?.endpoints?.some((e) => e.method === 'POST' && e.pathPattern === 'v1/web/token/generate'),
+    ).toBe(true);
+  });
+
+  it('detects a relative-path auth call site written with an explicit TypeScript generic argument (real axios idiom, GAP-064 follow-up)', async () => {
+    // Mirrors the ACTUAL real call site in psv-ui-c-and-a-react-latest-development's
+    // authService.ts:32 verbatim: `authApi.post<TokenGenerateResponse>('v1/web/token/generate', body)`.
+    // Found via real-app verification — the synthetic test above (no generic) passed while this
+    // exact real shape was still silently invisible to CALL_SITE_RE.
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(
+      dir,
+      'src/authService.ts',
+      "const { data } = await authApi.post<TokenGenerateResponse>('v1/web/token/generate', body);\n",
+    );
+    write(dir, '.env', 'AUTH_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = process.env.AUTH_API_URL;\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'AUTH_API_URL');
+    expect(dep).toBeDefined();
+    expect(
+      dep?.endpoints?.some((e) => e.method === 'POST' && e.pathPattern === 'v1/web/token/generate'),
+    ).toBe(true);
+  });
+
+  it('does NOT capture a bare relative-path .get() call (still gated — likely a Map/Storage getter, not an HTTP call)', async () => {
+    const dir = makeRepo();
+    write(dir, 'package.json', JSON.stringify({}));
+    write(dir, 'src/cache.ts', "cache.get('token');\n");
+    write(dir, '.env', 'AUTH_API_URL=https://eu.api.example-partner.test\n');
+    write(dir, 'src/env.ts', 'const base = process.env.AUTH_API_URL;\n');
+
+    const deps = await detectExternalDependencies(dir);
+    const dep = deps.find((d) => d.envVar === 'AUTH_API_URL');
+    expect(dep?.endpoints?.some((e) => e.pathPattern === 'token')).toBeFalsy();
+  });
+
   it('detects an auth path expressed as a template-literal interpolation the call-site regexes miss (fetch(`${base}/auth/token/generate`))', async () => {
     const dir = makeRepo();
     write(dir, 'package.json', JSON.stringify({}));
@@ -322,6 +372,53 @@ describe('detectExternalDependencies', () => {
     const dep = deps.find((d) => d.envVar === 'API_BASE_URL');
     expect(dep).toBeDefined();
     expect(dep?.endpoints?.some((e) => e.pathPattern === '/auth/token/generate')).toBe(true);
+  });
+
+  describe('Cluster F — multi-.env-file hostname detection', () => {
+    it('records hostnames from BOTH .env.local and .env when they define the same var differently (dev/prod split)', async () => {
+      const dir = makeRepo();
+      write(dir, 'package.json', JSON.stringify({}));
+      write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+      // .env.local takes precedence (used for note/reachable), but .env's DIFFERENT
+      // hostname must ALSO be recorded — the real running app may resolve this var from
+      // either file depending on how it was built/deployed.
+      write(dir, '.env.local', 'VITE_API_URL=https://dev.api.example-partner.test\n');
+      write(dir, '.env', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+      expect(dep).toBeDefined();
+      expect(dep?.hostnames).toEqual(
+        expect.arrayContaining(['dev.api.example-partner.test', 'eu.api.example-partner.test']),
+      );
+      expect(dep?.hostnames).toHaveLength(2);
+      // Precedence for note/reachable is still the highest-precedence (.env.local) value.
+      expect(dep?.note).toContain('dev.api.example-partner.test');
+    });
+
+    it('does not record a duplicate hostname when the same value is repeated across files', async () => {
+      const dir = makeRepo();
+      write(dir, 'package.json', JSON.stringify({}));
+      write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+      write(dir, '.env.local', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+      write(dir, '.env', 'VITE_API_URL=https://eu.api.example-partner.test\n');
+
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+      expect(dep?.hostnames).toEqual(['eu.api.example-partner.test']);
+    });
+
+    it('picks up a hostname from a newly-recognized env file (.env.production) when higher-precedence files do not define the var', async () => {
+      const dir = makeRepo();
+      write(dir, 'package.json', JSON.stringify({}));
+      write(dir, 'src/env.ts', 'const base = import.meta.env.VITE_API_URL;\n');
+      write(dir, '.env.production', 'VITE_API_URL=https://prod.api.example-partner.test\n');
+
+      const deps = await detectExternalDependencies(dir);
+      const dep = deps.find((d) => d.envVar === 'VITE_API_URL');
+      expect(dep).toBeDefined();
+      expect(dep?.hostnames).toEqual(['prod.api.example-partner.test']);
+    });
   });
 
   it('does not attribute an auth path to a non-network-call plain string constant', async () => {

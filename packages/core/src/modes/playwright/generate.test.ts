@@ -153,6 +153,8 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
       hasEndpointLevelMocks: true,
       inventoryTruncated: false,
       attributes: new Map([['type', new Set(['email'])]]),
+      modalText: '',
+      underlyingPageText: '',
       ...overrides,
     };
   }
@@ -315,6 +317,48 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
     const source = `await page.getByText('Moje kupóny').click();`;
     expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
   });
+
+  // F-11 (Cluster E): an unscoped getByText(...) matching text observed both inside a captured
+  // modal AND on the underlying page outside it can't reliably prove the modal shows it.
+  const modalGt = () =>
+    gt({
+      modalText: 'delete your account? this cannot be undone.',
+      underlyingPageText: 'delete your account? this cannot be undone. footer: contact us.',
+    });
+
+  it('warns on an unscoped getByText whose text is both inside a captured modal and on the underlying page', () => {
+    const source = `await expect(page.getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, modalGt());
+    expect(warn.some((w) => w.includes('modal') && w.includes('dialog'))).toBe(true);
+  });
+
+  it('does not flag the same text when the locator is already dialog-scoped', () => {
+    const source = `await expect(page.getByRole('dialog').getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, modalGt());
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag genuinely modal-exclusive text (absent from the underlying page)', () => {
+    const gtExclusive = gt({
+      modalText: 'delete your account? this cannot be undone.',
+      underlyingPageText: 'unrelated homepage copy entirely.',
+    });
+    const source = `await expect(page.getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, gtExclusive);
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag a short getByText below the minimum length threshold (covered by F-07 instead)', () => {
+    const gtShort = gt({ modalText: 'ok', underlyingPageText: 'ok' });
+    const source = `await expect(page.getByText('ok')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, gtShort);
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag anything when no modal was ever captured (modalText empty)', () => {
+    const source = `await expect(page.getByText('Some long enough page copy here')).toBeVisible();`;
+    expect(findUngroundedReferences(source, gt()).warn.some((w) => w.includes('modal'))).toBe(false);
+  });
 });
 
 describe('demoteEscapeHatchBlocks — ships an admitted guess as needs-review, not a real failure', () => {
@@ -375,6 +419,27 @@ test('[REQ:FR-AUTH-01] positive: logs in', async ({ page }) => {
     expect(result).toContain('the login form fields were not captured in the inventory.');
     // The details object goes between the title and the body callback.
     expect(result).toMatch(/test\.fixme\('\[REQ:FR-AUTH-01\] positive: logs in', \{ annotation:/);
+  });
+
+  it('carries the FULL reason through when the model word-wraps it across multiple // lines (GAP-062)', () => {
+    // Mirrors the real generated shape from
+    // suite/tests/tierB-auth/profile-field-editing-name-dob-salutation.spec.ts:24-26 — a
+    // naturally word-wrapped multi-line comment, not a single long line.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain(
+      'unobserved element — a dedicated success toast selector was not captured in the ' +
+        'interactive-element inventory; verifying the persisted field values as a coarser ' +
+        'observable outcome of a successful save instead.',
+    );
   });
 
   it('falls back to a generic reason when the marker carries no explanation', () => {
@@ -1688,14 +1753,82 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
     expect(prompt).toContain('#/SK');
   });
 
+  it('warns that a hash-only goto is a same-document navigation that needs a real reload to test a logged-out precondition (GAP-065)', async () => {
+    await generate(ctxWith(makeExploration(1, { hashRouted: true })), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('SAME-DOCUMENT navigation');
+    expect(prompt).toContain('page.reload()');
+    expect(prompt).toContain('no active session');
+  });
+
   it('omits hash-routing guidance for a non-hash app', async () => {
     await generate(ctxWith(makeExploration(1, { hashRouted: false })), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+    expect(calls[0].prompt).not.toContain('SAME-DOCUMENT navigation');
   });
 
   it('omits hash-routing guidance when there is no exploration artifact at all', async () => {
     await generate(ctxWith(undefined), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+  });
+});
+
+describe('generate — unautomatable-step gating (Cluster C: OTP + destructive actions)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-unautomatable-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWith(exploration: TestModeContext['exploration']): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration,
+    };
+  }
+
+  it('includes an OTP-gate notice with test.fixme guidance when a route has otpGateReached', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].otpGateReached = true;
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('OTP/verification-code gate detected');
+    expect(prompt).toContain('test.fixme');
+    expect(prompt).toContain('cannot observe or synthesize');
+  });
+
+  it('includes a destructive-action notice naming the control when a route has destructiveActionsSeen', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].destructiveActionsSeen = ['Delete account'];
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('Destructive/irreversible action(s) detected');
+    expect(prompt).toContain('"Delete account"');
+    expect(prompt).toContain('run manually');
+  });
+
+  it('omits both notices when neither signal is present on any relevant route', async () => {
+    await generate(ctxWith(makeExploration(1)), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('OTP/verification-code gate detected');
+    expect(prompt).not.toContain('Destructive/irreversible action(s) detected');
+  });
+
+  it('omits both notices when there is no exploration artifact at all', async () => {
+    await generate(ctxWith(undefined), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('OTP/verification-code gate detected');
+    expect(prompt).not.toContain('Destructive/irreversible action(s) detected');
   });
 });
 
@@ -2589,6 +2722,127 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     };
     await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
     expect(calls[0].prompt).toContain('email (email, required)');
+  });
+
+  it('warns against .fill() for a widgetLike field and tags it WIDGET in the field list (GAP-066)', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'email', type: 'email', required: true },
+            { name: 'dob', type: 'text', required: true, testId: 'register-dob', widgetLike: true },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('dob (text, required, WIDGET)');
+    expect(prompt).toContain('email (email, required)');
+    expect(prompt).not.toContain('email (email, required, WIDGET)');
+    expect(prompt).toContain('WARNING');
+    expect(prompt).toContain('calling `.fill()` on them sets the DOM value directly');
+  });
+
+  it('adds no widget warning when no field is widgetLike', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [{ name: 'email', type: 'email', required: true }],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('WIDGET');
+  });
+
+  it('requires filling every required field (incl. confirm/repeat) before a validity-gated submit when a form has 2+ required fields (GAP-067)', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'password', type: 'password', required: true },
+            { name: 'confirm_password', type: 'password', required: true },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('RULE: this form has multiple required fields');
+    expect(prompt).toContain('password, confirm_password');
+    expect(prompt).toContain('confirm/repeat field cross-validated');
+  });
+
+  it('adds no multi-required-field rule when a form has 0 or 1 required fields', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'email', type: 'email', required: true },
+            { name: 'nickname', type: 'text', required: false },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('RULE: this form has multiple required fields');
   });
 
   it('rejects and retries a spec missing its mandatory [SRC:...] citation, accepting a corrected retry', async () => {

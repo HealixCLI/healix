@@ -24,6 +24,17 @@ export interface TriageInput {
    */
   apiEvidence?: string;
   /**
+   * Real evidence that THIS test's own request(s) fell through the generated mock fixture
+   * unintercepted (see modes/types.ts's ExecOutcome.mockPassthrough) — its hostname matched
+   * no detected dependency and no `mockOverride` matched either, so it hit the real
+   * (often unreachable, sandboxed) backend and hung. A very likely cause of a bare timeout
+   * with no assertion error — a mock-configuration gap, not the app being slow or a real
+   * environment/infra problem. App/mock-derived, so treated as untrusted data in the prompt,
+   * same as `error`/`apiEvidence`. Absent when the failing test's own requests were either
+   * all intercepted, or predates this feature.
+   */
+  mockPassthroughEvidence?: string;
+  /**
    * The project's configured/detected base URL (e.g.
    * `http://localhost:4202/#/SK/home`) — project configuration, not
    * app-rendered output, so it's cited normally rather than fenced as

@@ -106,6 +106,16 @@ export interface DomSnapshot {
    * predate this field (tests, cached exploration artifacts) stay valid. */
   contentElements?: ContentElement[];
   axTree?: unknown;
+  /** Clamped, concatenated textContent of every visible `[role="dialog"]`/`[role="alertdialog"]`/
+   * `[aria-modal="true"]` container present at snapshot time — see selectors.ts's
+   * collectModalText(). Deliberately scoped to this precise ARIA signal only (not a fuzzy
+   * z-index/class heuristic), to keep false positives low; silently absent on an app with no
+   * semantic dialog markup (a known, accepted limitation — see Cluster E). */
+  modalText?: string;
+  /** Clamped `document.body.textContent` at snapshot time — the "rest of the page" corpus a
+   * modal-scoping check (generate.ts's GroundTruth) compares `modalText` against, to tell
+   * "permanent static page copy" apart from content that only exists once a modal is open. */
+  bodyText?: string;
 }
 
 /** A single XHR/fetch request/response pair observed while the page was live. */
@@ -117,6 +127,10 @@ export interface CapturedNetworkEvent {
   requestBody?: string;
   /** Best-effort, size-capped; omitted when the body couldn't be read (binary, redirect, etc). */
   responseBody?: string;
+  /** The response's real `content-type` header, when readable (GAP-063 follow-up: lets a
+   * mock built from this event serve back the real content-type instead of always
+   * defaulting to application/json). */
+  contentType?: string;
 }
 
 /**

@@ -2,6 +2,7 @@ import type { CallExpression, File, JSXOpeningElement, ObjectExpression } from '
 import {
   isArrayExpression,
   isIdentifier,
+  isJSXElement,
   isJSXExpressionContainer,
   isJSXIdentifier,
   isObjectExpression,
@@ -9,17 +10,41 @@ import {
   isStringLiteral,
 } from '@babel/types';
 import type { FunctionalityUnit } from '../functionality-index.js';
+import { ROUTE_GUARD_NAME_RE } from './auth-patterns.js';
 import { parseModule } from './parse.js';
 import { traverse } from './traverse.js';
 
 /** Router-config factory calls whose array-of-route-object argument we walk for `path`. */
 const ROUTER_FACTORY_NAMES = new Set(['createBrowserRouter', 'createHashRouter', 'createMemoryRouter']);
 
-function unit(rel: string, routePath: string): FunctionalityUnit {
+function unit(rel: string, routePath: string, guardName?: string): FunctionalityUnit {
   // A root `<Route index>` (or an empty-string `path`) composes to '' (no ancestor segment at
   // all) — normalize to '/' so it reads as the real root URL instead of a bare, slash-less key.
   const normalized = routePath === '' ? '/' : routePath;
-  return { key: `route:${normalized}`, kind: 'route', label: `route: ${normalized}`, file: rel };
+  const out: FunctionalityUnit = {
+    key: `route:${normalized}`,
+    kind: 'route',
+    label: `route: ${normalized}`,
+    file: rel,
+  };
+  if (guardName) out.authGuardName = guardName;
+  return out;
+}
+
+/**
+ * The JSX element name wrapping this `<Route>`'s `element` attribute, when it matches
+ * ROUTE_GUARD_NAME_RE (e.g. `element={<ProtectedRoute><Dashboard/></ProtectedRoute>}`).
+ * `element`'s value is a JSXExpressionContainer whose expression is the wrapping JSXElement.
+ */
+function guardNameFromElementAttr(opening: JSXOpeningElement): string | undefined {
+  for (const attr of opening.attributes) {
+    if (attr.type !== 'JSXAttribute' || !isJSXIdentifier(attr.name) || attr.name.name !== 'element') continue;
+    const value = attr.value;
+    if (!isJSXExpressionContainer(value) || !isJSXElement(value.expression)) continue;
+    const name = value.expression.openingElement.name;
+    if (isJSXIdentifier(name) && ROUTE_GUARD_NAME_RE.test(name.name)) return name.name;
+  }
+  return undefined;
 }
 
 /**
@@ -50,9 +75,11 @@ function walkRouteObjects(
   rel: string,
   parentPath: string,
   out: FunctionalityUnit[],
+  parentGuard?: string,
 ): void {
   let ownPath: string | null = null;
   let isIndex = false;
+  let ownGuard: string | undefined;
   for (const prop of obj.properties) {
     if (!isObjectProperty(prop) || prop.computed) continue;
     const keyName = isIdentifier(prop.key)
@@ -66,11 +93,19 @@ function walkRouteObjects(
     if (keyName === 'index' && prop.value.type === 'BooleanLiteral' && prop.value.value) {
       isIndex = true;
     }
+    if (keyName === 'element' && isJSXElement(prop.value)) {
+      const name = prop.value.openingElement.name;
+      if (isJSXIdentifier(name) && ROUTE_GUARD_NAME_RE.test(name.name)) ownGuard = name.name;
+    }
   }
+  // A node's own guard wins over an inherited one (same precedence as the JSX walker below);
+  // absent an own guard, inherit the parent's so every pathless/leaf descendant of a guarded
+  // layout route (e.g. `dashboard`'s `points`/`vouchers` children) is correctly flagged too.
+  const guard = ownGuard ?? parentGuard;
   // A pathless layout entry (neither `path` nor `index`) contributes no new segment — children
   // resolve directly against the current parentPath, same as a JSX `<Route element={...}>` wrapper.
   const composed = isIndex ? parentPath : ownPath !== null ? joinRoutePath(parentPath, ownPath) : parentPath;
-  if (ownPath !== null || isIndex) out.push(unit(rel, composed));
+  if (ownPath !== null || isIndex) out.push(unit(rel, composed, guard));
 
   for (const prop of obj.properties) {
     if (!isObjectProperty(prop) || prop.computed) continue;
@@ -81,7 +116,7 @@ function walkRouteObjects(
         : null;
     if (keyName === 'children' && isArrayExpression(prop.value)) {
       for (const el of prop.value.elements) {
-        if (el && isObjectExpression(el)) walkRouteObjects(el, rel, composed, out);
+        if (el && isObjectExpression(el)) walkRouteObjects(el, rel, composed, out, guard);
       }
     }
   }
@@ -154,6 +189,11 @@ export function extractReactRouterRoutesFromAst(rel: string, ast: File): Functio
   // entering a <Route> JSXElement, popped on leaving it, so a deeply-nested <Route> resolves
   // against its real enclosing path instead of being read in isolation (see joinRoutePath).
   const pathStack: string[] = [''];
+  // Parallel to pathStack: the nearest enclosing ROUTE_GUARD_NAME_RE wrapper name (if any),
+  // inherited by every descendant <Route> so a guard on a parent layout route (e.g.
+  // `<Route path="dashboard" element={<ProtectedRoute><Layout/></ProtectedRoute>}>`) correctly
+  // propagates down to pathless children (`points`, `vouchers`, ...) — see Cluster C.
+  const guardStack: Array<string | undefined> = [undefined];
   traverse(ast, {
     JSXElement: {
       enter(path) {
@@ -167,14 +207,17 @@ export function extractReactRouterRoutesFromAst(rel: string, ast: File): Functio
           : value !== null
             ? joinRoutePath(parentPath, value)
             : parentPath;
-        if (hasPath || isIndex) out.push(unit(rel, composed));
+        const inheritedGuard = guardNameFromElementAttr(opening) ?? guardStack[guardStack.length - 1];
+        if (hasPath || isIndex) out.push(unit(rel, composed, inheritedGuard));
         pathStack.push(composed);
+        guardStack.push(inheritedGuard);
       },
       exit(path) {
         const opening = path.node.openingElement;
         const name = opening.name;
         if (!isJSXIdentifier(name) || name.name !== 'Route') return;
         pathStack.pop();
+        guardStack.pop();
       },
     },
     CallExpression(path) {

@@ -223,7 +223,169 @@ describe('scaffold — mock fixture generation', () => {
     ]);
   });
 
-  it('lets a statically-detected endpoint win over an observed one for the same (method, path)', async () => {
+  it('falls back to {} (not the raw string) for an observed body that is not valid JSON, e.g. a truncated capture (GAP-063)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_API_BASE_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example.com'],
+      },
+    ];
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses: { 'env:VITE_API_BASE_URL': { status: 200, body: { profile: true } } },
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/customer/getbyemail',
+            status: 200,
+            // Mirrors a real capture cut mid-structure at browser/index.ts's char cap.
+            sampleResponseBody: '{"entity":{"customers":[{"id":"abc123","email":"user@examp…',
+            host: 'eu.api.example.com',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    const routesMatch = /const MOCKED_ROUTES = (\[[\s\S]*?\n\]);/.exec(contents);
+    const routes = JSON.parse(routesMatch![1]);
+    const route = routes.find((r: { id: string }) => r.id === 'env:VITE_API_BASE_URL');
+    const endpoint = route.endpoints.find(
+      (e: { pathPattern: string }) => e.pathPattern === '/customer/getbyemail',
+    );
+    expect(endpoint.response.body).toEqual({});
+  });
+
+  it("threads an observed endpoint's real content-type through to the mock response headers (GAP-063 follow-up)", async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_API_BASE_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example.com'],
+      },
+    ];
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses: { 'env:VITE_API_BASE_URL': { status: 200, body: { profile: true } } },
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/customer/getbyemail',
+            status: 200,
+            sampleResponseBody: '{"entity":{"customers":[]}}',
+            host: 'eu.api.example.com',
+            contentType: 'application/json; charset=utf-8',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    const routesMatch = /const MOCKED_ROUTES = (\[[\s\S]*?\n\]);/.exec(contents);
+    const routes = JSON.parse(routesMatch![1]);
+    const route = routes.find((r: { id: string }) => r.id === 'env:VITE_API_BASE_URL');
+    const endpoint = route.endpoints.find(
+      (e: { pathPattern: string }) => e.pathPattern === '/customer/getbyemail',
+    );
+    expect(endpoint.response.headers).toEqual({ 'content-type': 'application/json; charset=utf-8' });
+  });
+
+  it('passes an observed XML/SOAP body through as raw text instead of degrading to {} (GAP-069)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'backend',
+        label: 'Backend API (VITE_API_BASE_URL)',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example.com'],
+      },
+    ];
+    const xmlBody =
+      '<Envelope><Body><GetCustomerResponse><id>abc123</id></GetCustomerResponse></Body></Envelope>';
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses: { 'env:VITE_API_BASE_URL': { status: 200, body: { profile: true } } },
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/customer/getbyemail',
+            status: 200,
+            sampleResponseBody: xmlBody,
+            host: 'eu.api.example.com',
+            contentType: 'application/soap+xml; charset=utf-8',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    const routesMatch = /const MOCKED_ROUTES = (\[[\s\S]*?\n\]);/.exec(contents);
+    const routes = JSON.parse(routesMatch![1]);
+    const route = routes.find((r: { id: string }) => r.id === 'env:VITE_API_BASE_URL');
+    const endpoint = route.endpoints.find(
+      (e: { pathPattern: string }) => e.pathPattern === '/customer/getbyemail',
+    );
+    expect(endpoint.response.body).toBe(xmlBody);
+    expect(endpoint.response.headers).toEqual({ 'content-type': 'application/soap+xml; charset=utf-8' });
+  });
+
+  it('grounds a statically-detected endpoint in an observed one for the same (method, path) at the field level, preferring observed values on conflict', async () => {
     const deps: ExternalDependency[] = [
       {
         id: 'env:VITE_API_BASE_URL',
@@ -236,7 +398,7 @@ describe('scaffold — mock fixture generation', () => {
           {
             method: 'GET',
             pathPattern: '/customer/profile',
-            response: { status: 200, body: { fromStatic: true } },
+            response: { status: 200, body: { fromStatic: true, shared: 'static-value' } },
           },
         ],
       },
@@ -267,7 +429,7 @@ describe('scaffold — mock fixture generation', () => {
             method: 'GET',
             pathPattern: '/customer/profile',
             status: 200,
-            sampleResponseBody: '{"fromObserved":true}',
+            sampleResponseBody: '{"fromObserved":true,"shared":"observed-value"}',
             host: 'api.example.com',
           },
         ],
@@ -276,7 +438,157 @@ describe('scaffold — mock fixture generation', () => {
 
     await scaffold(ctx);
     const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    // Fields unique to either side survive...
     expect(contents).toContain('fromStatic');
-    expect(contents).not.toContain('fromObserved');
+    expect(contents).toContain('fromObserved');
+    // ...and on a genuine conflict, the real observed value wins over the static one.
+    expect(contents).toContain('observed-value');
+    expect(contents).not.toContain('static-value');
+  });
+
+  it('never lets a redacted secret leaf from observed traffic overwrite a working static auth token (Cluster A)', async () => {
+    const deps: ExternalDependency[] = [
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'auth',
+        label: 'Auth API',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['auth.example.com'],
+        endpoints: [
+          {
+            method: 'POST',
+            pathPattern: '/login',
+            category: 'auth',
+            response: {
+              status: 200,
+              body: { token: 'healix-static-real-jwt', user: { name: 'Healix Mock User' } },
+            },
+          },
+        ],
+      },
+    ];
+    const mockResponses: Record<string, MockResponse> = {
+      'env:VITE_API_BASE_URL': { status: 200, body: {} },
+    };
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses,
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'POST',
+            pathPattern: '/login',
+            status: 200,
+            // A real capture with its token field redacted by export/sanitize.ts before
+            // ever reaching this module — the user's real name still comes through.
+            sampleResponseBody: '{"token":"<REDACTED>","user":{"name":"adroy tester"}}',
+            host: 'auth.example.com',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    expect(contents).toContain('healix-static-real-jwt');
+    expect(contents).not.toContain('<REDACTED>');
+    expect(contents).toContain('adroy tester');
+  });
+
+  it("reconciles a purely-synthetic sibling endpoint's identity against real captured identity found elsewhere (Cluster B)", async () => {
+    const deps: ExternalDependency[] = [
+      // No static endpoint detail at all — its identity reaches the fixture purely via
+      // real EXPLORE-observed traffic.
+      {
+        id: 'env:VITE_MOBILE_WRAPPER_URL',
+        category: 'backend',
+        label: 'Mobile wrapper API',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu-api-gateway.example.com'],
+      },
+      // Purely synthetic login endpoint — no observed match for THIS (method, path), so it
+      // would otherwise keep the generic "Healix Mock User" identity untouched.
+      {
+        id: 'env:VITE_API_BASE_URL',
+        category: 'auth',
+        label: 'Auth API',
+        source: 'env-var',
+        mockStrategy: 'both',
+        hostnames: ['eu.api.example.com'],
+        endpoints: [
+          {
+            method: 'POST',
+            pathPattern: '/login',
+            category: 'auth',
+            response: {
+              status: 200,
+              body: {
+                token: 'healix-static-real-jwt',
+                user: { id: 'healix-mock-user', email: 'healix.mock@example.test', name: 'Healix Mock User' },
+              },
+            },
+          },
+        ],
+      },
+    ];
+    const mockResponses: Record<string, MockResponse> = {
+      'env:VITE_MOBILE_WRAPPER_URL': { status: 200, body: {} },
+      'env:VITE_API_BASE_URL': { status: 200, body: {} },
+    };
+    const ctx = makeCtx({
+      mockExternalDependencies: true,
+      externalDependencies: deps,
+      mockResponses,
+      exploration: {
+        crawl: {
+          routes: [],
+          visitedCount: 0,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: false,
+          authVerified: false,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [
+          {
+            method: 'GET',
+            pathPattern: '/mobile/v2/api/customer/getbyemail',
+            status: 200,
+            sampleResponseBody:
+              '{"firstname":"adroy","lastname":"tester","email":"adroytester@gmail.com","id":81278446}',
+            host: 'eu-api-gateway.example.com',
+          },
+        ],
+      },
+    } as unknown as Partial<TestModeContext>);
+
+    await scaffold(ctx);
+    const contents = await readFile(join(projectDir, 'fixtures', 'mock.fixture.ts'), 'utf-8');
+    // Both the real-observed side and the purely-synthetic login endpoint agree on one identity.
+    expect(contents).toContain('adroy tester');
+    expect(contents).not.toContain('Healix Mock User');
+    expect(contents).not.toContain('healix.mock@example.test');
+    // The token itself is untouched — only identity fields get reconciled.
+    expect(contents).toContain('healix-static-real-jwt');
   });
 });

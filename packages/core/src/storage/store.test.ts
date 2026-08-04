@@ -965,6 +965,42 @@ describe('KB foundation: requirements/mock_responses/exploration_summaries/escap
     expect(s.listMockResponses(run.id)[0]?.mockBodyJson).toBe(JSON.stringify({ message: 'second' }));
   });
 
+  it('upsertMockResponse refreshes (not duplicates) a row with null method/pathPattern on a resumed run', async () => {
+    // Regression test: SQLite's UNIQUE index treats every NULL as distinct
+    // from every other NULL, so ON CONFLICT(run_id, dependency_id, method,
+    // path_pattern) would never fire for two calls with method/pathPattern
+    // both null (the real-world path for a dependency with no endpoints,
+    // see orchestrator/index.ts) unless nulls are normalized before the
+    // insert/select.
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-mock-null-resume-project',
+      baseUrl: 'https://kb-mock-null-resume.test',
+    });
+    const run = s.createRun(project.id);
+    const input = {
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'payments',
+      method: null,
+      pathPattern: null,
+      mockStrategy: 'static',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ status: 'first' }),
+      mockHeadersJson: null,
+    };
+
+    const id1 = s.upsertMockResponse(input);
+    const id2 = s.upsertMockResponse({ ...input, mockBodyJson: JSON.stringify({ status: 'second' }) });
+
+    expect(id2).toBe(id1);
+    expect(await countRows('mock_responses')).toBe(1);
+    const row = s.listMockResponses(run.id)[0];
+    expect(row?.mockBodyJson).toBe(JSON.stringify({ status: 'second' }));
+    expect(row?.method).toBeNull();
+    expect(row?.pathPattern).toBeNull();
+  });
+
   it('recordMockUsage/listMockUsageForTest round-trip a per-test usage row', async () => {
     const s = await store();
     const project = s.createProject({ name: 'kb-mock-usage-project', baseUrl: 'https://kb-mock-usage.test' });

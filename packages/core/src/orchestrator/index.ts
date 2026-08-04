@@ -3991,7 +3991,7 @@ function persistResults(
       const traceArtifact = artifacts.find((a) => /trace\.zip$/i.test(a));
       const videoArtifact = artifacts.find((a) => /\.(webm|mp4)$/i.test(a));
       const screenshotArtifacts = artifacts.filter((a) => a !== traceArtifact && a !== videoArtifact);
-      const apiEvidenceKey = `${r.specFile ?? ''}#${r.title}`;
+      const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
       const evidence: ResultEvidence = {
         ...(traceArtifact ? { tracePath: traceArtifact } : {}),
         ...(videoArtifact ? { videoPath: videoArtifact } : {}),

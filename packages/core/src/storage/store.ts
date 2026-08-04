@@ -905,6 +905,15 @@ export class HealixStore {
     mockHeadersJson: string | null;
   }): string {
     const id = `mock_${nanoid(10)}`;
+    // SQLite's UNIQUE index treats every NULL as distinct from every other
+    // NULL, so ON CONFLICT(run_id, dependency_id, method, path_pattern) never
+    // fires when method/path_pattern are both null (the case for a
+    // dependency with no endpoints) — each call would insert a fresh
+    // duplicate row instead of refreshing the existing one. Normalize null
+    // to '' for storage/matching only; rowToMockResponse maps '' back to
+    // null so callers still see null.
+    const method = input.method ?? '';
+    const pathPattern = input.pathPattern ?? '';
     this.db
       .prepare(
         `INSERT INTO mock_responses (id, run_id, dependency_id, category, method, path_pattern, mock_strategy, mock_status, mock_body_json, mock_headers_json)
@@ -922,8 +931,8 @@ export class HealixStore {
         input.runId,
         input.dependencyId,
         input.category,
-        input.method,
-        input.pathPattern,
+        method,
+        pathPattern,
         input.mockStrategy,
         input.mockStatus,
         input.mockBodyJson,
@@ -934,9 +943,9 @@ export class HealixStore {
     // same reasoning as seedPlanKbItem/seedRequirement.
     const row = this.db
       .prepare(
-        'SELECT id FROM mock_responses WHERE run_id = ? AND dependency_id = ? AND method IS ? AND path_pattern IS ?',
+        'SELECT id FROM mock_responses WHERE run_id = ? AND dependency_id = ? AND method = ? AND path_pattern = ?',
       )
-      .get(input.runId, input.dependencyId, input.method, input.pathPattern) as { id: string } | undefined;
+      .get(input.runId, input.dependencyId, method, pathPattern) as { id: string } | undefined;
     return row?.id ?? id;
   }
 
@@ -1487,8 +1496,12 @@ function rowToMockResponse(r: Record<string, unknown>): MockResponseRow {
     runId: String(r.run_id),
     dependencyId: String(r.dependency_id),
     category: String(r.category),
-    method: s(r.method),
-    pathPattern: s(r.path_pattern),
+    // '' is upsertMockResponse's null-dedup sentinel (SQLite treats every
+    // NULL as distinct for UNIQUE-index purposes, so a real null couldn't be
+    // used there) — map it back to null so callers see the same value they
+    // passed in.
+    method: s(r.method) || null,
+    pathPattern: s(r.path_pattern) || null,
     mockStrategy: String(r.mock_strategy),
     mockStatus: n(r.mock_status),
     mockBodyJson: s(r.mock_body_json),

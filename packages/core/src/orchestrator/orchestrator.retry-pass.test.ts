@@ -1020,6 +1020,79 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
     );
   });
 
+  it('persistResults merges ExecOutcome.apiEvidence into evidence_json even when the result has no specFile (regression)', async () => {
+    // Root-cause regression: persistResults built its apiEvidence lookup key
+    // as `${r.specFile ?? ''}#${r.title}`, always inserting a '#' even when
+    // specFile is absent. Every other reader/writer of this same identity
+    // (execute.ts's keyOf, and the pre-existing lookup a few hundred lines
+    // above this same function) uses `r.specFile ? \`${r.specFile}#${r.title}\`
+    // : r.title` instead — no '#' when specFile is missing. A mismatched key
+    // means outcome.apiEvidence[key] silently misses for every specFile-less
+    // result, leaving evidenceJson.apiEvidence unset even though real
+    // evidence was captured.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'ApiEvidence No-SpecFile Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const ITEMS = [
+      {
+        title: 'POST /api/widgets contract',
+        tier: 'tierC-api',
+        intent: 'API contract for widgets.',
+        scenarios: [{ kind: 'positive', description: 'returns 200' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'no-specfile-result';
+    const evidenceMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        // A result item with NO specFile — the exact case the buggy key
+        // construction mishandled — plus an apiEvidence entry keyed the
+        // established way (bare title, no '#' prefix, since specFile is
+        // absent).
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          apiEvidence: { [RESULT_TITLE]: 'GET /api/widgets -> 200 {"ok":true}' },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const run = await createOrchestrator({
+      provider: fakeProviderWithPlan([], ITEMS),
+      getMode: () => evidenceMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run.status).toBe('passed');
+
+    const results = store.listResults(run.runId);
+    const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+    expect(target).toBeDefined();
+    expect(target!.evidenceJson).not.toBeNull();
+    const evidence = JSON.parse(target!.evidenceJson!) as { apiEvidence?: string };
+    expect(evidence.apiEvidence).toBe('GET /api/widgets -> 200 {"ok":true}');
+  });
+
   it("a spec quarantined by the LATER validate() step (not generate.ts's own checks) gets the KB corrected to dropped, so retry-pass can regenerate it (regression)", async () => {
     // Root-cause regression for a real bug found via manual testing on a real
     // app: generate.ts's own per-item checks can accept a spec — recording the

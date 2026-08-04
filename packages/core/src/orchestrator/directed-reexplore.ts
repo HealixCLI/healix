@@ -470,12 +470,25 @@ export async function runDirectedReexplore(
 
       await forgetCheckpointEntries(ctx.projectDir, affectedIds);
 
+      // A thrown error here (vs. an empty/invalid result) is typically a transient provider
+      // hiccup — the exact same "error (subtype: success)"-shaped failures the ORIGINAL GENERATE
+      // pass already tolerates via its own per-item retry/skip logic. Unlike that pass, this single
+      // `mode.generate` call has no internal retry of its own, so treating it as fatal for the
+      // WHOLE loop (the original `break` here) meant one flaky call could burn all 3 iterations
+      // down to 1, permanently abandoning gaps a later attempt may well have closed. `continue`
+      // instead lets the next loop iteration retry the same gaps from scratch (re-crawl included) —
+      // naturally bounded by DIRECTED_REEXPLORE_MAX_ITERATIONS, so this can't loop unboundedly, and
+      // a persistently broken provider still gives up after the same 3-iteration ceiling as before.
       let regenerated: GeneratedSpec[];
       try {
         regenerated = await mode.generate(ctx, { ...plan, items: affectedItems });
       } catch (err) {
-        emit('generate', 'warn', `Directed re-exploration regeneration failed (stopping): ${errMsg(err)}`);
-        break;
+        emit(
+          'generate',
+          'warn',
+          `Directed re-exploration regeneration failed on iteration ${iteration}/${DIRECTED_REEXPLORE_MAX_ITERATIONS} (retrying next iteration if any remain): ${errMsg(err)}`,
+        );
+        continue;
       }
       if (regenerated.length === 0) break;
 

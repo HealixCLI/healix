@@ -834,6 +834,37 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
     expect(generate).toHaveBeenCalledTimes(1);
   });
 
+  it('a thrown regeneration error retries on the next iteration instead of abandoning the whole loop (regression: a transient provider error used to stop all remaining iterations)', async () => {
+    const target = `${BASE_URL}/forgot-password`;
+    const { browser } = makeFakeBrowser({ [target]: { interactiveElements: [] } });
+    const ctx = makeCtx({ browser, exploration: makeExploration([thinRoute(target)]) });
+    const plan: TestPlan = { summary: 's', items: [planItem('a', 'route:/forgot-password')] };
+    // First call throws (simulating a transient provider error, e.g. the real
+    // "error (subtype: success)" shape seen in production); second call succeeds cleanly.
+    const generate = vi
+      .fn()
+      .mockRejectedValueOnce(new Error('error (subtype: success)'))
+      .mockResolvedValueOnce([cleanSpec('a', 'tests/x.spec.ts')]);
+    const mode = { generate } as unknown as TestMode;
+
+    const result = await runDirectedReexplore({
+      ctx,
+      mode,
+      plan,
+      specs: [specWithEscapeHatch('a', 'tests/x.spec.ts')],
+      routing: NO_HASH,
+      baseUrl: BASE_URL,
+      reregisterSpecRows: vi.fn(),
+      emit: noopEmit(),
+      forgetCheckpointEntries: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(generate).toHaveBeenCalledTimes(2);
+    expect(result.iterations).toBe(2);
+    expect(result.gapsClosed).toBe(1);
+    expect(result.gapsRemaining).toBe(0);
+  });
+
   it('never throws when the crawl fails mid-loop — degrades to a warn emit and leaves specs unchanged for that gap', async () => {
     // crawl() itself swallows a single dead-link goto() failure internally (dead link handling) —
     // to exercise OUR OWN try/catch around the crawl call, fail at a point crawl() does NOT

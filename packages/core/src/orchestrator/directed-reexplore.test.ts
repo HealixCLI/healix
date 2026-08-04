@@ -344,15 +344,37 @@ test('[REQ:${planItemId}] guessed', async ({ page }) => {
     expect(resolveGapTargets([spec], items, NO_HASH, BASE_URL, [], buildGroundTruth)).toEqual([]);
   });
 
-  it('prefers the sanctioned escape-hatch marker over warn-level detection when a spec has both', () => {
+  it('reports BOTH an escape-hatched block AND a separate shipped-but-ungrounded block in the same spec (regression: these must never be mutually exclusive)', () => {
+    // Regression test for a real bug found via live verification: a spec with ONE fixme'd test
+    // block and a SEPARATE, non-fixme block that shipped a testid reference the app doesn't
+    // actually have. Escape hatches are scoped to a single block; a WARN-level finding is a
+    // whole-spec-level check — checking escape hatches first and only falling back to the
+    // warn-check when NONE were found silently hid the second block's real problem entirely,
+    // because the first block's escape hatch alone made the spec look "already explained."
     const items = [planItem('a', undefined, 'tierA-public')];
-    // Has a real escape hatch AND, in principle, could also trip the warn-level check — the
-    // escape-hatch reasons must win, not get diluted/duplicated by also running the warn check.
-    const spec = specWithEscapeHatch('a', 'tests/x.spec.ts', 'a real escape-hatch reason');
-    const buildGroundTruth = () => groundTruth(); // would flag plenty if it were ever consulted
+    const spec: GeneratedSpec = {
+      path: 'tests/x.spec.ts',
+      title: '[REQ:a] two scenarios',
+      reqTag: 'a',
+      tier: 'tierA-public',
+      contents: `import { test, expect } from '@playwright/test';
+
+test('[REQ:a] positive: shipped but wrong', async ({ page }) => {
+  await page.getByTestId('mystery-button').click();
+});
+
+test.fixme('[REQ:a] edge: honestly escape-hatched', async ({ page }) => {
+  // TODO: unobserved element - a real escape-hatch reason
+  await page.locator('button').click();
+});
+`,
+      planItemId: 'a',
+    };
+    const buildGroundTruth = () => groundTruth(); // empty — "mystery-button" is genuinely ungrounded
     const gaps = resolveGapTargets([spec], items, NO_HASH, BASE_URL, [], buildGroundTruth);
-    expect(gaps).toHaveLength(1);
-    expect(gaps[0]?.reason).toBe('a real escape-hatch reason');
+    const reasons = gaps.map((g) => g.reason);
+    expect(reasons).toContain('a real escape-hatch reason');
+    expect(reasons.some((r) => r.includes('mystery-button'))).toBe(true);
   });
 });
 

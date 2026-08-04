@@ -160,8 +160,15 @@ export function resolveGapTargets(
     if (!spec.planItemId) continue;
     const item = items.find((it) => it.id === spec.planItemId);
     if (!item) continue;
-    const reasons = extractEscapeHatchReasons(spec.contents);
-    if (reasons.length === 0) reasons.push(...findUngroundedWarnReasons(spec, item, buildGroundTruth));
+    // Always check BOTH, never one-or-the-other: an escape hatch is scoped to a single
+    // test(...) block, but a WARN-level ungrounded reference is a whole-spec-level finding — a
+    // spec with one fixme'd block and a SEPARATE, shipped-but-wrong block is common (confirmed
+    // against real historical output), and checking escape hatches first, only falling back to
+    // the warn-check when NONE were found, silently hid the second block's real problem entirely.
+    const reasons = [
+      ...extractEscapeHatchReasons(spec.contents),
+      ...findUngroundedWarnReasons(spec, item, buildGroundTruth),
+    ];
     if (reasons.length === 0) continue;
 
     let targetUrl: string | undefined;

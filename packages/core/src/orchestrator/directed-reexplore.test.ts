@@ -18,6 +18,7 @@ import type {
   TestPlan,
   TestPlanItem,
 } from '../modes/types.js';
+import type { GroundTruth } from '../modes/playwright/generate.js';
 import {
   dedupGapTargets,
   resolveGapTargets,
@@ -56,10 +57,15 @@ function cleanSpec(planItemId: string, path = 'tests/x.spec.ts'): GeneratedSpec 
     title: `[REQ:${planItemId}] resolved`,
     reqTag: planItemId,
     tier: 'tierA-public',
+    // Deliberately a plain CSS selector, not a data-testid/getByRole/getByText call —
+    // findUngroundedReferences only checks THOSE patterns, so this "clean" fixture stays clean
+    // even against a fake/empty ground truth (an empty exploration would otherwise flag ANY
+    // testid reference as unverifiable, which is correct new behavior, just not what this
+    // fixture is meant to exercise).
     contents: `import { test, expect } from '@playwright/test';
 
 test('[REQ:${planItemId}] resolved', async ({ page }) => {
-  await page.locator('[data-testid="real"]').click();
+  await page.locator('.submit-button').click();
 });
 `,
     planItemId,
@@ -265,6 +271,88 @@ describe('resolveGapTargets — matches an already-discovered UI state before fa
     const gaps = resolveGapTargets([specWithEscapeHatch('a')], items, NO_HASH, BASE_URL, crawledRoutes);
     expect(gaps[0]?.targetUrl).toBe('https://a.test/forgot-password');
     expect(gaps[0]?.stateKey).toBeUndefined();
+  });
+});
+
+describe('resolveGapTargets — also catches WARN-level ungrounded references (a quiet guess, not the sanctioned escape hatch)', () => {
+  function groundTruth(overrides: Partial<GroundTruth> = {}): GroundTruth {
+    return {
+      testids: new Set(),
+      selectors: new Set(),
+      names: [],
+      roleByName: new Map(),
+      endpoints: [],
+      hasEndpointLevelMocks: false,
+      inventoryTruncated: false,
+      attributes: new Map(),
+      ...overrides,
+    };
+  }
+
+  function specReferencingTestId(planItemId: string, testid: string): GeneratedSpec {
+    return {
+      path: 'tests/x.spec.ts',
+      title: `[REQ:${planItemId}] guessed`,
+      reqTag: planItemId,
+      tier: 'tierA-public',
+      contents: `import { test, expect } from '@playwright/test';
+
+test('[REQ:${planItemId}] guessed', async ({ page }) => {
+  await page.getByTestId('${testid}').click();
+});
+`,
+      planItemId,
+    };
+  }
+
+  it('flags a spec with no escape-hatch marker but an ungrounded testid reference, when buildGroundTruth is supplied', () => {
+    const items = [planItem('a', undefined, 'tierA-public')];
+    const crawledRoutes = [
+      {
+        url: 'https://a.test/',
+        title: 'https://a.test/',
+        snapshot: { url: 'https://a.test/', title: 'https://a.test/', interactiveElements: [] },
+        depth: 0,
+        hasPasswordField: false,
+        role: 'anonymous' as const,
+        networkEvents: [],
+      },
+    ];
+    const spec = specReferencingTestId('a', 'mystery-button');
+    // findUngroundedReferences routes a testid miss to `hard` (not `warn`) whenever the ground
+    // truth's inventory is non-empty ("inventoryKnown") — a HARD finding gets rejected/retried
+    // during the ORIGINAL generation and never survives into a final spec, so the only shape
+    // findUngroundedWarnReasons needs to (and does) check is `warn`, which requires an EMPTY
+    // ground truth here (matching how this actually arises: nothing crawled for this item at all).
+    const buildGroundTruth = () => groundTruth();
+    const gaps = resolveGapTargets([spec], items, NO_HASH, BASE_URL, crawledRoutes, buildGroundTruth);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]?.reason).toContain('mystery-button');
+    expect(gaps[0]?.targetUrl).toBe('https://a.test/'); // still resolves via the tier fallback
+  });
+
+  it('does NOT flag the same spec when buildGroundTruth is omitted (existing escape-hatch-only behavior, unchanged)', () => {
+    const items = [planItem('a', undefined, 'tierA-public')];
+    const spec = specReferencingTestId('a', 'mystery-button');
+    expect(resolveGapTargets([spec], items, NO_HASH, BASE_URL)).toEqual([]);
+  });
+
+  it('does NOT flag a spec whose testid reference IS actually grounded (no false positive)', () => {
+    const items = [planItem('a', undefined, 'tierA-public')];
+    const spec = specReferencingTestId('a', 'mystery-button');
+    const buildGroundTruth = () => groundTruth({ testids: new Set(['mystery-button']) });
+    expect(resolveGapTargets([spec], items, NO_HASH, BASE_URL, [], buildGroundTruth)).toEqual([]);
+  });
+
+  it('prefers the sanctioned escape-hatch marker over warn-level detection when a spec has both', () => {
+    const items = [planItem('a', undefined, 'tierA-public')];
+    // Has a real escape hatch AND, in principle, could also trip the warn-level check — the
+    // escape-hatch reasons must win, not get diluted/duplicated by also running the warn check.
+    const spec = specWithEscapeHatch('a', 'tests/x.spec.ts', 'a real escape-hatch reason');
+    const buildGroundTruth = () => groundTruth(); // would flag plenty if it were ever consulted
+    const gaps = resolveGapTargets([spec], items, NO_HASH, BASE_URL, [], buildGroundTruth);
+    expect(gaps).toHaveLength(1);
+    expect(gaps[0]?.reason).toBe('a real escape-hatch reason');
   });
 });
 

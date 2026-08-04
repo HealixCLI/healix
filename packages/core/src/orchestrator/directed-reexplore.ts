@@ -23,7 +23,13 @@ import {
 import type { BrowserSurface } from '../browser/types.js';
 import type { ProjectCredential } from '../storage/types.js';
 import type { GeneratedSpec, TestMode, TestModeContext, TestPlan, TestPlanItem } from '../modes/types.js';
-import { extractEscapeHatchReasons, forgetGenerateCheckpointEntries } from '../modes/playwright/generate.js';
+import {
+  collectGroundTruth,
+  extractEscapeHatchReasons,
+  findUngroundedReferences,
+  forgetGenerateCheckpointEntries,
+  type GroundTruth,
+} from '../modes/playwright/generate.js';
 import { buildRequirementTokens, hasRequirementCoverage } from '../util/requirement-tokens.js';
 
 /** One escape-hatch marker found in a generated spec, resolved (or not) to a route to re-crawl. */
@@ -97,7 +103,40 @@ function findMatchingState(item: TestPlanItem, crawledRoutes: CrawledRoute[]): C
 }
 
 /**
- * Resolves each escape-hatched spec's plan item to a target to re-crawl, in priority order:
+ * A generated spec can carry an unresolved-selector gap in two shapes, both worth chasing the
+ * exact same way:
+ * 1. The SANCTIONED escape hatch (generate.ts's ESCAPE_HATCH_MARKER) — the model honestly admits
+ *    it couldn't find something and demotes that block to `test.fixme`. Self-describing: durably
+ *    embedded in the spec's own source, re-derivable any time via `extractEscapeHatchReasons`.
+ * 2. A QUIET guess generate.ts's own grounding gate (`findUngroundedReferences`) already caught as
+ *    a WARN-level (non-blocking) finding — the model referenced a selector/endpoint NOT actually
+ *    observed, but not severely enough to reject outright, so it SHIPPED as an ordinary-looking
+ *    test that will fail for real once executed, with no marker distinguishing it from a
+ *    legitimate test. This is arguably worse than case 1: same underlying problem (missing
+ *    grounding), but silent — nothing flags it as a gap unless re-checked here. Deliberately NOT
+ *    cached on `GeneratedSpec` at generation time (same "no cached field" reasoning as escape
+ *    hatches — see generate.ts's `extractEscapeHatchReasons` doc comment): re-derived on demand by
+ *    re-running the exact same `findUngroundedReferences` check against the CURRENT ground truth
+ *    (via the caller-supplied `buildGroundTruth`), which naturally reflects whatever this module's
+ *    own re-crawl has already merged into `ctx.exploration` by the time a later iteration re-checks.
+ */
+function findUngroundedWarnReasons(
+  spec: GeneratedSpec,
+  item: TestPlanItem,
+  buildGroundTruth?: (item: TestPlanItem) => GroundTruth,
+): { testTitle: string; reason: string }[] {
+  if (!buildGroundTruth) return [];
+  const groundTruth = buildGroundTruth(item);
+  const { warn } = findUngroundedReferences(spec.contents, groundTruth);
+  return warn.map((w) => ({
+    testTitle: spec.title,
+    reason: `unverifiable reference (shipped, not blocking): ${w}`,
+  }));
+}
+
+/**
+ * Resolves each spec carrying an unresolved-selector gap (see findUngroundedWarnReasons's doc
+ * comment for the two shapes this can take) to a target to re-crawl, in priority order:
  * 1. A `route:`-prefixed unitKey, resolved the same way gap-fill.ts's identifyUnmetContentNeeds
  *    does (reconcileStaticRoutePaths) — but deliberately WITHOUT that function's fallback cascade
  *    (substring match, then "every route" if even that fails).
@@ -114,14 +153,16 @@ export function resolveGapTargets(
   routing: RoutePrefixInfo,
   baseUrl: string,
   crawledRoutes: CrawledRoute[] = [],
+  buildGroundTruth?: (item: TestPlanItem) => GroundTruth,
 ): EscapeHatchGap[] {
   const gaps: EscapeHatchGap[] = [];
   for (const spec of specs) {
     if (!spec.planItemId) continue;
-    const reasons = extractEscapeHatchReasons(spec.contents);
-    if (reasons.length === 0) continue;
     const item = items.find((it) => it.id === spec.planItemId);
     if (!item) continue;
+    const reasons = extractEscapeHatchReasons(spec.contents);
+    if (reasons.length === 0) reasons.push(...findUngroundedWarnReasons(spec, item, buildGroundTruth));
+    if (reasons.length === 0) continue;
 
     let targetUrl: string | undefined;
     let stateKey: string | undefined;
@@ -322,12 +363,24 @@ export async function runDirectedReexplore(
   let iteration = 0;
   let gapsClosedTotal = 0;
   let browserStarted = false;
+  // Re-derives ground truth from whatever ctx.exploration looks like AT CALL TIME — so a spec that
+  // shipped with a quiet, WARN-level ungrounded reference (see findUngroundedWarnReasons) gets
+  // re-checked against the richer post-merge inventory on later iterations, the same way an
+  // escape-hatched spec's marker gets re-checked against the updated crawl.
+  const buildGroundTruth = (item: TestPlanItem): GroundTruth => collectGroundTruth(ctx, item.tier, item);
 
   try {
     for (;;) {
       if (iteration >= DIRECTED_REEXPLORE_MAX_ITERATIONS) break;
 
-      const gaps = resolveGapTargets(specs, plan.items, routing, baseUrl, ctx.exploration?.crawl.routes);
+      const gaps = resolveGapTargets(
+        specs,
+        plan.items,
+        routing,
+        baseUrl,
+        ctx.exploration?.crawl.routes,
+        buildGroundTruth,
+      );
       const targetable = gaps.filter((g): g is EscapeHatchGap & { targetUrl: string } => !!g.targetUrl);
       if (targetable.length === 0) break; // nothing left to chase (covers "no gaps" and "nothing resolvable")
 
@@ -455,9 +508,14 @@ export async function runDirectedReexplore(
       }
 
       const stillGapped = new Set(
-        resolveGapTargets(accepted, affectedItems, routing, baseUrl, ctx.exploration?.crawl.routes).map(
-          (g) => g.planItemId,
-        ),
+        resolveGapTargets(
+          accepted,
+          affectedItems,
+          routing,
+          baseUrl,
+          ctx.exploration?.crawl.routes,
+          buildGroundTruth,
+        ).map((g) => g.planItemId),
       );
       const closed = affectedItems.filter((it) => !stillGapped.has(it.id)).length;
       gapsClosedTotal += closed;
@@ -478,7 +536,13 @@ export async function runDirectedReexplore(
     specs,
     iterations: iteration,
     gapsClosed: gapsClosedTotal,
-    gapsRemaining: resolveGapTargets(specs, plan.items, routing, baseUrl, ctx.exploration?.crawl.routes)
-      .length,
+    gapsRemaining: resolveGapTargets(
+      specs,
+      plan.items,
+      routing,
+      baseUrl,
+      ctx.exploration?.crawl.routes,
+      buildGroundTruth,
+    ).length,
   };
 }

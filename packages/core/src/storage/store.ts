@@ -5,9 +5,15 @@ import { decryptSecret, encryptSecret } from './crypto.js';
 import { validateNewProject } from './validate.js';
 import type {
   AgentEvent,
+  EscapeHatchGap,
+  EscapeHatchGapStatus,
   EventLevel,
+  ExplorationSummary,
+  KbExecutionArtifact,
   KbItemStatus,
   KbScenarioStatus,
+  KbTestScript,
+  MockResponseRow,
   NewProject,
   NewProjectCredential,
   NewTriageResult,
@@ -17,9 +23,11 @@ import type {
   PlanKbScenario,
   Project,
   ProjectCredential,
+  Requirement,
   Run,
   RunStatus,
   SuiteMode,
+  TestMockUsage,
   Tier,
   TestCase,
   TestResult,
@@ -28,6 +36,19 @@ import type {
   UsageAggregate,
   UsageRow,
 } from './types.js';
+
+/** One flat (requirement, KB item, scenario) row from getTraceabilityMatrix — see its own doc comment. */
+export interface TraceabilityRow {
+  requirementTag: string;
+  requirementDescription: string | null;
+  kbItemId: string;
+  kbItemTitle: string;
+  kbItemStatus: KbItemStatus;
+  kbScenarioId: string;
+  scenarioDescription: string;
+  scenarioStatus: KbScenarioStatus;
+  testId: string | null;
+}
 
 /**
  * Thin synchronous repository over the local SQLite database.
@@ -468,7 +489,13 @@ export class HealixStore {
   insertResult(
     result: Omit<
       TestResult,
-      'id' | 'description' | 'details' | 'stepsJson' | 'skipReason' | 'videoUnavailableReason'
+      | 'id'
+      | 'description'
+      | 'details'
+      | 'stepsJson'
+      | 'skipReason'
+      | 'videoUnavailableReason'
+      | 'evidenceJson'
     > & {
       id?: string;
       description?: string | null;
@@ -476,6 +503,7 @@ export class HealixStore {
       stepsJson?: string | null;
       skipReason?: string | null;
       videoUnavailableReason?: string | null;
+      evidenceJson?: string | null;
     },
   ): TestResult {
     const full: TestResult = {
@@ -486,11 +514,12 @@ export class HealixStore {
       stepsJson: result.stepsJson ?? null,
       skipReason: result.skipReason ?? null,
       videoUnavailableReason: result.videoUnavailableReason ?? null,
+      evidenceJson: result.evidenceJson ?? null,
     };
     this.db.prepare('DELETE FROM results WHERE test_id = ?').run(full.testId);
     this.db
       .prepare(
-        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details, steps_json, skip_reason, video_unavailable_reason) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
+        'INSERT INTO results (id, test_id, status, duration_ms, error, artifacts_json, description, details, steps_json, skip_reason, video_unavailable_reason, evidence_json) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)',
       )
       .run(
         full.id,
@@ -504,6 +533,7 @@ export class HealixStore {
         full.stepsJson,
         full.skipReason,
         full.videoUnavailableReason,
+        full.evidenceJson,
       );
     return full;
   }
@@ -676,6 +706,21 @@ export class HealixStore {
           scenario.status ?? 'planned',
           scenario.testId ?? null,
         );
+      // The row just inserted (or ignored, if this scenario already existed
+      // from an earlier seed on a resumed run) — re-SELECT rather than trust
+      // the locally-generated scenarioId, same reasoning as kbItemId above:
+      // an IGNORE keeps the EXISTING row's real id, which may differ from
+      // this call's freshly-minted one.
+      const scenarioRow = this.db
+        .prepare('SELECT id FROM plan_kb_scenarios WHERE kb_item_id = ? AND scenario_index = ?')
+        .get(kbItemId, scenario.index) as { id: string } | undefined;
+      const realScenarioId = scenarioRow?.id ?? scenarioId;
+      // Every KB scenario gets exactly one kb_execution_artifacts row, seeded
+      // empty here and filled in once execution produces a real result — see
+      // updateKbExecutionArtifacts.
+      this.db
+        .prepare('INSERT OR IGNORE INTO kb_execution_artifacts (id, kb_scenario_id, run_id) VALUES (?, ?, ?)')
+        .run(`kea_${nanoid(10)}`, realScenarioId, input.runId);
     }
     return kbItemId;
   }
@@ -739,6 +784,270 @@ export class HealixStore {
       .run(status, testId);
   }
 
+  /**
+   * Fill in a KB scenario's execution artifacts once its result lands — same
+   * by-test_id join, same best-effort no-op semantics as
+   * updatePlanKbScenarioStatusByTestId. `errorMessage`/`tracePath` should be
+   * null for anything that isn't a failed/blocked result (the caller decides
+   * that, this just persists whatever it's given).
+   */
+  updateKbExecutionArtifacts(
+    testId: string,
+    input: { errorMessage: string | null; tracePath: string | null; executionSteps: string | null },
+  ): void {
+    this.db
+      .prepare(
+        `UPDATE kb_execution_artifacts SET error_message = ?, trace_path = ?, execution_steps = ?, updated_at = datetime('now')
+         WHERE kb_scenario_id = (SELECT id FROM plan_kb_scenarios WHERE test_id = ?)`,
+      )
+      .run(input.errorMessage, input.tracePath, input.executionSteps, testId);
+  }
+
+  /** The execution-artifacts row for one KB scenario, or null if it somehow has none (predates this feature, or was never seeded). */
+  getKbExecutionArtifact(kbScenarioId: string): KbExecutionArtifact | null {
+    const row = this.db
+      .prepare('SELECT * FROM kb_execution_artifacts WHERE kb_scenario_id = ?')
+      .get(kbScenarioId) as Record<string, unknown> | undefined;
+    return row ? rowToKbExecutionArtifact(row) : null;
+  }
+
+  /** All KB execution-artifacts rows for a run. */
+  listKbExecutionArtifacts(runId: string): KbExecutionArtifact[] {
+    return (
+      this.db.prepare('SELECT * FROM kb_execution_artifacts WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToKbExecutionArtifact);
+  }
+
+  // ---- KB foundation: requirements/mock_responses/exploration_summaries/escape_hatch_gaps ----
+  // See docs/design/kb-foundation-evidence-persistence.md.
+
+  /** Dedup a reqTag within a run, idempotently. Returns the requirement's persisted id (existing row's, if one already existed). */
+  seedRequirement(runId: string, tag: string, description: string | null): string {
+    const id = `req_${nanoid(10)}`;
+    this.db
+      .prepare('INSERT OR IGNORE INTO requirements (id, run_id, tag, description) VALUES (?, ?, ?, ?)')
+      .run(id, runId, tag, description);
+    const row = this.db
+      .prepare('SELECT id FROM requirements WHERE run_id = ? AND tag = ?')
+      .get(runId, tag) as { id: string } | undefined;
+    return row?.id ?? id;
+  }
+
+  /** Link a KB item to its resolved requirement — separate call (not a seedPlanKbItem param) so that method's signature/behavior stays untouched for every other caller. */
+  setPlanKbItemRequirement(kbItemId: string, requirementId: string): void {
+    this.db.prepare('UPDATE plan_kb_items SET requirement_id = ? WHERE id = ?').run(requirementId, kbItemId);
+  }
+
+  listRequirements(runId: string): Requirement[] {
+    return (
+      this.db.prepare('SELECT * FROM requirements WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToRequirement);
+  }
+
+  /**
+   * Requirement-traceability matrix: every requirement joined through its KB
+   * item(s), their scenarios, and (when linked) the real test/result status —
+   * a flat row per (requirement, kb item, scenario) triple, exactly the shape
+   * `requirements ⋈ plan_kb_items ⋈ plan_kb_scenarios ⋈ tests ⋈ results`
+   * expresses with no additional join logic.
+   */
+  getTraceabilityMatrix(runId: string): TraceabilityRow[] {
+    return (
+      this.db
+        .prepare(
+          `SELECT
+             req.tag AS requirement_tag,
+             req.description AS requirement_description,
+             it.id AS kb_item_id,
+             it.title AS kb_item_title,
+             it.status AS kb_item_status,
+             sc.id AS kb_scenario_id,
+             sc.description AS scenario_description,
+             sc.status AS scenario_status,
+             sc.test_id AS test_id
+           FROM requirements req
+           JOIN plan_kb_items it ON it.requirement_id = req.id
+           JOIN plan_kb_scenarios sc ON sc.kb_item_id = it.id
+           WHERE req.run_id = ?`,
+        )
+        .all(runId) as Array<Record<string, unknown>>
+    ).map((r) => ({
+      requirementTag: String(r.requirement_tag),
+      requirementDescription: s(r.requirement_description),
+      kbItemId: String(r.kb_item_id),
+      kbItemTitle: String(r.kb_item_title),
+      kbItemStatus: String(r.kb_item_status) as KbItemStatus,
+      kbScenarioId: String(r.kb_scenario_id),
+      scenarioDescription: String(r.scenario_description),
+      scenarioStatus: String(r.scenario_status) as KbScenarioStatus,
+      testId: s(r.test_id),
+    }));
+  }
+
+  /**
+   * Insert (or, on a resumed run, refresh) one mock target's generated
+   * mock_* fields. observed_* fields are never written here — see this
+   * table's own schema comment for why. Returns the row's persisted id.
+   */
+  upsertMockResponse(input: {
+    runId: string;
+    dependencyId: string;
+    category: string;
+    method: string | null;
+    pathPattern: string | null;
+    mockStrategy: string;
+    mockStatus: number | null;
+    mockBodyJson: string | null;
+    mockHeadersJson: string | null;
+  }): string {
+    const id = `mock_${nanoid(10)}`;
+    // SQLite's UNIQUE index treats every NULL as distinct from every other
+    // NULL, so ON CONFLICT(run_id, dependency_id, method, path_pattern) never
+    // fires when method/path_pattern are both null (the case for a
+    // dependency with no endpoints) — each call would insert a fresh
+    // duplicate row instead of refreshing the existing one. Normalize null
+    // to '' for storage/matching only; rowToMockResponse maps '' back to
+    // null so callers still see null.
+    const method = input.method ?? '';
+    const pathPattern = input.pathPattern ?? '';
+    this.db
+      .prepare(
+        `INSERT INTO mock_responses (id, run_id, dependency_id, category, method, path_pattern, mock_strategy, mock_status, mock_body_json, mock_headers_json)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(run_id, dependency_id, method, path_pattern) DO UPDATE SET
+           category = excluded.category,
+           mock_strategy = excluded.mock_strategy,
+           mock_status = excluded.mock_status,
+           mock_body_json = excluded.mock_body_json,
+           mock_headers_json = excluded.mock_headers_json,
+           updated_at = datetime('now')`,
+      )
+      .run(
+        id,
+        input.runId,
+        input.dependencyId,
+        input.category,
+        method,
+        pathPattern,
+        input.mockStrategy,
+        input.mockStatus,
+        input.mockBodyJson,
+        input.mockHeadersJson,
+      );
+    // ON CONFLICT keeps the EXISTING row's real id, which may differ from
+    // this call's freshly-minted one — re-SELECT rather than trust `id`,
+    // same reasoning as seedPlanKbItem/seedRequirement.
+    const row = this.db
+      .prepare(
+        'SELECT id FROM mock_responses WHERE run_id = ? AND dependency_id = ? AND method = ? AND path_pattern = ?',
+      )
+      .get(input.runId, input.dependencyId, method, pathPattern) as { id: string } | undefined;
+    return row?.id ?? id;
+  }
+
+  listMockResponses(runId: string): MockResponseRow[] {
+    return (
+      this.db.prepare('SELECT * FROM mock_responses WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToMockResponse);
+  }
+
+  /**
+   * Record a test's usage of a mock target. NOT called anywhere yet — see
+   * test_mock_usage's own schema comment: there is no honest per-test
+   * request_count to write until per-test mock-count tracking is built.
+   * Exists so that future work can populate it without another migration.
+   */
+  recordMockUsage(testId: string, mockResponseId: string, requestCount: number): void {
+    this.db
+      .prepare(
+        'INSERT INTO test_mock_usage (test_id, mock_response_id, request_count) VALUES (?, ?, ?) ' +
+          'ON CONFLICT(test_id, mock_response_id) DO UPDATE SET request_count = excluded.request_count',
+      )
+      .run(testId, mockResponseId, requestCount);
+  }
+
+  listMockUsageForTest(testId: string): TestMockUsage[] {
+    return (
+      this.db.prepare('SELECT * FROM test_mock_usage WHERE test_id = ?').all(testId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToTestMockUsage);
+  }
+
+  /** Insert one crawled route's summary, idempotently (INSERT OR IGNORE, unique on (run_id, route)). */
+  insertExplorationSummary(input: {
+    runId: string;
+    route: string;
+    selectorsJson: string | null;
+    formsJson: string | null;
+    authPattern: string | null;
+    stateProbeCount: number | null;
+  }): void {
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO exploration_summaries (id, run_id, route, selectors_json, forms_json, auth_pattern, state_probe_count) VALUES (?, ?, ?, ?, ?, ?, ?)',
+      )
+      .run(
+        `exs_${nanoid(10)}`,
+        input.runId,
+        input.route,
+        input.selectorsJson,
+        input.formsJson,
+        input.authPattern,
+        input.stateProbeCount,
+      );
+  }
+
+  listExplorationSummaries(runId: string): ExplorationSummary[] {
+    return (
+      this.db.prepare('SELECT * FROM exploration_summaries WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToExplorationSummary);
+  }
+
+  /**
+   * Record one escape-hatch gap. NOT called anywhere yet — the
+   * extractEscapeHatchReasons function this depends on does not exist (see
+   * this table's own schema comment). Exists so the (still unbuilt) directed
+   * re-exploration loop has somewhere real to write into once it lands.
+   */
+  insertEscapeHatchGap(input: {
+    runId: string;
+    planItemId: string;
+    unitKey: string | null;
+    reasonsJson: string;
+    iteration?: number;
+  }): string {
+    const id = `ehg_${nanoid(10)}`;
+    this.db
+      .prepare(
+        'INSERT INTO escape_hatch_gaps (id, run_id, plan_item_id, unit_key, reasons_json, iteration) VALUES (?, ?, ?, ?, ?, ?)',
+      )
+      .run(id, input.runId, input.planItemId, input.unitKey, input.reasonsJson, input.iteration ?? 0);
+    return id;
+  }
+
+  updateEscapeHatchGapStatus(id: string, status: EscapeHatchGapStatus): void {
+    this.db
+      .prepare("UPDATE escape_hatch_gaps SET status = ?, updated_at = datetime('now') WHERE id = ?")
+      .run(status, id);
+  }
+
+  listEscapeHatchGaps(runId: string): EscapeHatchGap[] {
+    return (
+      this.db.prepare('SELECT * FROM escape_hatch_gaps WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToEscapeHatchGap);
+  }
+
   /** KB items still needing regeneration for this run. */
   listDroppedPlanKbItems(runId: string): PlanKbItem[] {
     return (
@@ -773,6 +1082,38 @@ export class HealixStore {
         Record<string, unknown>
       >
     ).map(rowToPlanKbScenario);
+  }
+
+  /**
+   * Record the real source file backing a KB item's functionality (white-box
+   * only — the caller resolves `filePath` from the plan item's unitKey
+   * against the run's FunctionalityUnit/SourceContext before calling this;
+   * simply don't call it when there's no match). Idempotent (INSERT OR
+   * IGNORE, unique on kb_item_id) — safe to re-run on a resumed run.
+   */
+  recordKbTestScript(input: { kbItemId: string; runId: string; filePath: string }): void {
+    this.db
+      .prepare(
+        'INSERT OR IGNORE INTO kb_test_scripts (id, kb_item_id, run_id, file_path) VALUES (?, ?, ?, ?)',
+      )
+      .run(`kts_${nanoid(10)}`, input.kbItemId, input.runId, input.filePath);
+  }
+
+  /** The source file path for one KB item, or null when this item has no known source grounding. */
+  getKbTestScript(kbItemId: string): KbTestScript | null {
+    const row = this.db.prepare('SELECT * FROM kb_test_scripts WHERE kb_item_id = ?').get(kbItemId) as
+      | Record<string, unknown>
+      | undefined;
+    return row ? rowToKbTestScript(row) : null;
+  }
+
+  /** All KB test-script (source file path) rows for a run. */
+  listKbTestScripts(runId: string): KbTestScript[] {
+    return (
+      this.db.prepare('SELECT * FROM kb_test_scripts WHERE run_id = ?').all(runId) as Array<
+        Record<string, unknown>
+      >
+    ).map(rowToKbTestScript);
   }
 
   // ---- orchestrator events (resumable checkpoints) ----
@@ -1066,6 +1407,7 @@ function rowToResult(r: Record<string, unknown>): TestResult {
     stepsJson: s(r.steps_json),
     skipReason: s(r.skip_reason),
     videoUnavailableReason: s(r.video_unavailable_reason),
+    evidenceJson: s(r.evidence_json),
   };
 }
 
@@ -1091,6 +1433,7 @@ function rowToPlanKbItem(r: Record<string, unknown>): PlanKbItem {
     reqTag: s(r.req_tag),
     tier: s(r.tier),
     status: String(r.status) as KbItemStatus,
+    requirementId: s(r.requirement_id),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
   };
@@ -1106,6 +1449,101 @@ function rowToPlanKbScenario(r: Record<string, unknown>): PlanKbScenario {
     description: String(r.description),
     status: String(r.status) as KbScenarioStatus,
     testId: s(r.test_id),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function rowToKbTestScript(r: Record<string, unknown>): KbTestScript {
+  return {
+    id: String(r.id),
+    kbItemId: String(r.kb_item_id),
+    runId: String(r.run_id),
+    filePath: String(r.file_path),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function rowToKbExecutionArtifact(r: Record<string, unknown>): KbExecutionArtifact {
+  return {
+    id: String(r.id),
+    kbScenarioId: String(r.kb_scenario_id),
+    runId: String(r.run_id),
+    errorMessage: s(r.error_message),
+    tracePath: s(r.trace_path),
+    executionSteps: s(r.execution_steps),
+    networkLogs: s(r.network_logs),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function rowToRequirement(r: Record<string, unknown>): Requirement {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    tag: String(r.tag),
+    description: s(r.description),
+    source: String(r.source) as Requirement['source'],
+    createdAt: String(r.created_at),
+  };
+}
+
+function rowToMockResponse(r: Record<string, unknown>): MockResponseRow {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    dependencyId: String(r.dependency_id),
+    category: String(r.category),
+    // '' is upsertMockResponse's null-dedup sentinel (SQLite treats every
+    // NULL as distinct for UNIQUE-index purposes, so a real null couldn't be
+    // used there) — map it back to null so callers see the same value they
+    // passed in.
+    method: s(r.method) || null,
+    pathPattern: s(r.path_pattern) || null,
+    mockStrategy: String(r.mock_strategy),
+    mockStatus: n(r.mock_status),
+    mockBodyJson: s(r.mock_body_json),
+    mockHeadersJson: s(r.mock_headers_json),
+    observedStatus: n(r.observed_status),
+    observedBodyJson: s(r.observed_body_json),
+    observedHeadersJson: s(r.observed_headers_json),
+    createdAt: String(r.created_at),
+    updatedAt: String(r.updated_at),
+  };
+}
+
+function rowToTestMockUsage(r: Record<string, unknown>): TestMockUsage {
+  return {
+    testId: String(r.test_id),
+    mockResponseId: String(r.mock_response_id),
+    requestCount: Number(r.request_count),
+  };
+}
+
+function rowToExplorationSummary(r: Record<string, unknown>): ExplorationSummary {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    route: String(r.route),
+    selectorsJson: s(r.selectors_json),
+    formsJson: s(r.forms_json),
+    authPattern: s(r.auth_pattern),
+    stateProbeCount: n(r.state_probe_count),
+    createdAt: String(r.created_at),
+  };
+}
+
+function rowToEscapeHatchGap(r: Record<string, unknown>): EscapeHatchGap {
+  return {
+    id: String(r.id),
+    runId: String(r.run_id),
+    planItemId: String(r.plan_item_id),
+    unitKey: s(r.unit_key),
+    reasonsJson: String(r.reasons_json),
+    status: String(r.status) as EscapeHatchGapStatus,
+    iteration: Number(r.iteration),
     createdAt: String(r.created_at),
     updatedAt: String(r.updated_at),
   };

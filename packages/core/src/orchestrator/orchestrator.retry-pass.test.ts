@@ -983,6 +983,114 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
       expect(scenario!.testId).not.toBeNull();
       expect(scenario!.status).toBe('passed');
     }
+
+    // Every KB scenario also got its own kb_execution_artifacts row — seeded
+    // at plan time, filled in once the real result landed. These passed, so
+    // error_message/trace_path stay null; network_logs has no capture source
+    // yet anywhere, so it's always null.
+    const kbExecutionArtifacts = store.listKbExecutionArtifacts(run1.runId);
+    expect(kbExecutionArtifacts).toHaveLength(2);
+    for (const scenario of kbScenarios) {
+      const artifact = kbExecutionArtifacts.find((a) => a.kbScenarioId === scenario.id);
+      expect(artifact).toBeDefined();
+      expect(artifact!.errorMessage).toBeNull();
+      expect(artifact!.networkLogs).toBeNull();
+    }
+
+    // KB foundation: both items share reqTag 'REQ-001' — they must dedupe
+    // into ONE requirement row, and both items must link to it.
+    const requirements = store.listRequirements(run1.runId);
+    expect(requirements).toHaveLength(1);
+    expect(requirements[0].tag).toBe('REQ-001');
+    expect(kbItems.every((it) => it.requirementId === requirements[0].id)).toBe(true);
+
+    // The traceability matrix flattens requirement -> kb item -> scenario ->
+    // test into one row per (kb item, scenario) pair — both items' scenarios
+    // show up, joined to the same single requirement, each reflecting its
+    // real passed status and test id.
+    const matrix = store.getTraceabilityMatrix(run1.runId);
+    expect(matrix).toHaveLength(2);
+    for (const row of matrix) {
+      expect(row.requirementTag).toBe('REQ-001');
+      expect(row.scenarioStatus).toBe('passed');
+      expect(row.testId).not.toBeNull();
+    }
+    expect(new Set(matrix.map((r) => r.kbItemTitle))).toEqual(
+      new Set(['User registration via UI', 'POST /api/auth/register API contract']),
+    );
+  });
+
+  it('persistResults merges ExecOutcome.apiEvidence into evidence_json even when the result has no specFile (regression)', async () => {
+    // Root-cause regression: persistResults built its apiEvidence lookup key
+    // as `${r.specFile ?? ''}#${r.title}`, always inserting a '#' even when
+    // specFile is absent. Every other reader/writer of this same identity
+    // (execute.ts's keyOf, and the pre-existing lookup a few hundred lines
+    // above this same function) uses `r.specFile ? \`${r.specFile}#${r.title}\`
+    // : r.title` instead — no '#' when specFile is missing. A mismatched key
+    // means outcome.apiEvidence[key] silently misses for every specFile-less
+    // result, leaving evidenceJson.apiEvidence unset even though real
+    // evidence was captured.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'ApiEvidence No-SpecFile Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const ITEMS = [
+      {
+        title: 'POST /api/widgets contract',
+        tier: 'tierC-api',
+        intent: 'API contract for widgets.',
+        scenarios: [{ kind: 'positive', description: 'returns 200' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'no-specfile-result';
+    const evidenceMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        // A result item with NO specFile — the exact case the buggy key
+        // construction mishandled — plus an apiEvidence entry keyed the
+        // established way (bare title, no '#' prefix, since specFile is
+        // absent).
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          apiEvidence: { [RESULT_TITLE]: 'GET /api/widgets -> 200 {"ok":true}' },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const run = await createOrchestrator({
+      provider: fakeProviderWithPlan([], ITEMS),
+      getMode: () => evidenceMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run.status).toBe('passed');
+
+    const results = store.listResults(run.runId);
+    const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+    expect(target).toBeDefined();
+    expect(target!.evidenceJson).not.toBeNull();
+    const evidence = JSON.parse(target!.evidenceJson!) as { apiEvidence?: string };
+    expect(evidence.apiEvidence).toBe('GET /api/widgets -> 200 {"ok":true}');
   });
 
   it("a spec quarantined by the LATER validate() step (not generate.ts's own checks) gets the KB corrected to dropped, so retry-pass can regenerate it (regression)", async () => {

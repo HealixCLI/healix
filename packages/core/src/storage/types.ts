@@ -154,6 +154,8 @@ export interface PlanKbItem {
   reqTag: string | null;
   tier: Tier | null;
   status: KbItemStatus;
+  /** Requirement.id — set when this item has a non-null reqTag; null for a reqTag-less item. See docs/design/kb-foundation-evidence-persistence.md. */
+  requirementId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -175,6 +177,141 @@ export interface PlanKbScenario {
   updatedAt: string;
 }
 
+/**
+ * One row per Knowledge Base item with known source grounding — the real
+ * file path where that functionality's implementation lives (white-box
+ * projects only, resolved from the plan item's unitKey; absent for a
+ * black-box project or a unit-less item). See
+ * docs/design/retry-pass-coverage-kb-redesign.md.
+ */
+export interface KbTestScript {
+  id: string;
+  /** PlanKbItem.id — the join key back to its parent KB item row. */
+  kbItemId: string;
+  runId: string;
+  filePath: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * One row per Knowledge Base scenario (plan_kb_scenarios), seeded alongside
+ * it and filled in once that scenario's execution result lands. See
+ * docs/design/retry-pass-coverage-kb-redesign.md.
+ */
+export interface KbExecutionArtifact {
+  id: string;
+  /** PlanKbScenario.id — the join key back to its parent KB scenario row. */
+  kbScenarioId: string;
+  runId: string;
+  /** Only present for a failed/blocked result; null for anything else. */
+  errorMessage: string | null;
+  /** trace.zip artifact path; same failed/blocked-only gating as errorMessage. */
+  tracePath: string | null;
+  /** Step-by-step breakdown (click, fill, navigate, assert...) — present for both passed and failed results, mirrors results.steps_json. */
+  executionSteps: string | null;
+  /** Reserved: no capture source exists anywhere in the pipeline yet, so this is always null today. */
+  networkLogs: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Canonical dedup of a reqTag string within one run. See docs/design/kb-foundation-evidence-persistence.md. */
+export interface Requirement {
+  id: string;
+  runId: string;
+  tag: string;
+  /** First plan item's title/intent seen for this tag — best-effort, not authoritative. */
+  description: string | null;
+  source: 'plan' | 'prd';
+  createdAt: string;
+}
+
+/**
+ * One (dependency, method, path) mock target. mock_* fields are populated at
+ * generation time; observed_* fields are reserved (see this table's own
+ * schema-comment for why) and always null today.
+ */
+export interface MockResponseRow {
+  id: string;
+  runId: string;
+  /** ExternalDependency.id. */
+  dependencyId: string;
+  category: string;
+  method: string | null;
+  pathPattern: string | null;
+  mockStrategy: string;
+  mockStatus: number | null;
+  mockBodyJson: string | null;
+  mockHeadersJson: string | null;
+  observedStatus: number | null;
+  observedBodyJson: string | null;
+  observedHeadersJson: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** Per-test mock usage — see mock_responses' own schema comment for why request_count is unpopulated today. */
+export interface TestMockUsage {
+  testId: string;
+  mockResponseId: string;
+  requestCount: number;
+}
+
+/** One crawled route's summary (not the full raw crawl — see exploration-cache.ts). See docs/design/kb-foundation-evidence-persistence.md. */
+export interface ExplorationSummary {
+  id: string;
+  runId: string;
+  /** Normalized URL/path, or a stateKey-qualified identity for a same-URL modal/panel state. */
+  route: string;
+  /** JSON-encoded interactive-element selectors found on this route. */
+  selectorsJson: string | null;
+  /** Reserved: EXPLORE's DomSnapshot has no distinct per-route form-grouping structure today, so this is always null. */
+  formsJson: string | null;
+  authPattern: string | null;
+  /** Reserved: no per-route probe-budget tracking exists today, so this is always null. */
+  stateProbeCount: number | null;
+  createdAt: string;
+}
+
+export type EscapeHatchGapStatus = 'open' | 'resolved' | 'unresolved';
+
+/** Durable escape-hatch (fixMe) gap history — see docs/design/kb-foundation-evidence-persistence.md. */
+export interface EscapeHatchGap {
+  id: string;
+  runId: string;
+  planItemId: string;
+  unitKey: string | null;
+  /** JSON-encoded string[] of reasons. */
+  reasonsJson: string;
+  status: EscapeHatchGapStatus;
+  iteration: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * Structured execution evidence persisted onto a TestResult row
+ * (results.evidence_json). Loose JSON, same convention as
+ * artifacts_json/steps_json — not a separate table, since it's a 1:1
+ * enrichment of an existing row. mockPassthrough is part of the documented
+ * shape but never populated — no such mechanism exists in the codebase
+ * today (see this feature's design doc).
+ */
+export interface ResultEvidence {
+  tracePath?: string;
+  videoPath?: string;
+  screenshotPaths?: string[];
+  /** Reserved: no HAR/network capture mechanism exists yet. */
+  networkLogPath?: string;
+  /** The RUN-level aggregate (keyed by dependency id, not test-specific) — see ExecOutcome.mockedRequestCounts's own doc comment. */
+  mockedRequestCounts?: Record<string, number>;
+  /** This specific test's own API evidence — genuinely per-test (see ExecOutcome.apiEvidence's own doc comment). */
+  apiEvidence?: string;
+  /** Reserved: no such mechanism exists in the codebase today. */
+  mockPassthrough?: Record<string, string>;
+}
+
 export interface TestResult {
   id: string;
   testId: string;
@@ -192,6 +329,8 @@ export interface TestResult {
   skipReason: string | null;
   /** Why no usable video is present for this executed result (tierC-api/no-browser-page, blank recording, or a genuine artifact-retention gap) — see ExecResultItem.videoUnavailableReason. Null when a real video IS present, for a skipped result, or an older row from before this column existed. */
   videoUnavailableReason: string | null;
+  /** Structured execution evidence (trace/video/screenshot classification, mock/API evidence) — JSON-encoded ResultEvidence. Null for an older row predating this column, or a result with no evidence to record. See docs/design/kb-foundation-evidence-persistence.md. */
+  evidenceJson: string | null;
 }
 
 export type EventLevel = 'debug' | 'info' | 'warn' | 'error';

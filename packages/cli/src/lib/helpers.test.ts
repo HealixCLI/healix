@@ -154,6 +154,7 @@ describe('shapeRunShow', () => {
         stepsJson: null,
         skipReason: null,
         videoUnavailableReason: null,
+        evidenceJson: null,
       },
     ];
 

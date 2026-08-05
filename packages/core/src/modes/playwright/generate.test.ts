@@ -26,6 +26,7 @@ import {
   clearGenerateCheckpoint,
   collectGroundTruth,
   demoteEscapeHatchBlocks,
+  extractEscapeHatchReasons,
   findDominantPrefixes,
   findForbiddenApis,
   findUngroundedReferences,
@@ -465,6 +466,78 @@ test('[REQ:REQ-1] shows the user\\'s current email', async ({ page }) => {
 `;
     const result = demoteEscapeHatchBlocks(source);
     expect(result).toContain("test.fixme('[REQ:REQ-1] shows the user\\'s current email', { annotation:");
+  });
+});
+
+describe('extractEscapeHatchReasons — durable, queryable reasons for escape_hatch_gaps', () => {
+  it('returns [] for a spec with no escape-hatch marker', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([]);
+  });
+
+  it('extracts one reason per flagged block, matching the SAME text demoteEscapeHatchBlocks embeds as the annotation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+
+test('[REQ:REQ-1] edge: guessed consent checkbox', async ({ page }) => {
+  // TODO: unobserved element - the consent checkbox was not captured in the inventory.
+  await page.locator('input[type="checkbox"]').check();
+});
+
+test('[REQ:REQ-1] edge: guessed newsletter toggle', async ({ page }) => {
+  // TODO: unobserved element - the newsletter toggle was not captured in the inventory.
+  await page.locator('input[name="newsletter"]').check();
+});
+`;
+    const reasons = extractEscapeHatchReasons(source);
+    expect(reasons).toEqual([
+      'unobserved element — the consent checkbox was not captured in the inventory.',
+      'unobserved element — the newsletter toggle was not captured in the inventory.',
+    ]);
+    // Same text demoteEscapeHatchBlocks embeds in the Playwright annotation for the same spec —
+    // the two must never drift, since one feeds the live report and the other feeds the KB.
+    const demoted = demoteEscapeHatchBlocks(source);
+    for (const reason of reasons) {
+      expect(demoted).toContain(reason);
+    }
+  });
+
+  it('falls back to the generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual(['unobserved element — needs review']);
+  });
+
+  it('carries the FULL word-wrapped reason through, same as demoteEscapeHatchBlocks (GAP-062)', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      'unobserved element — a dedicated success toast selector was not captured in the ' +
+        'interactive-element inventory; verifying the persisted field values as a coarser ' +
+        'observable outcome of a successful save instead.',
+    ]);
   });
 });
 
@@ -1048,6 +1121,43 @@ test.describe('[REQ:REQ-1] Home page', () => {
 
     expect(specs).toHaveLength(1);
     expect(specs[0].contents).not.toContain('test.use(');
+  });
+
+  it('calls ctx.onEscapeHatchGap with the extracted reasons when the persisted spec has an escape-hatch marker (KB foundation wiring)', async () => {
+    // Proves the actual wiring gap this session closed: recordGenOutcome (the single funnel
+    // every per-item terminal outcome passes through, same as onKbItemOutcome) must fire
+    // ctx.onEscapeHatchGap with this item's id/unitKey and the reasons extractEscapeHatchReasons
+    // found in the FINAL persisted spec — not just that extractEscapeHatchReasons itself works
+    // in isolation (already covered elsewhere), and not just that store.insertEscapeHatchGap
+    // round-trips a hand-built row (already covered in store.test.ts) — the gap was whether
+    // generate.ts's real pipeline actually calls the callback with the right arguments.
+    const ESCAPE_HATCH_SPEC = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: home page renders', async ({ page }) => {
+  // TODO: unobserved element - the welcome banner was not captured in the inventory.
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const onEscapeHatchGap = vi.fn();
+    const ctx = { ...makeCtx(makeProvider([ESCAPE_HATCH_SPEC], calls)), onEscapeHatchGap };
+
+    const specs = await generate(ctx, { ...PLAN, items: [{ ...PLAN.items[0]!, unitKey: 'route:/' }] });
+
+    expect(specs).toHaveLength(1);
+    expect(onEscapeHatchGap).toHaveBeenCalledTimes(1);
+    expect(onEscapeHatchGap).toHaveBeenCalledWith('REQ-1', 'route:/', [
+      'unobserved element — the welcome banner was not captured in the inventory.',
+    ]);
+  });
+
+  it('never calls ctx.onEscapeHatchGap for a spec with no escape-hatch marker', async () => {
+    const onEscapeHatchGap = vi.fn();
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), onEscapeHatchGap };
+
+    await generate(ctx, PLAN);
+
+    expect(onEscapeHatchGap).not.toHaveBeenCalled();
   });
 });
 

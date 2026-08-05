@@ -437,13 +437,10 @@ const REASON_CONTINUATION_RE = /^\/\/[ \t]*(.*)$/;
 const SKIP_REASON_MAX_LENGTH = 300;
 
 /**
- * Builds the `TestDetails` argument carrying the skip reason as a real Playwright annotation.
- *
- * The reason has to reach Playwright's ANNOTATIONS, not just a source comment: execute.ts's
- * extractSkipReason and report.ts's skip-reason cell both read annotations, so a comment-only
- * marker leaves the report's "why was this skipped" column blank — for what is, in practice,
- * the most common skip cause there is. `JSON.stringify` does the embedding because the text is
- * model-authored and can hold quotes, backslashes, or newlines.
+ * Extracts the model's own explanation for a single flagged block's escape-hatch marker(s),
+ * as plain text (no annotation wrapping/truncation) — shared by escapeHatchDetails (which
+ * turns this into a Playwright annotation) and extractEscapeHatchReasons (which persists it
+ * to the Knowledge Base), so the two can never drift apart.
  *
  * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
  * than one long line. ESCAPE_HATCH_REASON_RE only ever captures the first line (deliberately, so
@@ -452,7 +449,7 @@ const SKIP_REASON_MAX_LENGTH = 300;
  * non-comment line. Without this, everything past the first line was silently dropped with no
  * indication truncation happened (GAP-062).
  */
-function escapeHatchDetails(body: string): string {
+function escapeHatchReasonText(body: string): string {
   const match = ESCAPE_HATCH_REASON_RE.exec(body);
   const firstLine = match?.[1]?.trim() ?? '';
   const continuationLines: string[] = [];
@@ -468,9 +465,36 @@ function escapeHatchDetails(body: string): string {
   }
   const detail = [firstLine, ...continuationLines].filter(Boolean).join(' ');
   const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
-  const description =
-    full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
+  return full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
+}
+
+/**
+ * Builds the `TestDetails` argument carrying the skip reason as a real Playwright annotation.
+ *
+ * The reason has to reach Playwright's ANNOTATIONS, not just a source comment: execute.ts's
+ * extractSkipReason and report.ts's skip-reason cell both read annotations, so a comment-only
+ * marker leaves the report's "why was this skipped" column blank — for what is, in practice,
+ * the most common skip cause there is. `JSON.stringify` does the embedding because the text is
+ * model-authored and can hold quotes, backslashes, or newlines.
+ */
+function escapeHatchDetails(body: string): string {
+  const description = escapeHatchReasonText(body);
   return `, { annotation: { type: 'fixme', description: ${JSON.stringify(description)} } }`;
+}
+
+/**
+ * All escape-hatch reasons found in a spec's flagged test blocks — one entry per flagged
+ * block, using the same extraction logic demoteEscapeHatchBlocks/escapeHatchDetails use to
+ * build the Playwright annotation, but returned to the caller instead of being consumed only
+ * for that inline string. Feeds escape_hatch_gaps (see storage/schema.ts) so a directed
+ * re-exploration pass (not yet implemented) has durable, queryable history of what was left
+ * unobserved, instead of only a source comment/report annotation that's discarded once the
+ * run ends. Returns [] when the spec has no flagged blocks.
+ */
+export function extractEscapeHatchReasons(source: string): string[] {
+  return splitTestBlocks(source)
+    .filter((b) => b.body.includes(ESCAPE_HATCH_MARKER))
+    .map((b) => escapeHatchReasonText(b.body));
 }
 
 /**
@@ -1438,6 +1462,8 @@ interface GenOneOutcome {
    * treats very differently from an ordinary content-validation skip).
    */
   providerFailureDetail?: string;
+  /** Escape-hatch reasons extracted from the persisted spec's flagged blocks, if any — see extractEscapeHatchReasons. Only ever set alongside a non-null `spec`. */
+  escapeHatchReasons?: string[];
 }
 
 // ---- Write-through per-item checkpoint (mirrors execute.ts's write-through
@@ -1553,6 +1579,12 @@ async function recordGenOutcome(
   // funnel, so the KB inherits "don't record an in-flight item as
   // permanently dropped on pause/abort" for free.
   ctx.onKbItemOutcome?.(item.id, outcome.spec ? 'generated' : 'dropped');
+  // Same funnel, same abort guard — an item still in flight when a pause/abort hits never
+  // reaches here at all (the check above returns first), so there's no risk of recording a
+  // gap for a spec that never actually finished generating.
+  if (outcome.escapeHatchReasons && outcome.escapeHatchReasons.length > 0) {
+    ctx.onEscapeHatchGap?.(item.id, item.unitKey ?? null, outcome.escapeHatchReasons);
+  }
 }
 
 /** Reconstructs a GeneratedSpec for an already-finished item from an earlier, interrupted generate() call — by re-reading its spec file rather than re-asking the AI. Returns null (best-effort) if the file is gone or the entry wasn't a 'generated' one. */
@@ -1617,6 +1649,8 @@ interface ValidationOutcome {
    * thin/truncated inventory is just as plausibly the root cause of any other rejection reason.
    */
   inventoryTruncated?: boolean;
+  /** Escape-hatch reasons extracted from the persisted spec's flagged blocks, if any — see extractEscapeHatchReasons. Only ever set alongside a non-null `spec`. */
+  escapeHatchReasons?: string[];
 }
 
 /**
@@ -1742,6 +1776,7 @@ async function validateAndPersist(
 
   source = ensureReqTag(source, reqTag);
   source = demoteEscapeHatchBlocks(source);
+  const escapeHatchReasons = extractEscapeHatchReasons(source);
   if (tier === 'tierB-auth') {
     const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
     const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;
@@ -1760,6 +1795,7 @@ async function validateAndPersist(
   return {
     spec: { path: absPath, title, reqTag, tier, contents: source, planItemId: item.id },
     ungroundedWarn: ungroundedWarn.length > 0 ? ungroundedWarn : undefined,
+    escapeHatchReasons: escapeHatchReasons.length > 0 ? escapeHatchReasons : undefined,
   };
 }
 
@@ -1826,7 +1862,7 @@ async function generateOne(
       );
     }
     if (validated.spec) {
-      return { spec: validated.spec };
+      return { spec: validated.spec, escapeHatchReasons: validated.escapeHatchReasons };
     }
 
     emit(ctx, `Output for "${item.title}" rejected (attempt ${attempt + 1}): ${validated.reason}; retrying`, {
@@ -2251,9 +2287,12 @@ async function generateBatch(
       );
     }
     if (validated.spec) {
-      const outcome: GenOneOutcome = { spec: validated.spec };
+      const outcome: GenOneOutcome = {
+        spec: validated.spec,
+        escapeHatchReasons: validated.escapeHatchReasons,
+      };
       await recordGenOutcome(ctx, item, outcome);
-      results.push({ item, spec: validated.spec });
+      results.push({ item, ...outcome });
       continue;
     }
     emit(

@@ -339,6 +339,170 @@ describe('buildTriagePrompt — unmocked passthrough evidence (mockPassthroughEv
   });
 });
 
+describe('buildTriagePrompt — traced requirement (KB requirements)', () => {
+  it('includes the requirement tag + description, NOT fenced as untrusted (durable project data)', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      requirement: { tag: 'REQ-1', description: 'Login UI flow' },
+    });
+    expect(prompt).toContain('--- TRACED REQUIREMENT ---');
+    expect(prompt).toContain('Tag: REQ-1');
+    expect(prompt).toContain('Description: Login UI flow');
+  });
+
+  it('omits the description line when the requirement has none', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom', requirement: { tag: 'REQ-1' } });
+    expect(prompt).toContain('Tag: REQ-1');
+    expect(prompt).not.toContain('Description:');
+  });
+
+  it('omits the block entirely when requirement is absent', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom' });
+    expect(prompt).not.toContain('--- TRACED REQUIREMENT ---');
+  });
+});
+
+describe('buildTriagePrompt — mock/observed evidence (mock_responses + test_mock_usage)', () => {
+  const OPEN = '<<<UNTRUSTED_TEST_OUTPUT';
+  const CLOSE = 'UNTRUSTED_TEST_OUTPUT>>>';
+
+  it('includes the FULL, untruncated mock + observed response, fenced as untrusted', () => {
+    const observedBody = `x`.repeat(10_000); // far past MAX_SOURCE_CHARS — must survive whole
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      mockEvidence: [
+        {
+          category: 'auth',
+          method: 'POST',
+          pathPattern: '/api/login',
+          mockStatus: 200,
+          mockBody: '{"message":"ok"}',
+          observedStatus: 500,
+          observedBody,
+        },
+      ],
+    });
+    expect(prompt).toContain(
+      '--- MOCK/OBSERVED RESPONSES (from mock_responses + test_mock_usage; untrusted) ---',
+    );
+    expect(prompt).toContain('auth POST /api/login');
+    expect(prompt).toContain('mockStatus: 200');
+    expect(prompt).toContain('mockBody: {"message":"ok"}');
+    expect(prompt).toContain('observedStatus: 500');
+    expect(prompt).toContain(observedBody); // full body present, not truncated
+
+    const idx = prompt.indexOf(observedBody);
+    const openIdx = prompt.lastIndexOf(OPEN, idx);
+    const closeIdx = prompt.indexOf(CLOSE, openIdx);
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(idx).toBeGreaterThan(openIdx);
+    expect(idx).toBeLessThan(closeIdx);
+  });
+
+  it('renders multiple mock evidence entries, one fence per entry', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      mockEvidence: [
+        {
+          category: 'auth',
+          method: 'POST',
+          pathPattern: '/api/login',
+          mockStatus: 200,
+          mockBody: null,
+          observedStatus: null,
+          observedBody: null,
+        },
+        {
+          category: 'sms',
+          method: null,
+          pathPattern: null,
+          mockStatus: null,
+          mockBody: null,
+          observedStatus: null,
+          observedBody: null,
+        },
+      ],
+    });
+    expect(prompt).toContain('[1] auth POST /api/login');
+    expect(prompt).toContain('[2] sms (any method) (any path)');
+  });
+
+  it('omits the block entirely when mockEvidence is absent or empty', () => {
+    expect(buildTriagePrompt({ title: 't', error: 'boom' })).not.toContain('MOCK/OBSERVED RESPONSES');
+    expect(buildTriagePrompt({ title: 't', error: 'boom', mockEvidence: [] })).not.toContain(
+      'MOCK/OBSERVED RESPONSES',
+    );
+  });
+});
+
+describe('buildTriagePrompt — persisted execution evidence (results.evidence_json)', () => {
+  const OPEN = '<<<UNTRUSTED_TEST_OUTPUT';
+  const CLOSE = 'UNTRUSTED_TEST_OUTPUT>>>';
+
+  it('includes trace/video/screenshot paths and mocked-request counts, fenced as untrusted', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      executionEvidence: {
+        tracePath: 'traces/a.zip',
+        videoPath: 'videos/a.webm',
+        screenshotPaths: ['shots/a.png', 'shots/b.png'],
+        mockedRequestCounts: { dep_1: 2 },
+      },
+    });
+    expect(prompt).toContain('--- PERSISTED EXECUTION EVIDENCE (results.evidence_json; untrusted) ---');
+    expect(prompt).toContain('tracePath: traces/a.zip');
+    expect(prompt).toContain('videoPath: videos/a.webm');
+    expect(prompt).toContain('screenshotPaths: shots/a.png, shots/b.png');
+    expect(prompt).toContain('mockedRequestCounts: {"dep_1":2}');
+
+    const idx = prompt.indexOf('traces/a.zip');
+    const openIdx = prompt.lastIndexOf(OPEN, idx);
+    const closeIdx = prompt.indexOf(CLOSE, openIdx);
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(idx).toBeLessThan(closeIdx);
+  });
+
+  it('omits the block entirely when executionEvidence is absent', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom' });
+    expect(prompt).not.toContain('PERSISTED EXECUTION EVIDENCE');
+  });
+});
+
+describe('buildTriagePrompt — exploration context (exploration_summaries)', () => {
+  const OPEN = '<<<UNTRUSTED_TEST_OUTPUT';
+  const CLOSE = 'UNTRUSTED_TEST_OUTPUT>>>';
+
+  it('includes route/selectors/forms/authPattern, fenced as untrusted', () => {
+    const prompt = buildTriagePrompt({
+      title: 't',
+      error: 'boom',
+      explorationContext: {
+        route: '/login',
+        selectors: JSON.stringify([{ selector: '#email' }]),
+        authPattern: 'password-form',
+      },
+    });
+    expect(prompt).toContain('--- EXPLORATION CONTEXT (exploration_summaries; untrusted) ---');
+    expect(prompt).toContain('route: /login');
+    expect(prompt).toContain('authPattern: password-form');
+
+    const idx = prompt.indexOf('route: /login');
+    const openIdx = prompt.lastIndexOf(OPEN, idx);
+    const closeIdx = prompt.indexOf(CLOSE, openIdx);
+    expect(openIdx).toBeGreaterThan(-1);
+    expect(idx).toBeLessThan(closeIdx);
+  });
+
+  it('omits the block entirely when explorationContext is absent', () => {
+    const prompt = buildTriagePrompt({ title: 't', error: 'boom' });
+    expect(prompt).not.toContain('EXPLORATION CONTEXT');
+  });
+});
+
 describe('buildBatchTriagePrompt / parseBatchTriageReply — batched triage round-trip', () => {
   const ITEMS: TriageBatchItem[] = [
     { id: 'a', input: { title: 'Login works', error: 'expect(locator).toBeVisible() failed' } },

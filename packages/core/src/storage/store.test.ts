@@ -938,6 +938,41 @@ describe('KB foundation: requirements/mock_responses/exploration_summaries/escap
     });
   });
 
+  it('recordObservedMockResponse grounds observed_* fields onto an existing row without touching its mock_* fields', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-observed-project', baseUrl: 'https://kb-observed.test' });
+    const run = s.createRun(project.id);
+
+    const id = s.upsertMockResponse({
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'auth',
+      method: 'POST',
+      pathPattern: '/api/login',
+      mockStrategy: 'route-intercept',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'Login successful' }),
+      mockHeadersJson: null,
+    });
+
+    s.recordObservedMockResponse(id, {
+      status: 200,
+      bodyJson: JSON.stringify({ message: 'Login successful' }),
+      headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+    });
+
+    const row = s.listMockResponses(run.id)[0];
+    expect(row).toMatchObject({
+      id,
+      // mock_* fields (the pre-execution plan) untouched by the observed_* write.
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'Login successful' }),
+      observedStatus: 200,
+      observedBodyJson: JSON.stringify({ message: 'Login successful' }),
+      observedHeadersJson: JSON.stringify({ 'content-type': 'application/json' }),
+    });
+  });
+
   it('upsertMockResponse refreshes mock_* fields on a resumed run instead of duplicating the row', async () => {
     const s = await store();
     const project = s.createProject({

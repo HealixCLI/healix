@@ -32,7 +32,7 @@ import type {
   TestPlan,
   TestPlanItem,
 } from '../modes/types.js';
-import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
+import { isPlanItemIncluded, mockResponseTupleKey, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { detectExternalDependencies } from '../target/dependencies.js';
@@ -630,6 +630,14 @@ async function retryPassPipeline(
         noteStoreOk();
       } catch (err) {
         noteStoreFailure('updatePlanKbItemStatus', err);
+      }
+    },
+    onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+      try {
+        store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('insertEscapeHatchGap', err);
       }
     },
     signal,
@@ -2051,6 +2059,14 @@ async function runPipeline(
           noteStoreOk();
         } catch (err) {
           noteStoreFailure('updatePlanKbItemStatus', err);
+        }
+      },
+      onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+        try {
+          store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('insertEscapeHatchGap', err);
         }
       },
       // Long mode phases (generate/execute) receive the run's abort signal so
@@ -3920,6 +3936,34 @@ function persistResults(
 ): void {
   const scenarioIndexByKey = new Map<string, number>();
 
+  // KB foundation: test_mock_usage / mock_responses.observed_*. Built once, up front, rather
+  // than re-querying per result — maps the EXACT (dependency, method, pathPattern) tuple each
+  // mock_responses row was seeded with (see upsertMockResponse) to that row's real id, using
+  // the SAME tuple-keying scheme execute.ts's readMockRequestCountsByTest/
+  // readObservedMockResponses use for the hits/observed responses they report. This resolves
+  // the precise row a hit belongs to even when a dependency has multiple endpoint-level rows
+  // — no attribution is lost to a coarse "only when exactly one row" fallback.
+  const mockResponseIdByTuple = new Map<string, string>();
+  for (const m of store.listMockResponses(runId)) {
+    mockResponseIdByTuple.set(mockResponseTupleKey(m.dependencyId, m.method, m.pathPattern), m.id);
+  }
+
+  // KB foundation: mock_responses.observed_* — dependency-level (not per-test), so this
+  // runs once per (dependency, method, pathPattern) tuple rather than once per result.
+  for (const observed of outcome.observedMockResponses ?? []) {
+    const mockResponseId = mockResponseIdByTuple.get(
+      mockResponseTupleKey(observed.dependencyId, observed.method, observed.pathPattern),
+    );
+    if (mockResponseId) {
+      try {
+        store.recordObservedMockResponse(mockResponseId, observed);
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('recordObservedMockResponse', err);
+      }
+    }
+  }
+
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
     // to carry the "[REQ:<tag>]" marker on EVERY scenario test (see generate.ts's
@@ -3999,6 +4043,10 @@ function persistResults(
       }
     }
 
+    // Shared by both try blocks below (evidence_json AND test_mock_usage) — same identity
+    // apiEvidence/execute.ts's own dedup keyOf() use.
+    const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
+
     try {
       // Copy the parent test row's description/details onto its result — results
       // have no independent source for this content, so it just mirrors the
@@ -4008,18 +4056,15 @@ function persistResults(
       // — classify this result's own artifacts by extension (same
       // trace.zip heuristic used for kb_execution_artifacts just below,
       // plus .webm/.mp4 → video, remainder → screenshots), and merge in
-      // this test's own apiEvidence slice (per-test, keyed by
-      // `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
-      // comment) alongside the run-level mockedRequestCounts aggregate
-      // (NOT test-specific — see ResultEvidence.mockedRequestCounts's own
-      // doc comment). mockPassthrough is part of the documented shape but
-      // never populated; no such mechanism exists in the codebase today.
-      // See docs/design/kb-foundation-evidence-persistence.md.
+      // this test's own apiEvidence/mockPassthrough slices (per-test, keyed
+      // by `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
+      // comment) alongside the run-level mockedRequestCounts aggregate (NOT
+      // test-specific — see ResultEvidence.mockedRequestCounts's own doc
+      // comment).
       const artifacts = r.artifacts ?? [];
       const traceArtifact = artifacts.find((a) => /trace\.zip$/i.test(a));
       const videoArtifact = artifacts.find((a) => /\.(webm|mp4)$/i.test(a));
       const screenshotArtifacts = artifacts.filter((a) => a !== traceArtifact && a !== videoArtifact);
-      const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
       const evidence: ResultEvidence = {
         ...(traceArtifact ? { tracePath: traceArtifact } : {}),
         ...(videoArtifact ? { videoPath: videoArtifact } : {}),
@@ -4029,6 +4074,9 @@ function persistResults(
           : {}),
         ...(outcome.apiEvidence?.[apiEvidenceKey]
           ? { apiEvidence: outcome.apiEvidence[apiEvidenceKey] }
+          : {}),
+        ...(outcome.mockPassthrough?.[apiEvidenceKey]
+          ? { mockPassthrough: outcome.mockPassthrough[apiEvidenceKey] }
           : {}),
       };
       store.insertResult({
@@ -4048,6 +4096,26 @@ function persistResults(
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
+    }
+    const mockUsage = outcome.mockedRequestCountsByTest?.[apiEvidenceKey];
+    if (mockUsage) {
+      // One try/catch PER tally, matching the sibling observedMockResponses loop above —
+      // sharing a single try/catch across every tuple meant one recordMockUsage failure (e.g.
+      // a constraint violation) silently aborted every LATER tuple for this test too, while
+      // noteStoreFailure only ever recorded the one exception that stopped the loop, masking
+      // how many rows actually never got written.
+      for (const tally of mockUsage) {
+        const mockResponseId = mockResponseIdByTuple.get(
+          mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern),
+        );
+        if (!mockResponseId) continue;
+        try {
+          store.recordMockUsage(testId, mockResponseId, tally.count);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('recordMockUsage', err);
+        }
+      }
     }
     try {
       // Keep the test row's status in sync — readers of `tests` (e.g. the CLI

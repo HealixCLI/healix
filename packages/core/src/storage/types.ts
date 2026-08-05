@@ -229,11 +229,8 @@ export interface Requirement {
 
 /**
  * One (dependency, method, path) mock target. mock_* fields are populated at
- * generation time; observed_* fields are populated after execution with the
- * response actually served for this EXACT tuple (see this table's own
- * schema comment) — resolved by (dependencyId, method, pathPattern), so a
- * dependency with multiple detected endpoints gets each row grounded
- * independently.
+ * generation time; observed_* fields are reserved (see this table's own
+ * schema-comment for why) and always null today.
  */
 export interface MockResponseRow {
   id: string;
@@ -254,11 +251,7 @@ export interface MockResponseRow {
   updatedAt: string;
 }
 
-/**
- * Per-test mock usage. Resolved to the exact mock_responses row via its (dependency,
- * method, pathPattern) tuple, so a dependency with multiple detected endpoints gets each
- * one's usage counted independently rather than conflated into a single row.
- */
+/** Per-test mock usage — see mock_responses' own schema comment for why request_count is unpopulated today. */
 export interface TestMockUsage {
   testId: string;
   mockResponseId: string;
@@ -301,7 +294,9 @@ export interface EscapeHatchGap {
  * Structured execution evidence persisted onto a TestResult row
  * (results.evidence_json). Loose JSON, same convention as
  * artifacts_json/steps_json — not a separate table, since it's a 1:1
- * enrichment of an existing row.
+ * enrichment of an existing row. mockPassthrough is part of the documented
+ * shape but never populated — no such mechanism exists in the codebase
+ * today (see this feature's design doc).
  */
 export interface ResultEvidence {
   tracePath?: string;
@@ -313,13 +308,8 @@ export interface ResultEvidence {
   mockedRequestCounts?: Record<string, number>;
   /** This specific test's own API evidence — genuinely per-test (see ExecOutcome.apiEvidence's own doc comment). */
   apiEvidence?: string;
-  /**
-   * This specific test's own mock-passthrough evidence — genuinely per-test, same shape as
-   * apiEvidence above (see ExecOutcome.mockPassthrough's own doc comment). A single string,
-   * not a map: this object is already scoped to one result, so there's nothing further to
-   * key by.
-   */
-  mockPassthrough?: string;
+  /** Reserved: no such mechanism exists in the codebase today. */
+  mockPassthrough?: Record<string, string>;
 }
 
 export interface TestResult {

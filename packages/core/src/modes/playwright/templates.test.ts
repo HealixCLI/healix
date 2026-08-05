@@ -180,35 +180,6 @@ describe('actionHighlighterFixtureContents', () => {
   });
 });
 
-describe('evidenceKey — the shared test-identity used by apiEvidence/mockPassthrough/mockedRequestCountsByTest', () => {
-  it('computes the key relative to testInfo.config.rootDir, NOT process.cwd() (regression: the two differ by testDir in every real run)', () => {
-    // Root-cause regression: process.cwd() during a real Playwright run is the SUITE root
-    // (execute.ts spawns with cwd: ctx.projectDir), but playwrightConfigContents() sets
-    // testDir: './tests' — one path segment deeper — and Playwright's own JSON reporter
-    // writes spec.file relative to THAT (rootDir), not cwd. Using process.cwd() here meant
-    // every real run's key carried an extra 'tests/' prefix the orchestrator's lookup
-    // (built from the JSON report's specFile, with no such prefix) could never match —
-    // apiEvidence/mockPassthrough/mockedRequestCountsByTest silently found nothing, in
-    // every real run, despite passing every existing test (which hand-construct both
-    // sides of the identity consistently, so the mismatch never had a chance to surface).
-    const src = actionHighlighterFixtureContents();
-    expect(src).toContain(
-      "return relative(testInfo.config.rootDir, testInfo.file).split(sep).join('/') + '#' + testInfo.title;",
-    );
-    expect(src).not.toContain('relative(process.cwd(), testInfo.file)');
-  });
-
-  it('is defined once and shared identically by BOTH actionHighlighterFixtureContents and mockFixtureContents (single source of truth)', () => {
-    const actionSrc = actionHighlighterFixtureContents();
-    const mockSrc = mockFixtureContents([]);
-    const extract = (src: string) => /function evidenceKey\(testInfo\) \{[\s\S]*?\n\}/.exec(src)?.[0];
-    const actionFn = extract(actionSrc);
-    const mockFn = extract(mockSrc);
-    expect(actionFn).toBeDefined();
-    expect(actionFn).toBe(mockFn);
-  });
-});
-
 describe('stepsReporterContents', () => {
   it('keeps test.step (human-authored step names) alongside pw:api/expect as a fallback', () => {
     const src = stepsReporterContents();
@@ -636,97 +607,26 @@ describe('mockFixtureContents', () => {
   });
 
   describe('F-15 — every intercepted request is logged so mockedRequestCounts can reflect fixture-level mocking', () => {
-    it('logs a hit (with the resolved dependency id, the test-identity key, the matched endpoint method/pathPattern, AND the actually-served status/body) whenever page.route() fulfills a mocked request', () => {
+    it('logs a hit (with the resolved dependency id) whenever page.route() fulfills a mocked request', () => {
       const src = mockFixtureContents([
         { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
       ]);
-      expect(src).toContain(
-        'await logMockHit(key, matchedId, matchedMethod, matchedPathPattern, response.status, contentType, text);',
-      );
+      expect(src).toContain('await logMockHit(matchedId);');
       expect(src).toContain("import { appendFile } from 'node:fs/promises';");
       expect(src).toContain('MOCK_REQUEST_LOG_PATH');
       expect(src).toContain(JSON.stringify(MOCK_REQUEST_LOG_FILENAME));
     });
 
-    it('logs a hit (with the test-identity key, the matched endpoint method/pathPattern, AND the actually-served status/body) whenever the `request` fixture serves a mocked response', () => {
+    it('logs a hit whenever the `request` fixture serves a mocked response', () => {
       const src = mockFixtureContents([
         { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
       ]);
-      expect(src).toContain(
-        'await logMockHit(key, match.id, match.method, match.pathPattern, canned.status, contentType, text);',
-      );
-    });
-
-    it('logs each hit against the SAME test-identity key evidenceKey(testInfo) computes for API evidence, so mock hits can be attributed to the test that caused them (test_mock_usage)', () => {
-      const src = mockFixtureContents([
-        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
-      ]);
-      // Both fixtures compute `key` from evidenceKey(testInfo) before ever calling logMockHit —
-      // proves the key passed to logMockHit is the same identity used elsewhere for per-test
-      // attribution (specFile#title), not a separately-invented one.
-      const pageFixtureSrc = src.slice(
-        src.indexOf('page: async ({ page, mockOverride }, use, testInfo) => {'),
-        src.indexOf('await logMockHit(key, matchedId,'),
-      );
-      expect(pageFixtureSrc).toContain('const key = evidenceKey(testInfo);');
-      const requestFixtureSrc = src.slice(
-        src.indexOf('request: async ({ request, mockOverride }, use, testInfo) => {'),
-        src.indexOf('await logMockHit(key, match.id,'),
-      );
-      expect(requestFixtureSrc).toContain('const key = evidenceKey(testInfo);');
-    });
-
-    it('logs the ACTUALLY-served status/body (post serializeBody), not the pre-generated mock_status/mock_body_json, so mock_responses.observed_* reflects what really shipped', () => {
-      const src = mockFixtureContents([
-        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
-      ]);
-      // Both call sites compute { contentType, text } via serializeBody(...) BEFORE calling
-      // logMockHit, and pass those exact locals through — not the route's original response
-      // object — so a per-test mockOverride() substitution is captured too.
-      expect(src).toMatch(
-        /const \{ contentType, text \} = serializeBody\(response\);\s*\n\s*await logMockHit\(key, matchedId, matchedMethod, matchedPathPattern, response\.status, contentType, text\);/,
-      );
-      expect(src).toMatch(
-        /const \{ contentType, text \} = serializeBody\(canned\);\s*\n\s*await logMockHit\(key, match\.id, match\.method, match\.pathPattern, canned\.status, contentType, text\);/,
-      );
-    });
-
-    it("logs the matched endpoint's own (method, pathPattern) — the SAME values seeded into mock_responses.method/path_pattern at generation time — so a hit can be resolved to its EXACT row, not just its dependency", () => {
-      const src = mockFixtureContents([
-        {
-          id: 'pkg:twilio',
-          hostnames: ['api.twilio.com'],
-          response: { status: 200, body: { ok: true } },
-          endpoints: [{ method: 'POST', pathPattern: '/v1/otp/send', response: { status: 200, body: {} } }],
-        },
-      ]);
-      expect(src).toMatch(
-        /return \{ response: endpoint\.response, method: endpoint\.method, pathPattern: endpoint\.pathPattern \};/,
-      );
-      expect(src).toMatch(
-        /return \{\s*id: route\.id,\s*response: override \? override\.response : endpoint\.response,\s*method: endpoint\.method,\s*pathPattern: endpoint\.pathPattern,?\s*\};/,
-      );
-      // The generic per-dependency fallback (no specific endpoint matched) explicitly logs
-      // null/null — there is no single mock_responses row it unambiguously belongs to among
-      // several endpoint-level rows, so it must never be attributed to the WRONG one.
-      expect(src).toContain('return { response: route.response, method: null, pathPattern: null };');
-    });
-
-    it("uses the override's OWN (method, pathPattern) rather than null, so a negative-test override (e.g. simulating a 500) still attributes to a real mock_responses row when one exists for that exact endpoint", () => {
-      const src = mockFixtureContents([
-        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
-      ]);
-      expect(src).toContain(
-        'if (override) return { response: override.response, method: override.method, pathPattern: override.pathPattern };',
-      );
+      expect(src).toContain('await logMockHit(match.id);');
     });
 
     it('a logging failure never blocks or throws through the actual mocked response (best-effort contract)', () => {
       const src = mockFixtureContents([]);
-      const fnSrc =
-        /async function logMockHit\(key, id, method, pathPattern, status, contentType, body\) \{[\s\S]*?\n\}/.exec(
-          src,
-        )?.[0];
+      const fnSrc = /async function logMockHit\(id\) \{[\s\S]*?\n\}/.exec(src)?.[0];
       expect(fnSrc).toBeDefined();
       expect(fnSrc).toMatch(/catch\s*\{/);
     });

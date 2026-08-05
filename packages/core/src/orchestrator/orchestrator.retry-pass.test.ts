@@ -732,6 +732,59 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
     expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(0);
   });
 
+  it("retry-pass a long time after the original run completed does NOT count that idle gap as active time — 'Total time' reflects only genuine processing (regression)", async () => {
+    // Root-cause regression: "Total time" in the desktop UI used to be computed as
+    // finishedAt - startedAt. retryPass() never touched startedAt and only ever
+    // overwrote finishedAt with "now" — so retrying a run a day (or, as simulated
+    // here, YEARS) after its original completion made "Total time" report that
+    // entire idle gap as if it were active processing. Simulates the gap directly
+    // by rewriting startedAt to a date years in the past between the original run
+    // and the retry-pass call — activeDurationMs after the retry must still be tiny
+    // (both passes' real, near-instant fake-mode execution time), nowhere near the
+    // multi-year gap.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass Active-Duration Gap Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([], new Set(['REQ-B'])),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+    const afterInitialRun = store.getRun(run1.runId);
+    expect(afterInitialRun?.activeDurationMs).not.toBeNull();
+    expect(afterInitialRun!.activeDurationMs!).toBeLessThan(60_000);
+
+    // Simulate "the original run finished years ago, retry-pass happens today" —
+    // rewrite ONLY startedAt (finishedAt/activeDurationMs are untouched by this
+    // direct store call; retryPass() itself never reads startedAt for its own
+    // contribution, only run.activeDurationMs, which is exactly the point being
+    // proven here).
+    store.updateRunStatus(run1.runId, afterInitialRun!.status, { startedAt: '2020-01-01T00:00:00.000Z' });
+
+    const summary = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).retryPass(run1.runId);
+
+    expect(summary.status).toBe('passed');
+    const afterRetry = store.getRun(run1.runId);
+    // The wall-clock gap between 2020 and now is years (billions of ms) — if the
+    // bug were still present, activeDurationMs (or a UI reader falling back to
+    // finishedAt - startedAt) would reflect that. It must instead stay tiny —
+    // both fake-mode passes' real execution time, nothing more.
+    expect(afterRetry?.activeDurationMs).not.toBeNull();
+    expect(afterRetry!.activeDurationMs!).toBeLessThan(60_000);
+  });
+
   it('executes a pending (generated-but-never-run) scenario WITHOUT regenerating it', async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({

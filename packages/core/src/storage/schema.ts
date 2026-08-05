@@ -1,4 +1,4 @@
-export const SCHEMA_VERSION = 21;
+export const SCHEMA_VERSION = 22;
 
 /** Idempotent DDL applied on first open (and on version bumps). */
 export const SCHEMA_SQL = `

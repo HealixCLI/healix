@@ -256,6 +256,7 @@ export class HealixStore {
       suiteMode: opts.suiteMode ?? null,
       baseRunId: opts.baseRunId ?? null,
       pauseReason: null,
+      activeDurationMs: null,
     };
     this.db
       .prepare(
@@ -328,7 +329,12 @@ export class HealixStore {
   updateRunStatus(
     id: string,
     status: RunStatus,
-    patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
+    patch: {
+      startedAt?: string;
+      finishedAt?: string;
+      pauseReason?: PauseReason | null;
+      activeDurationMs?: number | null;
+    } = {},
   ): void {
     const fields: string[] = ['status = ?'];
     const values: unknown[] = [status];
@@ -343,6 +349,10 @@ export class HealixStore {
     if (patch.pauseReason !== undefined) {
       fields.push('pause_reason = ?');
       values.push(patch.pauseReason);
+    }
+    if (patch.activeDurationMs !== undefined) {
+      fields.push('active_duration_ms = ?');
+      values.push(patch.activeDurationMs);
     }
     values.push(id);
     this.db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
@@ -1399,6 +1409,7 @@ function rowToRun(r: Record<string, unknown>): Run {
     suiteMode: s(r.suite_mode) as Run['suiteMode'],
     baseRunId: s(r.base_run_id),
     pauseReason: s(r.pause_reason) as Run['pauseReason'],
+    activeDurationMs: n(r.active_duration_ms),
   };
 }
 

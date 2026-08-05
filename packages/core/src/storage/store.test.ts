@@ -1295,6 +1295,42 @@ describe('top-up suite lineage', () => {
   });
 });
 
+describe('updateRunStatus — activeDurationMs (cumulative ACTIVE processing time, distinct from wall-clock finishedAt - startedAt)', () => {
+  it('defaults to null for a freshly created run', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'active-duration-fresh',
+      baseUrl: 'https://active-duration-fresh.test',
+    });
+    const run = s.createRun(project.id);
+    expect(run.activeDurationMs).toBeNull();
+    expect(s.getRun(run.id)?.activeDurationMs).toBeNull();
+  });
+
+  it('persists and round-trips a real activeDurationMs value', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'active-duration-roundtrip',
+      baseUrl: 'https://active-duration-roundtrip.test',
+    });
+    const run = s.createRun(project.id);
+    s.updateRunStatus(run.id, 'passed', { finishedAt: new Date().toISOString(), activeDurationMs: 42_000 });
+    expect(s.getRun(run.id)?.activeDurationMs).toBe(42_000);
+  });
+
+  it('leaves activeDurationMs untouched when the patch omits it (e.g. an intermediate phase-status update)', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'active-duration-untouched',
+      baseUrl: 'https://active-duration-untouched.test',
+    });
+    const run = s.createRun(project.id);
+    s.updateRunStatus(run.id, 'passed', { finishedAt: new Date().toISOString(), activeDurationMs: 5_000 });
+    s.updateRunStatus(run.id, 'generating'); // no activeDurationMs in this patch
+    expect(s.getRun(run.id)?.activeDurationMs).toBe(5_000);
+  });
+});
+
 describe('getLastSuccessfulRun', () => {
   it('returns null when the project has no runs at all', async () => {
     const s = await store();

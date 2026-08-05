@@ -209,7 +209,8 @@ export type QualityFindingCode =
   | 'unvalidated-status-code-assumption'
   | 'unattended-destructive-action'
   | 'unscoped-modal-assertion'
-  | 'unblurred-validation-assertion';
+  | 'unblurred-validation-assertion'
+  | 'invented-login-credential';
 
 export interface QualityFinding {
   code: QualityFindingCode;

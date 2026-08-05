@@ -270,11 +270,29 @@ const VISIBLE_OR_TEXT_ASSERTION_RE = /\.(?:not\.)?(?:toBeVisible|toHaveText)\(/;
 const SUCCESS_STATUS_ASSERTION_RE = /\.status\(\)\s*\)\.toBe\(\s*(?:200|201|204)\s*\)/;
 
 /**
+ * A `.click(...)` line naming a LOGIN/sign-in submit specifically — deliberately narrower than
+ * SUBMIT_CLICK_RE (no register/signup/continue/confirm/save) so a registration form's own
+ * Date.now()-based invented email (generate.ts's own guidance for signup-uniqueness scenarios) is
+ * never mistaken for the login-credential violation this flags. Same wording family as crawler.ts's
+ * LOGIN_TEXT_RE, duplicated here rather than imported since this module stays a pure text/regex
+ * layer with no dependency on the browser package.
+ */
+const LOGIN_SUBMIT_CLICK_RE = /[^\n;]*(?:log[- ]?in|sign[- ]?in|prihl[aá]s)[^\n;]*\.click\(\s*\)/i;
+/** Counts `.fill(` calls of ANY kind (literal or `process.env...`) — a login form's identifier
+ * AND password fields are both filled, so a block with fewer than two is unlikely to be one. */
+const ANY_FILL_RE = /\.fill\(/g;
+
+/**
  * Audit a single spec's parse-clean source for quality findings. Returns
  * both block-scoped findings (used for Phase B pruning) and — currently
  * none, but the shape allows it — file-scoped ones.
+ *
+ * `opts.hasCredentials` — true when the project has a real configured test credential (see
+ * suiteEnv() in execute.ts, which injects it into HEALIX_TIERB_EMAIL/HEALIX_TIERB_PASSWORD at
+ * runtime) — gates the invented-login-credential check below: with no credential configured
+ * there is nothing correct to reference, so it would be a false positive.
  */
-export function auditSpecQuality(source: string): QualityFinding[] {
+export function auditSpecQuality(source: string, opts?: { hasCredentials?: boolean }): QualityFinding[] {
   const findings: QualityFinding[] = [];
   const blocks = splitTestBlocks(source);
 
@@ -360,6 +378,32 @@ export function auditSpecQuality(source: string): QualityFinding[] {
           code: 'hardcoded-credential-literal',
           severity: 'warn',
           message: `Test "${block.title || '(untitled)'}" fills a non-placeholder-looking email literal ("${value}") — prefer an obviously-fake placeholder domain (e.g. *.example.com) for invented test data.`,
+          testTitle: block.title,
+          blockRange: [block.start, block.end],
+        });
+      }
+    }
+
+    // invented-login-credential: a login-submit block (identifier + password both filled, then a
+    // login/sign-in click) that is NOT itself a deliberate invalid-credentials scenario, but still
+    // fills a hardcoded string literal instead of referencing the real configured credential via
+    // process.env.HEALIX_TIERB_EMAIL/HEALIX_TIERB_PASSWORD (see generate.ts's formatLoginCredentialGuidance).
+    // HARD, unlike the WARN check above, because — unlike an invented signup email, which is
+    // CORRECT there — any literal here (even an obviously-fake one) can only ever be wrong: the
+    // real backend will reject it, so the test fails against a correctly-behaving app 100% of the
+    // time. Gated on hasCredentials since with none configured there is nothing correct to cite.
+    if (
+      opts?.hasCredentials &&
+      LOGIN_SUBMIT_CLICK_RE.test(block.body) &&
+      [...block.body.matchAll(ANY_FILL_RE)].length >= 2 &&
+      !NEGATIVE_TITLE_HINT_RE.test(block.title)
+    ) {
+      const literal = [...block.body.matchAll(FILL_LITERAL_RE)][0];
+      if (literal) {
+        findings.push({
+          code: 'invented-login-credential',
+          severity: 'hard',
+          message: `Test "${block.title || '(untitled)'}" submits a login form with a hardcoded literal ("${literal[1]}") instead of the real configured test credential. Fill the identifier/password fields with process.env.HEALIX_TIERB_EMAIL!/process.env.HEALIX_TIERB_PASSWORD! — a literal, even a placeholder-looking one, will never match the real account and will fail this test against a correctly-behaving app.`,
           testTitle: block.title,
           blockRange: [block.start, block.end],
         });

@@ -89,6 +89,49 @@ describe('auditSpecQuality', () => {
     expect(auditSpecQuality(source)).toEqual([]);
   });
 
+  it('hard-fails a login-form submission that fills a literal credential when the project has a configured credential', () => {
+    const source = block(
+      'succeeds with valid input',
+      `  await page.getByLabel('Email').fill('registered.user@example.com');\n  await page.getByLabel('Password').fill('hunter2');\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    const findings = auditSpecQuality(source, { hasCredentials: true });
+    expect(findings).toEqual([
+      expect.objectContaining({ code: 'invented-login-credential', severity: 'hard' }),
+    ]);
+  });
+
+  it('does not flag a login-form submission when the project has no configured credential', () => {
+    const source = block(
+      'succeeds with valid input',
+      `  await page.getByLabel('Email').fill('registered.user@example.com');\n  await page.getByLabel('Password').fill('hunter2');\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    expect(auditSpecQuality(source, { hasCredentials: false })).toEqual([]);
+  });
+
+  it('does not flag a login-form submission that references the real credential env vars', () => {
+    const source = block(
+      'succeeds with valid input',
+      `  await page.getByLabel('Email').fill(process.env.HEALIX_TIERB_EMAIL!);\n  await page.getByLabel('Password').fill(process.env.HEALIX_TIERB_PASSWORD!);\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    expect(auditSpecQuality(source, { hasCredentials: true })).toEqual([]);
+  });
+
+  it('does not flag a deliberate invalid-credentials (negative) login scenario for a literal wrong password', () => {
+    const source = block(
+      'fails with an incorrect password',
+      `  await page.getByLabel('Email').fill(process.env.HEALIX_TIERB_EMAIL!);\n  await page.getByLabel('Password').fill('definitely-wrong-password');\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page.getByText('Invalid credentials')).toBeVisible();`,
+    );
+    expect(auditSpecQuality(source, { hasCredentials: true })).toEqual([]);
+  });
+
+  it('does not flag a registration/signup form that invents a Date.now()-based email for uniqueness', () => {
+    const source = block(
+      'registers successfully with a unique email',
+      `  await page.getByLabel('Email').fill(\`email-\${Date.now()}@example.com\`);\n  await page.getByLabel('Password').fill('some-password');\n  await page.getByRole('button', { name: 'Register' }).click();\n  await expect(page).toHaveURL(/welcome/);`,
+    );
+    expect(auditSpecQuality(source, { hasCredentials: true })).toEqual([]);
+  });
+
   it('flags a negative-path test asserting a control becomes enabled as a soft (warn) finding', () => {
     const source = block(
       'shows error for invalid input',

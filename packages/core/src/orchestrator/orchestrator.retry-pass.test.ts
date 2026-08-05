@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createOrchestrator } from './index.js';
 import { diffAgainstBase } from './topup.js';
@@ -1471,6 +1471,111 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
       );
       expect(usage).toHaveLength(2);
     } finally {
+      await rm(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('a store failure recording ONE test_mock_usage tally does not silently drop the OTHER tallies for the same test (regression: was one shared try/catch for the whole per-test loop)', async () => {
+    // Root-cause regression: the write loop originally wrapped ALL of a test's tallies in a
+    // single try/catch, matching the sibling observedMockResponses loop's per-iteration
+    // pattern is what's correct — a throw on the FIRST tuple must not abort the loop and
+    // silently skip every LATER tuple for the same test.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-partial-failure-repo-'));
+    await writeFile(
+      join(repoPath, 'package.json'),
+      JSON.stringify({ name: 'fixture-app', dependencies: { twilio: '^4.23.0' } }),
+      'utf-8',
+    );
+    await mkdir(join(repoPath, 'src', 'app'), { recursive: true });
+    await writeFile(
+      join(repoPath, 'src', 'app', 'otp.js'),
+      "const twilio = require('twilio');\nrequest.post('/v1/otp/send');\nrequest.post('/v1/otp/verify');\n",
+      'utf-8',
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Partial Mock Usage Failure Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      repoPath,
+    });
+
+    const ITEMS = [
+      {
+        title: 'Send and verify OTP',
+        tier: 'tierA-public',
+        intent: 'Sends then verifies an OTP via SMS.',
+        scenarios: [{ kind: 'positive', description: 'succeeds' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'send-and-verify-otp-result';
+    const multiEndpointMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          mockedRequestCountsByTest: {
+            [RESULT_TITLE]: [
+              { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 1 },
+              { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 2 },
+            ],
+          },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    // Fail exactly the FIRST recordMockUsage call (whichever tuple that turns out to be for
+    // this test), succeed on every call after it — proving a failure on one tuple doesn't
+    // prevent the next tuple in the SAME loop from being attempted at all.
+    const originalRecordMockUsage = store.recordMockUsage.bind(store);
+    const recordMockUsageSpy = vi.spyOn(store, 'recordMockUsage');
+    let callCount = 0;
+    recordMockUsageSpy.mockImplementation((testId, mockResponseId, requestCount) => {
+      callCount += 1;
+      if (callCount === 1) throw new Error('simulated constraint violation');
+      return originalRecordMockUsage(testId, mockResponseId, requestCount);
+    });
+
+    try {
+      const run = await createOrchestrator({
+        provider: fakeProviderWithPlan([], ITEMS),
+        getMode: () => multiEndpointMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+
+      expect(run.status).toBe('passed');
+      expect(recordMockUsageSpy).toHaveBeenCalledTimes(2);
+
+      const mockResponses = store.listMockResponses(run.runId).filter((m) => m.dependencyId === 'pkg:twilio');
+      expect(mockResponses).toHaveLength(2);
+
+      const results = store.listResults(run.runId);
+      const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+      expect(target).toBeDefined();
+      const usage = store.listMockUsageForTest(target!.testId);
+      // Exactly one of the two tuples failed (the first call) — the SECOND tuple must still
+      // have been attempted and persisted, not silently skipped because the first one threw.
+      expect(usage).toHaveLength(1);
+    } finally {
+      recordMockUsageSpy.mockRestore();
       await rm(repoPath, { recursive: true, force: true });
     }
   });

@@ -4097,21 +4097,25 @@ function persistResults(
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
     }
-    try {
-      const mockUsage = outcome.mockedRequestCountsByTest?.[apiEvidenceKey];
-      if (mockUsage) {
-        for (const tally of mockUsage) {
-          const mockResponseId = mockResponseIdByTuple.get(
-            mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern),
-          );
-          if (mockResponseId) {
-            store.recordMockUsage(testId, mockResponseId, tally.count);
-          }
+    const mockUsage = outcome.mockedRequestCountsByTest?.[apiEvidenceKey];
+    if (mockUsage) {
+      // One try/catch PER tally, matching the sibling observedMockResponses loop above —
+      // sharing a single try/catch across every tuple meant one recordMockUsage failure (e.g.
+      // a constraint violation) silently aborted every LATER tuple for this test too, while
+      // noteStoreFailure only ever recorded the one exception that stopped the loop, masking
+      // how many rows actually never got written.
+      for (const tally of mockUsage) {
+        const mockResponseId = mockResponseIdByTuple.get(
+          mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern),
+        );
+        if (!mockResponseId) continue;
+        try {
+          store.recordMockUsage(testId, mockResponseId, tally.count);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('recordMockUsage', err);
         }
       }
-      noteStoreOk();
-    } catch (err) {
-      noteStoreFailure('recordMockUsage', err);
     }
     try {
       // Keep the test row's status in sync — readers of `tests` (e.g. the CLI

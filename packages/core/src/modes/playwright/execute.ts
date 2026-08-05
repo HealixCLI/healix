@@ -1,4 +1,4 @@
-﻿import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
+import { spawn as nodeSpawn, type ChildProcess } from 'node:child_process';
 import { statSync } from 'node:fs';
 import { access, readFile, stat, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';

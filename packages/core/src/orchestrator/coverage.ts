@@ -1,10 +1,4 @@
-import {
-  mockResponseTupleKey,
-  type ExecOutcome,
-  type GeneratedSpec,
-  type MockHitTally,
-  type TestPlanItem,
-} from '../modes/types.js';
+import type { ExecOutcome, GeneratedSpec, TestPlanItem } from '../modes/types.js';
 import type { FunctionalityUnit } from '../target/functionality-index.js';
 
 /** Fresh-suite runs target >80% coverage of detected functionality units. */
@@ -120,41 +114,6 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
     }
   }
 
-  // Same reasoning as mockedRequestCounts above (summed, not recomputed), just broken out
-  // per test first, then per EXACT (dependency, method, pathPattern) tuple — a later
-  // gap-fill iteration's per-test hits must add to an earlier iteration's, not replace them,
-  // for whichever (test, tuple) pairs appear in both.
-  const mockedRequestCountsByTest: Record<string, MockHitTally[]> = {};
-  for (const byTest of [a.mockedRequestCountsByTest, b.mockedRequestCountsByTest]) {
-    for (const [key, tallies] of Object.entries(byTest ?? {})) {
-      const merged = new Map<string, MockHitTally>(
-        (mockedRequestCountsByTest[key] ?? []).map((t) => [
-          mockResponseTupleKey(t.dependencyId, t.method, t.pathPattern),
-          t,
-        ]),
-      );
-      for (const tally of tallies) {
-        const tupleKey = mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern);
-        const existing = merged.get(tupleKey);
-        if (existing) existing.count += tally.count;
-        else merged.set(tupleKey, { ...tally });
-      }
-      mockedRequestCountsByTest[key] = [...merged.values()];
-    }
-  }
-
-  // Keyed by the SAME exact tuple identity, not the mergeIdentity test identity — `b`'s entry
-  // (the later iteration's) wins a tuple collision, same reasoning as apiEvidence below: it
-  // reflects the most recently actually-served response, which is what "observed" means.
-  const observedMockResponses = [
-    ...new Map(
-      [...(a.observedMockResponses ?? []), ...(b.observedMockResponses ?? [])].map((o) => [
-        mockResponseTupleKey(o.dependencyId, o.method, o.pathPattern),
-        o,
-      ]),
-    ).values(),
-  ];
-
   // apiEvidence is keyed by the SAME specFile#title identity as mergeIdentity
   // above, so — unlike mockedRequestCounts (summed, since it's a pure tally
   // with no notion of "latest") — a collision here should behave like the
@@ -170,8 +129,6 @@ export function mergeExecOutcomes(a: ExecOutcome, b: ExecOutcome): ExecOutcome {
     skipped: results.filter((r) => r.status === 'skipped').length,
     results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
-    ...(Object.keys(mockedRequestCountsByTest).length > 0 ? { mockedRequestCountsByTest } : {}),
-    ...(observedMockResponses.length > 0 ? { observedMockResponses } : {}),
     ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
   };
 }

@@ -215,16 +215,11 @@ CREATE INDEX IF NOT EXISTS idx_requirements_run ON requirements(run_id);
 
 -- One row per (dependency, method, path) mock target. mock_* columns are
 -- populated at generation time from the same data already embedded into
--- fixtures/mock.fixture.ts. observed_* columns are populated AFTER execution
--- with the response the mock fixture ACTUALLY served for that (dependency,
--- method, path) tuple (grounded from the fixture's own write-through hit
--- log, which now carries the matched endpoint's own method/pathPattern —
--- see execute.ts's readObservedMockResponses) — deliberately NOT a
--- comparison against a genuinely different real backend, since tests run
--- fully offline against this same fixture and there is no live upstream to
--- compare against. Resolved to the EXACT row via that tuple, so a
--- dependency with multiple statically-detected endpoints gets each one
--- grounded independently, not conflated into a single row.
+-- fixtures/mock.fixture.ts. observed_* columns are reserved for a real
+-- captured response folded in via a grounding mechanism that does not exist
+-- in the codebase yet (see this feature's design doc for why) — they are
+-- always null today, same "reserved, unpopulated" treatment as
+-- kb_execution_artifacts.network_logs.
 CREATE TABLE IF NOT EXISTS mock_responses (
   id                     TEXT PRIMARY KEY,
   run_id                 TEXT NOT NULL REFERENCES runs(id),
@@ -245,12 +240,12 @@ CREATE TABLE IF NOT EXISTS mock_responses (
 );
 CREATE INDEX IF NOT EXISTS idx_mock_responses_run ON mock_responses(run_id);
 
--- Per-test mock usage, from ExecOutcome.mockedRequestCountsByTest (see its own doc
--- comment in modes/types.ts — distinct from mockedRequestCounts, the pre-existing
--- run-level aggregate, which stays unchanged). Tallied per EXACT (dependency,
--- method, pathPattern) tuple and resolved to that specific mock_responses row, so a
--- dependency with multiple statically-detected endpoints gets each one's usage
--- counted independently rather than conflated into (or overstating) a single row.
+-- Per-test mock usage. Schema only in this pass — ExecOutcome.mockedRequestCounts
+-- is a RUN-level aggregate keyed by dependency id (see its own doc comment in
+-- modes/types.ts), not sliceable per individual test today, so there is no
+-- honest per-test request_count to write yet. The table and store methods
+-- exist so a later pass (once per-test mock-count tracking is built) can
+-- populate it without another migration.
 CREATE TABLE IF NOT EXISTS test_mock_usage (
   test_id           TEXT NOT NULL REFERENCES tests(id),
   mock_response_id  TEXT NOT NULL REFERENCES mock_responses(id),
@@ -276,12 +271,11 @@ CREATE TABLE IF NOT EXISTS exploration_summaries (
 );
 CREATE INDEX IF NOT EXISTS idx_exploration_summaries_run ON exploration_summaries(run_id);
 
--- Durable escape-hatch (fixMe) gap history, from generate.ts's
--- extractEscapeHatchReasons — one row per plan item with at least one
--- unobserved-element marker left in its generated spec. status/iteration
--- are written by (and only meaningful once there is) a directed
--- re-exploration loop, which is not yet implemented — every row lands here
--- as 'open'/iteration 0 until that loop exists to update them.
+-- Durable escape-hatch (fixMe) gap history. Schema only in this pass — the
+-- extractEscapeHatchReasons function this table's write point depends on
+-- (per the directed-reexploration-fixme-gaps.md design) does not exist yet;
+-- this table just gives that still-unbuilt feature somewhere real to write
+-- into once it lands, rather than being built alongside it.
 CREATE TABLE IF NOT EXISTS escape_hatch_gaps (
   id            TEXT PRIMARY KEY,
   run_id        TEXT NOT NULL REFERENCES runs(id),

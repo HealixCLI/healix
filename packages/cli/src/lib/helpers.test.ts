@@ -126,6 +126,7 @@ describe('shapeRunShow', () => {
       suiteMode: null,
       baseRunId: null,
       pauseReason: null,
+      activeDurationMs: null,
     };
     const tests: TestCase[] = [
       {

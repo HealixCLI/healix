@@ -57,19 +57,25 @@ describe('formatDuration', () => {
 
 describe('computeTotalDurationMs', () => {
   it('returns null when there is no run timing and no events', () => {
-    expect(computeTotalDurationMs({ startedAt: null, finishedAt: null }, [])).toBeNull();
+    expect(
+      computeTotalDurationMs({ startedAt: null, finishedAt: null, activeDurationMs: null }, []),
+    ).toBeNull();
   });
 
-  it("prefers the run's own startedAt/finishedAt when both are present", () => {
+  it("prefers the run's own startedAt/finishedAt when both are present (and activeDurationMs is absent — a run predating that column)", () => {
     const ms = computeTotalDurationMs(
-      { startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:05:00.000Z' },
+      {
+        startedAt: '2026-01-01T00:00:00.000Z',
+        finishedAt: '2026-01-01T00:05:00.000Z',
+        activeDurationMs: null,
+      },
       [event('plan', '2026-01-01T00:00:00.000Z'), event('execute', '2026-01-01T00:04:00.000Z')],
     );
     expect(ms).toBe(5 * 60_000);
   });
 
   it('falls back to the event span when startedAt/finishedAt are missing', () => {
-    const ms = computeTotalDurationMs({ startedAt: null, finishedAt: null }, [
+    const ms = computeTotalDurationMs({ startedAt: null, finishedAt: null, activeDurationMs: null }, [
       event('plan', '2026-01-01T00:00:00.000Z'),
       event('execute', '2026-01-01T00:03:00.000Z'),
     ]);
@@ -77,20 +83,40 @@ describe('computeTotalDurationMs', () => {
   });
 
   it('falls back to the event span when only one of startedAt/finishedAt is present', () => {
-    const ms = computeTotalDurationMs({ startedAt: '2026-01-01T00:00:00.000Z', finishedAt: null }, [
-      event('plan', '2026-01-01T00:00:00.000Z'),
-      event('execute', '2026-01-01T00:02:00.000Z'),
-    ]);
+    const ms = computeTotalDurationMs(
+      { startedAt: '2026-01-01T00:00:00.000Z', finishedAt: null, activeDurationMs: null },
+      [event('plan', '2026-01-01T00:00:00.000Z'), event('execute', '2026-01-01T00:02:00.000Z')],
+    );
     expect(ms).toBe(2 * 60_000);
   });
 
   it('computes the correct span from out-of-order events', () => {
-    const ms = computeTotalDurationMs({ startedAt: null, finishedAt: null }, [
+    const ms = computeTotalDurationMs({ startedAt: null, finishedAt: null, activeDurationMs: null }, [
       event('execute', '2026-01-01T00:05:00.000Z'),
       event('plan', '2026-01-01T00:00:00.000Z'),
       event('triage', '2026-01-01T00:02:00.000Z'),
     ]);
     expect(ms).toBe(5 * 60_000);
+  });
+
+  it('prefers activeDurationMs over startedAt/finishedAt — the whole point of this field: a retry-pass run a day after the original completed must NOT report ~24h of wall-clock idle time as its Total time', () => {
+    const ms = computeTotalDurationMs(
+      {
+        startedAt: '2026-01-01T00:00:00.000Z',
+        finishedAt: '2026-01-02T00:05:00.000Z', // ~24h later, wall-clock — must be ignored
+        activeDurationMs: 7 * 60_000, // the actual accumulated active processing time
+      },
+      [],
+    );
+    expect(ms).toBe(7 * 60_000);
+  });
+
+  it('treats activeDurationMs: 0 as a real value (a run whose every pass took 0ms is not the same as "field absent")', () => {
+    const ms = computeTotalDurationMs(
+      { startedAt: '2026-01-01T00:00:00.000Z', finishedAt: '2026-01-01T00:05:00.000Z', activeDurationMs: 0 },
+      [],
+    );
+    expect(ms).toBe(0);
   });
 });
 

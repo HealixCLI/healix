@@ -544,6 +544,20 @@ async function retryPassPipeline(
     emit('plan', 'error', `Run not found: ${runId}`);
     return { runId, status: 'error' };
   }
+  // Active-duration tracking (see runs.active_duration_ms's own schema comment): this
+  // retry-pass's own elapsed processing time gets ADDED to whatever the run already
+  // accrued, rather than letting "Total time" fall back to finishedAt - startedAt — the
+  // original startedAt could be days old by the time a retry-pass runs, which would count
+  // that entire idle gap as "active" time. run.activeDurationMs is null for a run that
+  // predates this column (or has never been retried before); fall back to that run's own
+  // single-pass wall-clock time as the best available baseline for it specifically —
+  // accurate for exactly one pass, which is all such a run has had so far.
+  const passStartedAtMs = Date.now();
+  const baselineActiveDurationMs =
+    run.activeDurationMs ??
+    (run.startedAt && run.finishedAt
+      ? Math.max(0, new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime())
+      : 0);
   const project = store.getProject(run.projectId);
   if (!project) {
     emit('plan', 'error', `Project not found: ${run.projectId}`);
@@ -818,7 +832,8 @@ async function retryPassPipeline(
     });
 
     try {
-      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso() });
+      const activeDurationMs = baselineActiveDurationMs + Math.max(0, Date.now() - passStartedAtMs);
+      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso(), activeDurationMs });
       noteStoreOk();
     } catch (err) {
       noteStoreFailure('updateRunStatus', err);
@@ -846,7 +861,8 @@ async function retryPassPipeline(
   } catch (err) {
     emit('generate', 'error', `Retry-pass failed: ${errMsg(err)}`, { stack: errStack(err) });
     try {
-      store.updateRunStatus(runId, 'error', { finishedAt: nowIso() });
+      const activeDurationMs = baselineActiveDurationMs + Math.max(0, Date.now() - passStartedAtMs);
+      store.updateRunStatus(runId, 'error', { finishedAt: nowIso(), activeDurationMs });
     } catch {
       /* best-effort */
     }
@@ -961,6 +977,17 @@ async function runPipeline(
   // Mutable status mirror so the returned summary always reflects the latest phase.
   let currentStatus: RunStatus = 'pending';
 
+  // Active-duration tracking (see runs.active_duration_ms's own schema comment): a paused
+  // run resumed later, or a retry-pass run days after the original completed, must not have
+  // its "Total time" stat include the idle gap in between — only genuinely active processing
+  // time should accumulate. activeStartedAtMs marks when the CURRENT active segment began
+  // (reset on every startedAt patch — a fresh run's initial 'pending' transition, or a
+  // resume-from-pause); accumulatedActiveDurationMs is the running total, seeded from
+  // whatever this run already accrued across any PRIOR pass (a resume continuing a paused
+  // run created earlier in this same process).
+  let activeStartedAtMs: number | null = run.startedAt ? new Date(run.startedAt).getTime() : null;
+  let accumulatedActiveDurationMs = run.activeDurationMs ?? 0;
+
   // Persistence health tracking. Best-effort store writes still swallow their
   // errors (a DB fault must never abort the run), but we count *consecutive*
   // failures and surface at least one warn via the DB-independent onEvent path
@@ -994,8 +1021,20 @@ async function runPipeline(
     patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
   ): void => {
     currentStatus = status;
+    if (patch.startedAt !== undefined) {
+      activeStartedAtMs = new Date(patch.startedAt).getTime();
+    }
+    // finishedAt marks the end of the CURRENT active segment (a terminal status, or a
+    // pause) — fold its elapsed time into the running total. A patch with finishedAt but
+    // no known segment start (shouldn't happen in practice, since every terminal/pause
+    // patch follows an earlier startedAt patch) is skipped rather than guessed at.
+    const fullPatch: typeof patch & { activeDurationMs?: number } = { ...patch };
+    if (patch.finishedAt !== undefined && activeStartedAtMs !== null) {
+      accumulatedActiveDurationMs += Math.max(0, new Date(patch.finishedAt).getTime() - activeStartedAtMs);
+      fullPatch.activeDurationMs = accumulatedActiveDurationMs;
+    }
     try {
-      store.updateRunStatus(runId, status, patch);
+      store.updateRunStatus(runId, status, fullPatch);
       noteStoreOk();
     } catch (err) {
       /* persistence best-effort; never abort the pipeline on a status write */

@@ -3,6 +3,7 @@ import { attemptLogin, attemptLoginViaToggle } from './login.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
+  CapturedNetworkEvent,
   DomSnapshot,
   InteractiveElement,
   Point,
@@ -25,8 +26,13 @@ function makeFakeBrowser(config: {
   throwOnClick?: boolean;
   /** Selectors whose click() call throws, instead of every click (throwOnClick). */
   throwOnSelector?: Set<string>;
+  /** Successive drainNetworkEvents() calls pop one entry each (FIFO), defaulting to `[]` once
+   * exhausted — lets a test model "these events accumulated between the previous drain and
+   * this one" without needing a real browser. */
+  networkEventsQueue?: CapturedNetworkEvent[][];
 }): BrowserSurface {
   let currentUrl = '';
+  const networkEventsQueue = [...(config.networkEventsQueue ?? [])];
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
@@ -65,7 +71,7 @@ function makeFakeBrowser(config: {
       return () => {};
     },
     drainNetworkEvents() {
-      return [];
+      return networkEventsQueue.shift() ?? [];
     },
     async exportStorageState() {
       return {};
@@ -103,6 +109,35 @@ describe('attemptLogin()', () => {
     expect(result.ok).toBe(true);
     expect(result.landingUrl).toBe('https://a.test/dashboard');
     expect(result.selectors).toEqual({ identifier: '#email', password: '#password', submit: '#submit' });
+  });
+
+  it('captures the real login POST response into networkEvents, discarding only what accumulated BEFORE the submit attempt', async () => {
+    const staleNoise: CapturedNetworkEvent = {
+      method: 'GET',
+      url: 'https://a.test/favicon.ico',
+      status: 200,
+    };
+    const realLoginResponse: CapturedNetworkEvent = {
+      method: 'POST',
+      url: 'https://a.test/auth/token',
+      status: 200,
+      responseBody: '{"user":{"id":"81552639","email":"user@a.test"}}',
+    };
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/dashboard': { elements: [{ role: 'heading', name: 'Dashboard', selector: 'h1' }] },
+      },
+      onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      // First drain (discard-before-submit) sees the stale noise; second drain (capture-after)
+      // sees the real login response — see submitLoginAttempt's two drainNetworkEvents() calls.
+      networkEventsQueue: [[staleNoise], [realLoginResponse]],
+    });
+
+    const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'correct-pw');
+
+    expect(result.ok).toBe(true);
+    expect(result.networkEvents).toEqual([realLoginResponse]);
   });
 
   it('omits `selectors.submit` when submission falls back to pressing Enter (no submit button found)', async () => {

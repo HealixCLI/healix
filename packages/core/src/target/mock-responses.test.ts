@@ -4,6 +4,7 @@ import {
   extractCanonicalIdentity,
   generateMockResponses,
   mergeGroundedResponse,
+  reconcileAuthTokens,
   staticMockResponse,
 } from './mock-responses.js';
 import type { CompleteOptions, ProviderAdapter } from '../providers/types.js';
@@ -204,6 +205,35 @@ describe('extractCanonicalIdentity', () => {
     expect(identity).toEqual({ name: 'Real Name', email: 'real@example.test' });
   });
 
+  it('fills the id from a separate (non-auth) endpoint when the auth/login response itself never provides one, instead of blocking on the incomplete auth match (regression: a token-generate response with only email/name used to permanently shadow a real id sitting in a sibling ledger/profile endpoint)', () => {
+    const identity = extractCanonicalIdentity([
+      {
+        pathPattern: '/auth/v1/web/token/generate',
+        sampleResponseBody: '{"user":{"email":"sid55boss@gmail.com","name":"Sid verekar"}}',
+      },
+      {
+        pathPattern: '/loyalty/v2/customer/ledger',
+        sampleResponseBody:
+          '{"customerDetails":{"firstName":"Sid","lastName":"verekar","user_id":"81552639"}}',
+      },
+    ]);
+    expect(identity).toEqual({ email: 'sid55boss@gmail.com', name: 'Sid verekar', id: '81552639' });
+  });
+
+  it('still lets an auth match win a field outright over a LATER non-auth match for that same field (auth stays sticky regardless of order)', () => {
+    const identity = extractCanonicalIdentity([
+      {
+        pathPattern: '/auth/login',
+        sampleResponseBody: '{"user":{"name":"Real Name","email":"real@example.test"}}',
+      },
+      {
+        pathPattern: '/customer/profile',
+        sampleResponseBody: '{"name":"Wrong Name","email":"wrong@example.test"}',
+      },
+    ]);
+    expect(identity).toEqual({ name: 'Real Name', email: 'real@example.test' });
+  });
+
   it('skips a malformed (non-JSON) observed body without throwing', () => {
     expect(
       extractCanonicalIdentity([
@@ -211,6 +241,22 @@ describe('extractCanonicalIdentity', () => {
         { pathPattern: '/customer', sampleResponseBody: '{"name":"OK","email":"ok@example.test"}' },
       ]),
     ).toEqual({ name: 'OK', email: 'ok@example.test' });
+  });
+
+  it('extracts a snake_case id field (e.g. a real Capillary-style "user_id") alongside email/name, not just camelCase/bare "id"', () => {
+    // Real shape observed from a live C&A/Capillary backend: the id key is snake_case, which
+    // used to never match the ('id'|'userid'|'customerid'|'username') lookup set because only
+    // .toLowerCase() was applied (never separator-stripped) — so this object's real numeric
+    // customer id silently fell through and the mocked auth response kept its fake placeholder
+    // id even after email/name were correctly grounded in real data.
+    const identity = extractCanonicalIdentity([
+      {
+        pathPattern: '/customer/profile',
+        sampleResponseBody:
+          '{"firstname":"Sid","lastname":"verekar","user_id":"81552639","email":"sid55boss@gmail.com"}',
+      },
+    ]);
+    expect(identity).toEqual({ id: '81552639', email: 'sid55boss@gmail.com', name: 'Sid verekar' });
   });
 });
 
@@ -244,6 +290,64 @@ describe('applyCanonicalIdentity', () => {
       coupon: { id: string; name: string };
     };
     expect(result.coupon).toEqual({ id: '526233086', name: 'Welcome_Online' });
+  });
+
+  it('rewrites a snake_case "user_id" key to the canonical id, not just camelCase/bare "id"', () => {
+    const body = {
+      user: { user_id: 'healix-mock-user', email: 'healix.mock@example.test', name: 'Healix Mock User' },
+    };
+    const result = applyCanonicalIdentity(body, {
+      id: '81552639',
+      email: 'sid55boss@gmail.com',
+      name: 'Sid verekar',
+    }) as {
+      user: { user_id: string; email: string; name: string };
+    };
+    expect(result.user).toEqual({ user_id: '81552639', email: 'sid55boss@gmail.com', name: 'Sid verekar' });
+  });
+});
+
+/** Decodes a base64url JWT's middle (payload) segment back to a plain object, for asserting on
+ * its claims — mirrors the encoding scheme reconcileAuthTokens/buildMockJwt use internally. */
+function decodeJwtPayload(jwt: string): Record<string, unknown> {
+  const [, payload] = jwt.split('.');
+  const padded = payload.replace(/-/g, '+').replace(/_/g, '/');
+  return JSON.parse(Buffer.from(padded, 'base64').toString('utf-8'));
+}
+
+describe('reconcileAuthTokens', () => {
+  it('is a no-op when canonical is null', () => {
+    const body = { token: 'stays-as-is', user: { id: 'healix-mock-user' } };
+    expect(reconcileAuthTokens(body, null)).toBe(body);
+  });
+
+  it('is a no-op when canonical has no id yet (email/name-only match)', () => {
+    const body = { token: 'stays-as-is' };
+    expect(reconcileAuthTokens(body, { email: 'x@example.test', name: 'X' })).toEqual(body);
+  });
+
+  it("regenerates token/access_token/accessToken so the JWT's own sub claim matches the real id — not just the plain user.id field", () => {
+    const body = {
+      token: 'fake.jwt.here',
+      access_token: 'fake.jwt.here',
+      accessToken: 'fake.jwt.here',
+      token_type: 'Bearer',
+      refresh_token: 'healix-mock-refresh-token',
+      user: { id: 'healix-mock-user', email: 'sid55boss@gmail.com', name: 'Sid verekar' },
+    };
+    const result = reconcileAuthTokens(body, { id: '81552639', email: 'sid55boss@gmail.com' }) as {
+      token: string;
+      access_token: string;
+      accessToken: string;
+      token_type: string;
+      refresh_token: string;
+    };
+    expect(decodeJwtPayload(result.token)).toMatchObject({ sub: '81552639' });
+    expect(decodeJwtPayload(result.access_token)).toMatchObject({ sub: '81552639' });
+    expect(decodeJwtPayload(result.accessToken)).toMatchObject({ sub: '81552639' });
+    // Never touched: not a decodable identity token, and not a JWT-bearing key at all.
+    expect(result.token_type).toBe('Bearer');
+    expect(result.refresh_token).toBe('healix-mock-refresh-token');
   });
 });
 

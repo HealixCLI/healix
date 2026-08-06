@@ -156,6 +156,107 @@ function matchRoleForItem(item: TestPlanItem, roles: string[]): string | null {
 }
 
 /**
+ * Reference expressions the model should write into generated code to pull the real configured
+ * credential(s) at RUNTIME — never the literal values themselves (see suiteEnv() in execute.ts:
+ * these env vars are injected into the spec's own process env, never sent to the AI provider).
+ * `matchedRole` narrows to one specific role's account (via the JSON blob every credential is
+ * also exposed in, see HEALIX_TIERB_CREDENTIALS_JSON at execute.ts:114); omitted, the reference
+ * falls back to the plain default-credential env vars — correct for both the common
+ * single-credential case and a multi-credential project's default/roleless account.
+ */
+function credentialFieldRefs(matchedRole: string | null): { identifier: string; password: string } {
+  if (matchedRole === null) {
+    return { identifier: 'process.env.HEALIX_TIERB_EMAIL!', password: 'process.env.HEALIX_TIERB_PASSWORD!' };
+  }
+  const find = `JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON!).find((c: { role: string | null }) => c.role === ${JSON.stringify(matchedRole)})`;
+  return { identifier: `${find}.username`, password: `${find}.password` };
+}
+
+/**
+ * When the project has a configured test credential, ground any login/sign-in FORM the model
+ * might generate a tierA-public spec for, so it never invents its own email/password literal
+ * where a real one is available — applies only conditionally, from the model's own read of
+ * whether this particular feature IS a login form; a feature that merely "requires no auth" but
+ * isn't a login page ignores this note entirely. `item` is passed only from the single-item
+ * prompt builder, where the plan item's own title/intent can be deterministically checked against
+ * the project's configured roles (see matchRoleForItem) — the batch builder covers several
+ * distinct items under one shared prompt, so it lists the available roles instead and leaves the
+ * per-item choice to the model's own read of each feature's title within the batch, exactly like
+ * formatRoleGuidance already does for tierB-auth's role routing.
+ */
+function formatLoginCredentialGuidance(ctx: TestModeContext, item?: TestPlanItem): string {
+  const credentials = ctx.credentials ?? [];
+  if (credentials.length === 0) return '';
+  const roles = [...new Set(credentials.map((c) => c.role).filter((r): r is string => !!r))];
+
+  const negativeCarveOut =
+    'This does NOT apply to a scenario that deliberately tests INVALID credentials (wrong ' +
+    'password, unregistered email, empty field) — there, use whatever literal the negative case ' +
+    'actually needs (e.g. the real identifier paired with an obviously wrong password literal) to ' +
+    'exercise the failure path.';
+
+  if (roles.length === 0 || !item) {
+    const refs = credentialFieldRefs(item ? matchRoleForItem(item, roles) : null);
+    const roleListNote =
+      roles.length > 0
+        ? ` This project has multiple test accounts with roles (${roles.join(', ')}) — if the ` +
+          "feature is clearly about ONE of these roles' own login, fill the fields from that " +
+          `role's entry instead: \`JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON!).find((c) => c.role === '<role>').username\` / \`.password\`. Otherwise use the default account shown below.`
+        : '';
+    return (
+      ' If (and only if) this feature IS the login/sign-in form itself: for any scenario that is ' +
+      'meant to submit VALID credentials and succeed (a positive login, or a negative/edge case ' +
+      'that still expects sign-in to succeed), you MUST fill the identifier and password fields ' +
+      `with \`${refs.identifier}\` and \`${refs.password}\` respectively — the real configured test ` +
+      `account is injected into these at runtime.${roleListNote} Do NOT invent, guess, or hardcode ` +
+      'ANY other email/password literal for these fields, even one that looks like a plausible ' +
+      'real account (e.g. "user@example.com") — it will not match the real account and will fail ' +
+      `the test against an otherwise-correctly-behaving app. ${negativeCarveOut}`
+    );
+  }
+
+  const matchedRole = matchRoleForItem(item, roles);
+  const refs = credentialFieldRefs(matchedRole);
+  const roleNote = matchedRole
+    ? ` This feature is clearly about the "${matchedRole}" role, so use THAT role's account, not the default one.`
+    : ' Use the default (roleless) account below unless this feature clearly names one of the project’s other configured roles.';
+  return (
+    ' If (and only if) this feature IS the login/sign-in form itself: for any scenario that is ' +
+    'meant to submit VALID credentials and succeed (a positive login, or a negative/edge case ' +
+    'that still expects sign-in to succeed), you MUST fill the identifier and password fields ' +
+    `with \`${refs.identifier}\` and \`${refs.password}\` respectively — the real configured test ` +
+    `account is injected into these at runtime.${roleNote} Do NOT invent, guess, or hardcode ANY ` +
+    'other email/password literal for these fields, even one that looks like a plausible real ' +
+    'account (e.g. "user@example.com") — it will not match the real account and will fail the ' +
+    `test against an otherwise-correctly-behaving app. ${negativeCarveOut}`
+  );
+}
+
+/**
+ * Same rule as formatLoginCredentialGuidance, for a tierC-api spec that hits an authentication
+ * endpoint directly (a login/token/session POST) instead of driving a browser form — the request
+ * BODY must reference the real credential the same way a form fill would, never an invented one.
+ */
+function formatApiCredentialGuidance(ctx: TestModeContext, item?: TestPlanItem): string {
+  const credentials = ctx.credentials ?? [];
+  if (credentials.length === 0) return '';
+  const roles = [...new Set(credentials.map((c) => c.role).filter((r): r is string => !!r))];
+  const matchedRole = item ? matchRoleForItem(item, roles) : null;
+  const refs = credentialFieldRefs(matchedRole);
+  const roleNote =
+    roles.length > 0 && !matchedRole
+      ? ` (this project has multiple test accounts with roles ${roles.join(', ')} — if this endpoint's own scenario is clearly about one of them, select that role's entry from the same JSON instead of the default)`
+      : '';
+  return (
+    ' If (and only if) this endpoint IS an authentication/login/token endpoint: for any scenario ' +
+    'that is meant to authenticate successfully, send the real configured test credential in the ' +
+    `request body — \`${refs.identifier}\` and \`${refs.password}\`${roleNote} — never an invented ` +
+    'email/password. This does NOT apply to a scenario deliberately testing invalid credentials, ' +
+    'where a literal wrong value is correct.'
+  );
+}
+
+/**
  * Force the matched role's storageState onto this spec — inserted right
  * after the test.describe(...) opening, ahead of every test(...) call — so
  * role routing is guaranteed by the orchestrator, not left to the model's
@@ -1229,7 +1330,7 @@ function formatObservedRoutes(ctx: TestModeContext, item?: TestPlanItem): string
   const more = omitted > 0 ? ` (+${omitted} more not shown)` : '';
   return `
 
-Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), use one of these real observed URLs/paths, or a regex scoped only to what you're sure of (e.g. that the path changed away from the current one) — do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
+Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), check this list FIRST — if the scenario's actual destination appears here (even under a name you wouldn't have guessed), you MUST assert that exact URL/path, e.g. \`toHaveURL(/\\/dashboard\\/vouchers/)\`. The coarser "the path merely changed away from the current one" fallback (e.g. \`not.toHaveURL(/\\/login$/)\`) is ONLY for when the true destination is genuinely NOT in this list — it is not an acceptable substitute for a real URL you do have, even for a scenario you're otherwise confident about. Asserting only "no longer on the old page" when a specific real destination was available proves far less than it looks like it does: it also passes on a mid-navigation blank frame or a wrong intermediate route, and — since Playwright's own test recording stops the moment this coarse check resolves — the run's video can end up showing nothing past the click, not the actual destination. Do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
 }
 
 /**
@@ -1394,10 +1495,10 @@ function buildPrompt(
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}`
+      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}${formatApiCredentialGuidance(ctx, item)}`
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
-        : 'This is a public flow requiring no authentication.';
+        : `This is a public flow requiring no authentication.${formatLoginCredentialGuidance(ctx, item)}`;
 
   const importSource = ctx.mockExternalDependencies
     ? MOCK_FIXTURE_IMPORT_PATH
@@ -2149,10 +2250,10 @@ function buildBatchPrompt(items: TestPlanItem[], ctx: TestModeContext, tier: Tie
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}`
+      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}${formatApiCredentialGuidance(ctx)}`
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
-        : 'This is a public flow requiring no authentication.';
+        : `This is a public flow requiring no authentication.${formatLoginCredentialGuidance(ctx)}`;
 
   const mockNote = ctx.mockExternalDependencies
     ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario. CRITICAL: the mock matches ONLY by method + path — it never inspects headers, tokens, or the request body, so it CANNOT organically reject a missing/invalid Authorization header, an unauthorized role, or cross-tenant/ownership access with a 401/403/404. If a scenario asserts that kind of rejection, you MUST call \`mockOverride(...)\` with that exact status first, or the mock will silently return its default success response and the assertion will fail every time — this is true even for a request you never customized before.${formatMockContent(ctx)}`

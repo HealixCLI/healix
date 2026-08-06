@@ -295,6 +295,7 @@ test('a deliberately skipped test with a real reason', async () => {
       finishedAt: '2026-01-01T00:01:00.000Z',
       createdAt: '2026-01-01T00:00:00.000Z',
       pauseReason: null,
+      activeDurationMs: null,
     };
     const project: Project = {
       id: 'prj_skip_e2e',

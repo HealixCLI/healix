@@ -588,7 +588,16 @@ describe('scaffold — mock fixture generation', () => {
     expect(contents).toContain('adroy tester');
     expect(contents).not.toContain('Healix Mock User');
     expect(contents).not.toContain('healix.mock@example.test');
-    // The token itself is untouched — only identity fields get reconciled.
-    expect(contents).toContain('healix-static-real-jwt');
+    // The static AI-provided token is regenerated too, so its OWN encoded `sub` claim agrees
+    // with the real reconciled id (81278446) — a correct user.id previously stayed contradicted
+    // by a token whose decoded subject still said "healix-mock-user" (see reconcileAuthTokens).
+    expect(contents).not.toContain('healix-static-real-jwt');
+    const jwtMatch = /token['"]?:\s*['"]([\w-]+\.[\w-]+\.[\w-]+)['"]/.exec(contents);
+    expect(jwtMatch).not.toBeNull();
+    const [, payloadSegment] = jwtMatch![1].split('.');
+    const payload = JSON.parse(
+      Buffer.from(payloadSegment.replace(/-/g, '+').replace(/_/g, '/'), 'base64').toString('utf-8'),
+    );
+    expect(payload.sub).toBe('81278446');
   });
 });

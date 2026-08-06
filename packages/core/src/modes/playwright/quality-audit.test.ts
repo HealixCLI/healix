@@ -396,6 +396,79 @@ describe('auditSpecQuality', () => {
       expect(auditSpecQuality(source).some((f) => f.code === 'unscoped-modal-assertion')).toBe(false);
     });
   });
+
+  describe('weak-positive-navigation-assertion', () => {
+    it('hard-fails a positive-titled test whose only navigation evidence is not.toHaveURL after a submit-like click — this is the exact shape that let a real login-failure redirect to /login/errorpage still report "passed"', () => {
+      const source = block(
+        'succeeds with valid input',
+        `  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page).not.toHaveURL(/\\/login$/);`,
+      );
+      const findings = auditSpecQuality(source);
+      expect(findings).toEqual([
+        expect.objectContaining({ code: 'weak-positive-navigation-assertion', severity: 'hard' }),
+      ]);
+    });
+
+    it('does NOT flag a test correctly asserting the user stayed on the current page (no submit-like click at all) — the same assertion shape is legitimate with this opposite intent', () => {
+      const source = block(
+        'canceling keeps the user on the form',
+        `  await page.getByRole('button', { name: 'Cancel' }).click();\n  await expect(page).not.toHaveURL(/\\/dashboard/);`,
+      );
+      expect(auditSpecQuality(source).some((f) => f.code === 'weak-positive-navigation-assertion')).toBe(
+        false,
+      );
+    });
+
+    it('does not flag it when a real, specific toHaveURL assertion is also present', () => {
+      const source = block(
+        'succeeds with valid input',
+        `  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page).not.toHaveURL(/\\/login$/);\n  await expect(page).toHaveURL(/\\/dashboard\\/vouchers/);`,
+      );
+      expect(auditSpecQuality(source).some((f) => f.code === 'weak-positive-navigation-assertion')).toBe(
+        false,
+      );
+    });
+
+    it('does not flag a negative-titled scenario using the same coarse check (a wrong/unknown destination legitimately has no better option)', () => {
+      const source = block(
+        'shows an error for an invalid password',
+        `  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page).not.toHaveURL(/\\/dashboard/);`,
+      );
+      expect(auditSpecQuality(source).some((f) => f.code === 'weak-positive-navigation-assertion')).toBe(
+        false,
+      );
+    });
+
+    it('does not flag a neutrally-titled "stays put" test whose click happens to match SUBMIT_CLICK_RE (e.g. a "Save filter" control) — the title never claims a redirect/login/signup happened', () => {
+      const source = block(
+        'applying a filter does not navigate away from the search results',
+        `  await page.getByRole('button', { name: 'Save filter' }).click();\n  await expect(page).not.toHaveURL(/\\/search-results/);`,
+      );
+      expect(auditSpecQuality(source).some((f) => f.code === 'weak-positive-navigation-assertion')).toBe(
+        false,
+      );
+    });
+
+    it('does not flag a test that already proves the real destination via page CONTENT instead of a URL — even though it also kept a merely-supplementary not.toHaveURL', () => {
+      const source = block(
+        'succeeds with valid input',
+        `  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page).not.toHaveURL(/\\/login$/);\n  await expect(page.getByText('Vouchers')).toBeVisible();`,
+      );
+      expect(auditSpecQuality(source).some((f) => f.code === 'weak-positive-navigation-assertion')).toBe(
+        false,
+      );
+    });
+
+    it('does not flag a block with no toHaveURL assertion at all', () => {
+      const source = block(
+        'succeeds with valid input',
+        `  await expect(page.getByText('Welcome')).toBeVisible();`,
+      );
+      expect(auditSpecQuality(source).some((f) => f.code === 'weak-positive-navigation-assertion')).toBe(
+        false,
+      );
+    });
+  });
 });
 
 describe('pruneHardFindings', () => {
@@ -421,6 +494,15 @@ describe('pruneHardFindings', () => {
     const pruned = pruneHardFindings(source, findings);
     expect(pruned).not.toBeNull();
     expect(/\btest\s*\(/.test(pruned as string)).toBe(false);
+  });
+
+  it('actually prunes a weak-positive-navigation-assertion block end to end, not just flags it', () => {
+    const source = `${HEADER}test('succeeds with valid input', async ({ page }) => {\n  await page.locator('button[data-testid="login-submit"]').click();\n  await expect(page).not.toHaveURL(/\\/login$/);\n});\n\ntest('renders the login form', async ({ page }) => {\n  await expect(page.getByLabel('Email')).toBeVisible();\n});\n`;
+    const findings = auditSpecQuality(source);
+    const pruned = pruneHardFindings(source, findings);
+    expect(pruned).not.toBeNull();
+    expect(pruned).not.toContain('succeeds with valid input');
+    expect(pruned).toContain('renders the login form');
   });
 });
 

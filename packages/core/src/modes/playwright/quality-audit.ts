@@ -215,6 +215,25 @@ const DISABLED_ASSERTION_RE = /(?<!\.not)\.toBeDisabled\(\s*\)/;
 /** A `.click(...)` call whose own line/statement mentions a submit-ish hint (testid, name, role, or button label) — English + a few observed Slovak equivalents. Not a full parser; matches the shape actual generated specs use (`locator('button[data-testid="login-submit"]').click()`). */
 const SUBMIT_CLICK_RE =
   /[^\n;]*(?:submit|login|log-in|sign-?in|register|continue|confirm|save|pokra[cč]ova|odosla|prihl[aá]s|zaregistruj)[^\n;]*\.click\(\s*\)/i;
+/** A negated URL-outcome check (`not.toHaveURL(...)`) — proves only "left the old page," which
+ * also passes on a mid-navigation blank frame or a wrong intermediate route. See
+ * weak-positive-navigation-assertion below. */
+const NOT_TO_HAVE_URL_RE = /\.not\.toHaveURL\(/;
+/** A real, specific URL-outcome check, OR a real destination-content check (toBeVisible/
+ * toHaveText/toContainText, non-negated) — either is genuine evidence the right page was
+ * reached, not just that the old one was left. Content evidence is deliberately treated as
+ * equally sufficient: it is the exact alternative this check's own message recommends for a
+ * genuinely-unobserved destination, so a test that correctly followed that advice (content proof
+ * + a merely-supplementary not.toHaveURL) must never be penalized for doing the right thing. */
+const POSITIVE_TO_HAVE_URL_RE = /(?<!\.not)\.toHaveURL\(/;
+const POSITIVE_CONTENT_ASSERTION_RE = /(?<!\.not)\.(?:toBeVisible|toHaveText|toContainText)\(/;
+/** The title must itself CLAIM a successful redirect/login/signup happened — narrower than "not a
+ * negative title": a neutrally- or oppositely-titled test using the identical not.toHaveURL
+ * shape to prove the user correctly STAYED PUT (e.g. "applying a filter does not navigate away",
+ * clicking a "Save filter" control that happens to match SUBMIT_CLICK_RE) has the opposite intent
+ * and must not be caught just because its title isn't negative either. */
+const POSITIVE_REDIRECT_TITLE_HINT_RE =
+  /\b(succeeds?|logs?\s*in|log-?in|sign(?:s|ed)?\s*in|redirect|navigat|creates?\s+(?:the\s+|a\s+)?account|signs?\s*up|registers?)\b/i;
 
 /**
  * A single-target interaction — real triage data across multiple runs traced repeat
@@ -435,6 +454,46 @@ export function auditSpecQuality(source: string, opts?: { hasCredentials?: boole
         code: 'disabled-button-click-race',
         severity: 'hard',
         message: `Test "${block.title}" fills invalid input then clicks a submit-like control with no assertion of its disabled/enabled state anywhere in the test — if the app correctly disables the control on invalid input, this click will hang until timeout. Assert the control stays disabled (\`toBeDisabled()\`), or assert the inline validation message without depending on the click succeeding.`,
+        testTitle: block.title,
+        blockRange: [block.start, block.end],
+      });
+    }
+
+    // A test whose TITLE claims a successful redirect/login/signup, that clicks a submit-like
+    // control, and whose ONLY navigation-outcome evidence is "left the old page" is provably
+    // unsafe, not just weak: a real login failure that redirects to /login/errorpage (or any
+    // other sibling route under the same path) still satisfies "not exactly /login" — this is
+    // not hypothetical, it is the exact false-pass this check exists to close, confirmed against
+    // a real run where credentials were rejected and the test still went green. It also passes
+    // on a mid-navigation blank frame, and can resolve before the SPA finishes painting the real
+    // destination, cutting the recorded video off mid-transition.
+    //
+    // Three independent false-positive guards, each closing a real case a broader version of
+    // this check would have wrongly pruned:
+    //  - SUBMIT_CLICK_RE: a test correctly asserting the user STAYED on the current page (e.g.
+    //    "canceling keeps you on the form") legitimately uses this exact assertion shape with the
+    //    opposite intent — that shape never submits anything, so it's excluded by construction.
+    //  - POSITIVE_TO_HAVE_URL_RE / POSITIVE_CONTENT_ASSERTION_RE: a test that already followed
+    //    this very check's own advice — proving the real destination via URL OR real page content
+    //    — must never be penalized just because it also kept a cheap supplementary not.toHaveURL.
+    //  - POSITIVE_REDIRECT_TITLE_HINT_RE: "not a negative title" alone isn't enough — a
+    //    neutrally-titled "stays put" test (e.g. clicking a "Save filter" control, which matches
+    //    SUBMIT_CLICK_RE) needs its title to affirmatively claim a redirect/login/signup outcome
+    //    before this coarse-check risk applies to it at all.
+    // Given all three, there is no legitimate submit-success case left that this blocks — every
+    // survivor is a test that both claims success AND still only proved "left," never "arrived."
+    if (
+      POSITIVE_REDIRECT_TITLE_HINT_RE.test(block.title) &&
+      !NEGATIVE_TITLE_HINT_RE.test(block.title) &&
+      SUBMIT_CLICK_RE.test(block.body) &&
+      NOT_TO_HAVE_URL_RE.test(block.body) &&
+      !POSITIVE_TO_HAVE_URL_RE.test(block.body) &&
+      !POSITIVE_CONTENT_ASSERTION_RE.test(block.body)
+    ) {
+      findings.push({
+        code: 'weak-positive-navigation-assertion',
+        severity: 'hard',
+        message: `Test "${block.title}" verifies a successful navigation using only \`not.toHaveURL(...)\` — this proves "left the old page," not "reached the right one." A real login/action failure that redirects to a sibling error route (e.g. /login/errorpage) still satisfies "not exactly the old URL" and would silently pass. Assert the real observed destination URL instead (\`toHaveURL(/\\/dashboard\\/vouchers/)\`), or, if the destination is genuinely unobserved, assert real destination page content instead of a coarse "left the page" check.`,
         testTitle: block.title,
         blockRange: [block.start, block.end],
       });

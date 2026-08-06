@@ -210,7 +210,8 @@ export type QualityFindingCode =
   | 'unattended-destructive-action'
   | 'unscoped-modal-assertion'
   | 'unblurred-validation-assertion'
-  | 'invented-login-credential';
+  | 'invented-login-credential'
+  | 'weak-positive-navigation-assertion';
 
 export interface QualityFinding {
   code: QualityFindingCode;

@@ -868,6 +868,47 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(calls[0].prompt).not.toContain('HEALIX_TIERB_EMAIL');
   });
 
+  it('tells the model a real observed destination MUST be used over the coarser "path changed" fallback, and warns that the coarse check can truncate the recorded video', async () => {
+    const ctx = {
+      ...makeCtx(makeProvider([CLEAN_SPEC], calls)),
+      exploration: {
+        crawl: {
+          routes: [
+            {
+              url: 'http://localhost:3000/dashboard/vouchers',
+              title: 'Vouchers',
+              depth: 1,
+              hasPasswordField: false,
+              role: 'authenticated' as const,
+              snapshot: {
+                url: 'http://localhost:3000/dashboard/vouchers',
+                title: 'Vouchers',
+                interactiveElements: [],
+              },
+              networkEvents: [],
+            },
+          ],
+          visitedCount: 1,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: true,
+          authVerified: true,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [],
+      },
+    } as unknown as TestModeContext;
+
+    await generate(ctx, PLAN);
+
+    expect(calls[0].prompt).toContain('you MUST assert that exact URL/path');
+    expect(calls[0].prompt).toContain("run's video can end up showing nothing past the click");
+  });
+
   it('deterministically routes a login-page test to the specific role its title names, for a multi-credential project', async () => {
     const adminLoginPlan: TestPlan = {
       summary: 'login',

@@ -116,6 +116,36 @@ describe('auditSpecQuality', () => {
     expect(auditSpecQuality(source, { hasCredentials: true })).toEqual([]);
   });
 
+  it('does not flag a correctly-grounded login whose third, unrelated field (e.g. a promo code) is filled with a literal', () => {
+    const source = block(
+      'succeeds with valid input',
+      `  await page.getByLabel('Email').fill(process.env.HEALIX_TIERB_EMAIL!);\n  await page.getByLabel('Password').fill(process.env.HEALIX_TIERB_PASSWORD!);\n  await page.getByLabel('Promo code').fill('WELCOME10');\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    expect(auditSpecQuality(source, { hasCredentials: true })).toEqual([]);
+  });
+
+  it('catches an invented password even when it is filled third, after an unrelated field, by recognizing it by label rather than position', () => {
+    const source = block(
+      'succeeds with valid input',
+      `  await page.getByLabel('Company code').fill('ACME');\n  await page.getByLabel('Email').fill(process.env.HEALIX_TIERB_EMAIL!);\n  await page.getByLabel('Password').fill('hunter2');\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    const findings = auditSpecQuality(source, { hasCredentials: true });
+    expect(findings).toEqual([
+      expect.objectContaining({ code: 'invented-login-credential', severity: 'hard' }),
+    ]);
+  });
+
+  it('falls back to checking the first two fills when no fill line has a recognizable email/password label', () => {
+    const source = block(
+      'succeeds with valid input',
+      `  await page.locator('#field1').fill('someone@example.com');\n  await page.locator('#field2').fill('hunter2');\n  await page.getByRole('button', { name: 'Sign in' }).click();\n  await expect(page).toHaveURL(/dashboard/);`,
+    );
+    const findings = auditSpecQuality(source, { hasCredentials: true });
+    expect(findings).toEqual([
+      expect.objectContaining({ code: 'invented-login-credential', severity: 'hard' }),
+    ]);
+  });
+
   it('does not flag a deliberate invalid-credentials (negative) login scenario for a literal wrong password', () => {
     const source = block(
       'fails with an incorrect password',

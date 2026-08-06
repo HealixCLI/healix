@@ -300,6 +300,11 @@ const LOGIN_SUBMIT_CLICK_RE = /[^\n;]*(?:log[- ]?in|sign[- ]?in|prihl[aá]s)[^\n
 /** Counts `.fill(` calls of ANY kind (literal or `process.env...`) — a login form's identifier
  * AND password fields are both filled, so a block with fewer than two is unlikely to be one. */
 const ANY_FILL_RE = /\.fill\(/g;
+/** A `.fill(...)` line whose label/placeholder/selector text names an email/username/login/
+ * password field — English + the Slovak equivalents also matched by fixtures/auth.setup.ts's own
+ * field-locator heuristic (kept in sync deliberately: same real-world shape, same fallback words).
+ * Non-global so repeated `.test()` calls on the same instance stay safe (no shared lastIndex). */
+const CREDENTIAL_FIELD_HINT_RE = /e-?mail|user\s*name|login|password|passwd|heslo/i;
 
 /**
  * Audit a single spec's parse-clean source for quality findings. Returns
@@ -417,7 +422,35 @@ export function auditSpecQuality(source: string, opts?: { hasCredentials?: boole
       [...block.body.matchAll(ANY_FILL_RE)].length >= 2 &&
       !NEGATIVE_TITLE_HINT_RE.test(block.title)
     ) {
-      const literal = [...block.body.matchAll(FILL_LITERAL_RE)][0];
+      // Prefer identifying the identifier/password fills by what they actually ARE — a line whose
+      // label/placeholder/selector names an email/username/login/password field, the same
+      // heuristic fixtures/auth.setup.ts already uses at runtime to locate these fields — rather
+      // than assuming they're always the first two fills. This finds the real credential fields
+      // regardless of where they fall in the block, so an unrelated literal (OTP/promo/"remember
+      // me") elsewhere is never mistaken for one just because of its position.
+      //
+      // Only when NO line matches at all (a fully unlabeled form, with no recognizable hint on
+      // ANY fill) do we fall back to position: the first two fills, still far narrower than "any
+      // literal anywhere in the block". Ranked by match position rather than parsing each fill's
+      // argument text, so the fallback stays correct even when the correctly-grounded fill is a
+      // multi-paren expression (e.g. the multi-role
+      // `JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON!).find(...).username` lookup from
+      // generate.ts's credentialFieldRefs) that a naive argument-text scan could misparse.
+      const credentialLines = block.body
+        .split('\n')
+        .filter((line) => HAS_FILL_RE.test(line) && CREDENTIAL_FIELD_HINT_RE.test(line));
+      let literal;
+      if (credentialLines.length > 0) {
+        for (const line of credentialLines) {
+          literal = [...line.matchAll(FILL_LITERAL_RE)][0];
+          if (literal) break;
+        }
+      } else {
+        const fillPositions = [...block.body.matchAll(ANY_FILL_RE)].map((m) => m.index);
+        literal = [...block.body.matchAll(FILL_LITERAL_RE)].find(
+          (lm) => fillPositions.filter((pos) => pos <= lm.index).length <= 2,
+        );
+      }
       if (literal) {
         findings.push({
           code: 'invented-login-credential',

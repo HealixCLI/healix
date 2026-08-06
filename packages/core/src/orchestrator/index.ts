@@ -2522,6 +2522,9 @@ async function runPipeline(
             `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
+          if (!ctx.mockExternalDependencies) {
+            await hydrateCarriedMockFixture(ctx, project.id, baseRun!.id, emit);
+          }
         } else if (suiteMode === 'topup') {
           // Retry-pass/Repair (results-page actions): a retryItemIds-targeted item
           // must be regenerated even when it already has a covering test — that's
@@ -2542,6 +2545,9 @@ async function runPipeline(
           newSpecItems = diff.toGenerate;
           trackGeneration(diff.toGenerate.length, newSpecs.length);
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
+          if (!ctx.mockExternalDependencies) {
+            await hydrateCarriedMockFixture(ctx, project.id, baseRun!.id, emit);
+          }
         } else {
           emit('generate', 'info', 'Generating specs.');
           newSpecs = await mode.generate(ctx, planForGeneration);
@@ -4267,6 +4273,41 @@ async function hydrateCarriedSpecs(
     }
   }
   return specs;
+}
+
+/**
+ * Copies the base run's fixtures/mock.fixture.ts forward when THIS run's own scaffold
+ * pass didn't write one (ctx.mockExternalDependencies is falsy) — covers reuse mode
+ * (which never re-runs dependency detection at all, see the suiteMode === 'reuse'
+ * short-circuit at plan time) and the rarer top-up case where this run's own
+ * redetection came back empty while the base run's didn't. Carried-forward spec files
+ * (hydrateCarriedSpecs, copied byte-for-byte above) still `import` this fixture
+ * whenever the BASE run had external dependencies to mock — without this, every one of
+ * them fails with "Cannot find module '.../fixtures/mock.fixture'" and the whole suite
+ * reports a structurally-empty result (see
+ * docs/design/execute-suite-deps-silent-failure-fix.md). Deliberately does NOT re-run
+ * detectExternalDependencies/generateMockResponses here — that would spend real AI
+ * tokens and violate reuse mode's "zero AI calls" guarantee. Best-effort: a missing
+ * base fixture (base run had no external deps either) is not an error — it matches
+ * scaffold()'s own no-mock behavior for this run, just carried forward instead of
+ * freshly decided.
+ */
+async function hydrateCarriedMockFixture(
+  ctx: TestModeContext,
+  projectId: string,
+  baseRunId: string,
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<void> {
+  const srcAbs = join(projectsDir(), projectId, 'runs', baseRunId, 'suite', 'fixtures', 'mock.fixture.ts');
+  const destAbs = join(ctx.projectDir, 'fixtures', 'mock.fixture.ts');
+  try {
+    await mkdir(dirname(destAbs), { recursive: true });
+    await copyFile(srcAbs, destAbs);
+    emit('generate', 'debug', 'Carried forward mock.fixture.ts from base run.');
+  } catch {
+    // Base run had no mock fixture (no external deps) — nothing to carry, matches
+    // scaffold.ts's own no-mock behavior for this run; not an error.
+  }
 }
 
 /**

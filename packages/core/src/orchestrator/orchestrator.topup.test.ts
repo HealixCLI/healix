@@ -1,4 +1,4 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
@@ -101,8 +101,15 @@ function makeRealisticFakeMode(
 ): TestMode {
   return {
     id: 'playwright',
-    async scaffold(_ctx: TestModeContext): Promise<void> {
-      /* noop */
+    async scaffold(ctx: TestModeContext): Promise<void> {
+      // Mirrors scaffold.ts's real conditional write (only when THIS run detected
+      // external dependencies to mock) — needed so tests can exercise
+      // hydrateCarriedMockFixture's carry-forward behavior realistically.
+      if (ctx.mockExternalDependencies) {
+        const fixturesDir = join(ctx.projectDir, 'fixtures');
+        await mkdir(fixturesDir, { recursive: true });
+        await writeFile(join(fixturesDir, 'mock.fixture.ts'), '// fake mock fixture content\n', 'utf-8');
+      }
     },
     async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
       generateCalls.push(plan);
@@ -1095,5 +1102,160 @@ describe('reuse-mode exploration inheritance (3-tier Tier B login fallback)', ()
     );
     // Tier 2 must never even attempt a discovery crawl when there's nothing to log in with.
     expect(events.some((m) => m.includes('running a bounded login-only discovery'))).toBe(false);
+  });
+});
+
+/**
+ * See docs/design/reuse-mode-mock-fixture-carry-forward-fix.md. Reuse/top-up carry
+ * forward spec FILES byte-for-byte (hydrateCarriedSpecs), but a base run's
+ * fixtures/mock.fixture.ts — written by scaffold() only when THIS run detected
+ * external dependencies — was never carried forward at all, breaking every carried
+ * spec that imports it whenever the current run doesn't independently rediscover the
+ * same dependencies (always true for reuse, which never redetects at all).
+ */
+describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', () => {
+  it('REUSE: carries fixtures/mock.fixture.ts forward from the base run when this run detected no dependencies of its own', async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-mockfixture-'));
+    writeFileSync(join(repoPath, 'package.json'), JSON.stringify({ dependencies: { twilio: '^4.0.0' } }));
+    mkdirSync(join(repoPath, 'src'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'src', 'sms.js'),
+      "import twilio from 'twilio';\nconst client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Mock Fixture Carry-Forward Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    try {
+      // ---- Run 1: fresh — real dependency detection finds twilio, scaffold() (the
+      // fake mode above) writes fixtures/mock.fixture.ts because ctx.mockExternalDependencies
+      // is true this run. ----
+      const run1 = await createOrchestrator({
+        provider: fakeProviderWithPlan(
+          [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+          [],
+        ),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+      expect(run1.status).toBe('passed');
+
+      const run1Fixture = join(dataDir, 'projects', project.id, 'runs', run1.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+      expect(existsSync(run1Fixture)).toBe(true);
+
+      // ---- Run 2: reuse — never redetects dependencies at all (ctx.mockExternalDependencies
+      // stays falsy), so hydrateCarriedMockFixture must carry the base run's fixture forward. ----
+      const run2 = await createOrchestrator({
+        provider: fakeProviderWithPlan([], []),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, suiteMode: 'reuse', autoApprove: true });
+      expect(run2.status).toBe('passed');
+
+      const run2Fixture = join(dataDir, 'projects', project.id, 'runs', run2.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+      expect(existsSync(run2Fixture)).toBe(true);
+      expect(await readFile(run2Fixture, 'utf-8')).toBe(await readFile(run1Fixture, 'utf-8'));
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('REGRESSION: a project with no external dependencies at all — reuse mode stays a clean no-op, no fixture file, no error', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No Dependencies Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    const run1Fixture = join(dataDir, 'projects', project.id, 'runs', run1.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+    expect(existsSync(run1Fixture)).toBe(false);
+
+    const events: Array<{ message: string }> = [];
+    const run2 = await createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run(
+      { projectId: project.id, suiteMode: 'reuse', autoApprove: true },
+      { onEvent: (e) => events.push({ message: e.message }) },
+    );
+
+    expect(run2.status).toBe('passed');
+    const run2Fixture = join(dataDir, 'projects', project.id, 'runs', run2.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+    expect(existsSync(run2Fixture)).toBe(false);
+    // Best-effort no-op: no warn/error emitted for the (correctly) missing base fixture.
+    expect(events.some((e) => /mock\.fixture/i.test(e.message) && !/carried forward/i.test(e.message))).toBe(
+      false,
+    );
+  });
+
+  it("TOP-UP: this run's own freshly-scaffolded mock.fixture.ts is never clobbered by the carry-forward copy", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-mockfixture-topup-'));
+    writeFileSync(join(repoPath, 'package.json'), JSON.stringify({ dependencies: { twilio: '^4.0.0' } }));
+    mkdirSync(join(repoPath, 'src'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'src', 'sms.js'),
+      "import twilio from 'twilio';\nconst client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Top-up Mock Fixture Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    try {
+      const run1 = await createOrchestrator({
+        provider: fakeProviderWithPlan(
+          [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+          [],
+        ),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+      expect(run1.status).toBe('passed');
+
+      // Top-up: same repoPath, so its OWN dependency redetection also finds twilio and
+      // this run's own scaffold() writes a fresh mock.fixture.ts — the carry-forward
+      // copy must be skipped (gated on !ctx.mockExternalDependencies), never overwriting it.
+      const run2 = await createOrchestrator({
+        provider: fakeProviderWithPlan(
+          [{ title: 'Settings works', reqTag: 'REQ-002', tier: 'tierA-public', intent: 'new' }],
+          [],
+        ),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, suiteMode: 'topup', autoApprove: true });
+      expect(run2.status).toBe('passed');
+
+      const run2Fixture = join(dataDir, 'projects', project.id, 'runs', run2.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+      // Still exactly the fake mode's own freshly-written content — never touched by carry-forward.
+      expect(await readFile(run2Fixture, 'utf-8')).toBe('// fake mock fixture content\n');
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
   });
 });

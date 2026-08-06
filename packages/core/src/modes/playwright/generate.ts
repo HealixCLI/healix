@@ -437,33 +437,44 @@ const REASON_CONTINUATION_RE = /^\/\/[ \t]*(.*)$/;
 const SKIP_REASON_MAX_LENGTH = 300;
 
 /**
+ * Walks a flagged block's body forward from its ESCAPE_HATCH_REASON_RE match through any
+ * word-wrapped continuation `//` comment lines directly below it, joining them into one raw
+ * detail string — no "unobserved element —" prefix, no length cap; callers apply their own
+ * formatting. Shared by escapeHatchReasonText (annotation/KB text) AND extractEscapeHatchReasons
+ * (directed re-exploration's structured reasons) so neither can independently regress into only
+ * capturing the marker's first line (GAP-062) — that already happened once, when
+ * extractEscapeHatchReasons called ESCAPE_HATCH_REASON_RE directly instead of going through this.
+ * Returns '' when no marker matches at all.
+ */
+function extractRawEscapeHatchDetail(body: string): string {
+  const match = ESCAPE_HATCH_REASON_RE.exec(body);
+  if (!match) return '';
+  const firstLine = match[1]?.trim() ?? '';
+  const continuationLines: string[] = [];
+  const rest = body.slice(match.index + match[0].length);
+  // The first split segment is the (already-empty) remainder of the TODO line itself, up to
+  // its own trailing newline — real continuation lines start at index 1.
+  for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
+    const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
+    if (!contMatch) break;
+    continuationLines.push(contMatch[1].trim());
+  }
+  return [firstLine, ...continuationLines].filter(Boolean).join(' ');
+}
+
+/**
  * Extracts the model's own explanation for a single flagged block's escape-hatch marker(s),
  * as plain text (no annotation wrapping/truncation) — shared by escapeHatchDetails (which
  * turns this into a Playwright annotation) and extractEscapeHatchReasonTexts (which persists it
  * to the Knowledge Base), so the two can never drift apart.
  *
  * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
- * than one long line. ESCAPE_HATCH_REASON_RE only ever captures the first line (deliberately, so
- * it can't cross into following test code) — so once it matches, this walks forward through the
- * remaining `//`-prefixed lines directly below it and appends them, stopping at the first
- * non-comment line. Without this, everything past the first line was silently dropped with no
- * indication truncation happened (GAP-062).
+ * than one long line — see extractRawEscapeHatchDetail, which does the actual continuation-line
+ * walking this relies on. Without that, everything past the first line was silently dropped
+ * with no indication truncation happened (GAP-062).
  */
 function escapeHatchReasonText(body: string): string {
-  const match = ESCAPE_HATCH_REASON_RE.exec(body);
-  const firstLine = match?.[1]?.trim() ?? '';
-  const continuationLines: string[] = [];
-  if (match) {
-    const rest = body.slice(match.index + match[0].length);
-    // The first split segment is the (already-empty) remainder of the TODO line itself, up to
-    // its own trailing newline — real continuation lines start at index 1.
-    for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
-      const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
-      if (!contMatch) break;
-      continuationLines.push(contMatch[1].trim());
-    }
-  }
-  const detail = [firstLine, ...continuationLines].filter(Boolean).join(' ');
+  const detail = extractRawEscapeHatchDetail(body);
   const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
   return full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
 }
@@ -561,7 +572,10 @@ export function extractEscapeHatchReasons(source: string): EscapeHatchReason[] {
   const out: EscapeHatchReason[] = [];
   for (const block of splitTestBlocks(source)) {
     if (!block.body.includes(ESCAPE_HATCH_MARKER)) continue;
-    const detail = ESCAPE_HATCH_REASON_RE.exec(block.body)?.[1]?.trim();
+    // Goes through extractRawEscapeHatchDetail (not a raw ESCAPE_HATCH_REASON_RE.exec) so a
+    // word-wrapped, multi-line reason is fully captured instead of silently truncated to its
+    // first line — see that function's doc comment (GAP-062 regressed once already here).
+    const detail = extractRawEscapeHatchDetail(block.body);
     out.push({ testTitle: block.title, reason: detail || 'needs review' });
   }
   return out;

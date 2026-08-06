@@ -562,6 +562,29 @@ test('[REQ:REQ-1] guessed', async ({ page }) => {
       { testTitle: '[REQ:REQ-1] guessed', reason: 'reason survives demotion.' },
     ]);
   });
+
+  it("carries the FULL word-wrapped reason through, not just the marker's first line (GAP-062 regression)", () => {
+    // Previously called ESCAPE_HATCH_REASON_RE directly instead of going through
+    // extractRawEscapeHatchDetail — silently dropped every continuation line below the marker.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      {
+        testTitle: '[REQ:FR-PROFILE-01] positive: saves updated profile fields',
+        reason:
+          'a dedicated success toast selector was not captured in the ' +
+          'interactive-element inventory; verifying the persisted field values as a coarser ' +
+          'observable outcome of a successful save instead.',
+      },
+    ]);
+  });
 });
 
 describe('extractEscapeHatchReasonTexts — durable, queryable reasons for escape_hatch_gaps', () => {

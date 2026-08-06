@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
@@ -437,33 +437,44 @@ const REASON_CONTINUATION_RE = /^\/\/[ \t]*(.*)$/;
 const SKIP_REASON_MAX_LENGTH = 300;
 
 /**
+ * Walks a flagged block's body forward from its ESCAPE_HATCH_REASON_RE match through any
+ * word-wrapped continuation `//` comment lines directly below it, joining them into one raw
+ * detail string — no "unobserved element —" prefix, no length cap; callers apply their own
+ * formatting. Shared by escapeHatchReasonText (annotation/KB text) AND extractEscapeHatchReasons
+ * (directed re-exploration's structured reasons) so neither can independently regress into only
+ * capturing the marker's first line (GAP-062) — that already happened once, when
+ * extractEscapeHatchReasons called ESCAPE_HATCH_REASON_RE directly instead of going through this.
+ * Returns '' when no marker matches at all.
+ */
+function extractRawEscapeHatchDetail(body: string): string {
+  const match = ESCAPE_HATCH_REASON_RE.exec(body);
+  if (!match) return '';
+  const firstLine = match[1]?.trim() ?? '';
+  const continuationLines: string[] = [];
+  const rest = body.slice(match.index + match[0].length);
+  // The first split segment is the (already-empty) remainder of the TODO line itself, up to
+  // its own trailing newline — real continuation lines start at index 1.
+  for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
+    const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
+    if (!contMatch) break;
+    continuationLines.push(contMatch[1].trim());
+  }
+  return [firstLine, ...continuationLines].filter(Boolean).join(' ');
+}
+
+/**
  * Extracts the model's own explanation for a single flagged block's escape-hatch marker(s),
  * as plain text (no annotation wrapping/truncation) — shared by escapeHatchDetails (which
- * turns this into a Playwright annotation) and extractEscapeHatchReasons (which persists it
+ * turns this into a Playwright annotation) and extractEscapeHatchReasonTexts (which persists it
  * to the Knowledge Base), so the two can never drift apart.
  *
  * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
- * than one long line. ESCAPE_HATCH_REASON_RE only ever captures the first line (deliberately, so
- * it can't cross into following test code) — so once it matches, this walks forward through the
- * remaining `//`-prefixed lines directly below it and appends them, stopping at the first
- * non-comment line. Without this, everything past the first line was silently dropped with no
- * indication truncation happened (GAP-062).
+ * than one long line — see extractRawEscapeHatchDetail, which does the actual continuation-line
+ * walking this relies on. Without that, everything past the first line was silently dropped
+ * with no indication truncation happened (GAP-062).
  */
 function escapeHatchReasonText(body: string): string {
-  const match = ESCAPE_HATCH_REASON_RE.exec(body);
-  const firstLine = match?.[1]?.trim() ?? '';
-  const continuationLines: string[] = [];
-  if (match) {
-    const rest = body.slice(match.index + match[0].length);
-    // The first split segment is the (already-empty) remainder of the TODO line itself, up to
-    // its own trailing newline — real continuation lines start at index 1.
-    for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
-      const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
-      if (!contMatch) break;
-      continuationLines.push(contMatch[1].trim());
-    }
-  }
-  const detail = [firstLine, ...continuationLines].filter(Boolean).join(' ');
+  const detail = extractRawEscapeHatchDetail(body);
   const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
   return full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
 }
@@ -486,12 +497,18 @@ function escapeHatchDetails(body: string): string {
  * All escape-hatch reasons found in a spec's flagged test blocks — one entry per flagged
  * block, using the same extraction logic demoteEscapeHatchBlocks/escapeHatchDetails use to
  * build the Playwright annotation, but returned to the caller instead of being consumed only
- * for that inline string. Feeds escape_hatch_gaps (see storage/schema.ts) so a directed
- * re-exploration pass (not yet implemented) has durable, queryable history of what was left
+ * for that inline string. Feeds escape_hatch_gaps (see storage/schema.ts) via
+ * ctx.onEscapeHatchGap, giving the Knowledge Base durable, queryable history of what was left
  * unobserved, instead of only a source comment/report annotation that's discarded once the
  * run ends. Returns [] when the spec has no flagged blocks.
+ *
+ * Named distinctly from extractEscapeHatchReasons below (which returns one
+ * `{ testTitle, reason }` per block, for directed re-exploration's target-resolution needs) —
+ * both were built independently against the same marker for two different consumers with
+ * different shape needs, and are kept as two functions rather than one, to avoid either
+ * consumer reshaping the other's return value.
  */
-export function extractEscapeHatchReasons(source: string): string[] {
+export function extractEscapeHatchReasonTexts(source: string): string[] {
   return splitTestBlocks(source)
     .filter((b) => b.body.includes(ESCAPE_HATCH_MARKER))
     .map((b) => escapeHatchReasonText(b.body));
@@ -535,6 +552,33 @@ export function demoteEscapeHatchBlocks(source: string): string {
       result.slice(block.start + m[0].length);
   }
   return result;
+}
+
+/** One escape-hatch marker found in a spec's source, keyed to the test block that carried it. */
+export interface EscapeHatchReason {
+  testTitle: string;
+  reason: string;
+}
+
+/**
+ * Finds every escape-hatch marker still present in a spec's source (pre- or post-demotion — see
+ * demoteEscapeHatchBlocks above, which never strips the marker comment itself, only rewrites the
+ * enclosing `test(` call). Used by directed re-exploration (orchestrator/directed-reexplore.ts) to
+ * discover which scenarios need a targeted re-crawl, without needing a stored/cached field on
+ * GeneratedSpec — the marker text durably survives on disk, so this is always re-derivable from
+ * `contents` alone.
+ */
+export function extractEscapeHatchReasons(source: string): EscapeHatchReason[] {
+  const out: EscapeHatchReason[] = [];
+  for (const block of splitTestBlocks(source)) {
+    if (!block.body.includes(ESCAPE_HATCH_MARKER)) continue;
+    // Goes through extractRawEscapeHatchDetail (not a raw ESCAPE_HATCH_REASON_RE.exec) so a
+    // word-wrapped, multi-line reason is fully captured instead of silently truncated to its
+    // first line — see that function's doc comment (GAP-062 regressed once already here).
+    const detail = extractRawEscapeHatchDetail(block.body);
+    out.push({ testTitle: block.title, reason: detail || 'needs review' });
+  }
+  return out;
 }
 
 export interface GroundTruth {
@@ -1552,6 +1596,52 @@ export async function clearGenerateCheckpoint(projectDir: string): Promise<void>
 }
 
 /**
+ * Selectively drops specific item ids' entries from the ndjson checkpoint — unlike
+ * clearGenerateCheckpoint (which wipes the whole file), this lets a caller force ONLY certain
+ * items to be re-generated on the next generate() call while every other item's checkpoint entry
+ * (and therefore its "already done, skip" status at the readGenerateCheckpointEntries-based filter
+ * generate() applies) is left completely alone. Directed re-exploration
+ * (orchestrator/directed-reexplore.ts) needs this: without it, regenerating an item that already
+ * has a 'generated' entry would silently no-op.
+ *
+ * Rewrites via write-to-temp-then-rename rather than truncate-and-rewrite-in-place: a crash
+ * mid-write leaves either the OLD file fully intact or the NEW file fully in place, never a
+ * half-written ndjson line. Routed through the same appendQueues serialization
+ * appendGenerateCheckpointEntry already uses for this projectDir, so a rewrite can never race an
+ * in-flight append.
+ */
+export async function forgetGenerateCheckpointEntries(
+  projectDir: string,
+  itemIds: ReadonlySet<string> | readonly string[],
+): Promise<void> {
+  const forget = itemIds instanceof Set ? itemIds : new Set(itemIds);
+  if (forget.size === 0) return;
+
+  const prior = appendQueues.get(projectDir) ?? Promise.resolve();
+  const next = prior
+    .then(async () => {
+      const entries = await readGenerateCheckpointEntries(projectDir);
+      const remaining = entries.filter((e) => !forget.has(e.itemId));
+      if (remaining.length === entries.length) return; // nothing matched — file untouched
+      const filePath = genCheckpointFilePath(projectDir);
+      if (remaining.length === 0) {
+        await unlink(filePath).catch(() => {});
+        return;
+      }
+      const tmpPath = `${filePath}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+      const body = remaining.map((e) => `${JSON.stringify(e)}\n`).join('');
+      await writeFile(tmpPath, body, 'utf-8');
+      await rename(tmpPath, filePath);
+    })
+    .catch(() => {
+      // best-effort — same tolerance as appendGenerateCheckpointEntry/clearGenerateCheckpoint;
+      // worst case, an item is regenerated even though it wasn't strictly necessary to.
+    });
+  appendQueues.set(projectDir, next);
+  await next;
+}
+
+/**
  * Records an item's outcome as FINAL, unless a pause/abort is the reason
  * we're looking at it right now — in which case nothing is written, so the
  * item is retried fresh (not written off as permanently skipped) the next
@@ -1776,7 +1866,7 @@ async function validateAndPersist(
 
   source = ensureReqTag(source, reqTag);
   source = demoteEscapeHatchBlocks(source);
-  const escapeHatchReasons = extractEscapeHatchReasons(source);
+  const escapeHatchReasons = extractEscapeHatchReasonTexts(source);
   if (tier === 'tierB-auth') {
     const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
     const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;

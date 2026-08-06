@@ -98,6 +98,15 @@ function fakeProviderWithPlan(items: PlanItemSeed[], completeCalls: CompleteOpti
 function makeRealisticFakeMode(
   generateCalls: TestPlan[],
   failReqTags: ReadonlySet<string> = new Set(),
+  // Simulates validate.ts's real pruning: for a given reqTag, write fewer test()
+  // markers than the plan actually called for — models a low-quality block getting
+  // spliced out of otherwise-accepted content. See
+  // docs/design/pruned-block-orphaned-test-row-fix.md.
+  pruneToCounts: ReadonlyMap<string, number> = new Map(),
+  // Whether this fake mode implements the optional countScenarios capability at
+  // all — false models an older/other TestMode that doesn't, exercising
+  // registerSpecRows' fallback-to-plan-count path unchanged.
+  implementsCountScenarios = true,
 ): TestMode {
   return {
     id: 'playwright',
@@ -136,9 +145,16 @@ function makeRealisticFakeMode(
         const scenarios = item.scenarios?.length
           ? item.scenarios
           : [{ kind: 'positive', description: 'default' }];
+        // Simulates pruning: writes fewer test() markers than the plan called for,
+        // modeling validate.ts splicing a low-quality block out of the final content
+        // BEFORE registerSpecRows ever sees it (matches the real call order).
+        const prunedCount = pruneToCounts.get(specReqTag);
+        const survivingScenarios = prunedCount !== undefined ? scenarios.slice(0, prunedCount) : scenarios;
         const contents =
           `// spec for ${item.title} (${specReqTag})\n` +
-          scenarios.map((s) => `test('[REQ:${specReqTag}] ${s.kind}: ${s.description}');\n`).join('');
+          survivingScenarios
+            .map((s) => `test('[REQ:${specReqTag}] ${s.kind}: ${s.description}');\n`)
+            .join('');
         await writeFile(absPath, contents, 'utf-8');
         specs.push({
           path: absPath,
@@ -177,6 +193,13 @@ function makeRealisticFakeMode(
     async export(_ctx: TestModeContext): Promise<SuiteBundle> {
       return { dir: 'export', files: [] };
     },
+    ...(implementsCountScenarios
+      ? {
+          countScenarios(contents: string): number {
+            return (contents.match(/^test\(/gm) ?? []).length;
+          },
+        }
+      : {}),
   };
 }
 
@@ -1060,7 +1083,7 @@ describe('reuse-mode exploration inheritance (3-tier Tier B login fallback)', ()
     );
   });
 
-  it('TIER 3 (cache miss, no credentials configured): falls straight to today\'s guessed-selector behavior, no discovery attempted', async () => {
+  it("TIER 3 (cache miss, no credentials configured): falls straight to today's guessed-selector behavior, no discovery attempted", async () => {
     const store = (await getStore()) as HealixStore;
     const project = store.createProject({
       name: 'Reuse Tier3 Demo',
@@ -1146,7 +1169,16 @@ describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', 
       }).run({ projectId: project.id, autoApprove: true });
       expect(run1.status).toBe('passed');
 
-      const run1Fixture = join(dataDir, 'projects', project.id, 'runs', run1.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+      const run1Fixture = join(
+        dataDir,
+        'projects',
+        project.id,
+        'runs',
+        run1.runId,
+        'suite',
+        'fixtures',
+        'mock.fixture.ts',
+      );
       expect(existsSync(run1Fixture)).toBe(true);
 
       // ---- Run 2: reuse — never redetects dependencies at all (ctx.mockExternalDependencies
@@ -1159,7 +1191,16 @@ describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', 
       }).run({ projectId: project.id, suiteMode: 'reuse', autoApprove: true });
       expect(run2.status).toBe('passed');
 
-      const run2Fixture = join(dataDir, 'projects', project.id, 'runs', run2.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+      const run2Fixture = join(
+        dataDir,
+        'projects',
+        project.id,
+        'runs',
+        run2.runId,
+        'suite',
+        'fixtures',
+        'mock.fixture.ts',
+      );
       expect(existsSync(run2Fixture)).toBe(true);
       expect(await readFile(run2Fixture, 'utf-8')).toBe(await readFile(run1Fixture, 'utf-8'));
     } finally {
@@ -1185,7 +1226,16 @@ describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', 
       makeBrowser: () => fakeBrowser,
     }).run({ projectId: project.id, autoApprove: true });
     expect(run1.status).toBe('passed');
-    const run1Fixture = join(dataDir, 'projects', project.id, 'runs', run1.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+    const run1Fixture = join(
+      dataDir,
+      'projects',
+      project.id,
+      'runs',
+      run1.runId,
+      'suite',
+      'fixtures',
+      'mock.fixture.ts',
+    );
     expect(existsSync(run1Fixture)).toBe(false);
 
     const events: Array<{ message: string }> = [];
@@ -1200,7 +1250,16 @@ describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', 
     );
 
     expect(run2.status).toBe('passed');
-    const run2Fixture = join(dataDir, 'projects', project.id, 'runs', run2.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+    const run2Fixture = join(
+      dataDir,
+      'projects',
+      project.id,
+      'runs',
+      run2.runId,
+      'suite',
+      'fixtures',
+      'mock.fixture.ts',
+    );
     expect(existsSync(run2Fixture)).toBe(false);
     // Best-effort no-op: no warn/error emitted for the (correctly) missing base fixture.
     expect(events.some((e) => /mock\.fixture/i.test(e.message) && !/carried forward/i.test(e.message))).toBe(
@@ -1251,11 +1310,161 @@ describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', 
       }).run({ projectId: project.id, suiteMode: 'topup', autoApprove: true });
       expect(run2.status).toBe('passed');
 
-      const run2Fixture = join(dataDir, 'projects', project.id, 'runs', run2.runId, 'suite', 'fixtures', 'mock.fixture.ts');
+      const run2Fixture = join(
+        dataDir,
+        'projects',
+        project.id,
+        'runs',
+        run2.runId,
+        'suite',
+        'fixtures',
+        'mock.fixture.ts',
+      );
       // Still exactly the fake mode's own freshly-written content — never touched by carry-forward.
       expect(await readFile(run2Fixture, 'utf-8')).toBe('// fake mock fixture content\n');
     } finally {
       rmSync(repoPath, { recursive: true, force: true });
     }
+  });
+});
+
+/**
+ * See docs/design/pruned-block-orphaned-test-row-fix.md. registerSpecRows used to
+ * insert one row per PLANNED scenario regardless of how many test() blocks actually
+ * survived validate.ts's pruning — the excess sat at status: 'pending' forever,
+ * inflating a run's own Total count with phantom rows that could never receive a
+ * result. mode.countScenarios (new, optional TestMode capability) lets
+ * registerSpecRows cap registration to what actually exists.
+ */
+describe('registerSpecRows — caps row count to surviving test() blocks after pruning', () => {
+  it('registers only as many rows as test() blocks survive, not the full planned scenario count', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Pruned Block Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const plan: TestPlan = {
+      summary: 'one item, 3 scenarios, 1 pruned',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Delete a todo',
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent: 'x',
+          scenarios: [
+            { kind: 'positive', description: 'succeeds' },
+            { kind: 'negative', description: 'todo not found' },
+            { kind: 'edge', description: 'double-click race' },
+          ],
+        },
+      ],
+    };
+
+    // Simulates validate.ts pruning 1 of the 3 blocks (e.g. the "edge" scenario) —
+    // only 2 test() markers actually survive into the written spec file.
+    const orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan(plan.items, []),
+      getMode: () => makeRealisticFakeMode([], new Set(), new Map([['REQ-1', 2]])),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(summary.status).toBe('passed');
+
+    const tests = store.listTests(summary.runId);
+    // Exactly 2 rows — not 3 — and none left dangling at 'pending'.
+    expect(tests).toHaveLength(2);
+    expect(tests.every((t) => t.status === 'passed')).toBe(true);
+  });
+
+  it('falls back to the full planned scenario count when the mode has no countScenarios at all (unchanged prior behavior)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No countScenarios Capability Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const plan: TestPlan = {
+      summary: 'one item, 3 scenarios, 1 pruned, but mode has no countScenarios',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Delete a todo',
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent: 'x',
+          scenarios: [
+            { kind: 'positive', description: 'succeeds' },
+            { kind: 'negative', description: 'todo not found' },
+            { kind: 'edge', description: 'double-click race' },
+          ],
+        },
+      ],
+    };
+
+    // Same pruning-to-2 simulation as above, but this mode doesn't implement
+    // countScenarios at all — registerSpecRows must fall back to the plan's full
+    // scenario count (3), exactly matching today's pre-fix behavior for a mode
+    // that doesn't opt into the new capability. (This reproduces the ORIGINAL bug
+    // shape for a mode without countScenarios — an orphaned 3rd row stays 'pending'
+    // forever, which is the accepted, unchanged fallback behavior, not a fix regression.)
+    const orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan(plan.items, []),
+      getMode: () => makeRealisticFakeMode([], new Set(), new Map([['REQ-1', 2]]), false),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    const tests = store.listTests(summary.runId);
+    expect(tests).toHaveLength(3);
+    expect(tests.filter((t) => t.status === 'pending')).toHaveLength(1);
+  });
+
+  it('registers every scenario unchanged when nothing was pruned (normal case)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No Pruning Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const plan: TestPlan = {
+      summary: 'one item, 3 scenarios, none pruned',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Delete a todo',
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent: 'x',
+          scenarios: [
+            { kind: 'positive', description: 'succeeds' },
+            { kind: 'negative', description: 'todo not found' },
+            { kind: 'edge', description: 'double-click race' },
+          ],
+        },
+      ],
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan(plan.items, []),
+      getMode: () => makeRealisticFakeMode([]), // no pruning map — full scenario count written
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(summary.status).toBe('passed');
+
+    const tests = store.listTests(summary.runId);
+    expect(tests).toHaveLength(3);
+    expect(tests.every((t) => t.status === 'passed')).toBe(true);
   });
 });

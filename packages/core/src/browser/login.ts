@@ -327,7 +327,10 @@ async function submitLoginAttempt(
       // a click away from an already-working weaker-tier button. See
       // findLoginSubmitButtonCandidate's doc comment.
       const candidate = findLoginSubmitButtonCandidate(before.interactiveElements);
-      if (candidate && (await waitForCandidateEnabled(browser, candidate.selector, SUBMIT_ENABLE_TIMEOUT_MS))) {
+      if (
+        candidate &&
+        (await waitForCandidateEnabled(browser, candidate.selector, SUBMIT_ENABLE_TIMEOUT_MS))
+      ) {
         submit = candidate;
       }
     }

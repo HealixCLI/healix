@@ -23,12 +23,20 @@ The whole "detect missing deps → reinstall → re-run 98 specs" cycle complete
 
 Confirmed directly against `packages/core/src/modes/playwright/execute.ts`:
 
-1. **`ensureSuiteDeps()` (lines 492-517)** — the *first* place deps get installed (called from both `validate.ts`'s parse-check gate and `execute()` itself). Its "are deps present" check is a bare existence probe:
+1. **`ensureSuiteDeps()` (lines 492-517)** — the _first_ place deps get installed (called from both `validate.ts`'s parse-check gate and `execute()` itself). Its "are deps present" check is a bare existence probe:
+
    ```ts
    const marker = join(ctx.projectDir, 'node_modules', '@playwright');
-   try { await access(marker); return; } catch { /* fall through to install */ }
+   try {
+     await access(marker);
+     return;
+   } catch {
+     /* fall through to install */
+   }
    ```
+
    This only proves the `@playwright` directory exists — not that it (or anything else the suite needs) actually resolves correctly. And when the subsequent `npm install` itself fails:
+
    ```ts
    if (res.code === 0) {
      emit(ctx, '[execute] suite deps installed');
@@ -37,19 +45,27 @@ Confirmed directly against `packages/core/src/modes/playwright/execute.ts`:
      emit(ctx, '[execute] npm install did not exit cleanly; continuing', { code: res.code, tail });
    }
    ```
+
    ...it logs the failure and **continues anyway** — by design, per the function's own comment, but this is the first place a genuinely broken install gets silently waved through.
 
 2. **The retry path inside `execute()` itself (lines 1520-1557)** — triggered when the first Playwright invocation's exit code plus stderr/stdout match `looksLikeMissingSuiteDeps` (a `Cannot find module` / `MODULE_NOT_FOUND` pattern, line 537-539):
+
    ```ts
    if (looksLikeMissingSuiteDeps(cmd)) {
      emit(ctx, '[execute] missing suite dependency; re-running npm install…');
-     const depsInstall = await runCommand(ctx, 'npm', ['install', '--no-audit', '--no-fund', '--silent'], INSTALL_TIMEOUT_MS);
-     emit(ctx, '[execute] npm install complete', { code: depsInstall.code });   // <-- always "complete", never checked
+     const depsInstall = await runCommand(
+       ctx,
+       'npm',
+       ['install', '--no-audit', '--no-fund', '--silent'],
+       INSTALL_TIMEOUT_MS,
+     );
+     emit(ctx, '[execute] npm install complete', { code: depsInstall.code }); // <-- always "complete", never checked
    }
    emit(ctx, '[execute] re-running suite after dependency install');
    startedAt = Date.now();
-   cmd = await runPlaywright(ctx, invertFile);                                  // <-- retried unconditionally
+   cmd = await runPlaywright(ctx, invertFile); // <-- retried unconditionally
    ```
+
    **`depsInstall.code` is captured and logged, but never branched on.** A fast, failed, or no-op `npm install` (broken/partial `node_modules`, no network, a lockfile mismatch) is reported as `"npm install complete"` regardless of whether it actually succeeded, and Playwright is unconditionally re-invoked against still-broken dependencies.
 
 3. **Only one retry is attempted** — if the reinstalled deps are still broken, there's no second attempt; whatever the second Playwright invocation produces is taken as final.
@@ -90,50 +106,77 @@ That bug: a caller-supplied `testingScope` narrower than the carried suite's own
 
 ### 1. Check the install exit code before declaring success (both call sites)
 
-**`ensureSuiteDeps()` (`execute.ts:492-517`)** — already logs the failure reasonably; the remaining gap is that its *caller* (`validate.ts`'s parse-check gate) treats "deps appear missing" as a reason to skip validation entirely rather than surfacing install failure specifically. Lower priority than #2 below since this path already degrades gracefully (skip parse-check, don't block generation) rather than silently reporting fake success.
+**`ensureSuiteDeps()` (`execute.ts:492-517`)** — already logs the failure reasonably; the remaining gap is that its _caller_ (`validate.ts`'s parse-check gate) treats "deps appear missing" as a reason to skip validation entirely rather than surfacing install failure specifically. Lower priority than #2 below since this path already degrades gracefully (skip parse-check, don't block generation) rather than silently reporting fake success.
 
 **The retry path (`execute.ts:1538-1550`) — the primary fix site:**
+
 ```ts
 if (looksLikeMissingSuiteDeps(cmd)) {
   emit(ctx, '[execute] missing suite dependency; re-running npm install…');
-  const depsInstall = await runCommand(ctx, 'npm', ['install', '--no-audit', '--no-fund', '--silent'], INSTALL_TIMEOUT_MS);
+  const depsInstall = await runCommand(
+    ctx,
+    'npm',
+    ['install', '--no-audit', '--no-fund', '--silent'],
+    INSTALL_TIMEOUT_MS,
+  );
   if (depsInstall.code === 0) {
     emit(ctx, '[execute] npm install complete');
   } else {
     const tail = stripAnsi(depsInstall.stderr || depsInstall.stdout)
-      .split(/\r?\n/).filter(Boolean).slice(-8).join(' | ');
-    emit(ctx, '[execute] npm install failed; suite dependencies remain broken', {
-      code: depsInstall.code,
-      tail,
-    }, 'error');   // or 'warn' depending on the emit() severity convention already used elsewhere in this file
+      .split(/\r?\n/)
+      .filter(Boolean)
+      .slice(-8)
+      .join(' | ');
+    emit(
+      ctx,
+      '[execute] npm install failed; suite dependencies remain broken',
+      {
+        code: depsInstall.code,
+        tail,
+      },
+      'error',
+    ); // or 'warn' depending on the emit() severity convention already used elsewhere in this file
     // Do not re-run Playwright against dependencies we KNOW are still broken —
     // fall through to the existing "no runnable specs" reporting path instead
     // of wasting a full suite invocation that can only fail the same way.
   }
 }
 ```
+
 Only re-invoke `runPlaywright` when the install actually succeeded (or wasn't needed). A failed install should short-circuit straight to an explicit failure state rather than attempting the doomed re-run.
 
 ### 2. Distinguish "empty because nothing to run" from "empty because the suite never actually ran"
 
 Extend the `report` truthy-branch (around `execute.ts:1584-1585`) so a **structurally-empty** report (zero suites/specs discovered, as opposed to zero pass/fail among real skipped/pending entries) is treated the same as the no-report case — i.e. also triggers the `'Could not parse Playwright results; suite may have failed to start'`-style diagnostic, rather than silently taking the clean `parseReport` path:
+
 ```ts
-const reportIsStructurallyEmpty = (r: PwReport) => !r.suites || r.suites.every((s) => (s.specs?.length ?? 0) === 0 && (s.suites?.length ?? 0) === 0);
+const reportIsStructurallyEmpty = (r: PwReport) =>
+  !r.suites || r.suites.every((s) => (s.specs?.length ?? 0) === 0 && (s.suites?.length ?? 0) === 0);
 
 if (report && !reportIsStructurallyEmpty(report)) {
   parsed = parseReport(report, auth);
 } else {
   parsed = parseSummaryText(`${cmd.stdout}\n${cmd.stderr}`);
-  if (parsed.results.length === 0 && parsed.passed === 0 && parsed.failed === 0 && priorEntries.length === 0) {
+  if (
+    parsed.results.length === 0 &&
+    parsed.passed === 0 &&
+    parsed.failed === 0 &&
+    priorEntries.length === 0
+  ) {
     emit(ctx, 'Could not parse Playwright results; suite may have failed to start', {
       exitCode: cmd.code,
       timedOut: cmd.timedOut,
       structurallyEmptyReport: !!report,
-      tail: stripAnsi(cmd.stderr || cmd.stdout).split(/\r?\n/).filter(Boolean).slice(-8).join(' | '),
+      tail: stripAnsi(cmd.stderr || cmd.stdout)
+        .split(/\r?\n/)
+        .filter(Boolean)
+        .slice(-8)
+        .join(' | '),
     });
   }
 }
 ```
+
 This ensures a suite that "ran" but discovered zero tests (e.g. broken `node_modules` prevented Playwright from even collecting specs, but it still emitted a valid empty JSON reporter file) surfaces the same operator-visible diagnostic as a suite that crashed before producing any report at all — instead of the two cases silently diverging into "clean empty run" vs "error."
 
 ### 3. Optional hardening: verify the marker more precisely, and loop the retry once more

@@ -421,6 +421,17 @@ export interface TestMode {
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
   /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
   validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
+  /**
+   * Counts the real, executable test cases present in a spec's CURRENT (possibly
+   * pruned) contents — used by orchestrator/index.ts's registerSpecRows to cap DB row
+   * registration to what actually exists, instead of blindly trusting the plan's
+   * original scenario count (see docs/design/pruned-block-orphaned-test-row-fix.md —
+   * pruning a low-quality block out of an accepted spec previously left its DB row
+   * orphaned at 'pending' forever). Optional: a mode without one falls back to
+   * today's plan-driven count unchanged — never a behavior change for a mode that
+   * doesn't implement it.
+   */
+  countScenarios?(contents: string): number;
   execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;

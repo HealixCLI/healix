@@ -15,13 +15,13 @@ the suite itself changes.
 Two runs of the same project (`prj_U69CQO4XrA`, target `http://localhost:4202/`) were
 compared via their full timelines:
 
-| | Fresh run (`run_bK--BMAifc`) | Reuse run (`run_-uVs13oWoO`) |
-|---|---|---|
-| Total | 151 | 149 |
-| Passed | 39 | 27 |
-| Failed | 53 | 31 |
-| **Blocked** | **0** | **77** |
-| Rate | 26% | 18% |
+|             | Fresh run (`run_bK--BMAifc`) | Reuse run (`run_-uVs13oWoO`) |
+| ----------- | ---------------------------- | ---------------------------- |
+| Total       | 151                          | 149                          |
+| Passed      | 39                           | 27                           |
+| Failed      | 53                           | 31                           |
+| **Blocked** | **0**                        | **77**                       |
+| Rate        | 26%                          | 18%                          |
 
 The dominant signal is **blocked jumping from 0 to 77** — not scattered flakiness.
 Comparing the two timelines line-by-line, the reuse run's log contains a line that
@@ -46,6 +46,7 @@ The reuse run's log also shows:
 
 1. **Reuse mode never populates `ctx.exploration`.**
    `packages/core/src/orchestrator/index.ts:2094-2097`:
+
    ```ts
    if (suiteMode === 'reuse') {
      // No new specs are ever generated in reuse mode, so there is nothing for
@@ -54,8 +55,9 @@ The reuse run's log also shows:
    } else if (effectiveBaseUrl) {
      ...
    ```
+
    The entire EXPLORE block — including `loadExplorationCache(project.id,
-   effectiveBaseUrl)` (line 2160) and the two `ctx.exploration = ...` assignments
+effectiveBaseUrl)` (line 2160) and the two `ctx.exploration = ...` assignments
    (lines 2237, 2306) — lives only inside the `else if (effectiveBaseUrl)` branch. In
    reuse mode none of that runs, and `ctx.exploration` is never assigned anywhere else
    in the file (confirmed: those are the only two assignment sites). So `ctx.exploration`
@@ -63,6 +65,7 @@ The reuse run's log also shows:
 
 2. **Tier B auth setup depends on `ctx.exploration` for real login selectors.**
    `packages/core/src/modes/playwright/execute.ts:138-153`:
+
    ```ts
    const verified = ctx.exploration?.crawl?.verifiedLogin;
    const discovered = verified?.pageUrl ?? ctx.exploration?.loginCandidates?.[0]?.url;
@@ -77,6 +80,7 @@ The reuse run's log also shows:
      ...
    }
    ```
+
    With `ctx.exploration` undefined, `verified`/`discovered` are undefined. The login
    URL falls back to a guessed `/login` path, and the selector env vars are never set at
    all — `loginForm()` (`templates.ts:597+`) then falls back to its own generic
@@ -86,6 +90,7 @@ The reuse run's log also shows:
 
 3. **That failure cascades into mass "blocked" classification.**
    `execute.ts:1567-1581`:
+
    ```ts
    const freshSetup = report ? findAuthSetupOutcome(report) : { failed: false, error: '' };
    ...
@@ -94,6 +99,7 @@ The reuse run's log also shows:
      emit(ctx, '[execute] auth setup failed; Tier B outcomes classified as blocked', { ... });
    }
    ```
+
    This is the exact source of the observed log line.
    `AUTH_SETUP_FAILURE_MARKER = 'Tier B auth setup failed'` (`execute.ts:637`) is
    stamped on every Tier B row, and `triage/rules.ts:60` matches that marker to
@@ -106,7 +112,7 @@ The reuse run's log also shows:
    `exploration-cache.json`, never reloads exploration from the base run's stored
    artifact/DB. Exploration data is simply unavailable to a reuse run today, by
    omission, not by design intent (the code comment at 2094-2097 only reasons about
-   *why generation* doesn't need a fresh DOM snapshot — it doesn't address that
+   _why generation_ doesn't need a fresh DOM snapshot — it doesn't address that
    Tier B auth setup still needs the previously-verified login selectors).
 
 **Conclusion**: this is a genuine Healix orchestrator bug — not app flakiness, not a
@@ -117,7 +123,7 @@ the pass rate drops between a fresh run and a reuse run of the identical suite.
 
 ## Fix
 
-**Revised design** (see rationale below): guessing selectors must be the *last*
+**Revised design** (see rationale below): guessing selectors must be the _last_
 resort, not the immediate fallback on a cache miss — a guess can fail exactly the same
 way the current bug does, just with a warning logged instead of silently, which does
 not actually solve "pass rate drops on reuse." The fix is a 3-tier fallback, in order
@@ -143,7 +149,11 @@ if (suiteMode === 'reuse') {
       // first page, so this is a fraction of a full EXPLORE pass, but still
       // gets genuinely VERIFIED selectors (crawlWithAuth's attemptLogin
       // actually submits and confirms), not a guess.
-      emit('explore', 'info', 'No cached exploration artifact; running a bounded login-only discovery for reuse mode.');
+      emit(
+        'explore',
+        'info',
+        'No cached exploration artifact; running a bounded login-only discovery for reuse mode.',
+      );
       const discovery = await crawlWithAuth(browser, effectiveBaseUrl, {
         maxRoutes: 1,
         wallClockBudgetMs: REUSE_LOGIN_DISCOVERY_BUDGET_MS, // small, e.g. 60_000
@@ -156,17 +166,22 @@ if (suiteMode === 'reuse') {
         emit('explore', 'warn', 'Login-only discovery failed; Tier B login will use guessed selectors.');
       }
     } else {
-      emit('explore', 'warn', 'No cached exploration artifact and no test credentials configured; Tier B login will use guessed selectors.');
+      emit(
+        'explore',
+        'warn',
+        'No cached exploration artifact and no test credentials configured; Tier B login will use guessed selectors.',
+      );
     }
   }
 }
 ```
 
 Notes:
+
 - `loadExplorationCache` is already imported at `index.ts:48` — no new import needed.
   Passing `Infinity` (or another suitably large `maxAgeMs`) bypasses the normal 24h
   staleness window used by fresh EXPLORE runs — appropriate here since reuse mode is
-  explicitly re-running the *same* prior suite against the *same* app, not doing a
+  explicitly re-running the _same_ prior suite against the _same_ app, not doing a
   drift-sensitive fresh crawl.
 - **Tier 2 is a real crawl, not a guess** — `crawlWithAuth` (`crawler.ts:1389-1448`)
   with `maxRoutes: 1` stops the BFS after a single page, but its `attemptLogin`/
@@ -256,7 +271,7 @@ symptom in the no-cache case, not merely explain it after the fact.
   exists today (private helpers `findLoginSubmitButton`/`findNearestUsernameField`/
   `waitForCredentialForm` only run as part of a real login attempt)
 - `packages/core/src/modes/playwright/execute.ts` — `ctx.exploration?.crawl
-  ?.verifiedLogin` / `ctx.exploration?.loginCandidates` consumption (138-153),
+?.verifiedLogin` / `ctx.exploration?.loginCandidates` consumption (138-153),
   `AUTH_SETUP_FAILURE_MARKER` (637), auth-setup-failure detection (1567-1581) — reused
   as-is, confirms the fix is sufficient without touching this file
 - `packages/core/src/orchestrator/triage/rules.ts` — `AUTH_SETUP_FAILURE_MARKER`
@@ -272,6 +287,6 @@ stale compiled leftovers appear at `packages/core/dist/orchestrator/directed-ree
 {js,d.ts}`. This is expected, not a bug: that feature lives on
 `feature/gapfill-using-reexploration` and has not been merged into `dev` yet, so it is
 simply absent from a branch cut from `dev`. Unrelated to the present fix either way —
-that module replays an *already-known* login for a different purpose (regenerating
+that module replays an _already-known_ login for a different purpose (regenerating
 escape-hatched specs), not discovering one from scratch for reuse mode. Flagging only
 so the two features aren't confused when both branches eventually merge.

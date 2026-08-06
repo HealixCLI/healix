@@ -2006,9 +2006,9 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(outcome.failed).toBe(0);
     const diagnostic = events.find((e) => /could not parse playwright results/i.test(e.message));
     expect(diagnostic).toBeDefined();
-    expect((diagnostic?.data as { structurallyEmptyReport?: boolean } | undefined)?.structurallyEmptyReport).toBe(
-      true,
-    );
+    expect(
+      (diagnostic?.data as { structurallyEmptyReport?: boolean } | undefined)?.structurallyEmptyReport,
+    ).toBe(true);
   });
 
   it('regression: a report with a real result is NEVER misclassified as structurally empty', async () => {

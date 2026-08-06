@@ -337,7 +337,7 @@ async function regenerateDroppedAndExecutePending(params: {
       items: droppedItems,
     });
     for (const spec of newSpecs)
-      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure);
+      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure, mode);
   }
 
   // Reconstruct still-pending (generated but never executed) specs from
@@ -2124,11 +2124,7 @@ async function runPipeline(
           const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl, Infinity);
           if (cachedExploration) {
             ctx.exploration = cachedExploration;
-            emit(
-              'explore',
-              'debug',
-              'Rehydrated cached exploration artifact for reuse-mode Tier B login.',
-            );
+            emit('explore', 'debug', 'Rehydrated cached exploration artifact for reuse-mode Tier B login.');
           } else {
             const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
             if (defaultCredential) {
@@ -2666,9 +2662,18 @@ async function runPipeline(
         // Carried-forward specs (copied bytes from a prior run, already at
         // whatever granularity that run used) get a single row, as before.
         for (const spec of newSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey, noteStoreFailure);
+          registerSpecRows(
+            store,
+            runId,
+            ctx.projectDir,
+            spec,
+            newSpecItems,
+            testIdByKey,
+            noteStoreFailure,
+            mode,
+          );
         for (const spec of carriedSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure);
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure, mode);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
@@ -3885,6 +3890,7 @@ function registerSpecRows(
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
   noteStoreFailure: (op: string, err: unknown) => void,
+  mode: TestMode,
 ): void {
   // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
   // deliberately never persists the per-run synthetic tag — see persistedReqTag
@@ -3962,7 +3968,18 @@ function registerSpecRows(
     return;
   }
 
-  item.scenarios.forEach((s, i) => {
+  // A pruned spec (validate.ts's auditAndMaybePrune, already run by the time this is
+  // called — see runPipeline's contentsByPath pass) may have fewer real test() blocks
+  // than the plan originally called for. Registering one row per PLANNED scenario
+  // regardless left the excess permanently orphaned at 'pending' — never receiving a
+  // result, since persistResults only ever sees however many blocks actually survived
+  // — inflating this run's own Total with phantom rows (see
+  // docs/design/pruned-block-orphaned-test-row-fix.md). Capping registration to the
+  // number of blocks that actually exist keeps row count in lockstep with real,
+  // executable test count. mode.countScenarios is optional — a mode without it falls
+  // back to item.scenarios.length unchanged, exactly today's behavior.
+  const survivingCount = mode.countScenarios?.(spec.contents) ?? item.scenarios.length;
+  item.scenarios.slice(0, survivingCount).forEach((s, i) => {
     const test = store.insertTest({
       runId,
       title: `${spec.title} — ${s.kind}: ${s.description}`,

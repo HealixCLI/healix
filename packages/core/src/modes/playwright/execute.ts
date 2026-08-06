@@ -1578,10 +1578,14 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
           .filter(Boolean)
           .slice(-8)
           .join(' | ');
-        emit(ctx, '[execute] npm install failed; suite dependencies remain broken — not re-running against them', {
-          code: depsInstall.code,
-          tail,
-        });
+        emit(
+          ctx,
+          '[execute] npm install failed; suite dependencies remain broken — not re-running against them',
+          {
+            code: depsInstall.code,
+            tail,
+          },
+        );
       }
     }
     // Only retry Playwright when we have real reason to believe it can now

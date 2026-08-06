@@ -19,7 +19,7 @@ Running "Run Existing Suite" (reuse mode) against `prj_eQg-UbZR2a`'s fresh run
 ```
 
 Note: the `"Could not parse Playwright results; suite may have failed to start"` diagnostic
-firing here is the *silent-suite-deps-failure* fix (see
+firing here is the _silent-suite-deps-failure_ fix (see
 `docs/design/execute-suite-deps-silent-failure-fix.md`) working correctly — it now
 surfaces the failure instead of masking it as a clean `0 passed / 0 failed`. But the
 underlying reason the suite has zero runnable specs is a **separate, real bug**, confirmed
@@ -29,28 +29,32 @@ below.
 
 Comparing the reuse run's suite directory against the original fresh run it copied from:
 
-| | Fresh run (`run_oh8KFSPn9b/suite/fixtures/`) | Reuse run (`run_4cZ1cZ9hLq/suite/fixtures/`) |
-|---|---|---|
+|          | Fresh run (`run_oh8KFSPn9b/suite/fixtures/`)                                                                     | Reuse run (`run_4cZ1cZ9hLq/suite/fixtures/`)                                                                              |
+| -------- | ---------------------------------------------------------------------------------------------------------------- | ------------------------------------------------------------------------------------------------------------------------- |
 | Contents | `action-highlighter.ts`, `auth.setup.ts`, `checkpoint-reporter.cjs`, **`mock.fixture.ts`**, `steps-reporter.cjs` | `action-highlighter.ts`, `auth.setup.ts`, `checkpoint-reporter.cjs`, `steps-reporter.cjs` — **`mock.fixture.ts` missing** |
 
 And the reuse run's own `results.json` confirms the failure mode directly — every one of
 the 13 carried spec files fails identically:
+
 ```
 Error: Cannot find module '...\suite\fixtures\mock.fixture' imported from
 '...\home-page-at-home.spec.ts'
 ```
+
 (`suites.length === 0` in the parsed report — genuinely zero specs could even be
 collected, which is exactly what the structurally-empty-report detection correctly
 caught and surfaced.)
 
 **Why it's missing**: `packages/core/src/modes/playwright/scaffold.ts:248-251` only
 writes `fixtures/mock.fixture.ts` when `ctx.mockExternalDependencies` is truthy:
+
 ```ts
 if (ctx.mockExternalDependencies) {
   await writeFile(join(fixturesDir, 'mock.fixture.ts'), mockFixtureContents(routes), 'utf-8');
   emit(ctx, `Wrote mock fixture with ${routes.length} route(s)`, { routes: routes.map((r) => r.id) });
 }
 ```
+
 `ctx.mockExternalDependencies` is only ever set (`index.ts:2088-2094`) when
 `externalDependencies.length > 0`, and `externalDependencies` is only ever populated
 (`index.ts:1506`, inside `if (project.repoPath) {...}`) within the **non-reuse** branch
@@ -67,7 +71,7 @@ generated them, and the base run genuinely did have `mockExternalDependencies: t
 **This is the same class of bug as the Tier B exploration-inheritance fix** (see
 `docs/design/reuse-mode-exploration-inheritance-fix.md`) — reuse mode skips a
 GENERATE-time side effect that the carried-forward specs still depend on. Same shape,
-different artifact (a fixture *file* here, instead of exploration/login data there).
+different artifact (a fixture _file_ here, instead of exploration/login data there).
 
 Also worth noting: the earlier `"missing suite dependency; re-running npm install"`
 self-heal fired here uselessly — `looksLikeMissingSuiteDeps`'s `Cannot find module`
@@ -81,11 +85,11 @@ detector's scope — not something to fix here, just why the self-heal didn't he
 A full audit of `scaffold.ts`'s conditional writes (197-255) found `mock.fixture.ts` is
 the **only** artifact affected by this specific gap:
 
-| File | Gating condition | Reuse-mode-safe? |
-|---|---|---|
-| `package.json`, `playwright.config.ts`, `fixtures/auth.setup.ts`, `fixtures/action-highlighter.ts`, `fixtures/steps-reporter.cjs`, `fixtures/checkpoint-reporter.cjs`, `README.md`, `.gitignore`, `fixtures/.auth/user.json` | none — always written | ✅ unaffected |
-| `playwright.config.ts`'s `includeAuthSetup` | `ctx.hasTierBAuthPlanItems !== false` | ✅ reuse mode deliberately leaves this `undefined`, which defaults to `true` (documented at `index.ts:2078-2081` — "scaffold() is a no-op re-run over an already-working carried-forward suite, not a fresh decision about auth surface") — safe, not a bug |
-| **`fixtures/mock.fixture.ts`** | **`ctx.mockExternalDependencies`** | ❌ this bug |
+| File                                                                                                                                                                                                                         | Gating condition                      | Reuse-mode-safe?                                                                                                                                                                                                                                            |
+| ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `package.json`, `playwright.config.ts`, `fixtures/auth.setup.ts`, `fixtures/action-highlighter.ts`, `fixtures/steps-reporter.cjs`, `fixtures/checkpoint-reporter.cjs`, `README.md`, `.gitignore`, `fixtures/.auth/user.json` | none — always written                 | ✅ unaffected                                                                                                                                                                                                                                               |
+| `playwright.config.ts`'s `includeAuthSetup`                                                                                                                                                                                  | `ctx.hasTierBAuthPlanItems !== false` | ✅ reuse mode deliberately leaves this `undefined`, which defaults to `true` (documented at `index.ts:2078-2081` — "scaffold() is a no-op re-run over an already-working carried-forward suite, not a fresh decision about auth surface") — safe, not a bug |
+| **`fixtures/mock.fixture.ts`**                                                                                                                                                                                               | **`ctx.mockExternalDependencies`**    | ❌ this bug                                                                                                                                                                                                                                                 |
 
 No other conditional write in `scaffold.ts` is gated on `ctx.credentials` or
 `ctx.sourceContext` at all (confirmed via search).

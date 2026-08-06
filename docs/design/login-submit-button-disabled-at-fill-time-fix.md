@@ -3,10 +3,12 @@
 ## Bug report
 
 Real reuse run (`run_WcP0jcReoZ`, project `prj_eQg-UbZR2a`) failed Tier B auth setup with:
+
 ```
 Error: Login did not navigate away from the login page after submitting — still on
 http://localhost:4202/#/SK/login with a visible password field. Check credentials or selectors.
 ```
+
 Both identifier and password fields were located and filled correctly (confirmed via the
 error's own diagnostic and by checking the cached `verifiedLogin` — real, specific
 `data-testid`-based selectors, not guesses). The user independently confirmed the
@@ -19,6 +21,7 @@ app — the automated attempt failed at something more specific.
 
 The project's cached `exploration-cache.json` records `verifiedLogin` for this app with
 **no `submitSelector`**:
+
 ```json
 {
   "pageUrl": "http://localhost:4202/#/SK/login",
@@ -26,35 +29,46 @@ The project's cached `exploration-cache.json` records `verifiedLogin` for this a
   "passwordSelector": "input[data-testid=\"login-password\"]"
 }
 ```
+
 But the login page's full crawled snapshot **does** contain a real, specific, well-identified
 submit button:
+
 ```json
-{"role":"button","name":"Pokračovať","selector":"button[data-testid=\"login-submit\"]","disabled":true}
+{
+  "role": "button",
+  "name": "Pokračovať",
+  "selector": "button[data-testid=\"login-submit\"]",
+  "disabled": true
+}
 ```
 
 `disabled: true` here is simply the pre-fill page state (client-side validation gates the
 button until both fields hold a value — completely normal, and confirmed non-permanent by
 the user's own screenshot showing it enabled once both fields are filled). The problem is
 in `packages/core/src/browser/login.ts`'s `findLoginSubmitButton` (line 41-48):
+
 ```ts
 function findLoginSubmitButton(elements: InteractiveElement[]): InteractiveElement | undefined {
   const buttons = elements.filter((el) => el.role === 'button' && !el.disabled);
   ...
 }
 ```
+
 It unconditionally filters out disabled buttons. `submitLoginAttempt` (line 211-306) calls
-this **only once**, against the snapshot taken *before* credentials were typed
+this **only once**, against the snapshot taken _before_ credentials were typed
 (`before.interactiveElements`, or the toggle-swap-replaced snapshot — never a snapshot
-taken *after* filling):
+taken _after_ filling):
+
 ```ts
-const submit = findLoginSubmitButton(before.interactiveElements);   // line 272
+const submit = findLoginSubmitButton(before.interactiveElements); // line 272
 if (submit) {
   await browser.click(submit.selector);
   finalSubmitSelector = submit.selector;
 } else {
-  await browser.pressKey('Enter');                                   // line 277 — no readiness wait at all
+  await browser.pressKey('Enter'); // line 277 — no readiness wait at all
 }
 ```
+
 Since the button was disabled in that snapshot, `findLoginSubmitButton` returns
 `undefined` regardless of whether it's enabled by the time this code actually runs (after
 both fields were typed into) — the button is discarded **permanently**, never
@@ -62,10 +76,10 @@ re-considered, and the code falls straight to `browser.pressKey('Enter')` with *
 wait** for the form/button's own async validation to settle.
 
 This is exactly the gap the generated `auth.setup.ts` fixture's own click-path already
-protects against for a *grounded* submit selector — `waitForSubmitEnabled()`
+protects against for a _grounded_ submit selector — `waitForSubmitEnabled()`
 (`templates.ts:560-567`) polls up to a bounded timeout before clicking. But EXPLORE's own
 crawl-time login capture (`login.ts`) has no equivalent wait, and because it never
-grounds `submitSelector` at all here, the *replay* path also never gets a chance to use
+grounds `submitSelector` at all here, the _replay_ path also never gets a chance to use
 that existing, working `waitForSubmitEnabled` logic — it's stuck on the ungrounded,
 wait-free Enter fallback (`auth.setup.ts:252-256`: `if (hasGroundedForm &&
 !groundedSubmitSelector) { await page.keyboard.press('Enter'); }`, no wait beforehand).
@@ -93,6 +107,7 @@ blind through an ungrounded, unwaited Enter press.
 1. New `findLoginSubmitButtonCandidate` — same three-tier logic as `findLoginSubmitButton`,
    but without the `!el.disabled` filter (a candidate worth waiting for, not necessarily
    clickable yet):
+
    ```ts
    function findLoginSubmitButtonCandidate(elements: InteractiveElement[]): InteractiveElement | undefined {
      const buttons = elements.filter((el) => el.role === 'button');
@@ -103,12 +118,14 @@ blind through an ungrounded, unwaited Enter press.
      );
    }
    ```
+
    `findLoginSubmitButton` itself is left untouched (still used for the earlier
    `looksLikeSignupSubmission` check at line 230, whose purpose doesn't need
    disabled-button candidates and shouldn't change behavior).
 
 2. New `waitForCandidateEnabled(browser, selector, timeoutMs)` — polls fresh snapshots
    until that specific selector resolves to a non-disabled button, or the timeout elapses:
+
    ```ts
    const SUBMIT_ENABLE_TIMEOUT_MS = 5_000;
    const SUBMIT_ENABLE_POLL_MS = 200;
@@ -130,13 +147,17 @@ blind through an ungrounded, unwaited Enter press.
    ```
 
 3. `submitLoginAttempt`'s submit-decision block (lines 272-278) becomes:
+
    ```ts
    // Prefer an ALREADY-enabled candidate first — a weaker-tier button that's already
    // clickable beats waiting on a stronger-tier one that might never enable.
    let submit = findLoginSubmitButton(before.interactiveElements);
    if (!submit) {
      const candidate = findLoginSubmitButtonCandidate(before.interactiveElements);
-     if (candidate && (await waitForCandidateEnabled(browser, candidate.selector, SUBMIT_ENABLE_TIMEOUT_MS))) {
+     if (
+       candidate &&
+       (await waitForCandidateEnabled(browser, candidate.selector, SUBMIT_ENABLE_TIMEOUT_MS))
+     ) {
        submit = candidate;
      }
    }
@@ -147,6 +168,7 @@ blind through an ungrounded, unwaited Enter press.
      await browser.pressKey('Enter');
    }
    ```
+
    The `findLoginSubmitButton(...)` first check is a deliberate, load-bearing ordering
    decision, not just a redundant fast path: it MUST run first and MUST short-circuit the
    wait whenever it finds anything, because a page can have a strong-tier candidate that's

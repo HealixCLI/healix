@@ -26,10 +26,13 @@ import {
   clearGenerateCheckpoint,
   collectGroundTruth,
   demoteEscapeHatchBlocks,
+  extractEscapeHatchReasons,
+  extractEscapeHatchReasonTexts,
   findDominantPrefixes,
   findForbiddenApis,
   findUngroundedReferences,
   filterRoutesForItem,
+  forgetGenerateCheckpointEntries,
   formatMockContent,
   generate,
   GEN_CHECKPOINT_FILENAME,
@@ -465,6 +468,194 @@ test('[REQ:REQ-1] shows the user\\'s current email', async ({ page }) => {
 `;
     const result = demoteEscapeHatchBlocks(source);
     expect(result).toContain("test.fixme('[REQ:REQ-1] shows the user\\'s current email', { annotation:");
+  });
+});
+
+// Two functions were built independently against the same escape-hatch marker for two
+// different consumers with different shape needs (see generate.ts's doc comments on each):
+// extractEscapeHatchReasons returns one `{ testTitle, reason }` per block, for directed
+// re-exploration's target-resolution needs; extractEscapeHatchReasonTexts returns plain
+// reason strings, feeding the escape_hatch_gaps Knowledge Base table. Kept as two separate
+// describe blocks below rather than merged, since they test genuinely different functions.
+describe('extractEscapeHatchReasons — surfaces unresolved-selector gaps for directed re-exploration', () => {
+  it('returns an empty array when no escape-hatch marker is present', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([]);
+  });
+
+  it("captures the enclosing test's title and the model's own trailing explanation", () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-AUTH-01] positive: resets password', async ({ page }) => {
+  // TODO: unobserved element - the forgot-password link was never clicked during exploration.
+  await expect(page).toHaveURL(/reset/);
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      {
+        testTitle: '[REQ:FR-AUTH-01] positive: resets password',
+        reason: 'the forgot-password link was never clicked during exploration.',
+      },
+    ]);
+  });
+
+  it('falls back to a generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      { testTitle: '[REQ:REQ-1] guessed', reason: 'needs review' },
+    ]);
+  });
+
+  it('returns one entry per escape-hatched block, skipping blocks with no marker', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+});
+
+test('[REQ:REQ-1] edge: guessed consent checkbox', async ({ page }) => {
+  // TODO: unobserved element - consent modal never appeared during crawl.
+  await page.locator('input[type="checkbox"]').check();
+});
+
+test('[REQ:REQ-1] negative: rejects bad input', async ({ page }) => {
+  // TODO: unobserved element - validation error text never observed.
+  await page.locator('form').first().click();
+});
+`;
+    const reasons = extractEscapeHatchReasons(source);
+    expect(reasons).toHaveLength(2);
+    expect(reasons.map((r) => r.testTitle)).toEqual([
+      '[REQ:REQ-1] edge: guessed consent checkbox',
+      '[REQ:REQ-1] negative: rejects bad input',
+    ]);
+    expect(reasons.map((r) => r.reason)).toEqual([
+      'consent modal never appeared during crawl.',
+      'validation error text never observed.',
+    ]);
+  });
+
+  it('still finds the marker after demoteEscapeHatchBlocks has already rewritten the block to test.fixme', () => {
+    // Directed re-exploration reads escapeHatchReasons from a spec's PERSISTED contents (post-
+    // demotion), so extraction must keep working even once the enclosing call is test.fixme(...).
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element - reason survives demotion.
+  await page.locator('button').click();
+});
+`;
+    const demoted = demoteEscapeHatchBlocks(source);
+    expect(extractEscapeHatchReasons(demoted)).toEqual([
+      { testTitle: '[REQ:REQ-1] guessed', reason: 'reason survives demotion.' },
+    ]);
+  });
+
+  it("carries the FULL word-wrapped reason through, not just the marker's first line (GAP-062 regression)", () => {
+    // Previously called ESCAPE_HATCH_REASON_RE directly instead of going through
+    // extractRawEscapeHatchDetail — silently dropped every continuation line below the marker.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    expect(extractEscapeHatchReasons(source)).toEqual([
+      {
+        testTitle: '[REQ:FR-PROFILE-01] positive: saves updated profile fields',
+        reason:
+          'a dedicated success toast selector was not captured in the ' +
+          'interactive-element inventory; verifying the persisted field values as a coarser ' +
+          'observable outcome of a successful save instead.',
+      },
+    ]);
+  });
+});
+
+describe('extractEscapeHatchReasonTexts — durable, queryable reasons for escape_hatch_gaps', () => {
+  it('returns [] for a spec with no escape-hatch marker', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+`;
+    expect(extractEscapeHatchReasonTexts(source)).toEqual([]);
+  });
+
+  it('extracts one reason per flagged block, matching the SAME text demoteEscapeHatchBlocks embeds as the annotation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+
+test('[REQ:REQ-1] edge: guessed consent checkbox', async ({ page }) => {
+  // TODO: unobserved element - the consent checkbox was not captured in the inventory.
+  await page.locator('input[type="checkbox"]').check();
+});
+
+test('[REQ:REQ-1] edge: guessed newsletter toggle', async ({ page }) => {
+  // TODO: unobserved element - the newsletter toggle was not captured in the inventory.
+  await page.locator('input[name="newsletter"]').check();
+});
+`;
+    const reasons = extractEscapeHatchReasonTexts(source);
+    expect(reasons).toEqual([
+      'unobserved element — the consent checkbox was not captured in the inventory.',
+      'unobserved element — the newsletter toggle was not captured in the inventory.',
+    ]);
+    // Same text demoteEscapeHatchBlocks embeds in the Playwright annotation for the same spec —
+    // the two must never drift, since one feeds the live report and the other feeds the KB.
+    const demoted = demoteEscapeHatchBlocks(source);
+    for (const reason of reasons) {
+      expect(demoted).toContain(reason);
+    }
+  });
+
+  it('falls back to the generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(extractEscapeHatchReasonTexts(source)).toEqual(['unobserved element — needs review']);
+  });
+
+  it('carries the FULL word-wrapped reason through, same as demoteEscapeHatchBlocks (GAP-062)', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    expect(extractEscapeHatchReasonTexts(source)).toEqual([
+      'unobserved element — a dedicated success toast selector was not captured in the ' +
+        'interactive-element inventory; verifying the persisted field values as a coarser ' +
+        'observable outcome of a successful save instead.',
+    ]);
   });
 });
 
@@ -1049,6 +1240,44 @@ test.describe('[REQ:REQ-1] Home page', () => {
     expect(specs).toHaveLength(1);
     expect(specs[0].contents).not.toContain('test.use(');
   });
+
+  it('calls ctx.onEscapeHatchGap with the extracted reasons when the persisted spec has an escape-hatch marker (KB foundation wiring)', async () => {
+    // Proves the actual wiring gap this session closed: recordGenOutcome (the single funnel
+    // every per-item terminal outcome passes through, same as onKbItemOutcome) must fire
+    // ctx.onEscapeHatchGap with this item's id/unitKey and the reasons
+    // extractEscapeHatchReasonTexts found in the FINAL persisted spec — not just that
+    // extractEscapeHatchReasonTexts itself works in isolation (already covered elsewhere),
+    // and not just that store.insertEscapeHatchGap
+    // round-trips a hand-built row (already covered in store.test.ts) — the gap was whether
+    // generate.ts's real pipeline actually calls the callback with the right arguments.
+    const ESCAPE_HATCH_SPEC = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: home page renders', async ({ page }) => {
+  // TODO: unobserved element - the welcome banner was not captured in the inventory.
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const onEscapeHatchGap = vi.fn();
+    const ctx = { ...makeCtx(makeProvider([ESCAPE_HATCH_SPEC], calls)), onEscapeHatchGap };
+
+    const specs = await generate(ctx, { ...PLAN, items: [{ ...PLAN.items[0]!, unitKey: 'route:/' }] });
+
+    expect(specs).toHaveLength(1);
+    expect(onEscapeHatchGap).toHaveBeenCalledTimes(1);
+    expect(onEscapeHatchGap).toHaveBeenCalledWith('REQ-1', 'route:/', [
+      'unobserved element — the welcome banner was not captured in the inventory.',
+    ]);
+  });
+
+  it('never calls ctx.onEscapeHatchGap for a spec with no escape-hatch marker', async () => {
+    const onEscapeHatchGap = vi.fn();
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), onEscapeHatchGap };
+
+    await generate(ctx, PLAN);
+
+    expect(onEscapeHatchGap).not.toHaveBeenCalled();
+  });
 });
 
 // ---- exploration grounding: ctx.exploration feeds real selectors into the prompt --
@@ -1517,6 +1746,114 @@ describe('generate — write-through per-item checkpoint (resume mid-phase witho
     await clearGenerateCheckpoint(projectDir);
     expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
     await expect(clearGenerateCheckpoint(projectDir)).resolves.toBeUndefined();
+  });
+
+  it('forgetGenerateCheckpointEntries removes only the named item id, leaving every other entry byte-identical', async () => {
+    const a: GenCheckpointEntry = {
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    };
+    const b: GenCheckpointEntry = {
+      itemId: 'b',
+      title: 'Feature B',
+      reqTag: 'REQ-B',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/b.spec.ts'),
+      specTitle: '[REQ:REQ-B] Feature B',
+    };
+    await writeFile(
+      join(projectDir, GEN_CHECKPOINT_FILENAME),
+      `${JSON.stringify(a)}\n${JSON.stringify(b)}\n`,
+      'utf-8',
+    );
+
+    await forgetGenerateCheckpointEntries(projectDir, ['a']);
+
+    const entries = await readGenerateCheckpointEntries(projectDir);
+    expect(entries).toEqual([b]);
+  });
+
+  it('forgetGenerateCheckpointEntries is a true no-op when none of the given ids are present', async () => {
+    const a: GenCheckpointEntry = {
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    };
+    await seedEntry(a);
+
+    await forgetGenerateCheckpointEntries(projectDir, ['does-not-exist']);
+
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([a]);
+  });
+
+  it('forgetGenerateCheckpointEntries removes the file entirely when every entry is forgotten', async () => {
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath: join(projectDir, 'tests/tierA-public/a.spec.ts'),
+      specTitle: '[REQ:REQ-A] Feature A',
+    });
+
+    await forgetGenerateCheckpointEntries(projectDir, ['a']);
+
+    expect(await readGenerateCheckpointEntries(projectDir)).toEqual([]);
+    expect(existsSync(join(projectDir, GEN_CHECKPOINT_FILENAME))).toBe(false);
+  });
+
+  it('forgetGenerateCheckpointEntries is a no-op when given an empty id set', async () => {
+    await forgetGenerateCheckpointEntries(projectDir, []);
+    expect(existsSync(join(projectDir, GEN_CHECKPOINT_FILENAME))).toBe(false);
+  });
+
+  it('an item forgotten via forgetGenerateCheckpointEntries actually re-invokes the provider on the next generate() call — proves the checkpoint-skip gotcha is fixed', async () => {
+    // Regression test for the exact gotcha directed re-exploration exists to work around: without
+    // forgetGenerateCheckpointEntries, calling generate() again for an already-'generated' item id
+    // silently regenerates nothing (readGenerateCheckpointEntries' doneIds filter skips it).
+    const specPath = join(projectDir, 'tests/tierA-public/req-a.spec.ts');
+    await mkdir(join(projectDir, 'tests/tierA-public'), { recursive: true });
+    await writeFile(specPath, specFor('REQ-A', 'first attempt, guessed a selector'), 'utf-8');
+    await seedEntry({
+      itemId: 'a',
+      title: 'Feature REQ-A',
+      reqTag: 'REQ-A',
+      tier: 'tierA-public',
+      status: 'generated',
+      specPath,
+      specTitle: '[REQ:REQ-A] Feature REQ-A',
+    });
+
+    const plan: TestPlan = { summary: 'regenerate item a', items: [planItem('a', 'REQ-A')] };
+
+    // Without forgetting, generate() would skip item "a" entirely (restored from disk, provider
+    // never called) — confirm that's still true before the fix under test runs.
+    const skippedSpecs = await generate(
+      makeCtx(makeProvider([specFor('REQ-A', 'should not be used')], calls)),
+      plan,
+    );
+    expect(calls).toHaveLength(0);
+    expect(skippedSpecs[0]?.contents).toContain('first attempt, guessed a selector');
+
+    await forgetGenerateCheckpointEntries(projectDir, ['a']);
+
+    const regeneratedReply = specFor('REQ-A', 'second attempt, real selector found');
+    const specs = await generate(makeCtx(makeProvider([regeneratedReply], calls)), plan);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].prompt).toContain('REQ-A');
+    expect(specs[0]?.contents).toContain('second attempt, real selector found');
   });
 
   it('resume skips an already-generated item, restoring its spec from disk without re-invoking the provider', async () => {

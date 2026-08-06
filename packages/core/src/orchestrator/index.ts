@@ -32,7 +32,7 @@ import type {
   TestPlan,
   TestPlanItem,
 } from '../modes/types.js';
-import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
+import { isPlanItemIncluded, mockResponseTupleKey, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { detectExternalDependencies } from '../target/dependencies.js';
@@ -44,6 +44,7 @@ import { createBrowserSurface } from '../browser/index.js';
 import { runExplorePhase, splitStaticUnitsForExplore, assessExplorationUsefulness } from './explore.js';
 import { deriveRegionCodesFromText } from '../browser/seed-discovery.js';
 import { identifyExplorationGaps, runGapFillingPass } from './gap-fill.js';
+import { runDirectedReexplore } from './directed-reexplore.js';
 import { mergeCrawlResults } from '../browser/crawler.js';
 import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
@@ -643,6 +644,14 @@ async function retryPassPipeline(
         noteStoreOk();
       } catch (err) {
         noteStoreFailure('updatePlanKbItemStatus', err);
+      }
+    },
+    onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+      try {
+        store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('insertEscapeHatchGap', err);
       }
     },
     signal,
@@ -2066,6 +2075,14 @@ async function runPipeline(
           noteStoreFailure('updatePlanKbItemStatus', err);
         }
       },
+      onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+        try {
+          store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('insertEscapeHatchGap', err);
+        }
+      },
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
@@ -2675,6 +2692,55 @@ async function runPipeline(
         for (const spec of carriedSpecs)
           registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure, mode);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
+
+        // ---- 7b. DIRECTED RE-EXPLORATION (bounded, always-on, fail-open) ----
+        // When GENERATE couldn't find a real selector for something a scenario needs, it emits an
+        // escape hatch demoted to test.fixme(...) (generate.ts's ESCAPE_HATCH_MARKER) — today a
+        // permanent dead end. This re-crawls ONLY the specific route(s) those gaps resolve to
+        // (never the whole app again), regenerates ONLY the affected item(s), and merges the
+        // richer crawl data back into ctx.exploration before EXECUTE ever runs. Distinct from the
+        // KB/retry-pass/coverage-feedback-loop below (that recovers generation/execution
+        // FAILURES; this recovers items that generated fine but only by guessing) and from
+        // gap-fill.ts's EXPLORE-phase mechanism (proactive/content-coverage, runs before
+        // generate; this is reactive/selector-failure-based, after generate). No opt-in flag,
+        // unlike coverageLoopEnabled below — gated only on there being real work to do. Never
+        // runs for suiteMode 'reuse' (no new generation happens there at all). Wrapped in its own
+        // try/catch even though runDirectedReexplore never throws internally — belt-and-suspenders,
+        // mirroring EXPLORE's own two-layer try/catch around its gap-fill pass.
+        if (ctx.exploration && effectiveBaseUrl && suiteMode !== 'reuse') {
+          try {
+            // Captured as a local: `ctx` is a `let` binding, so TS can't carry this block's own
+            // narrowing (ctx.exploration truthy) into a closure that could in principle run later.
+            const reexploreCtx = ctx;
+            const reexploreProjectDir = ctx.projectDir;
+            const reexplore = await runDirectedReexplore({
+              ctx: reexploreCtx,
+              mode,
+              plan: planForGeneration,
+              specs,
+              routing: reexploreCtx.exploration!.routing,
+              baseUrl: effectiveBaseUrl,
+              reregisterSpecRows: (spec, items) =>
+                reregisterSpecRows(store, reexploreProjectDir, spec, items, testIdByKey, noteStoreFailure),
+              emit,
+            });
+            specs = reexplore.specs;
+            if (reexplore.iterations > 0) {
+              emit(
+                'generate',
+                'info',
+                `Directed re-exploration: ${reexplore.iterations} iteration(s), closed ${reexplore.gapsClosed} gap(s), ${reexplore.gapsRemaining} unresolved-selector gap(s) remain.`,
+              );
+            }
+          } catch (err) {
+            emit(
+              'generate',
+              'warn',
+              `Directed re-exploration failed (continuing without it): ${errMsg(err)}`,
+            );
+          }
+        }
+
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
         await writeCheckpoint(runDir, buildCheckpoint(false));
@@ -4006,6 +4072,58 @@ function registerSpecRows(
 }
 
 /**
+ * Like registerSpecRows, but for a spec regenerated by directed re-exploration
+ * (directed-reexplore.ts) to close an escape-hatch gap for an item that ALREADY has row(s) from
+ * this same GENERATE pass — updates the existing row(s) in place via store.updateTestSpec instead
+ * of inserting, which would create a duplicate row for the same scenario (EXECUTE hasn't run yet;
+ * nothing has removed the original). Resolves each scenario's existing test id the SAME way
+ * registerSpecRows populated testIdByKey moments earlier: the item-scoped `item:${item.id}#${i}`
+ * key first (never ambiguous across two items sharing a reqTag, and stable even if the
+ * regenerated spec's title changed), falling back to the reqTag/title-keyed `${base}#${i}` key.
+ */
+function reregisterSpecRows(
+  store: HealixStore,
+  projectDir: string,
+  spec: GeneratedSpec,
+  items: TestPlanItem[],
+  testIdByKey: Map<string, string>,
+  noteStoreFailure: (op: string, err: unknown) => void,
+): void {
+  const reqTag = (spec.reqTag ?? extractReqTag(spec.contents) ?? '').trim();
+  const item =
+    (spec.planItemId ? items.find((it) => it.id === spec.planItemId) : undefined) ??
+    (reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined);
+  if (!item) {
+    noteStoreFailure(
+      'reregisterSpecRows',
+      new Error(`no plan item resolved for regenerated spec ${spec.path}`),
+    );
+    return;
+  }
+  const specPath = relative(projectDir, spec.path);
+  const base = stableKey(reqTag, spec.title);
+  const itemBase = `item:${item.id}`;
+  const scenarios = item.scenarios.length > 0 ? item.scenarios : [undefined];
+
+  scenarios.forEach((s, i) => {
+    const testId = testIdByKey.get(`${itemBase}#${i}`) ?? testIdByKey.get(`${base}#${i}`);
+    if (!testId) {
+      noteStoreFailure(
+        'reregisterSpecRows',
+        new Error(`no existing test row found for item ${item.id} scenario ${i}`),
+      );
+      return;
+    }
+    const title = s ? `${spec.title} — ${s.kind}: ${s.description}` : spec.title;
+    try {
+      store.updateTestSpec(testId, { title, specPath, specCode: spec.contents });
+    } catch (err) {
+      noteStoreFailure('updateTestSpec', err);
+    }
+  });
+}
+
+/**
  * Persist execution results. Each spec's scenario results are matched back, IN
  * ENCOUNTER ORDER, to the positionally-keyed rows registerSpecRows inserted for
  * that reqTag — the first scenario result for a reqTag maps to `#0`, the second
@@ -4023,6 +4141,34 @@ function persistResults(
   noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
   const scenarioIndexByKey = new Map<string, number>();
+
+  // KB foundation: test_mock_usage / mock_responses.observed_*. Built once, up front, rather
+  // than re-querying per result — maps the EXACT (dependency, method, pathPattern) tuple each
+  // mock_responses row was seeded with (see upsertMockResponse) to that row's real id, using
+  // the SAME tuple-keying scheme execute.ts's readMockRequestCountsByTest/
+  // readObservedMockResponses use for the hits/observed responses they report. This resolves
+  // the precise row a hit belongs to even when a dependency has multiple endpoint-level rows
+  // — no attribution is lost to a coarse "only when exactly one row" fallback.
+  const mockResponseIdByTuple = new Map<string, string>();
+  for (const m of store.listMockResponses(runId)) {
+    mockResponseIdByTuple.set(mockResponseTupleKey(m.dependencyId, m.method, m.pathPattern), m.id);
+  }
+
+  // KB foundation: mock_responses.observed_* — dependency-level (not per-test), so this
+  // runs once per (dependency, method, pathPattern) tuple rather than once per result.
+  for (const observed of outcome.observedMockResponses ?? []) {
+    const mockResponseId = mockResponseIdByTuple.get(
+      mockResponseTupleKey(observed.dependencyId, observed.method, observed.pathPattern),
+    );
+    if (mockResponseId) {
+      try {
+        store.recordObservedMockResponse(mockResponseId, observed);
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('recordObservedMockResponse', err);
+      }
+    }
+  }
 
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
@@ -4103,6 +4249,10 @@ function persistResults(
       }
     }
 
+    // Shared by both try blocks below (evidence_json AND test_mock_usage) — same identity
+    // apiEvidence/execute.ts's own dedup keyOf() use.
+    const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
+
     try {
       // Copy the parent test row's description/details onto its result — results
       // have no independent source for this content, so it just mirrors the
@@ -4112,18 +4262,15 @@ function persistResults(
       // — classify this result's own artifacts by extension (same
       // trace.zip heuristic used for kb_execution_artifacts just below,
       // plus .webm/.mp4 → video, remainder → screenshots), and merge in
-      // this test's own apiEvidence slice (per-test, keyed by
-      // `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
-      // comment) alongside the run-level mockedRequestCounts aggregate
-      // (NOT test-specific — see ResultEvidence.mockedRequestCounts's own
-      // doc comment). mockPassthrough is part of the documented shape but
-      // never populated; no such mechanism exists in the codebase today.
-      // See docs/design/kb-foundation-evidence-persistence.md.
+      // this test's own apiEvidence/mockPassthrough slices (per-test, keyed
+      // by `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
+      // comment) alongside the run-level mockedRequestCounts aggregate (NOT
+      // test-specific — see ResultEvidence.mockedRequestCounts's own doc
+      // comment).
       const artifacts = r.artifacts ?? [];
       const traceArtifact = artifacts.find((a) => /trace\.zip$/i.test(a));
       const videoArtifact = artifacts.find((a) => /\.(webm|mp4)$/i.test(a));
       const screenshotArtifacts = artifacts.filter((a) => a !== traceArtifact && a !== videoArtifact);
-      const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
       const evidence: ResultEvidence = {
         ...(traceArtifact ? { tracePath: traceArtifact } : {}),
         ...(videoArtifact ? { videoPath: videoArtifact } : {}),
@@ -4133,6 +4280,9 @@ function persistResults(
           : {}),
         ...(outcome.apiEvidence?.[apiEvidenceKey]
           ? { apiEvidence: outcome.apiEvidence[apiEvidenceKey] }
+          : {}),
+        ...(outcome.mockPassthrough?.[apiEvidenceKey]
+          ? { mockPassthrough: outcome.mockPassthrough[apiEvidenceKey] }
           : {}),
       };
       store.insertResult({
@@ -4152,6 +4302,26 @@ function persistResults(
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
+    }
+    const mockUsage = outcome.mockedRequestCountsByTest?.[apiEvidenceKey];
+    if (mockUsage) {
+      // One try/catch PER tally, matching the sibling observedMockResponses loop above —
+      // sharing a single try/catch across every tuple meant one recordMockUsage failure (e.g.
+      // a constraint violation) silently aborted every LATER tuple for this test too, while
+      // noteStoreFailure only ever recorded the one exception that stopped the loop, masking
+      // how many rows actually never got written.
+      for (const tally of mockUsage) {
+        const mockResponseId = mockResponseIdByTuple.get(
+          mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern),
+        );
+        if (!mockResponseId) continue;
+        try {
+          store.recordMockUsage(testId, mockResponseId, tally.count);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('recordMockUsage', err);
+        }
+      }
     }
     try {
       // Keep the test row's status in sync — readers of `tests` (e.g. the CLI

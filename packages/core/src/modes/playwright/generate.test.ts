@@ -1016,6 +1016,197 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(calls[0].opts?.taskType).toBe('codegen');
   });
 
+  it('grounds a login-page tierA-public prompt in the real credential env vars when the project has one configured', async () => {
+    const loginPlan: TestPlan = {
+      summary: 'login',
+      items: [
+        {
+          id: 'REQ-LOGIN',
+          title: 'Login page',
+          reqTag: 'REQ-LOGIN',
+          tier: 'tierA-public',
+          intent: 'user can log in',
+          scenarios: [{ kind: 'positive', description: 'succeeds with valid input' }],
+        },
+      ],
+    };
+    const credential: ProjectCredential = {
+      authType: 'form',
+      username: 'sid55boss@gmail.com',
+      password: 'sid55boss@A',
+      role: null,
+      token: null,
+      urlTemplate: null,
+      extraParams: null,
+      authCheckText: null,
+    } as unknown as ProjectCredential;
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), credentials: [credential] };
+
+    await generate(ctx, loginPlan);
+
+    expect(calls[0].prompt).toContain('process.env.HEALIX_TIERB_EMAIL!');
+    expect(calls[0].prompt).toContain('process.env.HEALIX_TIERB_PASSWORD!');
+    // The real plaintext credential itself must never reach the prompt/provider.
+    expect(calls[0].prompt).not.toContain('sid55boss@gmail.com');
+    expect(calls[0].prompt).not.toContain('sid55boss@A');
+  });
+
+  it('omits the login-credential grounding note when the project has no configured credential', async () => {
+    const ctx = makeCtx(makeProvider([CLEAN_SPEC], calls));
+
+    await generate(ctx, PLAN);
+
+    expect(calls[0].prompt).not.toContain('HEALIX_TIERB_EMAIL');
+  });
+
+  it('tells the model a real observed destination MUST be used over the coarser "path changed" fallback, and warns that the coarse check can truncate the recorded video', async () => {
+    const ctx = {
+      ...makeCtx(makeProvider([CLEAN_SPEC], calls)),
+      exploration: {
+        crawl: {
+          routes: [
+            {
+              url: 'http://localhost:3000/dashboard/vouchers',
+              title: 'Vouchers',
+              depth: 1,
+              hasPasswordField: false,
+              role: 'authenticated' as const,
+              snapshot: {
+                url: 'http://localhost:3000/dashboard/vouchers',
+                title: 'Vouchers',
+                interactiveElements: [],
+              },
+              networkEvents: [],
+            },
+          ],
+          visitedCount: 1,
+          budgetExhausted: false,
+          redirectLoopsDetected: [],
+          shellCollapsed: false,
+          degenerateRedirectsSkipped: [],
+          authAttempted: true,
+          authVerified: true,
+        },
+        routing: { hashRouted: false },
+        loginCandidates: [],
+        useful: true,
+        observedEndpoints: [],
+      },
+    } as unknown as TestModeContext;
+
+    await generate(ctx, PLAN);
+
+    expect(calls[0].prompt).toContain('you MUST assert that exact URL/path');
+    expect(calls[0].prompt).toContain("run's video can end up showing nothing past the click");
+  });
+
+  it('deterministically routes a login-page test to the specific role its title names, for a multi-credential project', async () => {
+    const adminLoginPlan: TestPlan = {
+      summary: 'login',
+      items: [
+        {
+          id: 'REQ-LOGIN-ADMIN',
+          title: 'Admin login page',
+          reqTag: 'REQ-LOGIN-ADMIN',
+          tier: 'tierA-public',
+          intent: 'the Admin role can log in',
+          scenarios: [{ kind: 'positive', description: 'succeeds with valid Admin input' }],
+        },
+      ],
+    };
+    const credentials: ProjectCredential[] = [
+      {
+        authType: 'form',
+        username: 'default@corp.test',
+        password: 'default-pw',
+        role: null,
+      } as unknown as ProjectCredential,
+      {
+        authType: 'form',
+        username: 'admin@corp.test',
+        password: 'admin-pw',
+        role: 'Admin',
+      } as unknown as ProjectCredential,
+    ];
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), credentials };
+
+    await generate(ctx, adminLoginPlan);
+
+    expect(calls[0].prompt).toContain('HEALIX_TIERB_CREDENTIALS_JSON');
+    expect(calls[0].prompt).toContain(`c.role === "Admin"`);
+    expect(calls[0].prompt).toContain("use THAT role's account, not the default one");
+    // Never the plaintext values themselves.
+    expect(calls[0].prompt).not.toContain('admin@corp.test');
+    expect(calls[0].prompt).not.toContain('admin-pw');
+  });
+
+  it('lists all configured roles for a batch (multi-item) prompt instead of picking one deterministically', async () => {
+    const loginItem: TestPlanItem = {
+      id: 'REQ-LOGIN',
+      title: 'Login page',
+      reqTag: 'REQ-LOGIN',
+      tier: 'tierA-public',
+      intent: 'user can log in',
+      scenarios: [{ kind: 'positive', description: 'succeeds with valid input' }],
+    };
+    const otherItem: TestPlanItem = {
+      id: 'REQ-OTHER',
+      title: 'Public FAQ page',
+      reqTag: 'REQ-OTHER',
+      tier: 'tierA-public',
+      intent: 'FAQ renders',
+      scenarios: [{ kind: 'positive', description: 'renders' }],
+    };
+    const credentials: ProjectCredential[] = [
+      {
+        authType: 'form',
+        username: 'a@corp.test',
+        password: 'a-pw',
+        role: 'Admin',
+      } as unknown as ProjectCredential,
+      {
+        authType: 'form',
+        username: 'v@corp.test',
+        password: 'v-pw',
+        role: 'Viewer',
+      } as unknown as ProjectCredential,
+    ];
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), credentials };
+
+    await generate(ctx, { summary: 'batch', items: [loginItem, otherItem] });
+
+    expect(calls[0].prompt).toContain('roles (Admin, Viewer)');
+  });
+
+  it('grounds a tierC-api authentication-endpoint test in the real credential instead of an invented one', async () => {
+    const apiLoginPlan: TestPlan = {
+      summary: 'api login',
+      items: [
+        {
+          id: 'REQ-API-LOGIN',
+          title: 'POST /api/login authenticates a user',
+          reqTag: 'REQ-API-LOGIN',
+          tier: 'tierC-api',
+          intent: 'the login endpoint authenticates valid credentials',
+          scenarios: [{ kind: 'positive', description: 'succeeds with valid credentials' }],
+        },
+      ],
+    };
+    const credential: ProjectCredential = {
+      authType: 'form',
+      username: 'sid55boss@gmail.com',
+      password: 'sid55boss@A',
+      role: null,
+    } as unknown as ProjectCredential;
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), credentials: [credential] };
+
+    await generate(ctx, apiLoginPlan);
+
+    expect(calls[0].prompt).toContain('authentication/login/token endpoint');
+    expect(calls[0].prompt).toContain('process.env.HEALIX_TIERB_EMAIL!');
+    expect(calls[0].prompt).not.toContain('sid55boss@gmail.com');
+  });
+
   it('emits a per-batch "Dispatched" event distinct from the "Progress" event', async () => {
     const ctx = makeCtx(makeProvider([CLEAN_SPEC], calls));
 

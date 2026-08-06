@@ -11,6 +11,7 @@ import {
   endpointCategory,
   extractCanonicalIdentity,
   mergeGroundedResponse,
+  reconcileAuthTokens,
   staticMockResponse,
 } from '../../target/mock-responses.js';
 import {
@@ -62,10 +63,18 @@ function parseObservedBody(sampleResponseBody: string | undefined, contentType: 
 }
 
 /** Reconciles a purely-synthetic (static/AI) response's identity fields against `canonical`,
- * a no-op when nothing real has been captured yet (see `extractCanonicalIdentity`). */
-function withCanonicalIdentity(response: MockResponse, canonical: CanonicalIdentity | null): MockResponse {
+ * a no-op when nothing real has been captured yet (see `extractCanonicalIdentity`). For an
+ * auth-classified response, also regenerates its JWT-bearing fields so the token's own
+ * encoded subject agrees with `canonical.id` — otherwise a correctly-reconciled `user.id`
+ * would still be contradicted by an unrelated, still-fake token (see `reconcileAuthTokens`). */
+function withCanonicalIdentity(
+  response: MockResponse,
+  canonical: CanonicalIdentity | null,
+  category?: ExternalDependencyCategory,
+): MockResponse {
   if (!canonical) return response;
-  return { ...response, body: applyCanonicalIdentity(response.body, canonical) };
+  const body = applyCanonicalIdentity(response.body, canonical);
+  return { ...response, body: category === 'auth' ? reconcileAuthTokens(body, canonical) : body };
 }
 
 /**
@@ -111,7 +120,11 @@ function mergedEndpoints(
       pathPattern: e.pathPattern,
       // Reconcile identity BEFORE the observed-traffic merge below, so a static/AI-guessed
       // endpoint agrees with real captured identity from elsewhere in the same run.
-      response: withCanonicalIdentity(e.response ?? staticMockResponse(category), canonicalIdentity),
+      response: withCanonicalIdentity(
+        e.response ?? staticMockResponse(category),
+        canonicalIdentity,
+        category,
+      ),
     });
   }
 
@@ -163,7 +176,7 @@ function mockRouteEntries(ctx: TestModeContext): MockRouteEntry[] {
     if (!dep.hostnames || dep.hostnames.length === 0) continue;
     const depResponse = responses[dep.id];
     if (!depResponse) continue;
-    const response = withCanonicalIdentity(depResponse, canonicalIdentity);
+    const response = withCanonicalIdentity(depResponse, canonicalIdentity, dep.category);
     const endpoints = mergedEndpoints(dep, observedEndpoints, canonicalIdentity);
     entries.push({
       id: dep.id,

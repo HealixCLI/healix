@@ -149,6 +149,14 @@ export interface CrawlOptions {
    * budget (see GAP-060), so this is purely an allocation knob between the two calls, not a
    * change to how a single call spends its own budget. */
   stateProbeBudget?: number;
+  /** Network events already captured BEFORE this crawl's first navigation (e.g. a real login
+   * form submission `attemptLogin` just performed) that should be attributed to route 0 instead
+   * of discarded by the startup drain below. Without this, `crawlWithAuth`'s real login POST —
+   * the one call that actually proves the account's real identity — is thrown away a moment
+   * after it happens, purely because it landed in the buffer microseconds before crawl() started
+   * rather than during it; every mock/identity-reconciliation pass downstream then has nothing
+   * real to ground itself in for that endpoint, and falls back to a synthetic placeholder. */
+  seedNetworkEvents?: CapturedNetworkEvent[];
 }
 
 const DEFAULT_MAX_ROUTES = 60;
@@ -997,9 +1005,15 @@ export async function crawl(
   let remainingClickProbes = MAX_CLICK_PROBES_PER_CRAWL;
   let remainingStateProbes = opts.stateProbeBudget ?? MAX_STATE_PROBES_PER_CRAWL;
   let resetFailures = 0;
+  // Attributed to route 0 only, then cleared — see CrawlOptions.seedNetworkEvents. A caller that
+  // passes this has already drained the browser itself (there is nothing left to discard here);
+  // a caller that doesn't still gets the original "discard stale pre-crawl noise" behavior.
+  let pendingSeedEvents = opts.seedNetworkEvents ?? [];
 
-  // Discard anything buffered before this crawl started so it doesn't leak into route 0.
-  browser.drainNetworkEvents();
+  if (pendingSeedEvents.length === 0) {
+    // Discard anything buffered before this crawl started so it doesn't leak into route 0.
+    browser.drainNetworkEvents();
+  }
 
   while (queue.length > 0) {
     if (routes.length >= maxRoutes || Date.now() >= deadline) {
@@ -1029,7 +1043,8 @@ export async function crawl(
       browser.drainNetworkEvents();
       continue;
     }
-    const networkEvents = browser.drainNetworkEvents();
+    const networkEvents = [...pendingSeedEvents, ...browser.drainNetworkEvents()];
+    pendingSeedEvents = [];
 
     const resolvedUrl = normalizeUrl(snapshot.url || requestedUrl);
 
@@ -1429,7 +1444,13 @@ export async function crawlWithAuth(
     };
   }
 
-  const authCrawl = await crawl(browser, attempt.landingUrl ?? candidate.url, opts);
+  // Ground the login landing page's own real network traffic (real id/email/name, a real
+  // signed token) instead of letting crawl()'s startup drain discard it — see
+  // LoginAttemptResult.networkEvents and CrawlOptions.seedNetworkEvents.
+  const authCrawl = await crawl(browser, attempt.landingUrl ?? candidate.url, {
+    ...opts,
+    seedNetworkEvents: attempt.networkEvents,
+  });
 
   return {
     ...mergeCrawlResults(anonymous, authCrawl, 'authenticated'),

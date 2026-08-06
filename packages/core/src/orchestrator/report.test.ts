@@ -23,6 +23,7 @@ function makeRun(overrides: Partial<Run> = {}): Run {
     finishedAt: '2026-01-01T00:01:00.000Z',
     createdAt: '2026-01-01T00:00:00.000Z',
     pauseReason: null,
+    activeDurationMs: null,
     ...overrides,
   };
 }
@@ -425,6 +426,7 @@ const run: Run = {
   suiteMode: 'fresh',
   baseRunId: null,
   pauseReason: null,
+  activeDurationMs: null,
 };
 
 const project: Project = {

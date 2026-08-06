@@ -10,6 +10,7 @@ import {
   checkpointReporterContents,
   EXEC_CHECKPOINT_FILENAME,
   mockFixtureContents,
+  MOCK_PASSTHROUGH_LOG_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
   playwrightConfigContents,
   stepsReporterContents,
@@ -176,6 +177,35 @@ describe('actionHighlighterFixtureContents', () => {
     // and already requests + attaches its own video — skip re-attaching it
     // here so every test doesn't get a duplicate (broken, mid-recording) video.
     expect(src).toContain('isDefaultContext');
+  });
+});
+
+describe('evidenceKey — the shared test-identity used by apiEvidence/mockPassthrough/mockedRequestCountsByTest', () => {
+  it('computes the key relative to testInfo.config.rootDir, NOT process.cwd() (regression: the two differ by testDir in every real run)', () => {
+    // Root-cause regression: process.cwd() during a real Playwright run is the SUITE root
+    // (execute.ts spawns with cwd: ctx.projectDir), but playwrightConfigContents() sets
+    // testDir: './tests' — one path segment deeper — and Playwright's own JSON reporter
+    // writes spec.file relative to THAT (rootDir), not cwd. Using process.cwd() here meant
+    // every real run's key carried an extra 'tests/' prefix the orchestrator's lookup
+    // (built from the JSON report's specFile, with no such prefix) could never match —
+    // apiEvidence/mockPassthrough/mockedRequestCountsByTest silently found nothing, in
+    // every real run, despite passing every existing test (which hand-construct both
+    // sides of the identity consistently, so the mismatch never had a chance to surface).
+    const src = actionHighlighterFixtureContents();
+    expect(src).toContain(
+      "return relative(testInfo.config.rootDir, testInfo.file).split(sep).join('/') + '#' + testInfo.title;",
+    );
+    expect(src).not.toContain('relative(process.cwd(), testInfo.file)');
+  });
+
+  it('is defined once and shared identically by BOTH actionHighlighterFixtureContents and mockFixtureContents (single source of truth)', () => {
+    const actionSrc = actionHighlighterFixtureContents();
+    const mockSrc = mockFixtureContents([]);
+    const extract = (src: string) => /function evidenceKey\(testInfo\) \{[\s\S]*?\n\}/.exec(src)?.[0];
+    const actionFn = extract(actionSrc);
+    const mockFn = extract(mockSrc);
+    expect(actionFn).toBeDefined();
+    expect(actionFn).toBe(mockFn);
   });
 });
 
@@ -471,12 +501,22 @@ describe('mockFixtureContents', () => {
     function loadMatchAnyRoute(
       src: string,
       overrides: Array<{ method: string; pathPattern: string; response: unknown }>,
-    ): (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown } {
+    ): (
+      routes: unknown[],
+      method: string,
+      path: string,
+      opts?: { allowGenericFallback?: boolean },
+    ) => { id?: string; response?: unknown } {
       const pathMatchesSrc = extractFunctionSource(src, 'pathMatches');
       const matchSrc = extractFunctionSource(src, 'matchAnyRoute');
       const factory = new Function('overrides', `${pathMatchesSrc}\n${matchSrc}\nreturn matchAnyRoute;`) as (
         o: unknown,
-      ) => (routes: unknown[], method: string, path: string) => { id?: string; response?: unknown };
+      ) => (
+        routes: unknown[],
+        method: string,
+        path: string,
+        opts?: { allowGenericFallback?: boolean },
+      ) => { id?: string; response?: unknown };
       return factory(overrides);
     }
 
@@ -534,6 +574,44 @@ describe('mockFixtureContents', () => {
       expect(src).not.toMatch(/const route = MOCKED_ROUTES\[0\]/);
     });
 
+    describe('Cluster F — allowGenericFallback opt-out (page.route no-hostname-match branch)', () => {
+      it('with allowGenericFallback: false, resolves a request matching an endpoint on a DIFFERENT route (known call, misdetected/stale host)', () => {
+        const src = mockFixtureContents([depA, depB]);
+        const match = loadMatchAnyRoute(src, []);
+        const result = match([depA, depB], 'POST', '/v3/oauth/token/generate', {
+          allowGenericFallback: false,
+        });
+        expect(result.response).toEqual({ status: 200, body: { token: 'real-token' } });
+        expect(result.id).toBe('dep-a');
+      });
+
+      it('with allowGenericFallback: false, returns an undefined response (never a generic default) when NO route anywhere has a matching endpoint — the regression guard against wrongly mocking a genuinely different third-party host', () => {
+        const src = mockFixtureContents([depA, depB]);
+        const match = loadMatchAnyRoute(src, []);
+        const result = match([depA, depB], 'GET', '/totally/unrelated/analytics/beacon', {
+          allowGenericFallback: false,
+        });
+        expect(result.response).toBeUndefined();
+      });
+
+      it('with allowGenericFallback: false, an override still resolves (an explicitly-registered override is never "an unrelated third party")', () => {
+        const src = mockFixtureContents([depA, depB]);
+        const overrideResponse = { status: 500, body: { error: 'forced' } };
+        const match = loadMatchAnyRoute(src, [
+          { method: 'GET', pathPattern: '/x', response: overrideResponse },
+        ]);
+        const result = match([depA, depB], 'GET', '/x', { allowGenericFallback: false });
+        expect(result.response).toEqual(overrideResponse);
+      });
+
+      it("omitting opts (the `request`-fixture call site) keeps today's behavior — generic fallback still allowed", () => {
+        const src = mockFixtureContents([depA, depB]);
+        const match = loadMatchAnyRoute(src, []);
+        const result = match([depA, depB], 'GET', '/unmatched/path');
+        expect(result.response).toEqual(depA.response);
+      });
+    });
+
     it('F-14: page.route() registers ONE catch-all interceptor and decides per-request whether a host OR an override matches, instead of one predicate per hostname', () => {
       const src = mockFixtureContents([depA]);
       expect(src).toContain("page.route('**/*', async (r) => {");
@@ -542,36 +620,148 @@ describe('mockFixtureContents', () => {
       // path has no hostname to match against at all (a same-origin fetch).
       expect(src).toContain('const hostRoute = MOCKED_ROUTES.find(');
       expect(src).toContain('const overrideMatches = overrides.some(');
-      expect(src).toContain('if (!hostRoute && !overrideMatches) {');
-      expect(src).toContain('await r.continue();');
       // When there's no host match, resolution still goes through the
       // any-route resolver (which checks overrides) instead of skipping the
-      // override-only, same-origin case.
-      expect(src).toContain('matchAnyRoute(MOCKED_ROUTES, method, requestPath)');
+      // override-only, same-origin case — but (Cluster F) it must NOT allow
+      // the any-route resolver's generic-default fallback unless an override
+      // actually matched, so a genuinely unrelated third-party host isn't
+      // wrongly mocked with some other dependency's default response.
+      expect(src).toContain(
+        'matchAnyRoute(MOCKED_ROUTES, method, requestPath, { allowGenericFallback: overrideMatches })',
+      );
+      // Only falls through to the real network (and logs it) when nothing resolved a response.
+      expect(src).toContain('if (!response) {');
+      expect(src).toContain('await r.continue();');
     });
   });
 
   describe('F-15 — every intercepted request is logged so mockedRequestCounts can reflect fixture-level mocking', () => {
-    it('logs a hit (with the resolved dependency id) whenever page.route() fulfills a mocked request', () => {
+    it('logs a hit (with the resolved dependency id, the test-identity key, the matched endpoint method/pathPattern, AND the actually-served status/body) whenever page.route() fulfills a mocked request', () => {
       const src = mockFixtureContents([
         { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
       ]);
-      expect(src).toContain('await logMockHit(matchedId);');
+      expect(src).toContain(
+        'await logMockHit(key, matchedId, matchedMethod, matchedPathPattern, response.status, contentType, text);',
+      );
       expect(src).toContain("import { appendFile } from 'node:fs/promises';");
       expect(src).toContain('MOCK_REQUEST_LOG_PATH');
       expect(src).toContain(JSON.stringify(MOCK_REQUEST_LOG_FILENAME));
     });
 
-    it('logs a hit whenever the `request` fixture serves a mocked response', () => {
+    it('logs a hit (with the test-identity key, the matched endpoint method/pathPattern, AND the actually-served status/body) whenever the `request` fixture serves a mocked response', () => {
       const src = mockFixtureContents([
         { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
       ]);
-      expect(src).toContain('await logMockHit(match.id);');
+      expect(src).toContain(
+        'await logMockHit(key, match.id, match.method, match.pathPattern, canned.status, contentType, text);',
+      );
+    });
+
+    it('logs each hit against the SAME test-identity key evidenceKey(testInfo) computes for API evidence, so mock hits can be attributed to the test that caused them (test_mock_usage)', () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      // Both fixtures compute `key` from evidenceKey(testInfo) before ever calling logMockHit —
+      // proves the key passed to logMockHit is the same identity used elsewhere for per-test
+      // attribution (specFile#title), not a separately-invented one.
+      const pageFixtureSrc = src.slice(
+        src.indexOf('page: async ({ page, mockOverride }, use, testInfo) => {'),
+        src.indexOf('await logMockHit(key, matchedId,'),
+      );
+      expect(pageFixtureSrc).toContain('const key = evidenceKey(testInfo);');
+      const requestFixtureSrc = src.slice(
+        src.indexOf('request: async ({ request, mockOverride }, use, testInfo) => {'),
+        src.indexOf('await logMockHit(key, match.id,'),
+      );
+      expect(requestFixtureSrc).toContain('const key = evidenceKey(testInfo);');
+    });
+
+    it('logs the ACTUALLY-served status/body (post serializeBody), not the pre-generated mock_status/mock_body_json, so mock_responses.observed_* reflects what really shipped', () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      // Both call sites compute { contentType, text } via serializeBody(...) BEFORE calling
+      // logMockHit, and pass those exact locals through — not the route's original response
+      // object — so a per-test mockOverride() substitution is captured too.
+      expect(src).toMatch(
+        /const \{ contentType, text \} = serializeBody\(response\);\s*\n\s*await logMockHit\(key, matchedId, matchedMethod, matchedPathPattern, response\.status, contentType, text\);/,
+      );
+      expect(src).toMatch(
+        /const \{ contentType, text \} = serializeBody\(canned\);\s*\n\s*await logMockHit\(key, match\.id, match\.method, match\.pathPattern, canned\.status, contentType, text\);/,
+      );
+    });
+
+    it("logs the matched endpoint's own (method, pathPattern) — the SAME values seeded into mock_responses.method/path_pattern at generation time — so a hit can be resolved to its EXACT row, not just its dependency", () => {
+      const src = mockFixtureContents([
+        {
+          id: 'pkg:twilio',
+          hostnames: ['api.twilio.com'],
+          response: { status: 200, body: { ok: true } },
+          endpoints: [{ method: 'POST', pathPattern: '/v1/otp/send', response: { status: 200, body: {} } }],
+        },
+      ]);
+      expect(src).toMatch(
+        /return \{ response: endpoint\.response, method: endpoint\.method, pathPattern: endpoint\.pathPattern \};/,
+      );
+      expect(src).toMatch(
+        /return \{\s*id: route\.id,\s*response: override \? override\.response : endpoint\.response,\s*method: endpoint\.method,\s*pathPattern: endpoint\.pathPattern,?\s*\};/,
+      );
+      // The generic per-dependency fallback (no specific endpoint matched) explicitly logs
+      // null/null — there is no single mock_responses row it unambiguously belongs to among
+      // several endpoint-level rows, so it must never be attributed to the WRONG one.
+      expect(src).toContain('return { response: route.response, method: null, pathPattern: null };');
+    });
+
+    it("uses the override's OWN (method, pathPattern) rather than null, so a negative-test override (e.g. simulating a 500) still attributes to a real mock_responses row when one exists for that exact endpoint", () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      expect(src).toContain(
+        'if (override) return { response: override.response, method: override.method, pathPattern: override.pathPattern };',
+      );
     });
 
     it('a logging failure never blocks or throws through the actual mocked response (best-effort contract)', () => {
       const src = mockFixtureContents([]);
-      const fnSrc = /async function logMockHit\(id\) \{[\s\S]*?\n\}/.exec(src)?.[0];
+      const fnSrc =
+        /async function logMockHit\(key, id, method, pathPattern, status, contentType, body\) \{[\s\S]*?\n\}/.exec(
+          src,
+        )?.[0];
+      expect(fnSrc).toBeDefined();
+      expect(fnSrc).toMatch(/catch\s*\{/);
+    });
+  });
+
+  describe('Cluster F — unmocked-passthrough logging (mockPassthrough)', () => {
+    it('logs a passthrough entry (key, method, url) right before falling through to the real network', () => {
+      const src = mockFixtureContents([
+        { id: 'pkg:twilio', hostnames: ['api.twilio.com'], response: { status: 200, body: { ok: true } } },
+      ]);
+      expect(src).toContain('await logMockPassthrough(key, method, url);');
+      // Must be called BEFORE r.continue(), not after (order matters for the log to be
+      // written even if the continued request itself later hangs).
+      const idx = src.indexOf('if (!response) {');
+      const block = src.slice(idx, idx + 200);
+      expect(block.indexOf('logMockPassthrough')).toBeGreaterThan(-1);
+      expect(block.indexOf('logMockPassthrough')).toBeLessThan(block.indexOf('r.continue()'));
+    });
+
+    it('writes to a dedicated sidecar file, distinct from the mock-hit log', () => {
+      const src = mockFixtureContents([]);
+      expect(src).toContain('MOCK_PASSTHROUGH_LOG_PATH');
+      expect(src).toContain(JSON.stringify(MOCK_PASSTHROUGH_LOG_FILENAME));
+      expect(MOCK_PASSTHROUGH_LOG_FILENAME).not.toBe(MOCK_REQUEST_LOG_FILENAME);
+    });
+
+    it('keys the passthrough entry the same way API evidence is keyed, so it can be joined back to a test', () => {
+      const src = mockFixtureContents([]);
+      expect(src).toContain('const key = evidenceKey(testInfo);');
+      expect(src).toContain('page: async ({ page, mockOverride }, use, testInfo) => {');
+    });
+
+    it('a logging failure never blocks or throws through the passthrough itself (best-effort contract)', () => {
+      const src = mockFixtureContents([]);
+      const fnSrc = /async function logMockPassthrough\(key, method, url\) \{[\s\S]*?\n\}/.exec(src)?.[0];
       expect(fnSrc).toBeDefined();
       expect(fnSrc).toMatch(/catch\s*\{/);
     });

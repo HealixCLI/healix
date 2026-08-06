@@ -2,7 +2,7 @@ import { mkdtempSync, rmSync } from 'node:fs';
 import { mkdir, readFile, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
-import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 
 import { createOrchestrator } from './index.js';
 import { diffAgainstBase } from './topup.js';
@@ -982,6 +982,601 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
       expect(scenario).toBeDefined();
       expect(scenario!.testId).not.toBeNull();
       expect(scenario!.status).toBe('passed');
+    }
+
+    // Every KB scenario also got its own kb_execution_artifacts row — seeded
+    // at plan time, filled in once the real result landed. These passed, so
+    // error_message/trace_path stay null; network_logs has no capture source
+    // yet anywhere, so it's always null.
+    const kbExecutionArtifacts = store.listKbExecutionArtifacts(run1.runId);
+    expect(kbExecutionArtifacts).toHaveLength(2);
+    for (const scenario of kbScenarios) {
+      const artifact = kbExecutionArtifacts.find((a) => a.kbScenarioId === scenario.id);
+      expect(artifact).toBeDefined();
+      expect(artifact!.errorMessage).toBeNull();
+      expect(artifact!.networkLogs).toBeNull();
+    }
+
+    // KB foundation: both items share reqTag 'REQ-001' — they must dedupe
+    // into ONE requirement row, and both items must link to it.
+    const requirements = store.listRequirements(run1.runId);
+    expect(requirements).toHaveLength(1);
+    expect(requirements[0].tag).toBe('REQ-001');
+    expect(kbItems.every((it) => it.requirementId === requirements[0].id)).toBe(true);
+
+    // The traceability matrix flattens requirement -> kb item -> scenario ->
+    // test into one row per (kb item, scenario) pair — both items' scenarios
+    // show up, joined to the same single requirement, each reflecting its
+    // real passed status and test id.
+    const matrix = store.getTraceabilityMatrix(run1.runId);
+    expect(matrix).toHaveLength(2);
+    for (const row of matrix) {
+      expect(row.requirementTag).toBe('REQ-001');
+      expect(row.scenarioStatus).toBe('passed');
+      expect(row.testId).not.toBeNull();
+    }
+    expect(new Set(matrix.map((r) => r.kbItemTitle))).toEqual(
+      new Set(['User registration via UI', 'POST /api/auth/register API contract']),
+    );
+  });
+
+  it('persistResults merges ExecOutcome.apiEvidence into evidence_json even when the result has no specFile (regression)', async () => {
+    // Root-cause regression: persistResults built its apiEvidence lookup key
+    // as `${r.specFile ?? ''}#${r.title}`, always inserting a '#' even when
+    // specFile is absent. Every other reader/writer of this same identity
+    // (execute.ts's keyOf, and the pre-existing lookup a few hundred lines
+    // above this same function) uses `r.specFile ? \`${r.specFile}#${r.title}\`
+    // : r.title` instead — no '#' when specFile is missing. A mismatched key
+    // means outcome.apiEvidence[key] silently misses for every specFile-less
+    // result, leaving evidenceJson.apiEvidence unset even though real
+    // evidence was captured.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'ApiEvidence No-SpecFile Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const ITEMS = [
+      {
+        title: 'POST /api/widgets contract',
+        tier: 'tierC-api',
+        intent: 'API contract for widgets.',
+        scenarios: [{ kind: 'positive', description: 'returns 200' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'no-specfile-result';
+    const evidenceMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        // A result item with NO specFile — the exact case the buggy key
+        // construction mishandled — plus an apiEvidence entry keyed the
+        // established way (bare title, no '#' prefix, since specFile is
+        // absent).
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          apiEvidence: { [RESULT_TITLE]: 'GET /api/widgets -> 200 {"ok":true}' },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const run = await createOrchestrator({
+      provider: fakeProviderWithPlan([], ITEMS),
+      getMode: () => evidenceMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run.status).toBe('passed');
+
+    const results = store.listResults(run.runId);
+    const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+    expect(target).toBeDefined();
+    expect(target!.evidenceJson).not.toBeNull();
+    const evidence = JSON.parse(target!.evidenceJson!) as { apiEvidence?: string };
+    expect(evidence.apiEvidence).toBe('GET /api/widgets -> 200 {"ok":true}');
+  });
+
+  it('persistResults merges ExecOutcome.mockPassthrough into evidence_json (regression: real data existed, was used for triage input, but was never written to results.evidence_json)', async () => {
+    // Root-cause gap: ExecOutcome.mockPassthrough is real, per-test data (execute.ts's
+    // readMockPassthroughLog) and was already wired into Triage's prompt input
+    // (mockPassthroughEvidence, a few hundred lines above persistResults in this same file),
+    // but persistResults' own evidence object never included it — the comment sitting right
+    // next to it claimed "no such mechanism exists in the codebase today," which was stale
+    // (a separate PR had already built the mechanism). Fixed by merging it in the same way
+    // apiEvidence already was.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'MockPassthrough Evidence Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const ITEMS = [
+      {
+        title: 'Checkout via unmocked partner API',
+        tier: 'tierC-api',
+        intent: 'Calls a partner endpoint that fell through the mock fixture unintercepted.',
+        scenarios: [{ kind: 'positive', description: 'completes' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'checkout-passthrough-result';
+    const passthroughMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = [{ title: RESULT_TITLE, status: 'failed' as const, durationMs: 5 }];
+        return {
+          passed: 0,
+          failed: 1,
+          blocked: 0,
+          flaky: 0,
+          results,
+          mockPassthrough: {
+            [RESULT_TITLE]: 'POST /partner/v1/charge fell through unintercepted (no mockOverride matched)',
+          },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    const run = await createOrchestrator({
+      provider: fakeProviderWithPlan([], ITEMS),
+      getMode: () => passthroughMode,
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run.status).toBe('failed');
+
+    const results = store.listResults(run.runId);
+    const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+    expect(target).toBeDefined();
+    expect(target!.evidenceJson).not.toBeNull();
+    const evidence = JSON.parse(target!.evidenceJson!) as { mockPassthrough?: string };
+    expect(evidence.mockPassthrough).toBe(
+      'POST /partner/v1/charge fell through unintercepted (no mockOverride matched)',
+    );
+  });
+
+  it('persistResults attributes a per-test mock hit to test_mock_usage, keyed off a REAL detected dependency (not a synthetic one)', async () => {
+    // KB foundation gap: test_mock_usage was schema-only until now — nothing called
+    // store.recordMockUsage(). Uses a real repoPath with a package.json listing a known
+    // provider (see target/dependencies.ts's KNOWN_PROVIDERS) so this exercises the ACTUAL
+    // detectExternalDependencies -> upsertMockResponse pipeline, not a hand-seeded row —
+    // proving the dependency id the fake mode's ExecOutcome reports really does resolve to
+    // a real mock_responses row via persistResults' own attribution logic.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-mock-usage-repo-'));
+    await writeFile(
+      join(repoPath, 'package.json'),
+      JSON.stringify({ name: 'fixture-app', dependencies: { twilio: '^4.23.0' } }),
+      'utf-8',
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Test Mock Usage Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      repoPath,
+    });
+
+    const ITEMS = [
+      {
+        title: 'Send OTP',
+        tier: 'tierA-public',
+        intent: 'Sends an OTP via SMS.',
+        scenarios: [{ kind: 'positive', description: 'succeeds' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'sends-otp-result';
+    const mockUsageMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          mockedRequestCountsByTest: {
+            [RESULT_TITLE]: [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 3 }],
+          },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    try {
+      const run = await createOrchestrator({
+        provider: fakeProviderWithPlan([], ITEMS),
+        getMode: () => mockUsageMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+
+      expect(run.status).toBe('passed');
+
+      const mockResponses = store.listMockResponses(run.runId);
+      const twilioRow = mockResponses.find((m) => m.dependencyId === 'pkg:twilio');
+      expect(twilioRow).toBeDefined();
+
+      const results = store.listResults(run.runId);
+      const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+      expect(target).toBeDefined();
+
+      const usage = store.listMockUsageForTest(target!.testId);
+      expect(usage).toEqual([{ testId: target!.testId, mockResponseId: twilioRow!.id, requestCount: 3 }]);
+    } finally {
+      await rm(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('persistResults grounds mock_responses.observed_* with the actually-served response, keyed off a REAL detected dependency (not a synthetic one)', async () => {
+    // KB foundation gap: observed_* columns were schema-only until now — nothing called
+    // store.recordObservedMockResponse(). Uses a real repoPath + package.json (same as the
+    // test_mock_usage test above) so this exercises the ACTUAL detectExternalDependencies ->
+    // upsertMockResponse pipeline, proving the dependency id the fake mode's ExecOutcome
+    // reports really does resolve to the one real mock_responses row it should ground.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-observed-mock-repo-'));
+    await writeFile(
+      join(repoPath, 'package.json'),
+      JSON.stringify({ name: 'fixture-app', dependencies: { twilio: '^4.23.0' } }),
+      'utf-8',
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Observed Mock Response Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      repoPath,
+    });
+
+    const ITEMS = [
+      {
+        title: 'Send OTP',
+        tier: 'tierA-public',
+        intent: 'Sends an OTP via SMS.',
+        scenarios: [{ kind: 'positive', description: 'succeeds' }],
+      },
+    ];
+
+    const observedMockMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = [{ title: 'sends-otp-result', status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          observedMockResponses: [
+            {
+              dependencyId: 'pkg:twilio',
+              method: null,
+              pathPattern: null,
+              status: 200,
+              bodyJson: JSON.stringify({ message: 'OTP sent' }),
+              headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+            },
+          ],
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    try {
+      const run = await createOrchestrator({
+        provider: fakeProviderWithPlan([], ITEMS),
+        getMode: () => observedMockMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+
+      expect(run.status).toBe('passed');
+
+      const mockResponses = store.listMockResponses(run.runId);
+      const twilioRow = mockResponses.find((m) => m.dependencyId === 'pkg:twilio');
+      expect(twilioRow).toBeDefined();
+      expect(twilioRow).toMatchObject({
+        observedStatus: 200,
+        observedBodyJson: JSON.stringify({ message: 'OTP sent' }),
+        observedHeadersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      });
+    } finally {
+      await rm(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('attributes test_mock_usage AND observed_* to the EXACT endpoint-level mock_responses row when a dependency has MULTIPLE detected endpoints — not conflated into one, and not silently dropped', async () => {
+    // This is the regression the tuple-based redesign (dependencyId+method+pathPattern,
+    // not just dependencyId) exists to fix: the old "only attribute when a dependency has
+    // exactly one mock_responses row" gate meant a dependency with real endpoint-level
+    // detail got NO test_mock_usage/observed_* rows at all. Real endpoint-level detail is
+    // only attached when exactly one mockable dependency exists (see
+    // dependencies.ts's endpoint-attribution comment) AND the repo's own source has
+    // relative-path call sites — so this repoPath includes both a package.json (twilio
+    // only) and a real source file with two distinct call sites.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-multi-endpoint-repo-'));
+    await writeFile(
+      join(repoPath, 'package.json'),
+      JSON.stringify({ name: 'fixture-app', dependencies: { twilio: '^4.23.0' } }),
+      'utf-8',
+    );
+    // The import itself must be found (mockStrategy resolves to 'route-intercept', not
+    // 'undeterminable') AND live under a recognized frontend directory (see
+    // dependencies.ts's FRONTEND_DIR_RE) for ordinary endpoint-level call-site attribution to
+    // ever run at all (mockableDeps.length === 1 requires a mockable, not 'undeterminable',
+    // dependency) — a bare package.json listing alone (as used elsewhere in this file) only
+    // ever produces the coarse single-row case, never this one.
+    await mkdir(join(repoPath, 'src', 'app'), { recursive: true });
+    await writeFile(
+      join(repoPath, 'src', 'app', 'otp.js'),
+      "const twilio = require('twilio');\nrequest.post('/v1/otp/send');\nrequest.post('/v1/otp/verify');\n",
+      'utf-8',
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Multi-Endpoint Mock Attribution Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      repoPath,
+    });
+
+    const ITEMS = [
+      {
+        title: 'Send and verify OTP',
+        tier: 'tierA-public',
+        intent: 'Sends then verifies an OTP via SMS.',
+        scenarios: [{ kind: 'positive', description: 'succeeds' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'send-and-verify-otp-result';
+    const multiEndpointMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          mockedRequestCountsByTest: {
+            [RESULT_TITLE]: [
+              { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 1 },
+              { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 2 },
+            ],
+          },
+          observedMockResponses: [
+            {
+              dependencyId: 'pkg:twilio',
+              method: 'POST',
+              pathPattern: '/v1/otp/send',
+              status: 200,
+              bodyJson: JSON.stringify({ message: 'OTP sent' }),
+              headersJson: null,
+            },
+            {
+              dependencyId: 'pkg:twilio',
+              method: 'POST',
+              pathPattern: '/v1/otp/verify',
+              status: 400,
+              bodyJson: JSON.stringify({ error: 'Invalid code' }),
+              headersJson: null,
+            },
+          ],
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    try {
+      const run = await createOrchestrator({
+        provider: fakeProviderWithPlan([], ITEMS),
+        getMode: () => multiEndpointMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+
+      expect(run.status).toBe('passed');
+
+      const mockResponses = store.listMockResponses(run.runId).filter((m) => m.dependencyId === 'pkg:twilio');
+      // Real endpoint-level detection produced TWO distinct rows, not one coarse default.
+      expect(mockResponses).toHaveLength(2);
+      const sendRow = mockResponses.find((m) => m.pathPattern === '/v1/otp/send');
+      const verifyRow = mockResponses.find((m) => m.pathPattern === '/v1/otp/verify');
+      expect(sendRow).toBeDefined();
+      expect(verifyRow).toBeDefined();
+      expect(sendRow!.id).not.toBe(verifyRow!.id);
+
+      // observed_* grounded onto the CORRECT distinct row for each endpoint.
+      expect(sendRow).toMatchObject({
+        observedStatus: 200,
+        observedBodyJson: JSON.stringify({ message: 'OTP sent' }),
+      });
+      expect(verifyRow).toMatchObject({
+        observedStatus: 400,
+        observedBodyJson: JSON.stringify({ error: 'Invalid code' }),
+      });
+
+      // test_mock_usage attributed to the CORRECT distinct row, with the correct count each.
+      const results = store.listResults(run.runId);
+      const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+      expect(target).toBeDefined();
+      const usage = store.listMockUsageForTest(target!.testId);
+      expect(usage).toEqual(
+        expect.arrayContaining([
+          { testId: target!.testId, mockResponseId: sendRow!.id, requestCount: 1 },
+          { testId: target!.testId, mockResponseId: verifyRow!.id, requestCount: 2 },
+        ]),
+      );
+      expect(usage).toHaveLength(2);
+    } finally {
+      await rm(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('a store failure recording ONE test_mock_usage tally does not silently drop the OTHER tallies for the same test (regression: was one shared try/catch for the whole per-test loop)', async () => {
+    // Root-cause regression: the write loop originally wrapped ALL of a test's tallies in a
+    // single try/catch, matching the sibling observedMockResponses loop's per-iteration
+    // pattern is what's correct — a throw on the FIRST tuple must not abort the loop and
+    // silently skip every LATER tuple for the same test.
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-partial-failure-repo-'));
+    await writeFile(
+      join(repoPath, 'package.json'),
+      JSON.stringify({ name: 'fixture-app', dependencies: { twilio: '^4.23.0' } }),
+      'utf-8',
+    );
+    await mkdir(join(repoPath, 'src', 'app'), { recursive: true });
+    await writeFile(
+      join(repoPath, 'src', 'app', 'otp.js'),
+      "const twilio = require('twilio');\nrequest.post('/v1/otp/send');\nrequest.post('/v1/otp/verify');\n",
+      'utf-8',
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Partial Mock Usage Failure Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      repoPath,
+    });
+
+    const ITEMS = [
+      {
+        title: 'Send and verify OTP',
+        tier: 'tierA-public',
+        intent: 'Sends then verifies an OTP via SMS.',
+        scenarios: [{ kind: 'positive', description: 'succeeds' }],
+      },
+    ];
+
+    const RESULT_TITLE = 'send-and-verify-otp-result';
+    const multiEndpointMode: TestMode = {
+      id: 'playwright',
+      async scaffold(): Promise<void> {},
+      async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
+        return makeFakeMode([]).generate(ctx, plan);
+      },
+      async execute(_ctx: TestModeContext, _specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = [{ title: RESULT_TITLE, status: 'passed' as const, durationMs: 5 }];
+        return {
+          passed: 1,
+          failed: 0,
+          blocked: 0,
+          flaky: 0,
+          results,
+          mockedRequestCountsByTest: {
+            [RESULT_TITLE]: [
+              { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 1 },
+              { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 2 },
+            ],
+          },
+        };
+      },
+      async collectArtifacts() {
+        return { dir: 'artifacts', files: [] };
+      },
+      async export() {
+        return { dir: 'export', files: [] };
+      },
+    };
+
+    // Fail exactly the FIRST recordMockUsage call (whichever tuple that turns out to be for
+    // this test), succeed on every call after it — proving a failure on one tuple doesn't
+    // prevent the next tuple in the SAME loop from being attempted at all.
+    const originalRecordMockUsage = store.recordMockUsage.bind(store);
+    const recordMockUsageSpy = vi.spyOn(store, 'recordMockUsage');
+    let callCount = 0;
+    recordMockUsageSpy.mockImplementation((testId, mockResponseId, requestCount) => {
+      callCount += 1;
+      if (callCount === 1) throw new Error('simulated constraint violation');
+      return originalRecordMockUsage(testId, mockResponseId, requestCount);
+    });
+
+    try {
+      const run = await createOrchestrator({
+        provider: fakeProviderWithPlan([], ITEMS),
+        getMode: () => multiEndpointMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+
+      expect(run.status).toBe('passed');
+      expect(recordMockUsageSpy).toHaveBeenCalledTimes(2);
+
+      const mockResponses = store.listMockResponses(run.runId).filter((m) => m.dependencyId === 'pkg:twilio');
+      expect(mockResponses).toHaveLength(2);
+
+      const results = store.listResults(run.runId);
+      const target = results.find((r) => store.getTest(r.testId)?.title === RESULT_TITLE);
+      expect(target).toBeDefined();
+      const usage = store.listMockUsageForTest(target!.testId);
+      // Exactly one of the two tuples failed (the first call) — the SECOND tuple must still
+      // have been attempted and persisted, not silently skipped because the first one threw.
+      expect(usage).toHaveLength(1);
+    } finally {
+      recordMockUsageSpy.mockRestore();
+      await rm(repoPath, { recursive: true, force: true });
     }
   });
 

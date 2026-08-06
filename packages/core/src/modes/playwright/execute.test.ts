@@ -52,13 +52,17 @@ import {
   clearExecCheckpoint,
   playwrightProjectArgs,
   readMockRequestCounts,
+  readMockRequestCountsByTest,
+  readObservedMockResponses,
   readApiEvidence,
+  readMockPassthroughLog,
   type AuthSignals,
 } from './execute.js';
 import {
   API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_PASSTHROUGH_LOG_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
 } from './templates.js';
 
@@ -1258,6 +1262,15 @@ describe('write-through checkpoint: readCheckpointEntries / writeInvertFile / cl
     await clearExecCheckpoint(dir);
     expect(await readMockRequestCounts(dir)).toEqual({});
   });
+
+  it('Cluster F: clearExecCheckpoint also clears the mock-passthrough log, so a later unrelated execute() call starts fresh', async () => {
+    writeFileSync(
+      join(dir, MOCK_PASSTHROUGH_LOG_FILENAME),
+      `${JSON.stringify({ key: 'f#t', method: 'GET', url: 'https://unmocked.example.test/x', at: '2026-01-01T00:00:00Z' })}\n`,
+    );
+    await clearExecCheckpoint(dir);
+    expect(await readMockPassthroughLog(dir)).toEqual({});
+  });
 });
 
 describe("readMockRequestCounts — F-15: tallies the mock fixture's write-through hit log", () => {
@@ -1294,6 +1307,222 @@ describe("readMockRequestCounts — F-15: tallies the mock fixture's write-throu
       `${JSON.stringify({ id: 'pkg:twilio' })}\nnot valid json\n\n`,
     );
     expect(await readMockRequestCounts(dir)).toEqual({ 'pkg:twilio': 1 });
+  });
+});
+
+describe('readMockRequestCountsByTest — same log, broken out per test (feeds test_mock_usage)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-request-log-by-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists', async () => {
+    expect(await readMockRequestCountsByTest(dir)).toEqual({});
+  });
+
+  it('groups hits by test key first, then tallies per EXACT (dependency, method, pathPattern) tuple', async () => {
+    const lines = [
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send' },
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send' },
+      { key: 'tests/b.spec.ts#test B', id: 'pkg:stripe', method: null, pathPattern: null },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': [
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 2 },
+      ],
+      'tests/b.spec.ts#test B': [{ dependencyId: 'pkg:stripe', method: null, pathPattern: null, count: 1 }],
+    });
+  });
+
+  it('keeps two DIFFERENT endpoints under the SAME dependency as separate tallies, not one merged count', async () => {
+    const lines = [
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send' },
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify' },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': expect.arrayContaining([
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 1 },
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 1 },
+      ]),
+    });
+    expect(await readMockRequestCountsByTest(dir)).toHaveProperty(['tests/a.spec.ts#test A', 'length'], 2);
+  });
+
+  it('omits a line with no key (an older log from before this field existed) rather than crashing or mis-grouping it', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio' })}\n${JSON.stringify({ key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: null, pathPattern: null })}\n`,
+    );
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 1 }],
+    });
+  });
+
+  it('omits a hit with no resolvable dependency id entirely — there is no row an "override" tally could ever attribute to', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ key: 'tests/a.spec.ts#test A' })}\n`,
+    );
+    expect(await readMockRequestCountsByTest(dir)).toEqual({});
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: null, pathPattern: null })}\nnot valid json\n\n`,
+    );
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 1 }],
+    });
+  });
+});
+
+describe('readObservedMockResponses — grounds mock_responses.observed_* with the actually-served response', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-observed-mock-log-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns [] when no log file exists', async () => {
+    expect(await readObservedMockResponses(dir)).toEqual([]);
+  });
+
+  it('folds a hit down to its (dependency, method, pathPattern) tuple with the served status/body/headers', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({
+        id: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/send',
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'OTP sent' }),
+      })}\n`,
+    );
+    expect(await readObservedMockResponses(dir)).toEqual([
+      {
+        dependencyId: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/send',
+        status: 200,
+        bodyJson: JSON.stringify({ message: 'OTP sent' }),
+        headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      },
+    ]);
+  });
+
+  it('keeps two DIFFERENT endpoints under the SAME dependency as separate entries', async () => {
+    const lines = [
+      {
+        id: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/send',
+        status: 200,
+        contentType: 'application/json',
+        body: '{}',
+      },
+      {
+        id: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/verify',
+        status: 400,
+        contentType: 'application/json',
+        body: '{}',
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    const result = await readObservedMockResponses(dir);
+    expect(result).toHaveLength(2);
+    expect(result).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ pathPattern: '/v1/otp/send', status: 200 }),
+        expect.objectContaining({ pathPattern: '/v1/otp/verify', status: 400 }),
+      ]),
+    );
+  });
+
+  it('keeps only the LAST response for a repeated (dependency, method, pathPattern) tuple, reflecting a mid-run mockOverride()', async () => {
+    const lines = [
+      {
+        id: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 200,
+        contentType: 'application/json',
+        body: 'first',
+      },
+      {
+        id: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 500,
+        contentType: 'application/json',
+        body: 'second',
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readObservedMockResponses(dir)).toEqual([
+      {
+        dependencyId: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 500,
+        bodyJson: 'second',
+        headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      },
+    ]);
+  });
+
+  it('omits a hit with no resolvable dependency id ("override") or no logged status (an older log line)', async () => {
+    const lines = [
+      JSON.stringify({ status: 200, contentType: 'application/json', body: '{}' }),
+      JSON.stringify({
+        id: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        contentType: 'application/json',
+        body: '{}',
+      }),
+    ].join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readObservedMockResponses(dir)).toEqual([]);
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio', method: null, pathPattern: null, status: 200, contentType: 'application/json', body: '{}' })}\nnot valid json\n\n`,
+    );
+    expect(await readObservedMockResponses(dir)).toEqual([
+      {
+        dependencyId: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 200,
+        bodyJson: '{}',
+        headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      },
+    ]);
   });
 });
 
@@ -1367,6 +1596,65 @@ describe('readApiEvidence — per-test summary of actual request-fixture calls',
       ].join('\n') + '\n',
     );
     const out = await readApiEvidence(dir);
+    expect(Object.keys(out)).toEqual(['f#t']);
+    expect(out['f#t']).toContain('/ok');
+  });
+});
+
+describe('readMockPassthroughLog — per-test evidence of unintercepted mock-fixture requests (Cluster F)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-passthrough-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists (mocking disabled, or nothing ever fell through)', async () => {
+    expect(await readMockPassthroughLog(dir)).toEqual({});
+  });
+
+  it('groups entries by key and formats a compact summary naming the method/url that fell through', async () => {
+    writeFileSync(
+      join(dir, MOCK_PASSTHROUGH_LOG_FILENAME),
+      `${JSON.stringify({
+        key: 'tests/tierB-auth/x.spec.ts#a',
+        method: 'POST',
+        url: 'https://old-host.example.test/auth/login',
+        at: '2026-01-01T00:00:00.000Z',
+      })}\n`,
+    );
+    const out = await readMockPassthroughLog(dir);
+    const summary = out['tests/tierB-auth/x.spec.ts#a'];
+    expect(summary).toContain('POST https://old-host.example.test/auth/login');
+    expect(summary).toContain('fell through the mock fixture unintercepted');
+  });
+
+  it('keeps only the LAST few calls per key (bounded, so a chatty test cannot blow up the prompt)', async () => {
+    const many = Array.from({ length: 6 }, (_, i) =>
+      JSON.stringify({ key: 'f#t', method: 'GET', url: `/call-${i}`, at: '2026-01-01T00:00:00Z' }),
+    ).join('\n');
+    writeFileSync(join(dir, MOCK_PASSTHROUGH_LOG_FILENAME), `${many}\n`);
+    const summary = (await readMockPassthroughLog(dir))['f#t'];
+    expect(summary).not.toContain('/call-0');
+    expect(summary).not.toContain('/call-2');
+    expect(summary).toContain('/call-3');
+    expect(summary).toContain('/call-5');
+  });
+
+  it('skips a malformed line instead of losing every other entry, and drops lines with no key', async () => {
+    writeFileSync(
+      join(dir, MOCK_PASSTHROUGH_LOG_FILENAME),
+      [
+        JSON.stringify({ key: 'f#t', method: 'GET', url: '/ok', at: '2026-01-01T00:00:00Z' }),
+        'not valid json',
+        JSON.stringify({ method: 'GET', url: '/nokey', at: '2026-01-01T00:00:00Z' }),
+        '',
+      ].join('\n') + '\n',
+    );
+    const out = await readMockPassthroughLog(dir);
     expect(Object.keys(out)).toEqual(['f#t']);
     expect(out['f#t']).toContain('/ok');
   });

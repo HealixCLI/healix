@@ -6,6 +6,7 @@ import type {
   PauseReason,
   Project,
   ProjectCredential,
+  ResultEvidence,
   Run,
   RunStatus,
   SuiteMode,
@@ -31,7 +32,7 @@ import type {
   TestPlan,
   TestPlanItem,
 } from '../modes/types.js';
-import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
+import { isPlanItemIncluded, mockResponseTupleKey, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { detectExternalDependencies } from '../target/dependencies.js';
@@ -57,6 +58,7 @@ import {
   buildBatchPlanPrompt,
   parsePlanWithDiagnostics,
   synthesizePlan,
+  applyAuthGuardTierOverrides,
   type PlanRepoContext,
   type PlanParseFailureReason,
 } from './plan.js';
@@ -629,6 +631,14 @@ async function retryPassPipeline(
         noteStoreOk();
       } catch (err) {
         noteStoreFailure('updatePlanKbItemStatus', err);
+      }
+    },
+    onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+      try {
+        store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('insertEscapeHatchGap', err);
       }
     },
     signal,
@@ -1517,6 +1527,48 @@ async function runPipeline(
               );
             }
           }
+          // KB foundation: persist one mock_responses row per (dependency,
+          // method, path) mock target — additive to the existing behavior of
+          // embedding the same data into fixtures/mock.fixture.ts, not a
+          // replacement of it. observed_* fields are never written here (see
+          // this table's own schema comment for why). See
+          // docs/design/kb-foundation-evidence-persistence.md.
+          try {
+            for (const dep of externalDependencies) {
+              const fallback = mockResponses.get(dep.id) ?? null;
+              if (dep.endpoints && dep.endpoints.length > 0) {
+                for (const endpoint of dep.endpoints) {
+                  const response = endpoint.response ?? fallback;
+                  store.upsertMockResponse({
+                    runId,
+                    dependencyId: dep.id,
+                    category: endpoint.category ?? dep.category,
+                    method: endpoint.method,
+                    pathPattern: endpoint.pathPattern,
+                    mockStrategy: dep.mockStrategy,
+                    mockStatus: response?.status ?? null,
+                    mockBodyJson: response ? JSON.stringify(response.body) : null,
+                    mockHeadersJson: response?.headers ? JSON.stringify(response.headers) : null,
+                  });
+                }
+              } else {
+                store.upsertMockResponse({
+                  runId,
+                  dependencyId: dep.id,
+                  category: dep.category,
+                  method: null,
+                  pathPattern: null,
+                  mockStrategy: dep.mockStrategy,
+                  mockStatus: fallback?.status ?? null,
+                  mockBodyJson: fallback ? JSON.stringify(fallback.body) : null,
+                  mockHeadersJson: fallback?.headers ? JSON.stringify(fallback.headers) : null,
+                });
+              }
+            }
+            noteStoreOk();
+          } catch (err) {
+            noteStoreFailure('upsertMockResponse', err);
+          }
           await writeJson(
             join(runDir, 'plan', 'dependencies.json'),
             externalDependencies.map((d) => ({ ...d, mockResponse: mockResponses.get(d.id) ?? null })),
@@ -1714,10 +1766,17 @@ async function runPipeline(
     // seedPlanKbItem), so re-running this on a resumed run is harmless.
     // Skipped for suiteMode 'reuse': that mode carries no new plan to track
     // (planForGeneration is empty there — see suiteMode === 'reuse' above).
+    //
+    // Alongside each item, also record the real source file backing its
+    // functionality (kb_test_scripts) — resolved from the item's unitKey
+    // against this run's FunctionalityUnit/SourceContext, when both exist
+    // (white-box projects only). An item with no unitKey, or whose unitKey
+    // doesn't match any indexed unit (black-box, or a unit-less item), simply
+    // gets no kb_test_scripts row — there is no real file path to record.
     if (suiteMode !== 'reuse') {
       try {
         for (const item of planForGeneration.items) {
-          store.seedPlanKbItem({
+          const kbItemId = store.seedPlanKbItem({
             runId,
             planItemId: item.id,
             title: item.title,
@@ -1725,6 +1784,18 @@ async function runPipeline(
             tier: item.tier,
             scenarios: item.scenarios.map((s, i) => ({ index: i, kind: s.kind, description: s.description })),
           });
+          const filePath = item.unitKey
+            ? sourceContext?.units.find((u) => u.key === item.unitKey)?.file
+            : undefined;
+          if (filePath) store.recordKbTestScript({ kbItemId, runId, filePath });
+          // KB foundation: dedup this item's reqTag into a canonical requirement
+          // row and link the item to it — see
+          // docs/design/kb-foundation-evidence-persistence.md. A reqTag-less
+          // item simply gets no requirement link.
+          if (item.reqTag) {
+            const requirementId = store.seedRequirement(runId, item.reqTag, item.intent ?? item.title);
+            store.setPlanKbItemRequirement(kbItemId, requirementId);
+          }
         }
         noteStoreOk();
       } catch (err) {
@@ -1989,6 +2060,14 @@ async function runPipeline(
           noteStoreOk();
         } catch (err) {
           noteStoreFailure('updatePlanKbItemStatus', err);
+        }
+      },
+      onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+        try {
+          store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('insertEscapeHatchGap', err);
         }
       },
       // Long mode phases (generate/execute) receive the run's abort signal so
@@ -2273,6 +2352,36 @@ async function runPipeline(
               'warn',
               `Detected auth librar${detectedLibraries.size === 1 ? 'y' : 'ies'} (${[...detectedLibraries].join(', ')}) in source, but no login form was found during exploration — this app may use non-form/token-based auth that EXPLORE cannot currently detect.`,
             );
+          }
+
+          // KB foundation: durable per-route exploration index (summary, not
+          // the full raw crawl — exploration-cache.json's file cache stays
+          // the source of truth for that, unchanged). Written here so it
+          // covers BOTH the cache-hit and fresh-crawl paths, plus any
+          // gap-fill routes merged in above — ctx.exploration is the final
+          // artifact regardless of which path got here. See
+          // docs/design/kb-foundation-evidence-persistence.md.
+          try {
+            for (const route of ctx.exploration?.crawl.routes ?? []) {
+              store.insertExplorationSummary({
+                runId,
+                route: route.stateKey ?? route.url,
+                selectorsJson:
+                  route.snapshot.interactiveElements.length > 0
+                    ? JSON.stringify(route.snapshot.interactiveElements)
+                    : null,
+                // Reserved: EXPLORE's DomSnapshot has no distinct per-route
+                // form-grouping structure today (only a flat interactive-
+                // element list), so there is nothing real to write here yet.
+                formsJson: null,
+                authPattern: route.hasPasswordField ? 'password-form' : null,
+                // Reserved: no per-route probe-budget tracking exists today.
+                stateProbeCount: null,
+              });
+            }
+            noteStoreOk();
+          } catch (err) {
+            noteStoreFailure('insertExplorationSummary', err);
           }
         } catch (err) {
           emit('explore', 'warn', `Exploration failed (continuing): ${errMsg(err)}`, {
@@ -2914,6 +3023,11 @@ async function runPipeline(
             // assertion happened to print.
             const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
             const apiEvidence = execOutcome.apiEvidence?.[apiEvidenceKey];
+            // Same key/rationale as apiEvidence above — see execute.ts's
+            // readMockPassthroughLog() and ExecOutcome.mockPassthrough (Cluster F): real
+            // evidence that this test's own request fell through the generated mock fixture
+            // unintercepted, the likely cause of an otherwise-unexplained bare timeout.
+            const mockPassthroughEvidence = execOutcome.mockPassthrough?.[apiEvidenceKey];
             // Recover the plan item this spec was generated from, to find the source-context unit
             // (if any) it was grounded on during GENERATE — read lazily, only for AI-enriched
             // candidates below, since most failures never reach that stage.
@@ -2930,6 +3044,7 @@ async function runPipeline(
               ...(spec?.contents ? { specSource: spec.contents } : {}),
               ...(tracePath ? { tracePath } : {}),
               ...(apiEvidence ? { apiEvidence } : {}),
+              ...(mockPassthroughEvidence ? { mockPassthroughEvidence } : {}),
               ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
             };
             let triage: ReportTriageEntry['triage'] | null = null;
@@ -3570,7 +3685,22 @@ export async function runPlanPhase(
       recordUsage,
       'initial',
     );
-    if (result.plan) return { ...result.plan, planSource: 'ai' };
+    if (result.plan) {
+      const correctedItems = applyAuthGuardTierOverrides(
+        result.plan.items,
+        units,
+        opts.testingScope ?? 'both',
+      );
+      const overrideCount = correctedItems.filter((it) => it.tierOverride).length;
+      if (overrideCount > 0) {
+        emit(
+          'plan',
+          'info',
+          `Corrected ${overrideCount} item(s) to tierB-auth based on detected route guards.`,
+        );
+      }
+      return { ...result.plan, items: correctedItems, planSource: 'ai' };
+    }
     emit('plan', 'warn', `Synthesizing fallback plan (reason: ${result.reason}).`);
     return {
       ...synthesizePlan(project, opts.testingScope ?? 'both'),
@@ -3692,9 +3822,15 @@ export async function runPlanPhase(
     };
   }
 
+  const correctedItems = applyAuthGuardTierOverrides(items, units, opts.testingScope ?? 'both');
+  const overrideCount = correctedItems.filter((it) => it.tierOverride).length;
+  if (overrideCount > 0) {
+    emit('plan', 'info', `Corrected ${overrideCount} item(s) to tierB-auth based on detected route guards.`);
+  }
+
   return {
     summary: `Planned ${items.length} item(s) across ${batches.length} batch(es) covering ${units.length} detected unit(s).`,
-    items,
+    items: correctedItems,
     planSource: 'ai',
     ...(failedBatches.length > 0
       ? {
@@ -3902,6 +4038,34 @@ function persistResults(
 ): void {
   const scenarioIndexByKey = new Map<string, number>();
 
+  // KB foundation: test_mock_usage / mock_responses.observed_*. Built once, up front, rather
+  // than re-querying per result — maps the EXACT (dependency, method, pathPattern) tuple each
+  // mock_responses row was seeded with (see upsertMockResponse) to that row's real id, using
+  // the SAME tuple-keying scheme execute.ts's readMockRequestCountsByTest/
+  // readObservedMockResponses use for the hits/observed responses they report. This resolves
+  // the precise row a hit belongs to even when a dependency has multiple endpoint-level rows
+  // — no attribution is lost to a coarse "only when exactly one row" fallback.
+  const mockResponseIdByTuple = new Map<string, string>();
+  for (const m of store.listMockResponses(runId)) {
+    mockResponseIdByTuple.set(mockResponseTupleKey(m.dependencyId, m.method, m.pathPattern), m.id);
+  }
+
+  // KB foundation: mock_responses.observed_* — dependency-level (not per-test), so this
+  // runs once per (dependency, method, pathPattern) tuple rather than once per result.
+  for (const observed of outcome.observedMockResponses ?? []) {
+    const mockResponseId = mockResponseIdByTuple.get(
+      mockResponseTupleKey(observed.dependencyId, observed.method, observed.pathPattern),
+    );
+    if (mockResponseId) {
+      try {
+        store.recordObservedMockResponse(mockResponseId, observed);
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('recordObservedMockResponse', err);
+      }
+    }
+  }
+
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
     // to carry the "[REQ:<tag>]" marker on EVERY scenario test (see generate.ts's
@@ -3981,11 +4145,42 @@ function persistResults(
       }
     }
 
+    // Shared by both try blocks below (evidence_json AND test_mock_usage) — same identity
+    // apiEvidence/execute.ts's own dedup keyOf() use.
+    const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
+
     try {
       // Copy the parent test row's description/details onto its result — results
       // have no independent source for this content, so it just mirrors the
       // TestCase registered for it in GENERATE.
       const parentTest = store.getTest(testId);
+      // KB foundation: structured execution evidence (results.evidence_json)
+      // — classify this result's own artifacts by extension (same
+      // trace.zip heuristic used for kb_execution_artifacts just below,
+      // plus .webm/.mp4 → video, remainder → screenshots), and merge in
+      // this test's own apiEvidence/mockPassthrough slices (per-test, keyed
+      // by `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
+      // comment) alongside the run-level mockedRequestCounts aggregate (NOT
+      // test-specific — see ResultEvidence.mockedRequestCounts's own doc
+      // comment).
+      const artifacts = r.artifacts ?? [];
+      const traceArtifact = artifacts.find((a) => /trace\.zip$/i.test(a));
+      const videoArtifact = artifacts.find((a) => /\.(webm|mp4)$/i.test(a));
+      const screenshotArtifacts = artifacts.filter((a) => a !== traceArtifact && a !== videoArtifact);
+      const evidence: ResultEvidence = {
+        ...(traceArtifact ? { tracePath: traceArtifact } : {}),
+        ...(videoArtifact ? { videoPath: videoArtifact } : {}),
+        ...(screenshotArtifacts.length > 0 ? { screenshotPaths: screenshotArtifacts } : {}),
+        ...(outcome.mockedRequestCounts && Object.keys(outcome.mockedRequestCounts).length > 0
+          ? { mockedRequestCounts: outcome.mockedRequestCounts }
+          : {}),
+        ...(outcome.apiEvidence?.[apiEvidenceKey]
+          ? { apiEvidence: outcome.apiEvidence[apiEvidenceKey] }
+          : {}),
+        ...(outcome.mockPassthrough?.[apiEvidenceKey]
+          ? { mockPassthrough: outcome.mockPassthrough[apiEvidenceKey] }
+          : {}),
+      };
       store.insertResult({
         testId,
         status: r.status as TestStatus,
@@ -3997,11 +4192,32 @@ function persistResults(
         stepsJson: r.steps && r.steps.length > 0 ? JSON.stringify(r.steps) : null,
         skipReason: r.skipReason ?? null,
         videoUnavailableReason: r.videoUnavailableReason ?? null,
+        evidenceJson: Object.keys(evidence).length > 0 ? JSON.stringify(evidence) : null,
       });
       noteStoreOk();
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
+    }
+    const mockUsage = outcome.mockedRequestCountsByTest?.[apiEvidenceKey];
+    if (mockUsage) {
+      // One try/catch PER tally, matching the sibling observedMockResponses loop above —
+      // sharing a single try/catch across every tuple meant one recordMockUsage failure (e.g.
+      // a constraint violation) silently aborted every LATER tuple for this test too, while
+      // noteStoreFailure only ever recorded the one exception that stopped the loop, masking
+      // how many rows actually never got written.
+      for (const tally of mockUsage) {
+        const mockResponseId = mockResponseIdByTuple.get(
+          mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern),
+        );
+        if (!mockResponseId) continue;
+        try {
+          store.recordMockUsage(testId, mockResponseId, tally.count);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('recordMockUsage', err);
+        }
+      }
     }
     try {
       // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
@@ -4023,6 +4239,25 @@ function persistResults(
       noteStoreOk();
     } catch (err) {
       noteStoreFailure('updatePlanKbScenarioStatusByTestId', err);
+    }
+    try {
+      // Same by-test_id join/no-op semantics as updatePlanKbScenarioStatusByTestId.
+      // error_message/trace_path are only ever populated for a failed/blocked
+      // result — anything else (passed/flaky/skipped/pending) gets null for
+      // both, even though a trace.zip artifact may technically exist for a
+      // passing test too (this suite's own playwright.config always records
+      // trace: 'on') — the KB's own error/trace fields are meant to answer
+      // "why did this fail", not "does a trace exist".
+      const isFailure = r.status === 'failed' || r.status === 'blocked';
+      const tracePath = (r.artifacts ?? []).find((a) => /trace\.zip$/i.test(a)) ?? null;
+      store.updateKbExecutionArtifacts(testId, {
+        errorMessage: isFailure ? (r.error ?? null) : null,
+        tracePath: isFailure ? tracePath : null,
+        executionSteps: r.steps && r.steps.length > 0 ? JSON.stringify(r.steps) : null,
+      });
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('updateKbExecutionArtifacts', err);
     }
   }
 }

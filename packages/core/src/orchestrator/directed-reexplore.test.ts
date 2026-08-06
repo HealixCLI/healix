@@ -285,6 +285,8 @@ describe('resolveGapTargets — also catches WARN-level ungrounded references (a
       hasEndpointLevelMocks: false,
       inventoryTruncated: false,
       attributes: new Map(),
+      modalText: '',
+      underlyingPageText: '',
       ...overrides,
     };
   }

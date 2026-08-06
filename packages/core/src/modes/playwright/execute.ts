@@ -13,11 +13,13 @@ import type {
   TestingScope,
   TestModeContext,
 } from '../types.js';
-import { tiersForScope, UNEXPLAINED_MISSING_VIDEO_REASON } from '../types.js';
+import { mockResponseTupleKey, tiersForScope, UNEXPLAINED_MISSING_VIDEO_REASON } from '../types.js';
+import type { MockHitTally, MockHitTuple } from '../types.js';
 import {
   API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
   EXEC_CHECKPOINT_INVERT_FILENAME,
+  MOCK_PASSTHROUGH_LOG_FILENAME,
   MOCK_REQUEST_LOG_FILENAME,
 } from './templates.js';
 
@@ -894,6 +896,129 @@ export async function readMockRequestCounts(projectDir: string): Promise<Record<
   return counts;
 }
 
+// MockHitTuple/mockResponseTupleKey/MockHitTally live in modes/types.ts (imported above) --
+// shared with coverage.ts's mergeExecOutcomes and orchestrator/index.ts, neither of which
+// should import from this Playwright-specific file for a plain string-keying helper.
+
+/**
+ * Same write-through log as readMockRequestCounts, but grouped by the test-identity `key`
+ * (`${specFile}#${title}`, same identity as readApiEvidence/this file's own checkpoint
+ * keyOf()) each log line now also carries (see templates.ts's logMockHit), and tallied per
+ * EXACT (dependency, method, pathPattern) tuple rather than just dependency id — the KB's
+ * test_mock_usage table needs to resolve the specific mock_responses row a hit belongs to,
+ * not just its dependency. Additive: does not change readMockRequestCounts' own behavior or
+ * return shape at all. A hit with no resolvable dependency id ('override', from a call
+ * matchAnyRoute couldn't attribute at all) is omitted — there's no row to attribute it to,
+ * same treatment readObservedMockResponses gives it. Tolerates OLDER log lines with no `key`
+ * field (an in-flight run resumed across this change) by simply omitting them — they still
+ * count toward the existing run-level aggregate above, so no data is lost, only the newer
+ * per-test attribution is unavailable for that one line.
+ */
+export async function readMockRequestCountsByTest(
+  projectDir: string,
+): Promise<Record<string, MockHitTally[]>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_REQUEST_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const byKey: Record<string, Map<string, MockHitTally>> = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as {
+        key?: unknown;
+        id?: unknown;
+        method?: unknown;
+        pathPattern?: unknown;
+      };
+      if (typeof entry.key !== 'string' || !entry.key) continue;
+      const dependencyId = typeof entry.id === 'string' && entry.id ? entry.id : null;
+      if (!dependencyId || dependencyId === 'override') continue;
+      const method = typeof entry.method === 'string' ? entry.method : null;
+      const pathPattern = typeof entry.pathPattern === 'string' ? entry.pathPattern : null;
+      const tupleKey = mockResponseTupleKey(dependencyId, method, pathPattern);
+      const perTest = byKey[entry.key] ?? new Map<string, MockHitTally>();
+      const existing = perTest.get(tupleKey);
+      if (existing) existing.count += 1;
+      else perTest.set(tupleKey, { dependencyId, method, pathPattern, count: 1 });
+      byKey[entry.key] = perTest;
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  const out: Record<string, MockHitTally[]> = {};
+  for (const [key, tallies] of Object.entries(byKey)) out[key] = [...tallies.values()];
+  return out;
+}
+
+export interface ObservedMockResponse extends MockHitTuple {
+  status: number;
+  bodyJson: string | null;
+  headersJson: string | null;
+}
+
+/**
+ * Same write-through hit log as readMockRequestCounts/readMockRequestCountsByTest, but
+ * folded down to each (dependency, method, pathPattern) tuple's LAST actually-served response
+ * (status/body, from templates.ts's logMockHit, which now logs the response post-
+ * serializeBody() — i.e. what really shipped for that hit, not the originally-generated
+ * mock_status/mock_body_json, which can differ per-call via a per-test mockOverride()). Feeds
+ * mock_responses.observed_* (see storage/schema.ts), resolved to the EXACT row via the same
+ * tuple identity, not just the dependency. "Observed" here deliberately means "proven to have
+ * actually been served during this run" — NOT a comparison against a genuinely different real
+ * backend; tests run fully offline against this same fixture, so there is no live upstream to
+ * compare against (see this table's own schema comment). "Last" (not first) so a later
+ * mockOverride() mid-run reflects what a subsequent reader would actually see if they re-ran
+ * the same call. An entry with no dependency id (an unattributed 'override'-only hit) or no
+ * logged status (an older log line from before this field existed) is simply omitted — same
+ * best-effort contract as readMockRequestCounts.
+ */
+export async function readObservedMockResponses(projectDir: string): Promise<ObservedMockResponse[]> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_REQUEST_LOG_FILENAME), 'utf-8');
+  } catch {
+    return [];
+  }
+  const byTuple = new Map<string, ObservedMockResponse>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as {
+        id?: unknown;
+        method?: unknown;
+        pathPattern?: unknown;
+        status?: unknown;
+        contentType?: unknown;
+        body?: unknown;
+      };
+      const dependencyId =
+        typeof entry.id === 'string' && entry.id && entry.id !== 'override' ? entry.id : null;
+      if (!dependencyId || typeof entry.status !== 'number') continue;
+      const method = typeof entry.method === 'string' ? entry.method : null;
+      const pathPattern = typeof entry.pathPattern === 'string' ? entry.pathPattern : null;
+      byTuple.set(mockResponseTupleKey(dependencyId, method, pathPattern), {
+        dependencyId,
+        method,
+        pathPattern,
+        status: entry.status,
+        bodyJson: typeof entry.body === 'string' ? entry.body : null,
+        headersJson:
+          typeof entry.contentType === 'string'
+            ? JSON.stringify({ 'content-type': entry.contentType })
+            : null,
+      });
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  return [...byTuple.values()];
+}
+
 interface ApiEvidenceLogEntry {
   key: string;
   method: string;
@@ -960,6 +1085,64 @@ export async function readApiEvidence(projectDir: string): Promise<Record<string
   return out;
 }
 
+interface MockPassthroughLogEntry {
+  key: string;
+  method: string;
+  url: string;
+  at: string;
+}
+
+/** How many of a test's own unintercepted passthrough calls get folded into its evidence
+ * string — same bound/rationale as API_EVIDENCE_MAX_CALLS_PER_TEST. */
+const MOCK_PASSTHROUGH_MAX_CALLS_PER_TEST = 3;
+
+/**
+ * Best-effort read of the mock fixture's write-through passthrough log (see
+ * MOCK_PASSTHROUGH_LOG_FILENAME's doc comment in templates.ts) — groups entries by key
+ * (`${specFile}#${title}`, same identity as readApiEvidence/this file's own checkpoint
+ * keyOf()) and formats the LAST few unintercepted calls per key into a compact,
+ * prompt-ready string. This is the concrete evidence that lets triage tell "this test's own
+ * request fell through the mock fixture and hit the real, unreachable backend" apart from "the
+ * app is just slow" for an otherwise-unexplained bare timeout. A missing file (no fixture-level
+ * mocking enabled, or nothing ever fell through) just means "no evidence" (`{}`), same
+ * best-effort contract as readApiEvidence/readMockRequestCounts.
+ */
+export async function readMockPassthroughLog(projectDir: string): Promise<Record<string, string>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_PASSTHROUGH_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const byKey = new Map<string, MockPassthroughLogEntry[]>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as Partial<MockPassthroughLogEntry>;
+      if (typeof entry.key !== 'string' || !entry.key) continue;
+      const list = byKey.get(entry.key) ?? [];
+      list.push({
+        key: entry.key,
+        method: typeof entry.method === 'string' && entry.method ? entry.method : 'GET',
+        url: typeof entry.url === 'string' ? entry.url : '',
+        at: typeof entry.at === 'string' ? entry.at : '',
+      });
+      byKey.set(entry.key, list);
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  const out: Record<string, string> = {};
+  for (const [key, entries] of byKey) {
+    out[key] = entries
+      .slice(-MOCK_PASSTHROUGH_MAX_CALLS_PER_TEST)
+      .map((e) => `${e.method} ${e.url} — fell through the mock fixture unintercepted (${e.at})`)
+      .join('\n');
+  }
+  return out;
+}
+
 /** Best-effort read of the write-through checkpoint; a missing/corrupt file just means "nothing finished yet". */
 export async function readCheckpointEntries(projectDir: string): Promise<CheckpointEntry[]> {
   let raw: string;
@@ -1017,6 +1200,9 @@ export async function clearExecCheckpoint(projectDir: string): Promise<void> {
     // readApiEvidence has already run for THIS invocation) so a later,
     // unrelated execute() call reusing this projectDir starts fresh.
     unlink(join(projectDir, API_EVIDENCE_LOG_FILENAME)).catch(() => {}),
+    // Same rationale again: cleared here (after readMockPassthroughLog has already run for
+    // THIS invocation) so a later, unrelated execute() call reusing this projectDir starts fresh.
+    unlink(join(projectDir, MOCK_PASSTHROUGH_LOG_FILENAME)).catch(() => {}),
   ]);
 }
 
@@ -1577,10 +1763,18 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // of results.json/steps.json — present regardless of whether the report
   // parsed, since the fixture logs a hit the moment it fulfills a request.
   const mockedRequestCounts = await readMockRequestCounts(ctx.projectDir);
+  // Same log, broken out per test — feeds test_mock_usage (KB foundation).
+  const mockedRequestCountsByTest = await readMockRequestCountsByTest(ctx.projectDir);
+  // Same log again, folded to each dependency's last actually-served response — feeds
+  // mock_responses.observed_* (KB foundation).
+  const observedMockResponses = await readObservedMockResponses(ctx.projectDir);
   // Same rationale as mockedRequestCounts above: present regardless of
   // whether results.json parsed, since the request fixture logs a call the
   // moment it resolves.
   const apiEvidence = await readApiEvidence(ctx.projectDir);
+  // Same rationale again: present regardless of whether results.json parsed, since the
+  // page.route() handler logs a passthrough the moment it decides not to intercept.
+  const mockPassthrough = await readMockPassthroughLog(ctx.projectDir);
 
   const outcome: ExecOutcome = {
     passed: parsed.passed,
@@ -1590,7 +1784,10 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     skipped: parsed.skipped,
     results: parsed.results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
+    ...(Object.keys(mockedRequestCountsByTest).length > 0 ? { mockedRequestCountsByTest } : {}),
+    ...(Object.keys(observedMockResponses).length > 0 ? { observedMockResponses } : {}),
     ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
+    ...(Object.keys(mockPassthrough).length > 0 ? { mockPassthrough } : {}),
     raw: {
       exitCode: cmd.code,
       signal: cmd.signal,

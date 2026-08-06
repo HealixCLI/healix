@@ -37,6 +37,20 @@ export interface CrawledRoute {
    * distinguished from one that's just thin. Optional so existing hand-built
    * fixtures (tests) default to "not crashed" rather than requiring the field. */
   crashed?: boolean;
+  /** True when this state's DOM contains a visible, unfilled OTP/verification-code-shaped input
+   * (see OTP_HINT_RE) — a further step exists here that Healix deliberately never advances past,
+   * since a real code can't be observed or synthesized. Set independent of whether
+   * `fillSafeInputs` actually ran against this exact snapshot, so a state reached at the crawl's
+   * max recursion depth (where `fillSafeInputs` never runs to look one hop further — see
+   * MAX_STATE_DEPTH) still correctly reports the gate (see Cluster C). */
+  otpGateReached?: boolean;
+  /** Accessible names of visible, enabled controls on this state whose wording reads as a
+   * destructive/irreversible action (see DESTRUCTIVE_ACTION_TEXT_RE) — e.g. "Delete account",
+   * "Pay now". These are already never clicked by `extractClickCandidates`'s existing
+   * UNSAFE_CLICK_TEXT_RE filter; this field just makes that "saw it, deliberately skipped it"
+   * fact visible to GENERATE instead of silently discarding it (see Cluster C). Absent/empty when
+   * none were observed. */
+  destructiveActionsSeen?: string[];
   /** Diagnostic-only provenance: the region/locale code (or other seed label) this route was
    * reached through, when it came from a derived/config-driven seed rather than ordinary link
    * discovery from the primary crawl — see `browser/seed-discovery.ts`. Never used for
@@ -360,6 +374,42 @@ export const STATE_REVEAL_MIN_NEW_INPUTS = 1;
 const OTP_HINT_RE = /otp|verification.?code|one.?time|\b2fa\b|\bmfa\b/i;
 
 /**
+ * Wording that reads as a destructive/irreversible action against a real app/account — a
+ * deliberately NARROW subset of UNSAFE_CLICK_TEXT_RE's wording (see Cluster C, discussed with the
+ * user): only actions genuinely unsafe to actually execute (delete an account, make a payment),
+ * not merely mutating/reversible ones (logout/save/submit/cancel), which remain normal, valuable
+ * things for a generated test to click. A separate, narrower regex rather than reusing
+ * UNSAFE_CLICK_TEXT_RE directly, since that one's broader scope exists for a different purpose
+ * (click-probing safety during EXPLORE) and mixing the two would over-flag safe actions as
+ * manual-only.
+ */
+export const DESTRUCTIVE_ACTION_TEXT_RE = /delete|remove|checkout|\bpay\b|purchase/i;
+
+/** True when this snapshot contains a visible, unfilled OTP/verification-code-shaped input (see
+ * OTP_HINT_RE) — independent of whether fillSafeInputs actually ran against this exact snapshot. */
+function hasOtpGate(snapshot: DomSnapshot): boolean {
+  return snapshot.interactiveElements.some(
+    (el) =>
+      el.role === 'textbox' &&
+      !el.disabled &&
+      el.inputType !== 'password' &&
+      el.inputType !== 'file' &&
+      (OTP_HINT_RE.test(el.name) || OTP_HINT_RE.test(el.selector)),
+  );
+}
+
+/** Accessible names of visible, enabled destructive-action-shaped controls on this snapshot (see
+ * DESTRUCTIVE_ACTION_TEXT_RE) — the same candidate shape `extractClickCandidates` considers, but
+ * recorded rather than silently dropped, since these are exactly the ones it never clicks. */
+function destructiveActionsSeen(snapshot: DomSnapshot): string[] {
+  return snapshot.interactiveElements
+    .filter((el) => el.role === 'button' || el.role === 'generic' || el.role === 'link')
+    .filter((el) => !el.disabled)
+    .filter((el) => DESTRUCTIVE_ACTION_TEXT_RE.test(el.name))
+    .map((el) => el.name);
+}
+
+/**
  * A `role: 'generic'` candidate's accessible name longer than this is almost certainly a
  * pointer-styled CONTAINER whose `textContent` swept up a whole panel/card, not a real click
  * target (a genuine non-semantic control is a short label — "Zmeniť heslo", "Export", "Môj účet").
@@ -594,6 +644,7 @@ async function discoverClickRoutes(
           revealedInputFields(snapshot, after) >= STATE_REVEAL_MIN_NEW_INPUTS)
       ) {
         const stateKey = `${deepProbe.stateKeyPrefix}>>${candidate.selector}`;
+        const destructiveNames = destructiveActionsSeen(after);
         const stateFingerprint = `${routePathSegment(originalUrl)}::${fingerprintOf(after)}`;
         const priorOccurrences = deepProbe.stateFingerprints.get(stateFingerprint) ?? 0;
         deepProbe.stateFingerprints.set(stateFingerprint, priorOccurrences + 1);
@@ -609,6 +660,8 @@ async function discoverClickRoutes(
           role: 'anonymous',
           networkEvents: [],
           crashed: looksCrashed(after),
+          otpGateReached: hasOtpGate(after),
+          ...(destructiveNames.length > 0 ? { destructiveActionsSeen: destructiveNames } : {}),
         });
         discoveredUrls.push(...extractLinks(after, origin));
 
@@ -1005,6 +1058,7 @@ export async function crawl(
     const fpCount = (fingerprintCounts.get(fingerprint) ?? 0) + 1;
     fingerprintCounts.set(fingerprint, fpCount);
 
+    const destructiveNames = destructiveActionsSeen(snapshot);
     routes.push({
       url: resolvedUrl,
       title: snapshot.title,
@@ -1014,6 +1068,8 @@ export async function crawl(
       role: 'anonymous',
       networkEvents,
       crashed: looksCrashed(snapshot),
+      otpGateReached: hasOtpGate(snapshot),
+      ...(destructiveNames.length > 0 ? { destructiveActionsSeen: destructiveNames } : {}),
     });
 
     // A fingerprint that keeps repeating is a shell page rendering nothing

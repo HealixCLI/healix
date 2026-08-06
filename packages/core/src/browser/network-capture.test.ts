@@ -111,6 +111,22 @@ describe('collectObservedEndpoints()', () => {
     expect(collectObservedEndpoints(crawlResult([route([])]))).toEqual([]);
   });
 
+  it('carries the captured content-type through onto the observed endpoint (GAP-063 follow-up)', () => {
+    const events: CapturedNetworkEvent[] = [
+      {
+        method: 'GET',
+        url: 'https://a.test/api/coupons',
+        status: 200,
+        responseBody: '{"entity":[]}',
+        contentType: 'application/json; charset=utf-8',
+      },
+    ];
+
+    const result = collectObservedEndpoints(crawlResult([route(events)]));
+
+    expect(result[0]?.contentType).toBe('application/json; charset=utf-8');
+  });
+
   it("records each observed endpoint's real hostname, distinguishing calls to different dependencies", () => {
     const events: CapturedNetworkEvent[] = [
       { method: 'GET', url: 'https://api.one.test/customer/coupons', status: 200 },

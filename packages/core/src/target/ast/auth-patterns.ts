@@ -25,8 +25,10 @@ const AUTH_LIBRARY_MATCHERS: Array<{ label: string; test: (spec: string) => bool
   { label: 'cognito', test: (s) => s === 'aws-amplify' || s === 'amazon-cognito-identity-js' },
 ];
 
-/** JSX element names commonly used to wrap an auth-gated route/subtree. */
-const ROUTE_GUARD_NAME_RE = /^(ProtectedRoute|PrivateRoute|RequireAuth|AuthGuard|AuthenticatedRoute)$/;
+/** JSX element names commonly used to wrap an auth-gated route/subtree. Exported so
+ * target/ast/routes.ts can correlate a route's ancestor chain against the same
+ * recognized-guard list instead of duplicating/drifting it (see Cluster C, GAP-tier-guard). */
+export const ROUTE_GUARD_NAME_RE = /^(ProtectedRoute|PrivateRoute|RequireAuth|AuthGuard|AuthenticatedRoute)$/;
 
 function libraryFor(spec: string): string | null {
   return AUTH_LIBRARY_MATCHERS.find((m) => m.test(spec))?.label ?? null;

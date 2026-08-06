@@ -30,6 +30,10 @@ export interface FunctionalityUnit {
   observedStatusCodes?: number[];
   /** Distinct thrown-error messages from this unit's handler body — same deep-dive-only provenance as observedStatusCodes. */
   thrownErrorMessages?: string[];
+  /** Name of a detected route-guard wrapper component (ROUTE_GUARD_NAME_RE) gating this route or
+   * an ancestor in its nesting chain — only ever set by target/ast/routes.ts's React Router
+   * extractors (see Cluster C). Undefined for every other extractor/kind. */
+  authGuardName?: string;
 }
 
 export interface FunctionalityIndex {

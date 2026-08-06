@@ -193,6 +193,134 @@ describe('mergeExecOutcomes', () => {
     expect(merged.mockedRequestCounts).toBeUndefined();
   });
 
+  it("sums mockedRequestCountsByTest per test THEN per EXACT (dependency, method, pathPattern) tuple, so a re-executed test's later hits add to its earlier ones instead of replacing them (test_mock_usage)", () => {
+    const a: ExecOutcome = {
+      ...outcome([]),
+      mockedRequestCountsByTest: {
+        'f#shared': [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 2 }],
+        'f#a-only': [{ dependencyId: 'pkg:stripe', method: null, pathPattern: null, count: 1 }],
+      },
+    };
+    const b: ExecOutcome = {
+      ...outcome([]),
+      mockedRequestCountsByTest: {
+        'f#shared': [
+          { dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 1 },
+          { dependencyId: 'pkg:stripe', method: null, pathPattern: null, count: 3 },
+        ],
+        'f#b-only': [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 5 }],
+      },
+    };
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.mockedRequestCountsByTest?.['f#shared']).toEqual(
+      expect.arrayContaining([
+        { dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 3 },
+        { dependencyId: 'pkg:stripe', method: null, pathPattern: null, count: 3 },
+      ]),
+    );
+    expect(merged.mockedRequestCountsByTest?.['f#a-only']).toEqual([
+      { dependencyId: 'pkg:stripe', method: null, pathPattern: null, count: 1 },
+    ]);
+    expect(merged.mockedRequestCountsByTest?.['f#b-only']).toEqual([
+      { dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 5 },
+    ]);
+  });
+
+  it('keeps two DIFFERENT endpoints under the SAME dependency as separate tallies, not merged into one count (the exact gap the tuple redesign closes)', () => {
+    const a: ExecOutcome = {
+      ...outcome([]),
+      mockedRequestCountsByTest: {
+        'f#t': [
+          { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 2 },
+          { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 1 },
+        ],
+      },
+    };
+
+    const merged = mergeExecOutcomes(a, outcome([]));
+
+    expect(merged.mockedRequestCountsByTest?.['f#t']).toEqual(
+      expect.arrayContaining([
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 2 },
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 1 },
+      ]),
+    );
+    expect(merged.mockedRequestCountsByTest?.['f#t']).toHaveLength(2);
+  });
+
+  it('omits mockedRequestCountsByTest entirely when neither side has any (no empty-object noise)', () => {
+    const merged = mergeExecOutcomes(outcome([]), outcome([]));
+    expect(merged.mockedRequestCountsByTest).toBeUndefined();
+  });
+
+  it("unions observedMockResponses across a merge, keyed by the EXACT (dependency, method, pathPattern) tuple, with b (the later iteration's) response winning a tuple collision", () => {
+    const a: ExecOutcome = {
+      ...outcome([]),
+      observedMockResponses: [
+        {
+          dependencyId: 'pkg:twilio',
+          method: null,
+          pathPattern: null,
+          status: 200,
+          bodyJson: 'stale',
+          headersJson: null,
+        },
+        {
+          dependencyId: 'pkg:stripe',
+          method: 'POST',
+          pathPattern: '/v1/charges',
+          status: 200,
+          bodyJson: 'a-only',
+          headersJson: null,
+        },
+      ],
+    };
+    const b: ExecOutcome = {
+      ...outcome([]),
+      observedMockResponses: [
+        {
+          dependencyId: 'pkg:twilio',
+          method: null,
+          pathPattern: null,
+          status: 500,
+          bodyJson: 'fresh',
+          headersJson: null,
+        },
+      ],
+    };
+
+    const merged = mergeExecOutcomes(a, b);
+
+    expect(merged.observedMockResponses).toEqual(
+      expect.arrayContaining([
+        {
+          dependencyId: 'pkg:twilio',
+          method: null,
+          pathPattern: null,
+          status: 500,
+          bodyJson: 'fresh',
+          headersJson: null,
+        },
+        {
+          dependencyId: 'pkg:stripe',
+          method: 'POST',
+          pathPattern: '/v1/charges',
+          status: 200,
+          bodyJson: 'a-only',
+          headersJson: null,
+        },
+      ]),
+    );
+    expect(merged.observedMockResponses).toHaveLength(2);
+  });
+
+  it('omits observedMockResponses entirely when neither side has any (no empty-array noise)', () => {
+    const merged = mergeExecOutcomes(outcome([]), outcome([]));
+    expect(merged.observedMockResponses).toBeUndefined();
+  });
+
   it('unions apiEvidence across a merge, with b (the later iteration) winning a key collision', () => {
     const a: ExecOutcome = {
       ...outcome([]),

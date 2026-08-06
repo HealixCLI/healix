@@ -4,6 +4,7 @@ import { tiersForScope } from '../modes/types.js';
 import type { TestPlanItem } from '../modes/types.js';
 import type { CompleteOptions, ProviderAdapter } from '../providers/types.js';
 import {
+  applyAuthGuardTierOverrides,
   buildBatchPlanPrompt,
   buildGapFillPlanPrompt,
   buildPlanPrompt,
@@ -629,6 +630,118 @@ describe('buildPlanPrompt (repo context)', () => {
     );
 
     expect(prompt).not.toContain('RULE for tierC-api items');
+  });
+
+  it('annotates a unit carrying a detected route-guard, and adds the tierB-auth guidance line', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      {
+        key: 'route:/dashboard/unsubscribepage',
+        kind: 'route',
+        label: 'route: /dashboard/unsubscribepage',
+        file: 'src/routes/AppRoutes.tsx',
+        authGuardName: 'ProtectedRoute',
+      },
+      { key: 'route:/login', kind: 'route', label: 'route: /login', file: 'src/routes/AppRoutes.tsx' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id, testingScope: 'both' },
+      { summary: 'Framework: react.', files: [], functionality: units },
+    );
+
+    expect(prompt).toContain(
+      '[route] route: /dashboard/unsubscribepage (unitKey: "route:/dashboard/unsubscribepage") [route-guard detected: ProtectedRoute — MUST be tierB-auth]',
+    );
+    expect(prompt).toContain('[route] route: /login (unitKey: "route:/login")\n');
+    expect(prompt).toContain('MUST be planned as tierB-auth, never');
+  });
+
+  it('omits the route-guard guidance line when no unit carries a detected guard', () => {
+    const project = makeProject({ repoPath: '/repo/demo', baseUrl: null });
+    const units: FunctionalityUnit[] = [
+      { key: 'route:/login', kind: 'route', label: 'route: /login', file: 'src/routes/AppRoutes.tsx' },
+    ];
+    const prompt = buildPlanPrompt(
+      project,
+      { projectId: project.id, testingScope: 'both' },
+      { summary: 'Framework: react.', files: [], functionality: units },
+    );
+    expect(prompt).not.toContain('route-guard detected');
+    expect(prompt).not.toContain('MUST be planned as tierB-auth');
+  });
+});
+
+describe('applyAuthGuardTierOverrides (Cluster C)', () => {
+  const guardedUnit: FunctionalityUnit = {
+    key: 'route:/dashboard/unsubscribepage',
+    kind: 'route',
+    label: 'route: /dashboard/unsubscribepage',
+    file: 'src/routes/AppRoutes.tsx',
+    authGuardName: 'ProtectedRoute',
+  };
+  const unguardedUnit: FunctionalityUnit = {
+    key: 'route:/login',
+    kind: 'route',
+    label: 'route: /login',
+    file: 'src/routes/AppRoutes.tsx',
+  };
+
+  function makeItem(overrides: Partial<TestPlanItem> = {}): TestPlanItem {
+    return {
+      id: 'pli_test',
+      title: 'Test item',
+      tier: 'tierA-public',
+      intent: 'test',
+      scenarios: [{ kind: 'positive', description: 'test' }],
+      ...overrides,
+    };
+  }
+
+  it('corrects a wrongly-tiered item whose unit is guarded, recording tierOverride', () => {
+    const item = makeItem({ tier: 'tierA-public', unitKey: guardedUnit.key });
+    const [corrected] = applyAuthGuardTierOverrides([item], [guardedUnit], 'both');
+    expect(corrected!.tier).toBe('tierB-auth');
+    expect(corrected!.tierOverride).toEqual({
+      from: 'tierA-public',
+      to: 'tierB-auth',
+      reason: expect.stringContaining('ProtectedRoute'),
+    });
+    // Original item must not be mutated.
+    expect(item.tier).toBe('tierA-public');
+    expect(item.tierOverride).toBeUndefined();
+  });
+
+  it('leaves an already-tierB-auth item for a guarded unit untouched (no spurious tierOverride)', () => {
+    const item = makeItem({ tier: 'tierB-auth', unitKey: guardedUnit.key });
+    const [result] = applyAuthGuardTierOverrides([item], [guardedUnit], 'both');
+    expect(result).toBe(item);
+    expect(result!.tierOverride).toBeUndefined();
+  });
+
+  it('leaves an item with no unitKey untouched', () => {
+    const item = makeItem({ tier: 'tierA-public' });
+    const [result] = applyAuthGuardTierOverrides([item], [guardedUnit], 'both');
+    expect(result).toBe(item);
+  });
+
+  it('leaves an item whose unitKey does not match any guarded unit untouched', () => {
+    const item = makeItem({ tier: 'tierA-public', unitKey: unguardedUnit.key });
+    const [result] = applyAuthGuardTierOverrides([item], [guardedUnit, unguardedUnit], 'both');
+    expect(result).toBe(item);
+  });
+
+  it('is a no-op when tierB-auth is out of scope (e.g. backend-only)', () => {
+    const item = makeItem({ tier: 'tierC-api', unitKey: guardedUnit.key });
+    const result = applyAuthGuardTierOverrides([item], [guardedUnit], 'backend');
+    expect(result).toEqual([item]);
+    expect(result[0]!.tierOverride).toBeUndefined();
+  });
+
+  it('is a no-op when no unit in the index is guarded (returns the same array reference)', () => {
+    const items = [makeItem({ tier: 'tierA-public', unitKey: unguardedUnit.key })];
+    const result = applyAuthGuardTierOverrides(items, [unguardedUnit], 'both');
+    expect(result).toBe(items);
   });
 });
 

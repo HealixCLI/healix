@@ -16,6 +16,7 @@
  */
 
 import type { QualityFinding } from '../types.js';
+import { DESTRUCTIVE_ACTION_TEXT_RE } from '../../browser/crawler.js';
 export type { QualityFinding } from '../types.js';
 
 export interface TestBlock {
@@ -233,6 +234,26 @@ const LOCATOR_CLASS_OR_TAG_RE = /\.locator\(\s*['"](?:\.[a-zA-Z][\w-]*|[a-zA-Z][
 const AMBIGUOUS_LOCATOR_SAFETY_RE =
   /\.(?:first|last|nth)\(|\{\s*(?:name|exact)\s*:|getByTestId\(|\[(?:data-testid|id)=/;
 
+/** A line containing a `.click(...)` call — checked against DESTRUCTIVE_ACTION_TEXT_RE below via
+ * the accessible name/text it targets (see ACCESSIBLE_NAME_ON_LINE_RE), not the whole line, so an
+ * unrelated CSS/testid string elsewhere on the same line can't cause a false match. */
+const HAS_CLICK_RE = /\.click\(/;
+/** Pulls the accessible name/text out of a getByRole({name:...})/getByText(...)/getByLabel(...)
+ * call on the same line as a `.click(...)` — deliberately scoped to these accessible-name-bearing
+ * locator forms (not a bare CSS/testid selector, which could contain an unrelated substring) so
+ * the destructive-action match below is checked against what a user would actually read/click. */
+const ACCESSIBLE_NAME_ON_LINE_RE =
+  /getBy(?:Role\([^)]*\bname:\s*['"]([^'"]+)['"]|Text\(\s*['"]([^'"]+)['"]|Label\(\s*['"]([^'"]+)['"])/;
+/** True when `block.body` itself is a `test.fixme(...)` call — Healix's sanctioned way to mark a
+ * step it deliberately does not execute (see Cluster C's OTP/destructive-action gating). */
+const IS_FIXME_BLOCK_RE = /^test\.fixme\s*\(/;
+
+/** A `getByRole('dialog'|'alertdialog', ...)` or `[role="dialog"|"alertdialog"]` reference —
+ * used both to detect "this block already knows a modal exists" and "this getByText call is
+ * itself dialog-scoped" (see unscoped-modal-assertion, Cluster E). */
+const DIALOG_ROLE_REF_RE = /getByRole\(\s*['"](?:alert)?dialog['"]|\[role=["'](?:alert)?dialog["']\]/;
+/** A single line containing both an `expect(...)` and a `getByText(...)` call. */
+const EXPECT_GET_BY_TEXT_LINE_RE = /expect\(.*getByText\(/;
 /** Title explicitly calls out a blur-triggered validation scenario — a narrow, high-precision signal (vs. a general negative-title hint) since blur's own async-appearance risk only applies here. */
 const BLUR_TITLE_HINT_RE = /\bblur\b/i;
 /** An explicit blur trigger — the fix this finding recommends. */
@@ -258,6 +279,28 @@ export function auditSpecQuality(source: string): QualityFinding[] {
   const blocks = splitTestBlocks(source);
 
   for (const block of blocks) {
+    // Checked unconditionally, even for a block with no expect(...) at all — a spec that clicks
+    // "Delete account"/"Pay now" without wrapping it in test.fixme(...) is dangerous regardless of
+    // whether it also asserts anything (see Cluster C, discussed with the user: OTP/destructive
+    // steps must never be auto-completed, so this is a genuine safety backstop independent of
+    // whether the model followed generate.ts's prompt guidance).
+    if (!IS_FIXME_BLOCK_RE.test(block.body)) {
+      for (const line of block.body.split('\n')) {
+        if (!HAS_CLICK_RE.test(line)) continue;
+        const nameMatch = ACCESSIBLE_NAME_ON_LINE_RE.exec(line);
+        const name = nameMatch?.[1] ?? nameMatch?.[2] ?? nameMatch?.[3];
+        if (!name || !DESTRUCTIVE_ACTION_TEXT_RE.test(name)) continue;
+        findings.push({
+          code: 'unattended-destructive-action',
+          severity: 'hard',
+          message: `Test "${block.title || '(untitled)'}" clicks a control named "${name}" — wording that reads as a destructive/irreversible action (delete/remove/payment) — without wrapping it in test.fixme(...). Healix never completes this kind of step automatically (it could delete real data or trigger a real payment against the app under test); mark this test test.fixme('<title> — requires a destructive/irreversible action Healix will not execute automatically; run manually', ...) instead, covering only the steps up to (not including) this click.`,
+          testTitle: block.title,
+          blockRange: [block.start, block.end],
+        });
+        break; // one finding per block is enough signal.
+      }
+    }
+
     if (!HAS_EXPECT_RE.test(block.body)) {
       findings.push({
         code: 'empty-assertion-block',
@@ -268,6 +311,26 @@ export function auditSpecQuality(source: string): QualityFinding[] {
       });
       // No assertions at all makes the other assertion-shaped checks moot for this block.
       continue;
+    }
+
+    // unscoped-modal-assertion (Cluster E): fires ONLY when this block already references a
+    // dialog-role locator elsewhere (proving it knows a modal exists) but an expect(...)'s
+    // getByText(...) isn't itself scoped to it — a purely static heuristic (no ground truth
+    // available here, unlike generate.ts's F-11 check), so WARN only.
+    if (DIALOG_ROLE_REF_RE.test(block.body)) {
+      for (const line of block.body.split('\n')) {
+        if (!EXPECT_GET_BY_TEXT_LINE_RE.test(line)) continue;
+        const getByTextIdx = line.indexOf('getByText(');
+        if (getByTextIdx !== -1 && DIALOG_ROLE_REF_RE.test(line.slice(0, getByTextIdx))) continue;
+        findings.push({
+          code: 'unscoped-modal-assertion',
+          severity: 'warn',
+          message: `Test "${block.title || '(untitled)'}" references a dialog/modal elsewhere but asserts on a page-level getByText(...) not scoped to that dialog — if the same text is also permanent static copy elsewhere on the page, this assertion can pass or fail without the modal actually being open. Scope it via a dialog-role container locator (e.g. page.getByRole('dialog').getByText(...)) or assert modal-exclusive text instead.`,
+          testTitle: block.title,
+          blockRange: [block.start, block.end],
+        });
+        break; // one finding per block is enough signal.
+      }
     }
 
     if (WILDCARD_ASSERTION_RE.test(block.body)) {

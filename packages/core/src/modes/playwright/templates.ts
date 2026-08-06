@@ -45,6 +45,20 @@ export const MOCK_REQUEST_LOG_FILENAME = 'healix-mock-request-log.ndjson';
  */
 export const API_EVIDENCE_LOG_FILENAME = 'healix-api-evidence-log.ndjson';
 
+/**
+ * Write-through log of every request the mock fixture's page.route() handler saw but did
+ * NOT intercept — its hostname matched no detected dependency and no test-level
+ * `mockOverride` matched either, so it fell through to `r.continue()` and hit the real
+ * (often unreachable, in a sandboxed run) backend. Previously this had zero signal at all:
+ * such a request just hangs until Playwright's own test timeout, producing a bare "Test
+ * timeout of 60000ms exceeded" indistinguishable from a genuinely slow app — an AI triage
+ * pass has no way to tell "mock configuration gap" apart from "environment/infra issue"
+ * without this. execute.ts reads this back (readMockPassthroughLog) and threads it into
+ * ExecOutcome/TriageInput the same way API_EVIDENCE_LOG_FILENAME already is. Lives at the
+ * suite's project root, alongside the other sidecar logs.
+ */
+export const MOCK_PASSTHROUGH_LOG_FILENAME = 'healix-mock-passthrough-log.ndjson';
+
 /** Map a tier id to a short, human-readable label (used in READMEs / comments). */
 export function tierLabel(tier: Tier): string {
   switch (tier) {
@@ -827,13 +841,27 @@ setup('authenticate', async ({ page, browser }) => {
  * every HTTP call made through the `request` fixture to
  * API_EVIDENCE_LOG_FILENAME. Requires the caller's file to import
  * `appendFile` (node:fs/promises) and `join`/`relative`/`sep` (node:path).
+ *
+ * evidenceKey() root-cause regression: it used to compute the key relative to
+ * process.cwd(), but process.cwd() during a real Playwright run is the SUITE
+ * root (see execute.ts's cwd: ctx.projectDir), while Playwright's own JSON
+ * reporter writes spec.file relative to testDir/rootDir
+ * (playwrightConfigContents() sets testDir: './tests') — one path segment
+ * deeper. The two keys silently never matched in any real run (an extra
+ * 'tests/' prefix here that the orchestrator's specFile-derived lookup never
+ * had), so apiEvidence/mockPassthrough/mockedRequestCountsByTest lookups
+ * always missed — caught by inspecting a REAL run's results.json, not by any
+ * test (every test's fake TestMode/fake Playwright report constructs both
+ * sides of the identity consistently by hand, so the mismatch never had a
+ * chance to surface). testInfo.config.rootDir is what Playwright itself
+ * resolves spec.file relative to, so that's the one true identity now.
  */
 function apiEvidenceHelperSource(): string {
   return `const API_EVIDENCE_LOG_PATH = join(process.cwd(), ${JSON.stringify(API_EVIDENCE_LOG_FILENAME)});
 const API_EVIDENCE_BODY_CHARS = 500;
 
 function evidenceKey(testInfo) {
-  return relative(process.cwd(), testInfo.file).split(sep).join('/') + '#' + testInfo.title;
+  return relative(testInfo.config.rootDir, testInfo.file).split(sep).join('/') + '#' + testInfo.title;
 }
 
 async function logApiEvidence(key, method, url, status, bodyText, mocked) {
@@ -1184,9 +1212,37 @@ ${apiEvidenceHelperSource()}
 // just the separate launch-time mock HTTP server. Best-effort — a logging
 // failure must never affect the actual mocked response a test receives.
 const MOCK_REQUEST_LOG_PATH = join(process.cwd(), ${JSON.stringify(MOCK_REQUEST_LOG_FILENAME)});
-async function logMockHit(id) {
+// method/pathPattern are the STATICALLY-DETECTED endpoint's own values (see
+// resolveResponse/matchAnyRoute's own comments) — read back by execute.ts to resolve the
+// EXACT mock_responses row this hit belongs to (run_id, dependency_id, method, path_pattern),
+// not just the dependency. null for a call that matched no specific endpoint (the coarse
+// per-dependency generic default). status/contentType/body are the response ACTUALLY served
+// for this hit (as opposed to mock_responses.mock_status/mock_body_json, which are what was
+// generated/planned BEFORE any test ran, and can differ per-call via mockOverride()) — read
+// back by execute.ts's readObservedMockResponses() to ground mock_responses.observed_*.
+async function logMockHit(key, id, method, pathPattern, status, contentType, body) {
   try {
-    await appendFile(MOCK_REQUEST_LOG_PATH, JSON.stringify({ id: id || 'override' }) + '\\n', 'utf-8');
+    await appendFile(
+      MOCK_REQUEST_LOG_PATH,
+      JSON.stringify({ key, id: id || 'override', method, pathPattern, status, contentType, body }) + '\\n',
+      'utf-8',
+    );
+  } catch {
+    // best-effort — never fail the actual test run over this
+  }
+}
+
+// See MOCK_PASSTHROUGH_LOG_FILENAME's doc comment: records a request that reached the
+// page.route() handler but matched no hostname/override, so it fell through to the real
+// network instead of being mocked — the likely cause of an otherwise-unexplained bare timeout.
+const MOCK_PASSTHROUGH_LOG_PATH = join(process.cwd(), ${JSON.stringify(MOCK_PASSTHROUGH_LOG_FILENAME)});
+async function logMockPassthrough(key, method, url) {
+  try {
+    await appendFile(
+      MOCK_PASSTHROUGH_LOG_PATH,
+      JSON.stringify({ key, method, url, at: new Date().toISOString() }) + '\\n',
+      'utf-8',
+    );
   } catch {
     // best-effort — never fail the actual test run over this
   }
@@ -1234,16 +1290,31 @@ function serializeBody(response) {
 // or the shared static defaults. Reset after each test.
 let overrides = [];
 
+// Returns { response, method, pathPattern } — method/pathPattern are the STATICALLY-DETECTED
+// endpoint's own values (exactly what got seeded into mock_responses.method/path_pattern at
+// generation time — see orchestrator/index.ts), so execute.ts's readMockRequestCountsByTest/
+// readObservedMockResponses can resolve the EXACT row a hit belongs to instead of only the
+// coarse dependency id. null when no specific endpoint matched (a per-test mockOverride() with
+// no corresponding registered endpoint, or the route's own generic per-dependency default) —
+// there's no specific mock_responses row for those.
 function resolveResponse(route, method, requestPath) {
   const override = overrides.find(
     (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
   );
-  if (override) return override.response;
+  // Uses the override's OWN (method, pathPattern) rather than null: a negative-test override
+  // (e.g. "simulate a 500 for POST /api/login") very often targets an endpoint that WAS
+  // statically detected and has a real mock_responses row — attributing to it is strictly
+  // more useful than giving up. If no such row exists (an override for an untracked
+  // endpoint), the orchestrator's lookup simply finds nothing and skips attribution, same as
+  // any other unmatched tuple.
+  if (override) return { response: override.response, method: override.method, pathPattern: override.pathPattern };
   const endpoint = route.endpoints?.find(
     (e) => e.method.toUpperCase() === method.toUpperCase() && pathMatches(e.pathPattern, requestPath),
   );
-  if (endpoint?.response) return endpoint.response;
-  return route.response;
+  if (endpoint?.response) {
+    return { response: endpoint.response, method: endpoint.method, pathPattern: endpoint.pathPattern };
+  }
+  return { response: route.response, method: null, pathPattern: null };
 }
 
 // Used when there is no single hostname-matched route to resolve against —
@@ -1258,7 +1329,26 @@ function resolveResponse(route, method, requestPath) {
 // route's id alongside the response (F-15) so the caller can attribute this
 // hit to the right dependency in mockedRequestCounts instead of the count
 // being unattributable once there's more than one candidate route.
-function matchAnyRoute(routes, method, requestPath) {
+//
+// opts.allowGenericFallback (Cluster F, default true): whether a call that
+// matches no endpoint anywhere (and no override) may still fall back to
+// MOCKED_ROUTES[0]'s own generic default. The \`request\`-fixture call site
+// below always wants this (every one of ITS calls is inherently meant for
+// SOME mocked dependency — there's no "real third party" case there). The
+// page.route() handler's no-hostname-match branch does NOT want this: a call
+// whose hostname matched no detected dependency at all could just as easily
+// be a genuinely different, correctly-unmocked third party (an analytics
+// beacon, a CDN) — blindly mocking it with an unrelated dependency's default
+// would be WRONG, not just imprecise. Passing \`false\` there means this only
+// ever resolves a request that matches an ACTUAL statically-detected endpoint
+// on some route (the "known call, wrong/misdetected host" case), leaving
+// every other no-hostname-match request to fall through to the real network
+// (and get logged — see logMockPassthrough) exactly as before.
+// Returns { id, response, method, pathPattern } — see resolveResponse's own comment for why
+// method/pathPattern (the statically-detected endpoint's own values) matter: they let
+// execute.ts resolve the EXACT mock_responses row a hit belongs to, not just the dependency.
+function matchAnyRoute(routes, method, requestPath, opts) {
+  const allowGenericFallback = !opts || opts.allowGenericFallback !== false;
   const override = overrides.find(
     (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
   );
@@ -1267,15 +1357,25 @@ function matchAnyRoute(routes, method, requestPath) {
       (e) => e.method.toUpperCase() === method.toUpperCase() && pathMatches(e.pathPattern, requestPath),
     );
     if (endpoint?.response) {
-      return { id: route.id, response: override ? override.response : endpoint.response };
+      return {
+        id: route.id,
+        response: override ? override.response : endpoint.response,
+        method: endpoint.method,
+        pathPattern: endpoint.pathPattern,
+      };
     }
   }
-  if (override) return { id: undefined, response: override.response };
+  if (override) {
+    return { id: undefined, response: override.response, method: override.method, pathPattern: override.pathPattern };
+  }
+  if (!allowGenericFallback) return { id: undefined, response: undefined, method: null, pathPattern: null };
   // No endpoint-level match anywhere — fall back to the first route's own
   // generic default (the common case: exactly one mocked dependency with no
   // endpoint-level detail at all).
   const fallback = routes[0];
-  return fallback ? { id: fallback.id, response: fallback.response } : { id: undefined, response: undefined };
+  return fallback
+    ? { id: fallback.id, response: fallback.response, method: null, pathPattern: null }
+    : { id: undefined, response: undefined, method: null, pathPattern: null };
 }
 
 export const test = base.extend({
@@ -1298,8 +1398,9 @@ export const test = base.extend({
     await use(fn);
     overrides = [];
   },
-  page: async ({ page, mockOverride }, use) => {
+  page: async ({ page, mockOverride }, use, testInfo) => {
     void mockOverride; // ensures overrides reset alongside this test via the fixture above
+    const key = evidenceKey(testInfo);
     // A SINGLE catch-all route, rather than one per hostname: a per-hostname
     // predicate (the old approach) can never see a same-origin relative fetch
     // (e.g. page.evaluate(() => fetch('/auth/v1/token/generate'))) — it
@@ -1323,22 +1424,35 @@ export const test = base.extend({
       const overrideMatches = overrides.some(
         (o) => o.method.toUpperCase() === method.toUpperCase() && pathMatches(o.pathPattern, requestPath),
       );
-      if (!hostRoute && !overrideMatches) {
-        await r.continue();
-        return;
-      }
       let matchedId;
+      let matchedMethod;
+      let matchedPathPattern;
       let response;
       if (hostRoute) {
         matchedId = hostRoute.id;
-        response = resolveResponse(hostRoute, method, requestPath);
+        const resolved = resolveResponse(hostRoute, method, requestPath);
+        response = resolved.response;
+        matchedMethod = resolved.method;
+        matchedPathPattern = resolved.pathPattern;
       } else {
-        const match = matchAnyRoute(MOCKED_ROUTES, method, requestPath);
+        // No hostname match — still resolve against a genuinely-known endpoint on ANY
+        // registered route (the dependency's detected hostname may simply be stale/wrong
+        // for this runtime — see dependencies.ts's env-var detection), but never fall back to
+        // an unrelated route's generic default here: that would risk mocking a genuinely
+        // different, correctly-unmocked third party (see matchAnyRoute's doc comment).
+        const match = matchAnyRoute(MOCKED_ROUTES, method, requestPath, { allowGenericFallback: overrideMatches });
         matchedId = match.id;
         response = match.response;
+        matchedMethod = match.method;
+        matchedPathPattern = match.pathPattern;
       }
-      await logMockHit(matchedId);
+      if (!response) {
+        await logMockPassthrough(key, method, url);
+        await r.continue();
+        return;
+      }
       const { contentType, text } = serializeBody(response);
+      await logMockHit(key, matchedId, matchedMethod, matchedPathPattern, response.status, contentType, text);
       await r.fulfill({
         status: response.status,
         headers: { 'content-type': contentType, ...(response.headers || {}) },
@@ -1367,9 +1481,9 @@ export const test = base.extend({
     const key = evidenceKey(testInfo);
     const respond = async (method, requestPath) => {
       const match = matchAnyRoute(MOCKED_ROUTES, method, (requestPath || '/').split('?')[0]);
-      await logMockHit(match.id);
       const canned = match.response;
       const { contentType, text } = serializeBody(canned);
+      await logMockHit(key, match.id, match.method, match.pathPattern, canned.status, contentType, text);
       await logApiEvidence(key, method, requestPath || '', canned.status, text, true);
       return {
         ok: () => canned.status >= 200 && canned.status < 300,

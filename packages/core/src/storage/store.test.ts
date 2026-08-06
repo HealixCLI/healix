@@ -628,6 +628,573 @@ describe('insertResult', () => {
   });
 });
 
+describe('kb_test_scripts (Knowledge Base source-file grounding)', () => {
+  it('records and lists the source file path for a KB item', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-source-project', baseUrl: 'https://kb-source.test' });
+    const run = s.createRun(project.id);
+    const kbItemId = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Login',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'logs in' }],
+    });
+
+    s.recordKbTestScript({ kbItemId, runId: run.id, filePath: 'src/components/LoginForm.tsx' });
+
+    const rows = s.listKbTestScripts(run.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      kbItemId,
+      runId: run.id,
+      filePath: 'src/components/LoginForm.tsx',
+    });
+  });
+
+  it('getKbTestScript returns the row for one item, and null when there is none', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-source-lookup-project', baseUrl: 'https://kb-lookup.test' });
+    const run = s.createRun(project.id);
+    const groundedId = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_grounded',
+      title: 'Checkout',
+      reqTag: null,
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'completes checkout' }],
+    });
+    const ungroundedId = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_ungrounded',
+      title: 'Black-box smoke check',
+      reqTag: null,
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'page loads' }],
+    });
+    s.recordKbTestScript({ kbItemId: groundedId, runId: run.id, filePath: 'src/pages/Checkout.tsx' });
+
+    expect(s.getKbTestScript(groundedId)).toMatchObject({ filePath: 'src/pages/Checkout.tsx' });
+    expect(s.getKbTestScript(ungroundedId)).toBeNull();
+  });
+
+  it('is idempotent — recording the same KB item twice does not duplicate the row', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-source-idempotent-project',
+      baseUrl: 'https://kb-idem.test',
+    });
+    const run = s.createRun(project.id);
+    const kbItemId = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_resumed',
+      title: 'Resumed item',
+      reqTag: null,
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'works' }],
+    });
+
+    s.recordKbTestScript({ kbItemId, runId: run.id, filePath: 'src/pages/Resumed.tsx' });
+    s.recordKbTestScript({ kbItemId, runId: run.id, filePath: 'src/pages/Resumed.tsx' });
+
+    expect(await countRows('kb_test_scripts')).toBe(1);
+  });
+
+  it('a plan item with no source grounding simply has no row (not a row with a null/empty file path)', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-no-source-project', baseUrl: 'https://kb-no-source.test' });
+    const run = s.createRun(project.id);
+    s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_no_source',
+      title: 'Black-box item',
+      reqTag: null,
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'works' }],
+    });
+
+    expect(s.listKbTestScripts(run.id)).toEqual([]);
+  });
+});
+
+describe('kb_execution_artifacts (Knowledge Base error/trace/steps/network-log grounding)', () => {
+  it('seedPlanKbItem seeds exactly one (empty) kb_execution_artifacts row per scenario', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-exec-seed-project', baseUrl: 'https://kb-exec-seed.test' });
+    const run = s.createRun(project.id);
+
+    s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Login',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      scenarios: [
+        { index: 0, kind: 'positive', description: 'logs in' },
+        { index: 1, kind: 'negative', description: 'rejects bad password' },
+      ],
+    });
+
+    const kbScenarios = s.listPlanKbScenarios(run.id);
+    expect(kbScenarios).toHaveLength(2);
+    const rows = s.listKbExecutionArtifacts(run.id);
+    expect(rows).toHaveLength(2);
+    for (const row of rows) {
+      expect(row.errorMessage).toBeNull();
+      expect(row.tracePath).toBeNull();
+      expect(row.executionSteps).toBeNull();
+      expect(row.networkLogs).toBeNull();
+    }
+    expect(rows.map((r) => r.kbScenarioId).sort()).toEqual(kbScenarios.map((s) => s.id).sort());
+  });
+
+  it('updateKbExecutionArtifacts fills in error/trace/steps once a linked test result lands', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-exec-update-project',
+      baseUrl: 'https://kb-exec-update.test',
+    });
+    const run = s.createRun(project.id);
+    s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Login',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'negative', description: 'rejects bad password' }],
+    });
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'rejects bad password',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'pending',
+    });
+    s.linkPlanKbScenarioTest(run.id, 'pli_1', 0, test.id);
+
+    s.updateKbExecutionArtifacts(test.id, {
+      errorMessage: 'expect(locator).toBeVisible() failed',
+      tracePath: 'test-results/foo/trace.zip',
+      executionSteps: JSON.stringify([{ title: 'fill password', durationMs: 5 }]),
+    });
+
+    const [kbScenario] = s.listPlanKbScenarios(run.id);
+    const row = s.getKbExecutionArtifact(kbScenario.id);
+    expect(row?.errorMessage).toBe('expect(locator).toBeVisible() failed');
+    expect(row?.tracePath).toBe('test-results/foo/trace.zip');
+    expect(row?.executionSteps).toBe(JSON.stringify([{ title: 'fill password', durationMs: 5 }]));
+    expect(row?.networkLogs).toBeNull();
+  });
+
+  it('is a no-op for a test with no KB link (predates the KB, or a fallback row)', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-exec-nolink-project',
+      baseUrl: 'https://kb-exec-nolink.test',
+    });
+    const run = s.createRun(project.id);
+
+    expect(() =>
+      s.updateKbExecutionArtifacts('tst_unlinked', {
+        errorMessage: 'boom',
+        tracePath: null,
+        executionSteps: null,
+      }),
+    ).not.toThrow();
+    expect(s.listKbExecutionArtifacts(run.id)).toEqual([]);
+  });
+
+  it('re-seeding the same scenario on a resumed run does not duplicate its kb_execution_artifacts row', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-exec-resume-project',
+      baseUrl: 'https://kb-exec-resume.test',
+    });
+    const run = s.createRun(project.id);
+    const seed = () =>
+      s.seedPlanKbItem({
+        runId: run.id,
+        planItemId: 'pli_1',
+        title: 'Login',
+        reqTag: 'REQ-1',
+        tier: 'tierA-public',
+        scenarios: [{ index: 0, kind: 'positive', description: 'logs in' }],
+      });
+
+    seed();
+    seed();
+
+    expect(await countRows('kb_execution_artifacts')).toBe(1);
+  });
+});
+
+describe('KB foundation: requirements/mock_responses/exploration_summaries/escape_hatch_gaps', () => {
+  it('seedRequirement dedupes multiple items sharing the same reqTag within one run, and links plan_kb_items to it', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-req-project', baseUrl: 'https://kb-req.test' });
+    const run = s.createRun(project.id);
+
+    const kbItem1 = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Login UI flow',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'logs in' }],
+    });
+    const kbItem2 = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_2',
+      title: 'POST /api/login contract',
+      reqTag: 'REQ-1',
+      tier: 'tierC-api',
+      scenarios: [{ index: 0, kind: 'positive', description: 'returns 200' }],
+    });
+
+    const reqId1 = s.seedRequirement(run.id, 'REQ-1', 'Login UI flow');
+    const reqId2 = s.seedRequirement(run.id, 'REQ-1', 'a different description — must still dedupe');
+    expect(reqId2).toBe(reqId1);
+
+    s.setPlanKbItemRequirement(kbItem1, reqId1);
+    s.setPlanKbItemRequirement(kbItem2, reqId2);
+
+    const requirements = s.listRequirements(run.id);
+    expect(requirements).toHaveLength(1);
+    expect(requirements[0]).toMatchObject({ tag: 'REQ-1', description: 'Login UI flow', source: 'plan' });
+
+    const items = s.listPlanKbItems(run.id);
+    expect(items.every((it) => it.requirementId === reqId1)).toBe(true);
+  });
+
+  it('a reqTag-less item has no requirement row and requirementId stays null', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-req-none-project', baseUrl: 'https://kb-req-none.test' });
+    const run = s.createRun(project.id);
+    s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Untagged item',
+      reqTag: null,
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'works' }],
+    });
+
+    expect(s.listRequirements(run.id)).toEqual([]);
+    expect(s.listPlanKbItems(run.id)[0]?.requirementId).toBeNull();
+  });
+
+  it('getTraceabilityMatrix joins requirement -> kb item -> scenario -> test into flat rows', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-matrix-project', baseUrl: 'https://kb-matrix.test' });
+    const run = s.createRun(project.id);
+    const kbItemId = s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Login',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'logs in' }],
+    });
+    const reqId = s.seedRequirement(run.id, 'REQ-1', 'Login');
+    s.setPlanKbItemRequirement(kbItemId, reqId);
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'logs in',
+      reqTag: 'REQ-1',
+      tier: 'tierA-public',
+      status: 'pending',
+    });
+    s.linkPlanKbScenarioTest(run.id, 'pli_1', 0, test.id);
+    s.updatePlanKbScenarioStatusByTestId(test.id, 'passed');
+
+    const matrix = s.getTraceabilityMatrix(run.id);
+    expect(matrix).toHaveLength(1);
+    expect(matrix[0]).toMatchObject({
+      requirementTag: 'REQ-1',
+      kbItemTitle: 'Login',
+      scenarioDescription: 'logs in',
+      scenarioStatus: 'passed',
+      testId: test.id,
+    });
+  });
+
+  it('getTraceabilityMatrix omits a kb item with no requirement link (reqTag-less item)', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-matrix-none-project',
+      baseUrl: 'https://kb-matrix-none.test',
+    });
+    const run = s.createRun(project.id);
+    s.seedPlanKbItem({
+      runId: run.id,
+      planItemId: 'pli_1',
+      title: 'Untagged',
+      reqTag: null,
+      tier: 'tierA-public',
+      scenarios: [{ index: 0, kind: 'positive', description: 'works' }],
+    });
+
+    expect(s.getTraceabilityMatrix(run.id)).toEqual([]);
+  });
+
+  it('upsertMockResponse inserts mock_* fields and leaves observed_* fields null', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-mock-project', baseUrl: 'https://kb-mock.test' });
+    const run = s.createRun(project.id);
+
+    const id = s.upsertMockResponse({
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'auth',
+      method: 'POST',
+      pathPattern: '/api/login',
+      mockStrategy: 'route-intercept',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'Login successful' }),
+      mockHeadersJson: null,
+    });
+
+    const rows = s.listMockResponses(run.id);
+    expect(rows).toHaveLength(1);
+    expect(rows[0]).toMatchObject({
+      id,
+      dependencyId: 'dep_1',
+      category: 'auth',
+      method: 'POST',
+      pathPattern: '/api/login',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'Login successful' }),
+      observedStatus: null,
+      observedBodyJson: null,
+      observedHeadersJson: null,
+    });
+  });
+
+  it('recordObservedMockResponse grounds observed_* fields onto an existing row without touching its mock_* fields', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-observed-project', baseUrl: 'https://kb-observed.test' });
+    const run = s.createRun(project.id);
+
+    const id = s.upsertMockResponse({
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'auth',
+      method: 'POST',
+      pathPattern: '/api/login',
+      mockStrategy: 'route-intercept',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'Login successful' }),
+      mockHeadersJson: null,
+    });
+
+    s.recordObservedMockResponse(id, {
+      status: 200,
+      bodyJson: JSON.stringify({ message: 'Login successful' }),
+      headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+    });
+
+    const row = s.listMockResponses(run.id)[0];
+    expect(row).toMatchObject({
+      id,
+      // mock_* fields (the pre-execution plan) untouched by the observed_* write.
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'Login successful' }),
+      observedStatus: 200,
+      observedBodyJson: JSON.stringify({ message: 'Login successful' }),
+      observedHeadersJson: JSON.stringify({ 'content-type': 'application/json' }),
+    });
+  });
+
+  it('upsertMockResponse refreshes mock_* fields on a resumed run instead of duplicating the row', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-mock-resume-project',
+      baseUrl: 'https://kb-mock-resume.test',
+    });
+    const run = s.createRun(project.id);
+    const input = {
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'auth',
+      method: 'POST',
+      pathPattern: '/api/login',
+      mockStrategy: 'route-intercept',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ message: 'first' }),
+      mockHeadersJson: null,
+    };
+
+    const id1 = s.upsertMockResponse(input);
+    const id2 = s.upsertMockResponse({ ...input, mockBodyJson: JSON.stringify({ message: 'second' }) });
+
+    expect(id2).toBe(id1);
+    expect(await countRows('mock_responses')).toBe(1);
+    expect(s.listMockResponses(run.id)[0]?.mockBodyJson).toBe(JSON.stringify({ message: 'second' }));
+  });
+
+  it('upsertMockResponse refreshes (not duplicates) a row with null method/pathPattern on a resumed run', async () => {
+    // Regression test: SQLite's UNIQUE index treats every NULL as distinct
+    // from every other NULL, so ON CONFLICT(run_id, dependency_id, method,
+    // path_pattern) would never fire for two calls with method/pathPattern
+    // both null (the real-world path for a dependency with no endpoints,
+    // see orchestrator/index.ts) unless nulls are normalized before the
+    // insert/select.
+    const s = await store();
+    const project = s.createProject({
+      name: 'kb-mock-null-resume-project',
+      baseUrl: 'https://kb-mock-null-resume.test',
+    });
+    const run = s.createRun(project.id);
+    const input = {
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'payments',
+      method: null,
+      pathPattern: null,
+      mockStrategy: 'static',
+      mockStatus: 200,
+      mockBodyJson: JSON.stringify({ status: 'first' }),
+      mockHeadersJson: null,
+    };
+
+    const id1 = s.upsertMockResponse(input);
+    const id2 = s.upsertMockResponse({ ...input, mockBodyJson: JSON.stringify({ status: 'second' }) });
+
+    expect(id2).toBe(id1);
+    expect(await countRows('mock_responses')).toBe(1);
+    const row = s.listMockResponses(run.id)[0];
+    expect(row?.mockBodyJson).toBe(JSON.stringify({ status: 'second' }));
+    expect(row?.method).toBeNull();
+    expect(row?.pathPattern).toBeNull();
+  });
+
+  it('recordMockUsage/listMockUsageForTest round-trip a per-test usage row', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-mock-usage-project', baseUrl: 'https://kb-mock-usage.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'logs in',
+      reqTag: null,
+      tier: 'tierA-public',
+      status: 'pending',
+    });
+    const mockId = s.upsertMockResponse({
+      runId: run.id,
+      dependencyId: 'dep_1',
+      category: 'auth',
+      method: null,
+      pathPattern: null,
+      mockStrategy: 'route-intercept',
+      mockStatus: 200,
+      mockBodyJson: null,
+      mockHeadersJson: null,
+    });
+
+    s.recordMockUsage(test.id, mockId, 3);
+
+    const usage = s.listMockUsageForTest(test.id);
+    expect(usage).toEqual([{ testId: test.id, mockResponseId: mockId, requestCount: 3 }]);
+  });
+
+  it('insertExplorationSummary seeds one row per route, idempotently', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-explore-project', baseUrl: 'https://kb-explore.test' });
+    const run = s.createRun(project.id);
+
+    s.insertExplorationSummary({
+      runId: run.id,
+      route: '/login',
+      selectorsJson: JSON.stringify([{ selector: '#email' }]),
+      formsJson: null,
+      authPattern: 'password-form',
+      stateProbeCount: null,
+    });
+    s.insertExplorationSummary({
+      runId: run.id,
+      route: '/login',
+      selectorsJson: JSON.stringify([{ selector: '#email' }]),
+      formsJson: null,
+      authPattern: 'password-form',
+      stateProbeCount: null,
+    });
+    s.insertExplorationSummary({
+      runId: run.id,
+      route: '/dashboard',
+      selectorsJson: null,
+      formsJson: null,
+      authPattern: null,
+      stateProbeCount: null,
+    });
+
+    const rows = s.listExplorationSummaries(run.id);
+    expect(rows).toHaveLength(2);
+    expect(rows.find((r) => r.route === '/login')).toMatchObject({
+      authPattern: 'password-form',
+      selectorsJson: JSON.stringify([{ selector: '#email' }]),
+    });
+    expect(await countRows('exploration_summaries')).toBe(2);
+  });
+
+  it('insertEscapeHatchGap/updateEscapeHatchGapStatus/listEscapeHatchGaps round-trip a gap', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-escape-project', baseUrl: 'https://kb-escape.test' });
+    const run = s.createRun(project.id);
+
+    const id = s.insertEscapeHatchGap({
+      runId: run.id,
+      planItemId: 'pli_1',
+      unitKey: 'route:/checkout',
+      reasonsJson: JSON.stringify(['no selector observed for the confirmation banner']),
+    });
+
+    let [gap] = s.listEscapeHatchGaps(run.id);
+    expect(gap).toMatchObject({ id, status: 'open', iteration: 0 });
+
+    s.updateEscapeHatchGapStatus(id, 'resolved');
+    [gap] = s.listEscapeHatchGaps(run.id);
+    expect(gap?.status).toBe('resolved');
+  });
+
+  it('insertResult round-trips evidenceJson, defaulting to null when omitted', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'kb-evidence-project', baseUrl: 'https://kb-evidence.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({
+      runId: run.id,
+      title: 'logs in',
+      reqTag: null,
+      tier: 'tierA-public',
+      status: 'pending',
+    });
+
+    const evidence = JSON.stringify({
+      tracePath: 'test-results/foo/trace.zip',
+      apiEvidence: 'GET /x -> 200',
+    });
+    s.insertResult({
+      testId: test.id,
+      status: 'passed',
+      durationMs: 10,
+      error: null,
+      artifactsJson: null,
+      evidenceJson: evidence,
+    });
+    expect(s.listResults(run.id)[0]?.evidenceJson).toBe(evidence);
+
+    const test2 = s.insertTest({
+      runId: run.id,
+      title: 'no evidence',
+      reqTag: null,
+      tier: 'tierA-public',
+      status: 'pending',
+    });
+    s.insertResult({ testId: test2.id, status: 'passed', durationMs: 5, error: null, artifactsJson: null });
+    expect(s.listResults(run.id).find((r) => r.testId === test2.id)?.evidenceJson).toBeNull();
+  });
+});
+
 describe('deleteUnexecutedTests', () => {
   it('removes only test rows with zero result rows, leaving executed ones (including a genuine "pending"/skipped result) untouched', async () => {
     const s = await store();

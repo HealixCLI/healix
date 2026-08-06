@@ -27,6 +27,7 @@ import {
   collectGroundTruth,
   demoteEscapeHatchBlocks,
   extractEscapeHatchReasons,
+  extractEscapeHatchReasonTexts,
   findDominantPrefixes,
   findForbiddenApis,
   findUngroundedReferences,
@@ -155,6 +156,8 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
       hasEndpointLevelMocks: true,
       inventoryTruncated: false,
       attributes: new Map([['type', new Set(['email'])]]),
+      modalText: '',
+      underlyingPageText: '',
       ...overrides,
     };
   }
@@ -317,6 +320,48 @@ describe('findUngroundedReferences — grounding-validation gate over generated 
     const source = `await page.getByText('Moje kupóny').click();`;
     expect(findUngroundedReferences(source, gt())).toEqual({ hard: [], warn: [] });
   });
+
+  // F-11 (Cluster E): an unscoped getByText(...) matching text observed both inside a captured
+  // modal AND on the underlying page outside it can't reliably prove the modal shows it.
+  const modalGt = () =>
+    gt({
+      modalText: 'delete your account? this cannot be undone.',
+      underlyingPageText: 'delete your account? this cannot be undone. footer: contact us.',
+    });
+
+  it('warns on an unscoped getByText whose text is both inside a captured modal and on the underlying page', () => {
+    const source = `await expect(page.getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, modalGt());
+    expect(warn.some((w) => w.includes('modal') && w.includes('dialog'))).toBe(true);
+  });
+
+  it('does not flag the same text when the locator is already dialog-scoped', () => {
+    const source = `await expect(page.getByRole('dialog').getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, modalGt());
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag genuinely modal-exclusive text (absent from the underlying page)', () => {
+    const gtExclusive = gt({
+      modalText: 'delete your account? this cannot be undone.',
+      underlyingPageText: 'unrelated homepage copy entirely.',
+    });
+    const source = `await expect(page.getByText('Delete your account? this cannot be undone.')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, gtExclusive);
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag a short getByText below the minimum length threshold (covered by F-07 instead)', () => {
+    const gtShort = gt({ modalText: 'ok', underlyingPageText: 'ok' });
+    const source = `await expect(page.getByText('ok')).toBeVisible();`;
+    const { warn } = findUngroundedReferences(source, gtShort);
+    expect(warn.some((w) => w.includes('modal'))).toBe(false);
+  });
+
+  it('does not flag anything when no modal was ever captured (modalText empty)', () => {
+    const source = `await expect(page.getByText('Some long enough page copy here')).toBeVisible();`;
+    expect(findUngroundedReferences(source, gt()).warn.some((w) => w.includes('modal'))).toBe(false);
+  });
 });
 
 describe('demoteEscapeHatchBlocks — ships an admitted guess as needs-review, not a real failure', () => {
@@ -379,6 +424,27 @@ test('[REQ:FR-AUTH-01] positive: logs in', async ({ page }) => {
     expect(result).toMatch(/test\.fixme\('\[REQ:FR-AUTH-01\] positive: logs in', \{ annotation:/);
   });
 
+  it('carries the FULL reason through when the model word-wraps it across multiple // lines (GAP-062)', () => {
+    // Mirrors the real generated shape from
+    // suite/tests/tierB-auth/profile-field-editing-name-dob-salutation.spec.ts:24-26 — a
+    // naturally word-wrapped multi-line comment, not a single long line.
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    const result = demoteEscapeHatchBlocks(source);
+    expect(result).toContain(
+      'unobserved element — a dedicated success toast selector was not captured in the ' +
+        'interactive-element inventory; verifying the persisted field values as a coarser ' +
+        'observable outcome of a successful save instead.',
+    );
+  });
+
   it('falls back to a generic reason when the marker carries no explanation', () => {
     const source = `import { test, expect } from '@playwright/test';
 
@@ -405,6 +471,12 @@ test('[REQ:REQ-1] shows the user\\'s current email', async ({ page }) => {
   });
 });
 
+// Two functions were built independently against the same escape-hatch marker for two
+// different consumers with different shape needs (see generate.ts's doc comments on each):
+// extractEscapeHatchReasons returns one `{ testTitle, reason }` per block, for directed
+// re-exploration's target-resolution needs; extractEscapeHatchReasonTexts returns plain
+// reason strings, feeding the escape_hatch_gaps Knowledge Base table. Kept as two separate
+// describe blocks below rather than merged, since they test genuinely different functions.
 describe('extractEscapeHatchReasons — surfaces unresolved-selector gaps for directed re-exploration', () => {
   it('returns an empty array when no escape-hatch marker is present', () => {
     const source = `import { test, expect } from '@playwright/test';
@@ -488,6 +560,78 @@ test('[REQ:REQ-1] guessed', async ({ page }) => {
     const demoted = demoteEscapeHatchBlocks(source);
     expect(extractEscapeHatchReasons(demoted)).toEqual([
       { testTitle: '[REQ:REQ-1] guessed', reason: 'reason survives demotion.' },
+    ]);
+  });
+});
+
+describe('extractEscapeHatchReasonTexts — durable, queryable reasons for escape_hatch_gaps', () => {
+  it('returns [] for a spec with no escape-hatch marker', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+`;
+    expect(extractEscapeHatchReasonTexts(source)).toEqual([]);
+  });
+
+  it('extracts one reason per flagged block, matching the SAME text demoteEscapeHatchBlocks embeds as the annotation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: succeeds', async ({ page }) => {
+  await page.goto('/');
+  await expect(page).toHaveTitle(/Home/);
+});
+
+test('[REQ:REQ-1] edge: guessed consent checkbox', async ({ page }) => {
+  // TODO: unobserved element - the consent checkbox was not captured in the inventory.
+  await page.locator('input[type="checkbox"]').check();
+});
+
+test('[REQ:REQ-1] edge: guessed newsletter toggle', async ({ page }) => {
+  // TODO: unobserved element - the newsletter toggle was not captured in the inventory.
+  await page.locator('input[name="newsletter"]').check();
+});
+`;
+    const reasons = extractEscapeHatchReasonTexts(source);
+    expect(reasons).toEqual([
+      'unobserved element — the consent checkbox was not captured in the inventory.',
+      'unobserved element — the newsletter toggle was not captured in the inventory.',
+    ]);
+    // Same text demoteEscapeHatchBlocks embeds in the Playwright annotation for the same spec —
+    // the two must never drift, since one feeds the live report and the other feeds the KB.
+    const demoted = demoteEscapeHatchBlocks(source);
+    for (const reason of reasons) {
+      expect(demoted).toContain(reason);
+    }
+  });
+
+  it('falls back to the generic reason when the marker carries no explanation', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] guessed', async ({ page }) => {
+  // TODO: unobserved element
+  await page.locator('button').click();
+});
+`;
+    expect(extractEscapeHatchReasonTexts(source)).toEqual(['unobserved element — needs review']);
+  });
+
+  it('carries the FULL word-wrapped reason through, same as demoteEscapeHatchBlocks (GAP-062)', () => {
+    const source = `import { test, expect } from '@playwright/test';
+
+test('[REQ:FR-PROFILE-01] positive: saves updated profile fields', async ({ page }) => {
+  // TODO: unobserved element - a dedicated success toast selector was not captured in the
+  // interactive-element inventory; verifying the persisted field values as a coarser
+  // observable outcome of a successful save instead.
+  await expect(page.locator('#name')).toHaveValue('Jane');
+});
+`;
+    expect(extractEscapeHatchReasonTexts(source)).toEqual([
+      'unobserved element — a dedicated success toast selector was not captured in the ' +
+        'interactive-element inventory; verifying the persisted field values as a coarser ' +
+        'observable outcome of a successful save instead.',
     ]);
   });
 });
@@ -1072,6 +1216,44 @@ test.describe('[REQ:REQ-1] Home page', () => {
 
     expect(specs).toHaveLength(1);
     expect(specs[0].contents).not.toContain('test.use(');
+  });
+
+  it('calls ctx.onEscapeHatchGap with the extracted reasons when the persisted spec has an escape-hatch marker (KB foundation wiring)', async () => {
+    // Proves the actual wiring gap this session closed: recordGenOutcome (the single funnel
+    // every per-item terminal outcome passes through, same as onKbItemOutcome) must fire
+    // ctx.onEscapeHatchGap with this item's id/unitKey and the reasons
+    // extractEscapeHatchReasonTexts found in the FINAL persisted spec — not just that
+    // extractEscapeHatchReasonTexts itself works in isolation (already covered elsewhere),
+    // and not just that store.insertEscapeHatchGap
+    // round-trips a hand-built row (already covered in store.test.ts) — the gap was whether
+    // generate.ts's real pipeline actually calls the callback with the right arguments.
+    const ESCAPE_HATCH_SPEC = `import { test, expect } from '@playwright/test';
+
+test('[REQ:REQ-1] positive: home page renders', async ({ page }) => {
+  // TODO: unobserved element - the welcome banner was not captured in the inventory.
+  await page.goto('/');
+  await expect(page.getByRole('heading', { level: 1 })).toBeVisible();
+});
+`;
+    const onEscapeHatchGap = vi.fn();
+    const ctx = { ...makeCtx(makeProvider([ESCAPE_HATCH_SPEC], calls)), onEscapeHatchGap };
+
+    const specs = await generate(ctx, { ...PLAN, items: [{ ...PLAN.items[0]!, unitKey: 'route:/' }] });
+
+    expect(specs).toHaveLength(1);
+    expect(onEscapeHatchGap).toHaveBeenCalledTimes(1);
+    expect(onEscapeHatchGap).toHaveBeenCalledWith('REQ-1', 'route:/', [
+      'unobserved element — the welcome banner was not captured in the inventory.',
+    ]);
+  });
+
+  it('never calls ctx.onEscapeHatchGap for a spec with no escape-hatch marker', async () => {
+    const onEscapeHatchGap = vi.fn();
+    const ctx = { ...makeCtx(makeProvider([CLEAN_SPEC], calls)), onEscapeHatchGap };
+
+    await generate(ctx, PLAN);
+
+    expect(onEscapeHatchGap).not.toHaveBeenCalled();
   });
 });
 
@@ -1885,14 +2067,82 @@ describe('generate — grounds the prompt in the observed EXPLORE crawl', () => 
     expect(prompt).toContain('#/SK');
   });
 
+  it('warns that a hash-only goto is a same-document navigation that needs a real reload to test a logged-out precondition (GAP-065)', async () => {
+    await generate(ctxWith(makeExploration(1, { hashRouted: true })), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('SAME-DOCUMENT navigation');
+    expect(prompt).toContain('page.reload()');
+    expect(prompt).toContain('no active session');
+  });
+
   it('omits hash-routing guidance for a non-hash app', async () => {
     await generate(ctxWith(makeExploration(1, { hashRouted: false })), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+    expect(calls[0].prompt).not.toContain('SAME-DOCUMENT navigation');
   });
 
   it('omits hash-routing guidance when there is no exploration artifact at all', async () => {
     await generate(ctxWith(undefined), PLAN);
     expect(calls[0].prompt).not.toContain('hash-based routing');
+  });
+});
+
+describe('generate — unautomatable-step gating (Cluster C: OTP + destructive actions)', () => {
+  let projectDir: string;
+  let calls: FakeCall[];
+
+  beforeEach(async () => {
+    projectDir = await mkdtemp(join(tmpdir(), 'healix-generate-unautomatable-'));
+    calls = [];
+  });
+
+  afterEach(async () => {
+    await rm(projectDir, { recursive: true, force: true });
+  });
+
+  function ctxWith(exploration: TestModeContext['exploration']): TestModeContext {
+    return {
+      projectDir,
+      baseUrl: 'http://localhost:3000',
+      provider: makeProvider([CLEAN_SPEC], calls),
+      target: {} as TestModeContext['target'],
+      browser: {} as TestModeContext['browser'],
+      exploration,
+    };
+  }
+
+  it('includes an OTP-gate notice with test.fixme guidance when a route has otpGateReached', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].otpGateReached = true;
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('OTP/verification-code gate detected');
+    expect(prompt).toContain('test.fixme');
+    expect(prompt).toContain('cannot observe or synthesize');
+  });
+
+  it('includes a destructive-action notice naming the control when a route has destructiveActionsSeen', async () => {
+    const exploration = makeExploration(1);
+    exploration.crawl.routes[0].destructiveActionsSeen = ['Delete account'];
+    await generate(ctxWith(exploration), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('Destructive/irreversible action(s) detected');
+    expect(prompt).toContain('"Delete account"');
+    expect(prompt).toContain('run manually');
+  });
+
+  it('omits both notices when neither signal is present on any relevant route', async () => {
+    await generate(ctxWith(makeExploration(1)), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('OTP/verification-code gate detected');
+    expect(prompt).not.toContain('Destructive/irreversible action(s) detected');
+  });
+
+  it('omits both notices when there is no exploration artifact at all', async () => {
+    await generate(ctxWith(undefined), PLAN);
+    const prompt = calls[0].prompt;
+    expect(prompt).not.toContain('OTP/verification-code gate detected');
+    expect(prompt).not.toContain('Destructive/irreversible action(s) detected');
   });
 });
 
@@ -2786,6 +3036,127 @@ describe('generate — grounds the prompt in white-box source context (sourceCon
     };
     await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
     expect(calls[0].prompt).toContain('email (email, required)');
+  });
+
+  it('warns against .fill() for a widgetLike field and tags it WIDGET in the field list (GAP-066)', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'email', type: 'email', required: true },
+            { name: 'dob', type: 'text', required: true, testId: 'register-dob', widgetLike: true },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('dob (text, required, WIDGET)');
+    expect(prompt).toContain('email (email, required)');
+    expect(prompt).not.toContain('email (email, required, WIDGET)');
+    expect(prompt).toContain('WARNING');
+    expect(prompt).toContain('calling `.fill()` on them sets the DOM value directly');
+  });
+
+  it('adds no widget warning when no field is widgetLike', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [{ name: 'email', type: 'email', required: true }],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('WIDGET');
+  });
+
+  it('requires filling every required field (incl. confirm/repeat) before a validity-gated submit when a form has 2+ required fields (GAP-067)', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'password', type: 'password', required: true },
+            { name: 'confirm_password', type: 'password', required: true },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    const prompt = calls[0].prompt;
+    expect(prompt).toContain('RULE: this form has multiple required fields');
+    expect(prompt).toContain('password, confirm_password');
+    expect(prompt).toContain('confirm/repeat field cross-validated');
+  });
+
+  it('adds no multi-required-field rule when a form has 0 or 1 required fields', async () => {
+    const sourceContext: TestModeContext['sourceContext'] = {
+      units: [
+        {
+          key: 'endpoint:GET /api/users/:id',
+          kind: 'endpoint',
+          label: 'GET /api/users/:id',
+          file: 'routes/userRoutes.js',
+        },
+      ],
+      forms: [
+        {
+          file: 'routes/userRoutes.js',
+          fields: [
+            { name: 'email', type: 'email', required: true },
+            { name: 'nickname', type: 'text', required: false },
+          ],
+        },
+      ],
+      authPatterns: [],
+      selectorHints: [],
+      specSources: [],
+      summary: '',
+      truncated: false,
+    };
+    await generate(ctxWith(sourceContext), PLAN_WITH_UNIT_KEY);
+    expect(calls[0].prompt).not.toContain('RULE: this form has multiple required fields');
   });
 
   it('rejects and retries a spec missing its mandatory [SRC:...] citation, accepting a corrected retry', async () => {

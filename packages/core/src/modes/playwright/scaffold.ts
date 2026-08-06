@@ -2,7 +2,17 @@ import { mkdir, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { TestModeContext } from '../types.js';
+import { isXmlContentType } from '../../browser/index.js';
 import type { ObservedEndpoint } from '../../browser/network-capture.js';
+import type { ExternalDependency, ExternalDependencyCategory, MockResponse } from '../../target/types.js';
+import {
+  applyCanonicalIdentity,
+  type CanonicalIdentity,
+  endpointCategory,
+  extractCanonicalIdentity,
+  mergeGroundedResponse,
+  staticMockResponse,
+} from '../../target/mock-responses.js';
 import {
   TIERS,
   actionHighlighterFixtureContents,
@@ -29,47 +39,112 @@ function observedHostMatchesDependency(observedHost: string, depHostnames: strin
   );
 }
 
-/** Best-effort parse of a captured response body into JSON; falls back to the raw string wrapped as-is when it isn't valid JSON. */
-function parseObservedBody(sampleResponseBody: string | undefined): unknown {
+/**
+ * Best-effort resolve of a captured response body for the runtime mock fixture.
+ *
+ * Tries `JSON.parse()` first. On failure, an XML/SOAP body (per `contentType`) is passed
+ * through as-is: `browser/index.ts`'s `truncateBody()` routes XML content-types through a
+ * structural, well-formedness-preserving truncator (GAP-069), so the raw string is always
+ * safe to serve verbatim — `templates.ts`'s `serializeBody()` already knows to emit a
+ * non-JSON `body` string as-is by content-type instead of `JSON.stringify`-encoding it.
+ * Any other non-JSON body (HTML, plaintext, or a genuinely malformed capture) still falls
+ * back to `{}`: serving an invalid-JSON string AS the mock response body would silently
+ * corrupt the fixture (every property access resolving to `undefined` instead of throwing,
+ * producing confusing app-level failures that look like real bugs).
+ */
+function parseObservedBody(sampleResponseBody: string | undefined, contentType: string | undefined): unknown {
   if (!sampleResponseBody) return {};
   try {
     return JSON.parse(sampleResponseBody);
   } catch {
-    return sampleResponseBody;
+    return isXmlContentType(contentType) ? sampleResponseBody : {};
   }
+}
+
+/** Reconciles a purely-synthetic (static/AI) response's identity fields against `canonical`,
+ * a no-op when nothing real has been captured yet (see `extractCanonicalIdentity`). */
+function withCanonicalIdentity(response: MockResponse, canonical: CanonicalIdentity | null): MockResponse {
+  if (!canonical) return response;
+  return { ...response, body: applyCanonicalIdentity(response.body, canonical) };
 }
 
 /**
  * Merge a dependency's statically-detected `endpoints[]` with any real traffic EXPLORE
- * observed for that same hostname (see GAP-046 / network-capture.ts) — additive, real-traffic
+ * observed for that same hostname (see GAP-046 / network-capture.ts). Additive: real-traffic
  * ground truth is included even when static detection skipped endpoint-level attribution
  * entirely (dependencies.ts only attaches static endpoints when exactly one mockable
  * dependency exists; a multi-dependency app like a typical SPA with several backend hosts
  * would otherwise fall back to one flat, dependency-wide response for every path on that
- * host — including paths a canned generic body doesn't remotely resemble). Observed entries
- * are keyed by (method, pathPattern) so a statically-detected entry for the same call always
- * wins (it may already carry an AI-resolved response tailored to the scenario).
+ * host — including paths a canned generic body doesn't remotely resemble).
+ *
+ * When BOTH a static and an observed entry exist for the same (method, pathPattern), the
+ * static entry no longer wins outright — its body is grounded field-by-field in the observed
+ * one (`mergeGroundedResponse`), so a real captured login/profile response actually reaches
+ * the running fixture instead of being discarded in favor of a generic/AI-guessed shape (this
+ * used to silently reproduce the exact bug this module exists to prevent, for any endpoint —
+ * most visibly auth ones, since dependencies.ts always statically attaches those regardless of
+ * how many mockable dependencies exist, so real captured login traffic was always the one
+ * being thrown away). Secret-shaped fields that arrived redacted (see
+ * `export/sanitize.ts`'s `redactSecrets()`) are skipped during the merge, falling back to the
+ * static/floor value for that field — never serving the literal "<REDACTED>" as a token.
  */
 type EndpointEntry = NonNullable<MockRouteEntry['endpoints']>[number];
 
 function mergedEndpoints(
-  staticEndpoints: EndpointEntry[],
+  dep: ExternalDependency,
   observedEndpoints: ObservedEndpoint[],
-  depHostnames: string[],
+  canonicalIdentity: CanonicalIdentity | null,
 ): EndpointEntry[] {
-  const seen = new Set(staticEndpoints.map((e) => `${e.method.toUpperCase()} ${e.pathPattern}`));
-  const merged = [...staticEndpoints];
+  const staticEndpoints = dep.endpoints ?? [];
+  const depHostnames = dep.hostnames ?? [];
+  const merged: EndpointEntry[] = [];
+  const indexByKey = new Map<string, number>();
+  const categoryByKey = new Map<string, ExternalDependencyCategory>();
+
+  for (const e of staticEndpoints) {
+    const key = `${e.method.toUpperCase()} ${e.pathPattern}`;
+    const category = endpointCategory(dep, e);
+    indexByKey.set(key, merged.length);
+    categoryByKey.set(key, category);
+    merged.push({
+      method: e.method,
+      pathPattern: e.pathPattern,
+      // Reconcile identity BEFORE the observed-traffic merge below, so a static/AI-guessed
+      // endpoint agrees with real captured identity from elsewhere in the same run.
+      response: withCanonicalIdentity(e.response ?? staticMockResponse(category), canonicalIdentity),
+    });
+  }
+
   for (const observed of observedEndpoints) {
     if (!observed.host || !observedHostMatchesDependency(observed.host, depHostnames)) continue;
     const key = `${observed.method.toUpperCase()} ${observed.pathPattern}`;
-    if (seen.has(key)) continue;
-    seen.add(key);
-    merged.push({
-      method: observed.method,
-      pathPattern: observed.pathPattern,
-      response: { status: observed.status, body: parseObservedBody(observed.sampleResponseBody) },
-    });
+    const observedBody = parseObservedBody(observed.sampleResponseBody, observed.contentType);
+    const observedHeaders = observed.contentType ? { 'content-type': observed.contentType } : undefined;
+    const existingIndex = indexByKey.get(key);
+    if (existingIndex === undefined) {
+      indexByKey.set(key, merged.length);
+      merged.push({
+        method: observed.method,
+        pathPattern: observed.pathPattern,
+        response: { status: observed.status, body: observedBody, headers: observedHeaders },
+      });
+      continue;
+    }
+    const category = categoryByKey.get(key) ?? dep.category;
+    const current = merged[existingIndex];
+    merged[existingIndex] = {
+      method: current.method,
+      pathPattern: current.pathPattern,
+      response: mergeGroundedResponse(
+        category,
+        current.response ?? staticMockResponse(category),
+        observedBody,
+        observed.status,
+        observedHeaders,
+      ),
+    };
   }
+
   return merged;
 }
 
@@ -78,13 +153,18 @@ function mockRouteEntries(ctx: TestModeContext): MockRouteEntry[] {
   const deps = ctx.externalDependencies ?? [];
   const responses = ctx.mockResponses ?? {};
   const observedEndpoints = ctx.exploration?.observedEndpoints ?? [];
+  // Computed ONCE for the whole run: real captured traffic's identity (if any) is the single
+  // source of truth every purely-synthetic sibling endpoint gets reconciled against below —
+  // see extractCanonicalIdentity's doc comment (Cluster B).
+  const canonicalIdentity = extractCanonicalIdentity(observedEndpoints);
   const entries: MockRouteEntry[] = [];
   for (const dep of deps) {
     if (dep.mockStrategy !== 'route-intercept' && dep.mockStrategy !== 'both') continue;
     if (!dep.hostnames || dep.hostnames.length === 0) continue;
-    const response = responses[dep.id];
-    if (!response) continue;
-    const endpoints = mergedEndpoints(dep.endpoints ?? [], observedEndpoints, dep.hostnames);
+    const depResponse = responses[dep.id];
+    if (!depResponse) continue;
+    const response = withCanonicalIdentity(depResponse, canonicalIdentity);
+    const endpoints = mergedEndpoints(dep, observedEndpoints, canonicalIdentity);
     entries.push({
       id: dep.id,
       hostnames: dep.hostnames,

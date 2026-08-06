@@ -1,5 +1,22 @@
-import type { File, JSXAttribute, JSXOpeningElement } from '@babel/types';
-import { isBooleanLiteral, isJSXExpressionContainer, isJSXIdentifier, isStringLiteral } from '@babel/types';
+import type {
+  Expression,
+  File,
+  JSXAttribute,
+  JSXElement,
+  JSXOpeningElement,
+  ObjectProperty,
+} from '@babel/types';
+import {
+  isBooleanLiteral,
+  isCallExpression,
+  isIdentifier,
+  isJSXExpressionContainer,
+  isJSXIdentifier,
+  isJSXSpreadAttribute,
+  isObjectExpression,
+  isObjectProperty,
+  isStringLiteral,
+} from '@babel/types';
 import { parseModule } from './parse.js';
 import { traverse } from './traverse.js';
 
@@ -9,6 +26,13 @@ export interface FormField {
   type: string;
   required: boolean;
   testId?: string;
+  /** True when this field is rendered by a controlled third-party widget component (a
+   * calendar/picker/autocomplete-style component, e.g. react-datepicker's customInput) rather
+   * than a plain native/design-system input — such a widget only updates its bound value
+   * through its own onChange callback, so a plain `.fill()` sets the DOM value directly without
+   * ever invoking it (GAP-066). Consumers (e.g. GENERATE's prompt) should warn against `.fill()`
+   * for these and point at widget-appropriate interaction instead. */
+  widgetLike?: boolean;
 }
 
 export interface FormInfo {
@@ -35,6 +59,11 @@ const KNOWN_INPUT_TYPES = new Set([
 /** Custom component name shapes commonly used for form inputs, when no recognized `type` value is present either. */
 const INPUT_COMPONENT_NAME_RE = /(Input|Field)$/;
 const SUBMIT_COMPONENT_NAME_RE = /Button$/;
+/** Custom component name shapes for controlled third-party calendar/picker/autocomplete-style
+ * widgets (react-datepicker's customInput being the canonical case) — these don't end in
+ * Input/Field so INPUT_COMPONENT_NAME_RE alone would miss them, and they need a distinct
+ * `widgetLike` tag rather than being treated as an ordinary input (GAP-066). */
+const WIDGET_COMPONENT_NAME_RE = /Picker|Calendar|Datepicker|Autocomplete|Combobox|Typeahead/i;
 
 function attrString(el: JSXOpeningElement, name: string): string | undefined {
   const attr = el.attributes.find(
@@ -59,19 +88,120 @@ function hasTruthyAttr(el: JSXOpeningElement, name: string): boolean {
   return false;
 }
 
+/** Non-computed ObjectProperty key name as a string, or null if it can't be statically read
+ * (computed key, spread element, etc). */
+function propKeyName(prop: ObjectProperty): string | null {
+  if (prop.computed) return null;
+  const key = prop.key;
+  if (isIdentifier(key)) return key.name;
+  if (isStringLiteral(key)) return key.value;
+  return null;
+}
+
+/**
+ * Interpret a react-hook-form `register()`/`Controller` `rules` options object as a static
+ * `required` boolean. Recognizes a literal `required: true|false|"message"` property, and
+ * `validate: { required: <anything> }` — react-hook-form's `validate` map has no built-in key
+ * named `required`; this is a convention observed across real react-hook-form codebases where the
+ * required-check validator is keyed literally `required` (GAP-068). Only the key's presence is
+ * checked, never the validator function's body. Falls through to `false` (never throws) for
+ * anything not statically resolvable: a missing/non-literal options object, or a single custom
+ * `validate` function with no property literally named `required`.
+ */
+function requiredFromOptions(options: Expression | null | undefined): boolean {
+  if (!options || !isObjectExpression(options)) return false;
+  for (const prop of options.properties) {
+    if (!isObjectProperty(prop)) continue;
+    const keyName = propKeyName(prop);
+    if (keyName === 'required') {
+      const value = prop.value;
+      if (isBooleanLiteral(value)) return value.value;
+      return true; // `required: "message"` or any other non-boolean-literal value/expr.
+    }
+    if (keyName === 'validate' && isObjectExpression(prop.value)) {
+      const hasRequiredKey = prop.value.properties.some(
+        (p) => isObjectProperty(p) && propKeyName(p) === 'required',
+      );
+      if (hasRequiredKey) return true;
+    }
+  }
+  return false;
+}
+
+/**
+ * Whole-AST pre-pass (mirrors endpoints.ts's collectRouterVarNames): finds every
+ * `const X = register('name', options)` declaration and statically resolves its required-ness via
+ * requiredFromOptions, producing a variable-name -> required map so a later `{...xReg}` JSX spread
+ * can look the value up without any scope/binding-resolution utility (none exists in this
+ * codebase; see endpoints.ts for the precedent of this manual-pre-pass idiom).
+ */
+function collectRegisterRequiredMap(ast: File): Map<string, boolean> {
+  const map = new Map<string, boolean>();
+  traverse(ast, {
+    VariableDeclarator(path) {
+      const id = path.node.id;
+      const init = path.node.init;
+      if (!isIdentifier(id) || !init || !isCallExpression(init)) return;
+      if (!isIdentifier(init.callee) || init.callee.name !== 'register') return;
+      map.set(id.name, requiredFromOptions(init.arguments[1] as Expression | undefined));
+    },
+  });
+  return map;
+}
+
+/**
+ * Compute a JSX opening element's required-ness from every recognized source (first-true-wins):
+ * a literal `required` attribute on the element itself; an ancestor `Controller`'s `rules` prop;
+ * a `{...xReg}` spread resolved via registerRequiredMap; or an inline
+ * `{...register('x', { required: true })}` spread computed directly.
+ */
+function isRequired(
+  el: JSXOpeningElement,
+  registerRequiredMap: Map<string, boolean>,
+  controllerRequired: boolean,
+): boolean {
+  if (hasTruthyAttr(el, 'required')) return true;
+  if (controllerRequired) return true;
+  for (const attr of el.attributes) {
+    if (!isJSXSpreadAttribute(attr)) continue;
+    const arg = attr.argument;
+    if (isIdentifier(arg)) {
+      if (registerRequiredMap.get(arg.name)) return true;
+      continue;
+    }
+    if (
+      isCallExpression(arg) &&
+      isIdentifier(arg.callee) &&
+      arg.callee.name === 'register' &&
+      requiredFromOptions(arg.arguments[1] as Expression | undefined)
+    ) {
+      return true;
+    }
+  }
+  return false;
+}
+
 function isSubmitControl(el: JSXOpeningElement, tagName: string): boolean {
   const type = attrString(el, 'type');
   if (tagName === 'button') return type === 'submit';
   return SUBMIT_COMPONENT_NAME_RE.test(tagName) && type === 'submit';
 }
 
-function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number): FormField | null {
+function fieldFrom(
+  el: JSXOpeningElement,
+  tagName: string,
+  fallbackIndex: number,
+  registerRequiredMap: Map<string, boolean>,
+  controllerRequired: boolean,
+): FormField | null {
   const isNative = NATIVE_INPUT_TAGS.has(tagName);
   const declaredType = attrString(el, 'type');
+  const isWidget = WIDGET_COMPONENT_NAME_RE.test(tagName);
   const isInputLike =
     isNative ||
     (declaredType && KNOWN_INPUT_TYPES.has(declaredType)) ||
-    INPUT_COMPONENT_NAME_RE.test(tagName);
+    INPUT_COMPONENT_NAME_RE.test(tagName) ||
+    isWidget;
   if (!isInputLike) return null;
 
   const testId = attrString(el, 'data-testid');
@@ -83,9 +213,9 @@ function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number
     `field-${fallbackIndex}`;
   const type =
     declaredType ?? (tagName === 'select' ? 'select' : tagName === 'textarea' ? 'textarea' : 'text');
-  const required = hasTruthyAttr(el, 'required');
+  const required = isRequired(el, registerRequiredMap, controllerRequired);
 
-  return { name, type, required, ...(testId ? { testId } : {}) };
+  return { name, type, required, ...(testId ? { testId } : {}), ...(isWidget ? { widgetLike: true } : {}) };
 }
 
 /**
@@ -93,8 +223,12 @@ function fieldFrom(el: JSXOpeningElement, tagName: string, fallbackIndex: number
  * `<input>/<select>/<textarea>` fields AND custom input-like components (a `type` attribute
  * matching a known HTML input type, or a component name ending in Input/Field — covers common
  * design-system components like MUI's TextField or a bespoke MatInput that wrap a native input
- * with no native tag of their own). Returns null on parse failure so callers can skip the file
- * rather than crash the whole repo scan (there is no regex fallback for this new capability).
+ * with no native tag of their own), plus controlled third-party calendar/picker/autocomplete-style
+ * widgets (a component name matching WIDGET_COMPONENT_NAME_RE, e.g. a react-hook-form
+ * `Controller`'s rendered `MatDatepicker`/react-datepicker `customInput` — tagged `widgetLike` so
+ * downstream consumers know `.fill()` won't drive it, see GAP-066). Returns null on parse failure
+ * so callers can skip the file rather than crash the whole repo scan (there is no regex fallback
+ * for this new capability).
  */
 export function extractFormsAst(rel: string, source: string): FormInfo[] | null {
   const ast: File | null = parseModule(source, rel);
@@ -108,6 +242,7 @@ export function extractFormsAst(rel: string, source: string): FormInfo[] | null 
  */
 export function extractFormsFromAst(rel: string, ast: File): FormInfo[] {
   const forms: FormInfo[] = [];
+  const registerRequiredMap = collectRegisterRequiredMap(ast);
 
   traverse(ast, {
     JSXElement(path) {
@@ -117,8 +252,34 @@ export function extractFormsFromAst(rel: string, ast: File): FormInfo[] {
 
       const fields: FormField[] = [];
       let submitLabel: string | undefined;
+      const controllerStack: Array<{ node: JSXElement; required: boolean }> = [];
 
       path.traverse({
+        JSXElement: {
+          enter(inner) {
+            const innerOpening = inner.node.openingElement;
+            const innerName = innerOpening.name;
+            if (!isJSXIdentifier(innerName) || innerName.name !== 'Controller') return;
+            const rulesAttr = innerOpening.attributes.find(
+              (a): a is JSXAttribute =>
+                a.type === 'JSXAttribute' && isJSXIdentifier(a.name) && a.name.name === 'rules',
+            );
+            const rulesExpr =
+              rulesAttr && isJSXExpressionContainer(rulesAttr.value) ? rulesAttr.value.expression : undefined;
+            controllerStack.push({
+              node: inner.node,
+              required: requiredFromOptions(rulesExpr as Expression | undefined),
+            });
+          },
+          exit(inner) {
+            if (
+              controllerStack.length > 0 &&
+              controllerStack[controllerStack.length - 1].node === inner.node
+            ) {
+              controllerStack.pop();
+            }
+          },
+        },
         JSXOpeningElement(inner) {
           const innerName = inner.node.name;
           if (!isJSXIdentifier(innerName)) return;
@@ -131,7 +292,15 @@ export function extractFormsFromAst(rel: string, ast: File): FormInfo[] {
             return;
           }
 
-          const field = fieldFrom(inner.node, tagName, fields.length + 1);
+          const controllerRequired =
+            controllerStack.length > 0 && controllerStack[controllerStack.length - 1].required;
+          const field = fieldFrom(
+            inner.node,
+            tagName,
+            fields.length + 1,
+            registerRequiredMap,
+            controllerRequired,
+          );
           if (field) fields.push(field);
         },
       });

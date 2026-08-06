@@ -1,7 +1,13 @@
 import { describe, expect, it } from 'vitest';
-import { generateMockResponses, staticMockResponse } from './mock-responses.js';
+import {
+  applyCanonicalIdentity,
+  extractCanonicalIdentity,
+  generateMockResponses,
+  mergeGroundedResponse,
+  staticMockResponse,
+} from './mock-responses.js';
 import type { CompleteOptions, ProviderAdapter } from '../providers/types.js';
-import type { ExternalDependency } from './types.js';
+import type { ExternalDependency, MockResponse } from './types.js';
 
 function fakeProvider(
   text: string,
@@ -66,6 +72,178 @@ describe('staticMockResponse', () => {
     // Guard against the destructuring pattern this category exists to satisfy.
     const destructured = (body as { status?: { success?: boolean } }).status?.success;
     expect(destructured).toBe(true);
+  });
+});
+
+describe('mergeGroundedResponse', () => {
+  const staticResponse: MockResponse = {
+    status: 200,
+    body: { token: 'healix-static-jwt', shared: 'static-value', user: { name: 'Healix Mock User' } },
+  };
+
+  it('falls back to the static/floor response unchanged when observedBody is absent or unusable', () => {
+    expect(mergeGroundedResponse('backend', staticResponse, undefined)).toEqual(staticResponse);
+    expect(mergeGroundedResponse('backend', staticResponse, '')).toEqual(staticResponse);
+    expect(mergeGroundedResponse('backend', staticResponse, ['not', 'an', 'object'])).toEqual(staticResponse);
+  });
+
+  it('serves a non-empty STRING observedBody wholesale instead of falling back — real non-JSON traffic (XML/SOAP, GAP-069) is genuine captured data even though it is not mergeable field-by-field', () => {
+    const merged = mergeGroundedResponse('backend', staticResponse, '<xml/>');
+    expect(merged.body).toBe('<xml/>');
+    expect(merged.status).toBe(staticResponse.status);
+  });
+
+  it('prefers observed values on a genuine field conflict, for a non-auth category', () => {
+    const merged = mergeGroundedResponse('backend', staticResponse, { shared: 'observed-value' });
+    expect((merged.body as Record<string, unknown>).shared).toBe('observed-value');
+    // Fields the observed sample didn't include still survive from the static side.
+    expect((merged.body as Record<string, unknown>).token).toBe('healix-static-jwt');
+  });
+
+  it('skips a redacted secret leaf, keeping the static value at that field instead', () => {
+    const merged = mergeGroundedResponse('auth', staticResponse, {
+      token: '<REDACTED>',
+      user: { name: 'adroy tester' },
+    });
+    const body = merged.body as { token: string; user: { name: string } };
+    expect(body.token).toBe('healix-static-jwt');
+    expect(body.user.name).toBe('adroy tester');
+  });
+
+  it('skips a "Bearer <REDACTED>" leaf the same way', () => {
+    const merged = mergeGroundedResponse('auth', staticResponse, { token: 'Bearer <REDACTED>' });
+    expect((merged.body as { token: string }).token).toBe('healix-static-jwt');
+  });
+
+  it('runs the auth-category result through the auth floor, guaranteeing baseline fields', () => {
+    const merged = mergeGroundedResponse('auth', staticResponse, { user: { name: 'adroy tester' } });
+    const body = merged.body as Record<string, unknown>;
+    expect(body.access_token).toBeTruthy();
+    expect(body.success).toBe(true);
+  });
+
+  it('clamps an observed error status for auth (never brick every login-dependent test), but preserves it for other categories', () => {
+    const authMerged = mergeGroundedResponse('auth', staticResponse, { user: { name: 'x' } }, 401);
+    expect(authMerged.status).toBe(200);
+
+    const backendMerged = mergeGroundedResponse(
+      'backend',
+      { status: 200, body: {} },
+      { error: 'not found' },
+      404,
+    );
+    expect(backendMerged.status).toBe(200); // observedStatus >= 400 never overrides
+  });
+
+  it('prefers a non-error observed status over the static one', () => {
+    const merged = mergeGroundedResponse('backend', { status: 500, body: {} }, { ok: true }, 200);
+    expect(merged.status).toBe(200);
+  });
+
+  it("threads observedHeaders through (e.g. a captured content-type, GAP-063 follow-up), preferring it over the static response's own headers", () => {
+    const withStaticHeaders: MockResponse = {
+      status: 200,
+      body: {},
+      headers: { 'content-type': 'text/plain' },
+    };
+    const merged = mergeGroundedResponse('backend', withStaticHeaders, { ok: true }, 200, {
+      'content-type': 'application/json; charset=utf-8',
+    });
+    expect(merged.headers).toEqual({ 'content-type': 'application/json; charset=utf-8' });
+  });
+
+  it("keeps the static response's own headers when observedHeaders is not provided", () => {
+    const withStaticHeaders: MockResponse = {
+      status: 200,
+      body: {},
+      headers: { 'content-type': 'text/plain' },
+    };
+    const merged = mergeGroundedResponse('backend', withStaticHeaders, { ok: true }, 200);
+    expect(merged.headers).toEqual({ 'content-type': 'text/plain' });
+  });
+});
+
+describe('extractCanonicalIdentity', () => {
+  it('returns null when no observed endpoint has an identity-shaped body', () => {
+    expect(
+      extractCanonicalIdentity([
+        { pathPattern: '/coupons', sampleResponseBody: '{"couponId":"526233086","code":"1T6L6AU2"}' },
+      ]),
+    ).toBeNull();
+  });
+
+  it('ignores a lone id-shaped field (false-positive guard) — a coupon/transaction id is not a person', () => {
+    // Only one identity-shaped key ("id") present — must not qualify on its own.
+    expect(
+      extractCanonicalIdentity([{ pathPattern: '/coupons', sampleResponseBody: '{"id":526233086}' }]),
+    ).toBeNull();
+  });
+
+  it('extracts name/email/id from an object with >= 2 co-occurring identity-shaped keys', () => {
+    const identity = extractCanonicalIdentity([
+      {
+        pathPattern: '/mobile/v2/api/customer/getbyemail',
+        sampleResponseBody:
+          '{"firstname":"adroy","lastname":"tester","email":"adroytester@gmail.com","id":81278446}',
+      },
+    ]);
+    expect(identity).toEqual({ id: '81278446', email: 'adroytester@gmail.com', name: 'adroy tester' });
+  });
+
+  it('prefers a match from an auth/login-shaped endpoint over an earlier non-auth match', () => {
+    const identity = extractCanonicalIdentity([
+      {
+        pathPattern: '/customer/profile',
+        sampleResponseBody: '{"name":"Wrong Name","email":"wrong@example.test"}',
+      },
+      {
+        pathPattern: '/auth/login',
+        sampleResponseBody: '{"user":{"name":"Real Name","email":"real@example.test"}}',
+      },
+    ]);
+    expect(identity).toEqual({ name: 'Real Name', email: 'real@example.test' });
+  });
+
+  it('skips a malformed (non-JSON) observed body without throwing', () => {
+    expect(
+      extractCanonicalIdentity([
+        { pathPattern: '/x', sampleResponseBody: 'not json' },
+        { pathPattern: '/customer', sampleResponseBody: '{"name":"OK","email":"ok@example.test"}' },
+      ]),
+    ).toEqual({ name: 'OK', email: 'ok@example.test' });
+  });
+});
+
+describe('applyCanonicalIdentity', () => {
+  it('is a no-op when canonical is null', () => {
+    const body = { user: { name: 'Healix Mock User', email: 'healix.mock@example.test' } };
+    expect(applyCanonicalIdentity(body, null)).toBe(body);
+  });
+
+  it("rewrites an identity-qualifying object's matching fields to the canonical values", () => {
+    const body = {
+      user: { id: 'healix-mock-user', email: 'healix.mock@example.test', name: 'Healix Mock User' },
+    };
+    const result = applyCanonicalIdentity(body, {
+      id: '81278446',
+      email: 'adroytester@gmail.com',
+      name: 'adroy tester',
+    }) as {
+      user: { id: string; email: string; name: string };
+    };
+    expect(result.user).toEqual({ id: '81278446', email: 'adroytester@gmail.com', name: 'adroy tester' });
+  });
+
+  it('never rewrites a lone id/name-shaped field on an object that does not itself qualify as identity', () => {
+    const body = { coupon: { id: '526233086', name: 'Welcome_Online' } };
+    const result = applyCanonicalIdentity(body, {
+      id: 'x',
+      email: 'x@example.test',
+      name: 'Someone Else',
+    }) as {
+      coupon: { id: string; name: string };
+    };
+    expect(result.coupon).toEqual({ id: '526233086', name: 'Welcome_Online' });
   });
 });
 
@@ -247,5 +425,24 @@ describe('generateMockResponses', () => {
     await generateMockResponses([backendDep], provider);
     expect(capturedPrompt).toContain('env:VITE_API_URL::POST::/auth/token/generate');
     expect(capturedPrompt).toContain('category: auth (LOGIN HANDSHAKE)');
+  });
+
+  it("instructs the model to inspect the app's own response-consuming code instead of guessing from the path (Cluster A, Track 2)", async () => {
+    const backendDep: ExternalDependency = {
+      id: 'env:VITE_API_URL',
+      category: 'auth',
+      label: 'Auth API',
+      source: 'env-var',
+      mockStrategy: 'both',
+      endpoints: [{ method: 'POST', pathPattern: '/login', category: 'auth' }],
+    };
+    let capturedPrompt = '';
+    const provider = fakeProvider('```json\n{"responses":[]}\n```', true, (_opts, prompt) => {
+      capturedPrompt = prompt ?? '';
+    });
+    await generateMockResponses([backendDep], provider);
+    expect(capturedPrompt).toContain('use your read-only file access');
+    expect(capturedPrompt).toContain('destructured or checked');
+    expect(capturedPrompt).toContain('"gate" field');
   });
 });

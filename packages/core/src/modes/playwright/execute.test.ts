@@ -1927,6 +1927,111 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
     expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
   });
 
+  // See docs/design/execute-suite-deps-silent-failure-fix.md — the reinstall's exit code was
+  // previously captured but never checked, so a broken/no-op `npm install` was reported as
+  // "complete" and Playwright was unconditionally re-invoked against still-broken deps.
+  it('does NOT re-run Playwright when the recovery npm install itself fails (no doomed retry, no silent 0/0)', async () => {
+    const spawnedCommands: string[] = [];
+    const events: Array<{ message: string; data?: unknown }> = [];
+
+    // 1st spawn: `npx playwright test` fails with a "Cannot find module" signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module '@playwright/test'\n");
+    });
+    // 2nd spawn: the recovery `npm install` — itself fails (e.g. no network, broken lockfile).
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, 'npm ERR! network request failed\n');
+    });
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      [{ path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' }],
+    );
+
+    // Exactly 2 spawns — original run + the failed reinstall — Playwright is never
+    // re-invoked a third time against dependencies known to still be broken.
+    expect(spawnedCommands).toEqual(['npx', 'npm']);
+    // No silent clean-looking empty success: the failure is visible in both the
+    // emitted events and the returned outcome.
+    expect(events.some((e) => /npm install failed/i.test(e.message))).toBe(true);
+    expect(events.some((e) => /could not parse playwright results/i.test(e.message))).toBe(true);
+    expect(outcome.passed).toBe(0);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('DOES re-run Playwright once the recovery npm install genuinely succeeds (unchanged prior behavior)', async () => {
+    const spawnedCommands: string[] = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module '@playwright/test'\n");
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0); // install succeeds
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('treats a syntactically valid but structurally EMPTY results.json the same as no report at all (not a silent 0/0)', async () => {
+    const events: Array<{ message: string; data?: unknown }> = [];
+
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      // A real, parseable Playwright report — but it discovered zero specs anywhere
+      // (e.g. broken node_modules let Playwright start and flush an empty JSON
+      // reporter file, but it never actually collected any tests).
+      writeFileSync(join(dir, 'results.json'), JSON.stringify(report([])), 'utf-8');
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      [{ path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' }],
+    );
+
+    expect(outcome.passed).toBe(0);
+    expect(outcome.failed).toBe(0);
+    const diagnostic = events.find((e) => /could not parse playwright results/i.test(e.message));
+    expect(diagnostic).toBeDefined();
+    expect((diagnostic?.data as { structurallyEmptyReport?: boolean } | undefined)?.structurallyEmptyReport).toBe(
+      true,
+    );
+  });
+
+  it('regression: a report with a real result is NEVER misclassified as structurally empty', async () => {
+    const events: Array<{ message: string; data?: unknown }> = [];
+
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(report([{ title: 'a', projectName: 'tierA-public', status: 'passed' }])),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      [{ path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' }],
+    );
+
+    expect(outcome.passed).toBe(1);
+    expect(events.some((e) => /could not parse playwright results/i.test(e.message))).toBe(false);
+  });
+
   it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {
     writeCheckpointEntries([
       {

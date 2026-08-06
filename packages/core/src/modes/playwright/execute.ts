@@ -584,6 +584,25 @@ interface PwReport {
   suites?: PwSuite[];
 }
 
+/**
+ * A syntactically valid but structurally empty report — Playwright loaded its config fine
+ * but discovered zero specs anywhere (as opposed to legitimately discovering specs that are
+ * simply all skipped/pending). Distinct from `!report` (no report at all): a broken/partial
+ * `node_modules` can let Playwright start, write an empty JSON reporter file, and exit
+ * "successfully" from its own CLI's perspective — which previously took the `if (report)`
+ * branch straight into `parseReport`, producing a silent, legitimate-looking `0 passed / 0
+ * failed` with no indication anything was ever wrong (see
+ * docs/design/execute-suite-deps-silent-failure-fix.md). Recurses into nested `suites` so a
+ * real, non-empty report (including one where every individual tier/project happens to have
+ * no specs) is never misclassified — only a report with literally zero specs ANYWHERE counts
+ * as structurally empty.
+ */
+function reportIsStructurallyEmpty(report: PwReport): boolean {
+  const hasAnySpec = (suites: PwSuite[] | undefined): boolean =>
+    (suites ?? []).some((s) => (s.specs?.length ?? 0) > 0 || hasAnySpec(s.suites));
+  return !hasAnySpec(report.suites);
+}
+
 const STATUS_PRIORITY: Record<string, number> = {
   failed: 5,
   blocked: 4,
@@ -1535,6 +1554,13 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
       const browserInstall = await runCommand(ctx, 'npx', ['playwright', 'install'], INSTALL_TIMEOUT_MS);
       emit(ctx, '[execute] browser install complete', { code: browserInstall.code });
     }
+    // Tracks whether a suite-deps reinstall was attempted and genuinely failed —
+    // previously this exit code was captured but never checked, so a broken/no-op
+    // `npm install` was reported as "complete" and Playwright was unconditionally
+    // re-invoked against still-broken dependencies, eventually surfacing as a
+    // silent "0 passed, 0 failed" instead of a real error (see
+    // docs/design/execute-suite-deps-silent-failure-fix.md).
+    let depsInstallFailed = false;
     if (looksLikeMissingSuiteDeps(cmd)) {
       emit(ctx, '[execute] missing suite dependency; re-running npm install…');
       const depsInstall = await runCommand(
@@ -1543,16 +1569,35 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
         ['install', '--no-audit', '--no-fund', '--silent'],
         INSTALL_TIMEOUT_MS,
       );
-      emit(ctx, '[execute] npm install complete', { code: depsInstall.code });
+      if (depsInstall.code === 0) {
+        emit(ctx, '[execute] npm install complete');
+      } else {
+        depsInstallFailed = true;
+        const tail = stripAnsi(depsInstall.stderr || depsInstall.stdout)
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .slice(-8)
+          .join(' | ');
+        emit(ctx, '[execute] npm install failed; suite dependencies remain broken — not re-running against them', {
+          code: depsInstall.code,
+          tail,
+        });
+      }
     }
-    emit(ctx, '[execute] re-running suite after dependency install');
-    startedAt = Date.now();
-    cmd = await runPlaywright(ctx, invertFile);
+    // Only retry Playwright when we have real reason to believe it can now
+    // succeed — re-running against dependencies we KNOW are still broken can
+    // only fail the same way, and previously masked that failure as a clean
+    // empty result instead of a visible error.
+    if (!depsInstallFailed) {
+      emit(ctx, '[execute] re-running suite after dependency install');
+      startedAt = Date.now();
+      cmd = await runPlaywright(ctx, invertFile);
 
-    // The retry run can be cancelled too (as can the install(s) before it).
-    if (cmd.aborted || ctx.signal?.aborted) {
-      emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
-      return abortedOutcome(cmd.code);
+      // The retry run can be cancelled too (as can the install(s) before it).
+      if (cmd.aborted || ctx.signal?.aborted) {
+        emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
+        return abortedOutcome(cmd.code);
+      }
     }
   }
   emit(ctx, '[execute] Playwright run finished', { exitCode: cmd.code, timedOut: cmd.timedOut });
@@ -1581,7 +1626,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   }
 
   let parsed: ParsedReport;
-  if (report) {
+  if (report && !reportIsStructurallyEmpty(report)) {
     parsed = parseReport(report, auth);
   } else {
     parsed = parseSummaryText(`${cmd.stdout}\n${cmd.stderr}`);
@@ -1599,6 +1644,10 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
       emit(ctx, 'Could not parse Playwright results; suite may have failed to start', {
         exitCode: cmd.code,
         timedOut: cmd.timedOut,
+        // Distinguishes "Playwright produced a valid report with literally nothing in it"
+        // (e.g. broken deps let it start but discover zero specs) from "no report at all"
+        // (e.g. it crashed before writing anything) — same underlying diagnostic either way.
+        structurallyEmptyReport: !!report,
         tail,
       });
     }

@@ -556,6 +556,76 @@ describe('attemptLogin()', () => {
       expect(clicked).toEqual(['#enabled-fallback']);
       expect(result.selectors?.submit).toBe('#enabled-fallback');
     });
+
+    // See docs/design/login-submit-button-disabled-at-fill-time-fix.md. Many real login forms
+    // disable submit until client-side validation settles — the pre-fill snapshot always sees
+    // it disabled, and discarding it outright forced a blind, unwaited Enter press even when
+    // the button reliably becomes clickable moments later.
+    it('waits for a submit button disabled at fill-time to become enabled, then clicks it (not Enter)', async () => {
+      const submitButton: InteractiveElement = {
+        role: 'button',
+        name: 'Pokračovať',
+        selector: 'button[data-testid="login-submit"]',
+        inForm: true,
+        buttonType: 'submit',
+        disabled: true,
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, submitButton] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+      // Simulates the app's own async validation enabling the button shortly after fill —
+      // well within the fix's bounded poll window.
+      setTimeout(() => {
+        submitButton.disabled = false;
+      }, 250);
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(clicked).toEqual(['button[data-testid="login-submit"]']);
+      expect(result.selectors?.submit).toBe('button[data-testid="login-submit"]');
+    });
+
+    it('falls back to Enter when the only candidate never becomes enabled (unchanged final outcome)', async () => {
+      const submitButton: InteractiveElement = {
+        role: 'button',
+        name: 'Pokračovať',
+        selector: 'button[data-testid="login-submit"]',
+        inForm: true,
+        buttonType: 'submit',
+        disabled: true, // never flips — models a genuinely broken/dead button
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, submitButton] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        // Enter is the only thing that can navigate here — proves the fallback itself ran.
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(clicked).toEqual([]); // never clicked — the disabled candidate was never used
+      expect(result.ok).toBe(true); // Enter still worked (this fake browser's onSubmitGoTo fires on pressKey too)
+      expect(result.selectors?.submit).toBeUndefined();
+    }, 8000);
   });
 });
 

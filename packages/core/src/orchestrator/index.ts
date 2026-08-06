@@ -173,6 +173,19 @@ const PLAN_BATCH_MAX_UNITS = 10;
 const PLAN_MAX_SPLIT_DEPTH = 3;
 
 /**
+ * Reuse mode skips EXPLORE entirely (see the `suiteMode === 'reuse'` branch below), so
+ * `ctx.exploration` is normally rehydrated from the cached artifact of the run being reused
+ * instead. When no cache exists (cleared, expired, or the project never had a real EXPLORE
+ * pass), falling straight back to guessed Tier B login selectors reproduces the exact bug this
+ * budget exists to prevent: a guess can fail exactly like the missing-grounding case did,
+ * mass-blocking every Tier B test and silently tanking the reuse run's pass rate. Instead, this
+ * bounds a REAL (not guessed) single-page login discovery via `runExplorePhase` with
+ * `maxRoutes: 1` — a small fraction of a full EXPLORE crawl's `DEFAULT_BUDGET_MS` (240_000, see
+ * browser/crawler.ts), since it never needs to visit more than the login page itself.
+ */
+const REUSE_LOGIN_DISCOVERY_BUDGET_MS = 60_000;
+
+/**
  * Run state machine for the Healix orchestrator. Every phase transition is
  * checkpointed to SQLite (run status + events), so an interrupted run is fully
  * inspectable after the fact. A run can also PAUSE — manually, or automatically
@@ -2093,8 +2106,76 @@ async function runPipeline(
     if (checkCancelled()) return await pauseOrCancel('explore');
     if (suiteMode === 'reuse') {
       // No new specs are ever generated in reuse mode, so there is nothing for
-      // a DOM snapshot to ground — skip the live browser pass entirely.
+      // a DOM snapshot to ground for GENERATE — skip the live full-crawl pass
+      // entirely. BUT Tier B auth setup during EXECUTE still needs the real,
+      // previously-verified login selectors (ctx.exploration.crawl.verifiedLogin /
+      // ctx.exploration.loginCandidates — see modes/playwright/execute.ts) to log
+      // in; without them it falls back to guessed selectors, which can genuinely
+      // fail on a real app and mass-block every Tier B outcome (the exact bug this
+      // block exists to prevent — see docs/design/reuse-mode-exploration-inheritance-fix.md).
       emit('explore', 'debug', 'Skipping exploration (reuse mode).');
+      if (effectiveBaseUrl) {
+        try {
+          // Tier 1: cheap — reuse the cached artifact from the run being reused.
+          // Infinity bypasses the normal 24h staleness window: reuse mode is
+          // explicitly re-running the SAME prior suite against the SAME app, not
+          // doing a drift-sensitive fresh crawl, so "how old is this crawl" isn't
+          // the relevant question here the way it is for a fresh EXPLORE pass.
+          const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl, Infinity);
+          if (cachedExploration) {
+            ctx.exploration = cachedExploration;
+            emit(
+              'explore',
+              'debug',
+              'Rehydrated cached exploration artifact for reuse-mode Tier B login.',
+            );
+          } else {
+            const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            if (defaultCredential) {
+              // Tier 2: no cache — run a REAL, bounded, single-page login discovery
+              // instead of guessing. maxRoutes: 1 stops the crawl's BFS after the
+              // first page, so this is a small fraction of a full EXPLORE pass, but
+              // it still gets genuinely VERIFIED selectors (runExplorePhase's
+              // crawlWithAuth actually submits and confirms the login), not a guess.
+              emit(
+                'explore',
+                'info',
+                'No cached exploration artifact for reuse mode; running a bounded login-only discovery.',
+              );
+              const discovery = await runExplorePhase({
+                browser,
+                baseUrl: effectiveBaseUrl,
+                credentials: { username: defaultCredential.username, password: defaultCredential.password },
+                crawlOptions: { maxRoutes: 1, wallClockBudgetMs: REUSE_LOGIN_DISCOVERY_BUDGET_MS },
+                emit,
+              }).catch((err) => {
+                emit('explore', 'debug', `Reuse-mode login discovery failed (continuing): ${errMsg(err)}`);
+                return null;
+              });
+              if (discovery?.crawl.verifiedLogin) {
+                ctx.exploration = discovery;
+              } else {
+                // Tier 3: last resort, unchanged from today's existing fallback behavior.
+                emit(
+                  'explore',
+                  'warn',
+                  'Reuse-mode login discovery could not verify a login; Tier B login will use guessed selectors.',
+                );
+              }
+            } else {
+              emit(
+                'explore',
+                'warn',
+                'No cached exploration artifact and no test credentials configured for reuse mode; Tier B login will use guessed selectors.',
+              );
+            }
+          }
+        } catch (err) {
+          // Fail-open, matching this whole block's posture: any unexpected error here must
+          // degrade to today's pre-fix behavior (guessed selectors), never abort the run.
+          emit('explore', 'debug', `Reuse-mode exploration inheritance failed (continuing): ${errMsg(err)}`);
+        }
+      }
     } else if (effectiveBaseUrl) {
       // Black-box projects (a user-supplied baseUrl with no locally-spawned
       // dev server) never had that URL verified reachable — white-box

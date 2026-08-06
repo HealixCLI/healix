@@ -5,6 +5,7 @@ import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createOrchestrator } from './index.js';
+import { clearExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import type {
   CompleteOptions,
@@ -16,6 +17,7 @@ import type {
 } from '../providers/types.js';
 import type {
   ExecOutcome,
+  ExplorationArtifact,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
@@ -920,5 +922,178 @@ describe('orchestrator top-up / reuse suite modes', () => {
     for (const t of run2Tests) {
       expect(run2Results.filter((r) => r.testId === t.id)).toHaveLength(1);
     }
+  });
+});
+
+/**
+ * See docs/design/reuse-mode-exploration-inheritance-fix.md. Reuse mode always skips the full
+ * EXPLORE crawl (asserted elsewhere), but ctx.exploration still needs SOME source of Tier B
+ * login selectors or auth setup silently guesses and can mass-block every Tier B outcome. These
+ * tests exercise the 3-tier fallback added to fix that: (1) cached artifact, (2) a bounded real
+ * login-only discovery when no cache exists, (3) today's pre-fix guessed-selector behavior as
+ * the last resort only.
+ */
+function sampleExplorationArtifact(overrides: Partial<ExplorationArtifact> = {}): ExplorationArtifact {
+  return {
+    crawl: {
+      routes: [],
+      visitedCount: 1,
+      budgetExhausted: false,
+      redirectLoopsDetected: [],
+      shellCollapsed: false,
+      degenerateRedirectsSkipped: [],
+      authAttempted: true,
+      authVerified: true,
+      verifiedLogin: {
+        pageUrl: 'https://app.example.test/login',
+        identifierSelector: '#email',
+        passwordSelector: '#password',
+        submitSelector: '#submit',
+      },
+    },
+    routing: { hashRouted: false },
+    loginCandidates: [],
+    useful: true,
+    observedEndpoints: [],
+    ...overrides,
+  };
+}
+
+describe('reuse-mode exploration inheritance (3-tier Tier B login fallback)', () => {
+  it('TIER 1 (cache hit): rehydrates ctx.exploration from the cached artifact, no live discovery attempted', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Tier1 Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      credentials: [{ role: null, username: 'user@example.test', password: 'pw' }],
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    // Pre-populate the cache the run-1 EXPLORE phase would normally have written.
+    persistExplorationCache(project.id, 'https://app.example.test', sampleExplorationArtifact());
+
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+    const events = store.listEvents(run2.runId).map((e) => e.message);
+    expect(events).toContain('Rehydrated cached exploration artifact for reuse-mode Tier B login.');
+    // Tier 2/3 must never fire on a cache hit.
+    expect(events.some((m) => m.includes('running a bounded login-only discovery'))).toBe(false);
+    expect(events.some((m) => m.includes('Tier B login will use guessed selectors'))).toBe(false);
+  });
+
+  it('TIER 2 (cache miss, credentials configured): attempts a bounded real login discovery instead of guessing immediately', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Tier2 Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      credentials: [{ role: null, username: 'user@example.test', password: 'pw' }],
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    // run1's own fresh EXPLORE phase persists a cache entry — clear it to simulate a genuine
+    // cache miss for the reuse run below (e.g. cache expired, or was explicitly cleared).
+    clearExplorationCache(project.id);
+
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser, // returns an empty snapshot — no login form is ever "found"
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    // Fail-open: even though discovery can't verify a login against fakeBrowser's blank
+    // snapshot, the run must still complete normally, never crash or hang.
+    expect(run2.status).toBe('passed');
+    const events = store.listEvents(run2.runId).map((e) => e.message);
+    expect(events).toContain(
+      'No cached exploration artifact for reuse mode; running a bounded login-only discovery.',
+    );
+    // Falls through to tier 3 only because the fake browser has no real login form —
+    // this is the "discovery genuinely couldn't verify anything" path, still cheaper and more
+    // honest than guessing immediately on a bare cache miss.
+    expect(events).toContain(
+      'Reuse-mode login discovery could not verify a login; Tier B login will use guessed selectors.',
+    );
+  });
+
+  it('TIER 3 (cache miss, no credentials configured): falls straight to today\'s guessed-selector behavior, no discovery attempted', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Tier3 Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      // No credentials at all — nothing to discover a login with.
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    // run1's own fresh EXPLORE phase persists a cache entry — clear it to simulate a genuine
+    // cache miss for the reuse run below (e.g. cache expired, or was explicitly cleared).
+    clearExplorationCache(project.id);
+
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+    const events = store.listEvents(run2.runId).map((e) => e.message);
+    expect(events).toContain(
+      'No cached exploration artifact and no test credentials configured for reuse mode; Tier B login will use guessed selectors.',
+    );
+    // Tier 2 must never even attempt a discovery crawl when there's nothing to log in with.
+    expect(events.some((m) => m.includes('running a bounded login-only discovery'))).toBe(false);
   });
 });

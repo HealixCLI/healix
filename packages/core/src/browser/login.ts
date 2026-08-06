@@ -1,5 +1,5 @@
 import { LOGIN_TEXT_RE, LOGIN_URL_HINT_RE, SIGNUP_URL_HINT_RE, normalizeUrl } from './crawler.js';
-import type { BrowserSurface, DomSnapshot, InteractiveElement } from './types.js';
+import type { BrowserSurface, CapturedNetworkEvent, DomSnapshot, InteractiveElement } from './types.js';
 
 export interface LoginAttemptResult {
   ok: boolean;
@@ -16,6 +16,16 @@ export interface LoginAttemptResult {
    * of re-guessing from scratch.
    */
   selectors?: { identifier: string; password: string; submit?: string };
+  /**
+   * Network traffic captured from the submit click through the outcome settling, present only
+   * when `ok: true` — this is the REAL login response (the actual account's real id/email/name,
+   * a real signed token), the one piece of ground truth every mock/identity-reconciliation pass
+   * downstream needs but, until now, never received: nothing else in a run ever performs a real
+   * login again, so a caller that discards this (as crawl()'s own startup drain used to do
+   * unconditionally) leaves reconciliation permanently dependent on some OTHER page happening to
+   * expose the same identity by luck. Pass this to crawl() as `seedNetworkEvents` instead.
+   */
+  networkEvents?: CapturedNetworkEvent[];
 }
 
 /** Matches a submit-ish `selector` — built from `data-testid`/`data-test`/`name`/`aria-label`/`#id`,
@@ -216,6 +226,10 @@ async function submitLoginAttempt(
   // Waits for the credential form to mount, revealing it behind a login toggle if that's what
   // this app needs — see waitForCredentialForm.
   let before = await waitForCredentialForm(browser);
+  // Discard whatever page-load noise accumulated getting here, so the capture below (returned
+  // to the caller only on success) is scoped to the actual submit attempt — see
+  // LoginAttemptResult.networkEvents.
+  browser.drainNetworkEvents();
 
   const passwordIndex = before.interactiveElements.findIndex((el) => el.inputType === 'password');
   const passwordEl = before.interactiveElements[passwordIndex];
@@ -302,6 +316,7 @@ async function submitLoginAttempt(
       password: finalPasswordSelector,
       submit: finalSubmitSelector,
     },
+    networkEvents: browser.drainNetworkEvents(),
   };
 }
 

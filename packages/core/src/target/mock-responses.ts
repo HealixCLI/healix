@@ -13,16 +13,21 @@ function base64url(input: string): string {
 }
 
 /**
- * Deterministic, structurally valid, far-future-expiry JWT. An opaque placeholder like
+ * Deterministic, structurally valid, far-future-expiry JWT for the given `subject` (the
+ * identity an app decoding this token's `sub` claim would see). An opaque placeholder like
  * 'healix-mock-token' throws in any app that runs jwtDecode()/parses the payload on login,
- * which fails the login just as silently as a missing token. Computed once from a literal
- * payload (no Date.now()) so the generated fixture is byte-stable run to run.
+ * which fails the login just as silently as a missing token. Computed from a literal payload
+ * (no Date.now()) so the generated fixture is byte-stable run to run for the same subject.
  */
-const MOCK_JWT = [
-  base64url('{"alg":"HS256","typ":"JWT"}'),
-  base64url('{"sub":"healix-mock-user","exp":4102444800}'), // 2100-01-01, never expired
-  base64url('healix-mock-signature'),
-].join('.');
+function buildMockJwt(subject: string): string {
+  return [
+    base64url('{"alg":"HS256","typ":"JWT"}'),
+    base64url(JSON.stringify({ sub: subject, exp: 4102444800 })), // 2100-01-01, never expired
+    base64url('healix-mock-signature'),
+  ].join('.');
+}
+
+const MOCK_JWT = buildMockJwt('healix-mock-user');
 
 /**
  * A deliberate SUPERSET of the shapes real login APIs return, not one canonical shape: the
@@ -184,6 +189,15 @@ const IDENTITY_NAME_KEYS = new Set(['name', 'fullname', 'displayname']);
 const IDENTITY_FIRST_NAME_KEYS = new Set(['firstname']);
 const IDENTITY_LAST_NAME_KEYS = new Set(['lastname']);
 
+/** Strips separators (`_`, `-`, etc.) before lowercasing, so a real API's own naming style —
+ * `user_id`, `userId`, `USER-ID` — all resolve to the same lookup key against the IDENTITY_*
+ * sets above, which are already written in this stripped form. Without this, a snake_case
+ * field (e.g. Capillary's `user_id`) never matches `userid` and silently falls through to "no
+ * id found here" even though the value is sitting right there under a differently-styled key. */
+function normalizeIdentityKey(rawKey: string): string {
+  return rawKey.toLowerCase().replace(/[^a-z0-9]/g, '');
+}
+
 function stringLeaf(value: unknown): string | undefined {
   if (typeof value === 'string' && value.length > 0) return value;
   if (typeof value === 'number' && Number.isFinite(value)) return String(value);
@@ -207,7 +221,7 @@ function identityFromObject(obj: Record<string, unknown>): CanonicalIdentity | n
   let firstName: string | undefined;
   let lastName: string | undefined;
   for (const [rawKey, value] of Object.entries(obj)) {
-    const key = rawKey.toLowerCase();
+    const key = normalizeIdentityKey(rawKey);
     if (!id && IDENTITY_ID_KEYS.has(key)) {
       id = stringLeaf(value) ?? id;
     } else if (!email && IDENTITY_EMAIL_KEYS.has(key)) {
@@ -262,17 +276,27 @@ function findIdentityIn(value: unknown, depth = 0): CanonicalIdentity | null {
  * Scans real observed traffic for a canonical "who is the logged-in user" identity, so it can
  * be reused (via `applyCanonicalIdentity`) across sibling SYNTHETIC mocked endpoints that would
  * otherwise each invent their own inconsistent name/email/id (Cluster B: one endpoint showing
- * real captured "adroy tester" while another shows generic "Healix Mock User"). Prefers a match
- * found in an auth/login-shaped endpoint's body (most authoritative — it's literally "who just
- * logged in"), else the first match across any observed endpoint, in order. Returns `null` when
- * no real capture exists yet (the common PLAN-time-only case), or nothing observed looked like a
- * person record — the prompt-level identity-consistency rule in `buildPrompt` is what keeps
- * purely-synthetic endpoints consistent with each other in that case.
+ * real captured "adroy tester" while another shows generic "Healix Mock User").
+ *
+ * Merges field-by-field across every observed match rather than returning the first one found
+ * outright: an auth/login-shaped endpoint's own value for a field, once seen, is authoritative
+ * and never overwritten by anything else — but a field it never provided at all (a "generate
+ * token" call routinely returns email/name with no numeric customer id, which only shows up on
+ * a separate profile/loyalty endpoint) is still filled in from whichever OTHER observed endpoint
+ * has it. The earlier all-or-nothing version returned the very first auth match outright, so a
+ * real-but-incomplete login response permanently blocked a real id sitting right there in a
+ * sibling endpoint's own capture — id stayed on the synthetic placeholder even after the login
+ * response itself was genuinely captured. Among non-auth matches, first-found-per-field still
+ * wins (unchanged from before) unless an auth match later supplies that same field. Returns
+ * `null` when no real capture exists yet (the common PLAN-time-only case), or nothing observed
+ * looked like a person record — the prompt-level identity-consistency rule in `buildPrompt` is
+ * what keeps purely-synthetic endpoints consistent with each other in that case.
  */
 export function extractCanonicalIdentity(
   observedEndpoints: Array<{ pathPattern: string; sampleResponseBody?: string }>,
 ): CanonicalIdentity | null {
-  let firstMatch: CanonicalIdentity | null = null;
+  const merged: CanonicalIdentity = {};
+  const fieldSource: Partial<Record<keyof CanonicalIdentity, 'auth' | 'other'>> = {};
   for (const observed of observedEndpoints) {
     if (!observed.sampleResponseBody) continue;
     let parsed: unknown;
@@ -283,10 +307,18 @@ export function extractCanonicalIdentity(
     }
     const found = findIdentityIn(parsed);
     if (!found) continue;
-    if (isAuthEndpointPath(observed.pathPattern)) return found;
-    firstMatch ??= found;
+    const isAuth = isAuthEndpointPath(observed.pathPattern);
+    for (const key of ['id', 'email', 'name'] as const) {
+      const value = found[key];
+      if (value === undefined) continue;
+      const existing = fieldSource[key];
+      if (existing === 'auth') continue; // an auth-sourced field is final, never overwritten
+      if (existing === 'other' && !isAuth) continue; // first non-auth match still wins among non-auth
+      merged[key] = value;
+      fieldSource[key] = isAuth ? 'auth' : 'other';
+    }
   }
-  return firstMatch;
+  return Object.keys(merged).length > 0 ? merged : null;
 }
 
 /**
@@ -307,7 +339,7 @@ export function applyCanonicalIdentity(body: unknown, canonical: CanonicalIdenti
   const qualifies = identityFromObject(body) !== null;
   const result: Record<string, unknown> = {};
   for (const [rawKey, value] of Object.entries(body)) {
-    const key = rawKey.toLowerCase();
+    const key = normalizeIdentityKey(rawKey);
     if (qualifies && canonical.id !== undefined && IDENTITY_ID_KEYS.has(key)) {
       result[rawKey] = canonical.id;
     } else if (qualifies && canonical.email !== undefined && IDENTITY_EMAIL_KEYS.has(key)) {
@@ -316,6 +348,39 @@ export function applyCanonicalIdentity(body: unknown, canonical: CanonicalIdenti
       result[rawKey] = canonical.name;
     } else if (isPlainObject(value)) {
       result[rawKey] = applyCanonicalIdentity(value, canonical);
+    } else {
+      result[rawKey] = value;
+    }
+  }
+  return result;
+}
+
+/** The JWT-bearing sibling keys next to an auth response's `user` object — never rewritten by
+ * applyCanonicalIdentity (a JWT is an opaque string, not an identity-shaped leaf), so a
+ * reconciled real `user.id` was previously left contradicted by an unrelated, still-fake
+ * token whose own encoded `sub` claim kept saying "healix-mock-user". Deliberately excludes
+ * `refresh_token`/`refreshToken` — real login APIs never encode a decodable identity in a
+ * refresh token the way an access token does, so there is nothing to reconcile there. */
+const AUTH_TOKEN_KEYS = new Set(['token', 'accesstoken']);
+
+/**
+ * Regenerates every token-shaped field in a SYNTHETIC auth response so its encoded `sub`
+ * claim agrees with `canonical.id`, the same way applyCanonicalIdentity already reconciles
+ * the plain `user.id` JSON field — without this, an app that reads the identity by decoding
+ * the token (rather than, or in addition to, `user.id`) still sees the fake placeholder
+ * subject and can still reject the session even after `user.id` itself was fixed. No-op when
+ * `canonical` has no id yet, or the body isn't a plain object.
+ */
+export function reconcileAuthTokens(body: unknown, canonical: CanonicalIdentity | null): unknown {
+  if (!canonical?.id || !isPlainObject(body)) return body;
+  const freshToken = buildMockJwt(canonical.id);
+  const result: Record<string, unknown> = {};
+  for (const [rawKey, value] of Object.entries(body)) {
+    const key = normalizeIdentityKey(rawKey);
+    if (typeof value === 'string' && AUTH_TOKEN_KEYS.has(key)) {
+      result[rawKey] = freshToken;
+    } else if (isPlainObject(value)) {
+      result[rawKey] = reconcileAuthTokens(value, canonical);
     } else {
       result[rawKey] = value;
     }

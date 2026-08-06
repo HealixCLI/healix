@@ -117,6 +117,15 @@ export interface Run {
   baseRunId: string | null;
   /** Set only when status is 'paused'; null otherwise (including for runs predating this feature). */
   pauseReason: PauseReason | null;
+  /**
+   * Cumulative ACTIVE processing time (ms) across every pass this run has gone through —
+   * the original run, plus any retry-pass or resume-from-pause. Distinct from
+   * `finishedAt - startedAt`, which is wall-clock and includes idle time between passes
+   * (e.g. retrying a day after the original run completed). Null for runs predating this
+   * column — readers should fall back to `finishedAt - startedAt` for those, which is
+   * correct for a single, never-retried pass.
+   */
+  activeDurationMs: number | null;
 }
 
 export type Tier = 'tierA-public' | 'tierB-auth' | 'tierC-api' | (string & {});

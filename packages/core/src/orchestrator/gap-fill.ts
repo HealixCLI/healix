@@ -680,10 +680,19 @@ async function runMicroAgent(
     const prompt = buildMicroAgentPrompt(goalDescription, before, history);
     let completion: Awaited<ReturnType<GapFillProvider['provider']['complete']>>;
     try {
+      // Without an explicit timeoutMs, complete() falls back to its own hard backstop
+      // (ABSOLUTE_BACKSTOP_MS, 25 minutes) — wildly larger than this gap's own budget. A call that
+      // keeps streaming SOMETHING (so the provider's own idle-timeout sliding window never trips)
+      // but is simply too slow would then ride out the full 25-minute window before being killed,
+      // even though the per-gap deadline check above only fires BETWEEN turns and can't interrupt
+      // an in-flight call. Scoping timeoutMs to the gap's actual remaining budget bounds it
+      // correctly while leaving the provider's idle-timeout behavior (kill on genuine silence)
+      // untouched — a slow-but-live call is now capped by the gap's real budget, not by 25 minutes.
       completion = await gapFillProvider.provider.complete(prompt, {
         mode: 'default',
         readOnly: true,
         taskType: 'explore-gapfill',
+        timeoutMs: Math.max(0, perGapDeadline - Date.now()),
       });
     } catch (err) {
       emit('explore', 'debug', `Gap-fill micro-agent call failed (stopping this gap): ${errMsg(err)}`);

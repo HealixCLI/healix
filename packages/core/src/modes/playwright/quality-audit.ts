@@ -215,6 +215,25 @@ const DISABLED_ASSERTION_RE = /(?<!\.not)\.toBeDisabled\(\s*\)/;
 /** A `.click(...)` call whose own line/statement mentions a submit-ish hint (testid, name, role, or button label) — English + a few observed Slovak equivalents. Not a full parser; matches the shape actual generated specs use (`locator('button[data-testid="login-submit"]').click()`). */
 const SUBMIT_CLICK_RE =
   /[^\n;]*(?:submit|login|log-in|sign-?in|register|continue|confirm|save|pokra[cč]ova|odosla|prihl[aá]s|zaregistruj)[^\n;]*\.click\(\s*\)/i;
+/** A negated URL-outcome check (`not.toHaveURL(...)`) — proves only "left the old page," which
+ * also passes on a mid-navigation blank frame or a wrong intermediate route. See
+ * weak-positive-navigation-assertion below. */
+const NOT_TO_HAVE_URL_RE = /\.not\.toHaveURL\(/;
+/** A real, specific URL-outcome check, OR a real destination-content check (toBeVisible/
+ * toHaveText/toContainText, non-negated) — either is genuine evidence the right page was
+ * reached, not just that the old one was left. Content evidence is deliberately treated as
+ * equally sufficient: it is the exact alternative this check's own message recommends for a
+ * genuinely-unobserved destination, so a test that correctly followed that advice (content proof
+ * + a merely-supplementary not.toHaveURL) must never be penalized for doing the right thing. */
+const POSITIVE_TO_HAVE_URL_RE = /(?<!\.not)\.toHaveURL\(/;
+const POSITIVE_CONTENT_ASSERTION_RE = /(?<!\.not)\.(?:toBeVisible|toHaveText|toContainText)\(/;
+/** The title must itself CLAIM a successful redirect/login/signup happened — narrower than "not a
+ * negative title": a neutrally- or oppositely-titled test using the identical not.toHaveURL
+ * shape to prove the user correctly STAYED PUT (e.g. "applying a filter does not navigate away",
+ * clicking a "Save filter" control that happens to match SUBMIT_CLICK_RE) has the opposite intent
+ * and must not be caught just because its title isn't negative either. */
+const POSITIVE_REDIRECT_TITLE_HINT_RE =
+  /\b(succeeds?|logs?\s*in|log-?in|sign(?:s|ed)?\s*in|redirect|navigat|creates?\s+(?:the\s+|a\s+)?account|signs?\s*up|registers?)\b/i;
 
 /**
  * A single-target interaction — real triage data across multiple runs traced repeat
@@ -270,11 +289,34 @@ const VISIBLE_OR_TEXT_ASSERTION_RE = /\.(?:not\.)?(?:toBeVisible|toHaveText)\(/;
 const SUCCESS_STATUS_ASSERTION_RE = /\.status\(\)\s*\)\.toBe\(\s*(?:200|201|204)\s*\)/;
 
 /**
+ * A `.click(...)` line naming a LOGIN/sign-in submit specifically — deliberately narrower than
+ * SUBMIT_CLICK_RE (no register/signup/continue/confirm/save) so a registration form's own
+ * Date.now()-based invented email (generate.ts's own guidance for signup-uniqueness scenarios) is
+ * never mistaken for the login-credential violation this flags. Same wording family as crawler.ts's
+ * LOGIN_TEXT_RE, duplicated here rather than imported since this module stays a pure text/regex
+ * layer with no dependency on the browser package.
+ */
+const LOGIN_SUBMIT_CLICK_RE = /[^\n;]*(?:log[- ]?in|sign[- ]?in|prihl[aá]s)[^\n;]*\.click\(\s*\)/i;
+/** Counts `.fill(` calls of ANY kind (literal or `process.env...`) — a login form's identifier
+ * AND password fields are both filled, so a block with fewer than two is unlikely to be one. */
+const ANY_FILL_RE = /\.fill\(/g;
+/** A `.fill(...)` line whose label/placeholder/selector text names an email/username/login/
+ * password field — English + the Slovak equivalents also matched by fixtures/auth.setup.ts's own
+ * field-locator heuristic (kept in sync deliberately: same real-world shape, same fallback words).
+ * Non-global so repeated `.test()` calls on the same instance stay safe (no shared lastIndex). */
+const CREDENTIAL_FIELD_HINT_RE = /e-?mail|user\s*name|login|password|passwd|heslo/i;
+
+/**
  * Audit a single spec's parse-clean source for quality findings. Returns
  * both block-scoped findings (used for Phase B pruning) and — currently
  * none, but the shape allows it — file-scoped ones.
+ *
+ * `opts.hasCredentials` — true when the project has a real configured test credential (see
+ * suiteEnv() in execute.ts, which injects it into HEALIX_TIERB_EMAIL/HEALIX_TIERB_PASSWORD at
+ * runtime) — gates the invented-login-credential check below: with no credential configured
+ * there is nothing correct to reference, so it would be a false positive.
  */
-export function auditSpecQuality(source: string): QualityFinding[] {
+export function auditSpecQuality(source: string, opts?: { hasCredentials?: boolean }): QualityFinding[] {
   const findings: QualityFinding[] = [];
   const blocks = splitTestBlocks(source);
 
@@ -366,6 +408,60 @@ export function auditSpecQuality(source: string): QualityFinding[] {
       }
     }
 
+    // invented-login-credential: a login-submit block (identifier + password both filled, then a
+    // login/sign-in click) that is NOT itself a deliberate invalid-credentials scenario, but still
+    // fills a hardcoded string literal instead of referencing the real configured credential via
+    // process.env.HEALIX_TIERB_EMAIL/HEALIX_TIERB_PASSWORD (see generate.ts's formatLoginCredentialGuidance).
+    // HARD, unlike the WARN check above, because — unlike an invented signup email, which is
+    // CORRECT there — any literal here (even an obviously-fake one) can only ever be wrong: the
+    // real backend will reject it, so the test fails against a correctly-behaving app 100% of the
+    // time. Gated on hasCredentials since with none configured there is nothing correct to cite.
+    if (
+      opts?.hasCredentials &&
+      LOGIN_SUBMIT_CLICK_RE.test(block.body) &&
+      [...block.body.matchAll(ANY_FILL_RE)].length >= 2 &&
+      !NEGATIVE_TITLE_HINT_RE.test(block.title)
+    ) {
+      // Prefer identifying the identifier/password fills by what they actually ARE — a line whose
+      // label/placeholder/selector names an email/username/login/password field, the same
+      // heuristic fixtures/auth.setup.ts already uses at runtime to locate these fields — rather
+      // than assuming they're always the first two fills. This finds the real credential fields
+      // regardless of where they fall in the block, so an unrelated literal (OTP/promo/"remember
+      // me") elsewhere is never mistaken for one just because of its position.
+      //
+      // Only when NO line matches at all (a fully unlabeled form, with no recognizable hint on
+      // ANY fill) do we fall back to position: the first two fills, still far narrower than "any
+      // literal anywhere in the block". Ranked by match position rather than parsing each fill's
+      // argument text, so the fallback stays correct even when the correctly-grounded fill is a
+      // multi-paren expression (e.g. the multi-role
+      // `JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON!).find(...).username` lookup from
+      // generate.ts's credentialFieldRefs) that a naive argument-text scan could misparse.
+      const credentialLines = block.body
+        .split('\n')
+        .filter((line) => HAS_FILL_RE.test(line) && CREDENTIAL_FIELD_HINT_RE.test(line));
+      let literal;
+      if (credentialLines.length > 0) {
+        for (const line of credentialLines) {
+          literal = [...line.matchAll(FILL_LITERAL_RE)][0];
+          if (literal) break;
+        }
+      } else {
+        const fillPositions = [...block.body.matchAll(ANY_FILL_RE)].map((m) => m.index);
+        literal = [...block.body.matchAll(FILL_LITERAL_RE)].find(
+          (lm) => fillPositions.filter((pos) => pos <= lm.index).length <= 2,
+        );
+      }
+      if (literal) {
+        findings.push({
+          code: 'invented-login-credential',
+          severity: 'hard',
+          message: `Test "${block.title || '(untitled)'}" submits a login form with a hardcoded literal ("${literal[1]}") instead of the real configured test credential. Fill the identifier/password fields with process.env.HEALIX_TIERB_EMAIL!/process.env.HEALIX_TIERB_PASSWORD! — a literal, even a placeholder-looking one, will never match the real account and will fail this test against a correctly-behaving app.`,
+          testTitle: block.title,
+          blockRange: [block.start, block.end],
+        });
+      }
+    }
+
     if (NEGATIVE_TITLE_HINT_RE.test(block.title) && ENABLED_ASSERTION_RE.test(block.body)) {
       findings.push({
         code: 'disabled-button-race-risk',
@@ -391,6 +487,46 @@ export function auditSpecQuality(source: string): QualityFinding[] {
         code: 'disabled-button-click-race',
         severity: 'hard',
         message: `Test "${block.title}" fills invalid input then clicks a submit-like control with no assertion of its disabled/enabled state anywhere in the test — if the app correctly disables the control on invalid input, this click will hang until timeout. Assert the control stays disabled (\`toBeDisabled()\`), or assert the inline validation message without depending on the click succeeding.`,
+        testTitle: block.title,
+        blockRange: [block.start, block.end],
+      });
+    }
+
+    // A test whose TITLE claims a successful redirect/login/signup, that clicks a submit-like
+    // control, and whose ONLY navigation-outcome evidence is "left the old page" is provably
+    // unsafe, not just weak: a real login failure that redirects to /login/errorpage (or any
+    // other sibling route under the same path) still satisfies "not exactly /login" — this is
+    // not hypothetical, it is the exact false-pass this check exists to close, confirmed against
+    // a real run where credentials were rejected and the test still went green. It also passes
+    // on a mid-navigation blank frame, and can resolve before the SPA finishes painting the real
+    // destination, cutting the recorded video off mid-transition.
+    //
+    // Three independent false-positive guards, each closing a real case a broader version of
+    // this check would have wrongly pruned:
+    //  - SUBMIT_CLICK_RE: a test correctly asserting the user STAYED on the current page (e.g.
+    //    "canceling keeps you on the form") legitimately uses this exact assertion shape with the
+    //    opposite intent — that shape never submits anything, so it's excluded by construction.
+    //  - POSITIVE_TO_HAVE_URL_RE / POSITIVE_CONTENT_ASSERTION_RE: a test that already followed
+    //    this very check's own advice — proving the real destination via URL OR real page content
+    //    — must never be penalized just because it also kept a cheap supplementary not.toHaveURL.
+    //  - POSITIVE_REDIRECT_TITLE_HINT_RE: "not a negative title" alone isn't enough — a
+    //    neutrally-titled "stays put" test (e.g. clicking a "Save filter" control, which matches
+    //    SUBMIT_CLICK_RE) needs its title to affirmatively claim a redirect/login/signup outcome
+    //    before this coarse-check risk applies to it at all.
+    // Given all three, there is no legitimate submit-success case left that this blocks — every
+    // survivor is a test that both claims success AND still only proved "left," never "arrived."
+    if (
+      POSITIVE_REDIRECT_TITLE_HINT_RE.test(block.title) &&
+      !NEGATIVE_TITLE_HINT_RE.test(block.title) &&
+      SUBMIT_CLICK_RE.test(block.body) &&
+      NOT_TO_HAVE_URL_RE.test(block.body) &&
+      !POSITIVE_TO_HAVE_URL_RE.test(block.body) &&
+      !POSITIVE_CONTENT_ASSERTION_RE.test(block.body)
+    ) {
+      findings.push({
+        code: 'weak-positive-navigation-assertion',
+        severity: 'hard',
+        message: `Test "${block.title}" verifies a successful navigation using only \`not.toHaveURL(...)\` — this proves "left the old page," not "reached the right one." A real login/action failure that redirects to a sibling error route (e.g. /login/errorpage) still satisfies "not exactly the old URL" and would silently pass. Assert the real observed destination URL instead (\`toHaveURL(/\\/dashboard\\/vouchers/)\`), or, if the destination is genuinely unobserved, assert real destination page content instead of a coarse "left the page" check.`,
         testTitle: block.title,
         blockRange: [block.start, block.end],
       });

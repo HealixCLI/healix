@@ -44,6 +44,7 @@ import { createBrowserSurface } from '../browser/index.js';
 import { runExplorePhase, splitStaticUnitsForExplore, assessExplorationUsefulness } from './explore.js';
 import { deriveRegionCodesFromText } from '../browser/seed-discovery.js';
 import { identifyExplorationGaps, runGapFillingPass } from './gap-fill.js';
+import { runDirectedReexplore } from './directed-reexplore.js';
 import { mergeCrawlResults } from '../browser/crawler.js';
 import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
@@ -532,6 +533,20 @@ async function retryPassPipeline(
     emit('plan', 'error', `Run not found: ${runId}`);
     return { runId, status: 'error' };
   }
+  // Active-duration tracking (see runs.active_duration_ms's own schema comment): this
+  // retry-pass's own elapsed processing time gets ADDED to whatever the run already
+  // accrued, rather than letting "Total time" fall back to finishedAt - startedAt — the
+  // original startedAt could be days old by the time a retry-pass runs, which would count
+  // that entire idle gap as "active" time. run.activeDurationMs is null for a run that
+  // predates this column (or has never been retried before); fall back to that run's own
+  // single-pass wall-clock time as the best available baseline for it specifically —
+  // accurate for exactly one pass, which is all such a run has had so far.
+  const passStartedAtMs = Date.now();
+  const baselineActiveDurationMs =
+    run.activeDurationMs ??
+    (run.startedAt && run.finishedAt
+      ? Math.max(0, new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime())
+      : 0);
   const project = store.getProject(run.projectId);
   if (!project) {
     emit('plan', 'error', `Project not found: ${run.projectId}`);
@@ -821,7 +836,8 @@ async function retryPassPipeline(
     });
 
     try {
-      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso() });
+      const activeDurationMs = baselineActiveDurationMs + Math.max(0, Date.now() - passStartedAtMs);
+      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso(), activeDurationMs });
       noteStoreOk();
     } catch (err) {
       noteStoreFailure('updateRunStatus', err);
@@ -849,7 +865,8 @@ async function retryPassPipeline(
   } catch (err) {
     emit('generate', 'error', `Retry-pass failed: ${errMsg(err)}`, { stack: errStack(err) });
     try {
-      store.updateRunStatus(runId, 'error', { finishedAt: nowIso() });
+      const activeDurationMs = baselineActiveDurationMs + Math.max(0, Date.now() - passStartedAtMs);
+      store.updateRunStatus(runId, 'error', { finishedAt: nowIso(), activeDurationMs });
     } catch {
       /* best-effort */
     }
@@ -964,6 +981,17 @@ async function runPipeline(
   // Mutable status mirror so the returned summary always reflects the latest phase.
   let currentStatus: RunStatus = 'pending';
 
+  // Active-duration tracking (see runs.active_duration_ms's own schema comment): a paused
+  // run resumed later, or a retry-pass run days after the original completed, must not have
+  // its "Total time" stat include the idle gap in between — only genuinely active processing
+  // time should accumulate. activeStartedAtMs marks when the CURRENT active segment began
+  // (reset on every startedAt patch — a fresh run's initial 'pending' transition, or a
+  // resume-from-pause); accumulatedActiveDurationMs is the running total, seeded from
+  // whatever this run already accrued across any PRIOR pass (a resume continuing a paused
+  // run created earlier in this same process).
+  let activeStartedAtMs: number | null = run.startedAt ? new Date(run.startedAt).getTime() : null;
+  let accumulatedActiveDurationMs = run.activeDurationMs ?? 0;
+
   // Persistence health tracking. Best-effort store writes still swallow their
   // errors (a DB fault must never abort the run), but we count *consecutive*
   // failures and surface at least one warn via the DB-independent onEvent path
@@ -997,8 +1025,20 @@ async function runPipeline(
     patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
   ): void => {
     currentStatus = status;
+    if (patch.startedAt !== undefined) {
+      activeStartedAtMs = new Date(patch.startedAt).getTime();
+    }
+    // finishedAt marks the end of the CURRENT active segment (a terminal status, or a
+    // pause) — fold its elapsed time into the running total. A patch with finishedAt but
+    // no known segment start (shouldn't happen in practice, since every terminal/pause
+    // patch follows an earlier startedAt patch) is skipped rather than guessed at.
+    const fullPatch: typeof patch & { activeDurationMs?: number } = { ...patch };
+    if (patch.finishedAt !== undefined && activeStartedAtMs !== null) {
+      accumulatedActiveDurationMs += Math.max(0, new Date(patch.finishedAt).getTime() - activeStartedAtMs);
+      fullPatch.activeDurationMs = accumulatedActiveDurationMs;
+    }
     try {
-      store.updateRunStatus(runId, status, patch);
+      store.updateRunStatus(runId, status, fullPatch);
       noteStoreOk();
     } catch (err) {
       /* persistence best-effort; never abort the pipeline on a status write */
@@ -2616,6 +2656,55 @@ async function runPipeline(
         for (const spec of carriedSpecs)
           registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
+
+        // ---- 7b. DIRECTED RE-EXPLORATION (bounded, always-on, fail-open) ----
+        // When GENERATE couldn't find a real selector for something a scenario needs, it emits an
+        // escape hatch demoted to test.fixme(...) (generate.ts's ESCAPE_HATCH_MARKER) — today a
+        // permanent dead end. This re-crawls ONLY the specific route(s) those gaps resolve to
+        // (never the whole app again), regenerates ONLY the affected item(s), and merges the
+        // richer crawl data back into ctx.exploration before EXECUTE ever runs. Distinct from the
+        // KB/retry-pass/coverage-feedback-loop below (that recovers generation/execution
+        // FAILURES; this recovers items that generated fine but only by guessing) and from
+        // gap-fill.ts's EXPLORE-phase mechanism (proactive/content-coverage, runs before
+        // generate; this is reactive/selector-failure-based, after generate). No opt-in flag,
+        // unlike coverageLoopEnabled below — gated only on there being real work to do. Never
+        // runs for suiteMode 'reuse' (no new generation happens there at all). Wrapped in its own
+        // try/catch even though runDirectedReexplore never throws internally — belt-and-suspenders,
+        // mirroring EXPLORE's own two-layer try/catch around its gap-fill pass.
+        if (ctx.exploration && effectiveBaseUrl && suiteMode !== 'reuse') {
+          try {
+            // Captured as a local: `ctx` is a `let` binding, so TS can't carry this block's own
+            // narrowing (ctx.exploration truthy) into a closure that could in principle run later.
+            const reexploreCtx = ctx;
+            const reexploreProjectDir = ctx.projectDir;
+            const reexplore = await runDirectedReexplore({
+              ctx: reexploreCtx,
+              mode,
+              plan: planForGeneration,
+              specs,
+              routing: reexploreCtx.exploration!.routing,
+              baseUrl: effectiveBaseUrl,
+              reregisterSpecRows: (spec, items) =>
+                reregisterSpecRows(store, reexploreProjectDir, spec, items, testIdByKey, noteStoreFailure),
+              emit,
+            });
+            specs = reexplore.specs;
+            if (reexplore.iterations > 0) {
+              emit(
+                'generate',
+                'info',
+                `Directed re-exploration: ${reexplore.iterations} iteration(s), closed ${reexplore.gapsClosed} gap(s), ${reexplore.gapsRemaining} unresolved-selector gap(s) remain.`,
+              );
+            }
+          } catch (err) {
+            emit(
+              'generate',
+              'warn',
+              `Directed re-exploration failed (continuing without it): ${errMsg(err)}`,
+            );
+          }
+        }
+
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
         await writeCheckpoint(runDir, buildCheckpoint(false));
@@ -3959,6 +4048,58 @@ function registerSpecRows(
       store.linkPlanKbScenarioTest(runId, item.id, i, test.id);
     } catch (err) {
       noteStoreFailure('linkPlanKbScenarioTest', err);
+    }
+  });
+}
+
+/**
+ * Like registerSpecRows, but for a spec regenerated by directed re-exploration
+ * (directed-reexplore.ts) to close an escape-hatch gap for an item that ALREADY has row(s) from
+ * this same GENERATE pass — updates the existing row(s) in place via store.updateTestSpec instead
+ * of inserting, which would create a duplicate row for the same scenario (EXECUTE hasn't run yet;
+ * nothing has removed the original). Resolves each scenario's existing test id the SAME way
+ * registerSpecRows populated testIdByKey moments earlier: the item-scoped `item:${item.id}#${i}`
+ * key first (never ambiguous across two items sharing a reqTag, and stable even if the
+ * regenerated spec's title changed), falling back to the reqTag/title-keyed `${base}#${i}` key.
+ */
+function reregisterSpecRows(
+  store: HealixStore,
+  projectDir: string,
+  spec: GeneratedSpec,
+  items: TestPlanItem[],
+  testIdByKey: Map<string, string>,
+  noteStoreFailure: (op: string, err: unknown) => void,
+): void {
+  const reqTag = (spec.reqTag ?? extractReqTag(spec.contents) ?? '').trim();
+  const item =
+    (spec.planItemId ? items.find((it) => it.id === spec.planItemId) : undefined) ??
+    (reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined);
+  if (!item) {
+    noteStoreFailure(
+      'reregisterSpecRows',
+      new Error(`no plan item resolved for regenerated spec ${spec.path}`),
+    );
+    return;
+  }
+  const specPath = relative(projectDir, spec.path);
+  const base = stableKey(reqTag, spec.title);
+  const itemBase = `item:${item.id}`;
+  const scenarios = item.scenarios.length > 0 ? item.scenarios : [undefined];
+
+  scenarios.forEach((s, i) => {
+    const testId = testIdByKey.get(`${itemBase}#${i}`) ?? testIdByKey.get(`${base}#${i}`);
+    if (!testId) {
+      noteStoreFailure(
+        'reregisterSpecRows',
+        new Error(`no existing test row found for item ${item.id} scenario ${i}`),
+      );
+      return;
+    }
+    const title = s ? `${spec.title} — ${s.kind}: ${s.description}` : spec.title;
+    try {
+      store.updateTestSpec(testId, { title, specPath, specCode: spec.contents });
+    } catch (err) {
+      noteStoreFailure('updateTestSpec', err);
     }
   });
 }

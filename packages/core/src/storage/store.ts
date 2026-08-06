@@ -256,6 +256,7 @@ export class HealixStore {
       suiteMode: opts.suiteMode ?? null,
       baseRunId: opts.baseRunId ?? null,
       pauseReason: null,
+      activeDurationMs: null,
     };
     this.db
       .prepare(
@@ -328,7 +329,12 @@ export class HealixStore {
   updateRunStatus(
     id: string,
     status: RunStatus,
-    patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
+    patch: {
+      startedAt?: string;
+      finishedAt?: string;
+      pauseReason?: PauseReason | null;
+      activeDurationMs?: number | null;
+    } = {},
   ): void {
     const fields: string[] = ['status = ?'];
     const values: unknown[] = [status];
@@ -343,6 +349,10 @@ export class HealixStore {
     if (patch.pauseReason !== undefined) {
       fields.push('pause_reason = ?');
       values.push(patch.pauseReason);
+    }
+    if (patch.activeDurationMs !== undefined) {
+      fields.push('active_duration_ms = ?');
+      values.push(patch.activeDurationMs);
     }
     values.push(id);
     this.db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
@@ -475,6 +485,19 @@ export class HealixStore {
    */
   updateTestTitle(id: string, title: string): void {
     this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
+  }
+
+  /**
+   * Overwrite a regenerated spec's title/path/code onto an EXISTING row — used by directed
+   * re-exploration (orchestrator/directed-reexplore.ts's reregisterSpecRows) when a scenario that
+   * already has a row from this same GENERATE pass gets re-generated after a targeted re-crawl.
+   * Leaves status/req_tag/tier untouched: re-registration happens before EXECUTE ever runs
+   * against this row, so there's nothing to reconcile there yet.
+   */
+  updateTestSpec(id: string, fields: { title: string; specPath: string; specCode: string }): void {
+    this.db
+      .prepare('UPDATE tests SET title = ?, spec_path = ?, spec_code = ? WHERE id = ?')
+      .run(fields.title, fields.specPath, fields.specCode, id);
   }
 
   /**
@@ -1399,6 +1422,7 @@ function rowToRun(r: Record<string, unknown>): Run {
     suiteMode: s(r.suite_mode) as Run['suiteMode'],
     baseRunId: s(r.base_run_id),
     pauseReason: s(r.pause_reason) as Run['pauseReason'],
+    activeDurationMs: n(r.active_duration_ms),
   };
 }
 

@@ -195,6 +195,39 @@ describe('TestCase/TestResult description and details', () => {
   });
 });
 
+describe('updateTestSpec — directed re-exploration overwrites a regenerated spec onto an existing row', () => {
+  it('updates title/specPath/specCode in place, leaves status/reqTag/tier untouched, and does not change the row count', async () => {
+    const s = await store();
+    const project = s.createProject({ name: 'reexplore-project', baseUrl: 'https://reexplore.test' });
+    const run = s.createRun(project.id);
+    const test = s.insertTest({
+      runId: run.id,
+      title: '[REQ:REQ-1] positive: resets password',
+      reqTag: 'REQ-1',
+      tier: 'tierB-auth',
+      status: 'pending',
+      specPath: 'tests/tierB-auth/req-1.spec.ts',
+      specCode: 'test.fixme(...)',
+    });
+
+    s.updateTestSpec(test.id, {
+      title: '[REQ:REQ-1] positive: resets password (regenerated)',
+      specPath: 'tests/tierB-auth/req-1.spec.ts',
+      specCode: 'test(...) // real selector found after directed re-exploration',
+    });
+
+    const updated = s.getTest(test.id);
+    expect(updated?.title).toBe('[REQ:REQ-1] positive: resets password (regenerated)');
+    expect(updated?.specCode).toBe('test(...) // real selector found after directed re-exploration');
+    // Untouched fields.
+    expect(updated?.status).toBe('pending');
+    expect(updated?.reqTag).toBe('REQ-1');
+    expect(updated?.tier).toBe('tierB-auth');
+    // No duplicate row was created.
+    expect(s.listTests(run.id)).toHaveLength(1);
+  });
+});
+
 describe('deleteProject cascade', () => {
   it('removes all descendant rows without a FOREIGN KEY error and leaves no orphans', async () => {
     const s = await store();
@@ -1292,6 +1325,42 @@ describe('top-up suite lineage', () => {
     });
     expect(test.specPath).toBeNull();
     expect(s.listTests(run.id)).toMatchObject([{ specPath: null }]);
+  });
+});
+
+describe('updateRunStatus — activeDurationMs (cumulative ACTIVE processing time, distinct from wall-clock finishedAt - startedAt)', () => {
+  it('defaults to null for a freshly created run', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'active-duration-fresh',
+      baseUrl: 'https://active-duration-fresh.test',
+    });
+    const run = s.createRun(project.id);
+    expect(run.activeDurationMs).toBeNull();
+    expect(s.getRun(run.id)?.activeDurationMs).toBeNull();
+  });
+
+  it('persists and round-trips a real activeDurationMs value', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'active-duration-roundtrip',
+      baseUrl: 'https://active-duration-roundtrip.test',
+    });
+    const run = s.createRun(project.id);
+    s.updateRunStatus(run.id, 'passed', { finishedAt: new Date().toISOString(), activeDurationMs: 42_000 });
+    expect(s.getRun(run.id)?.activeDurationMs).toBe(42_000);
+  });
+
+  it('leaves activeDurationMs untouched when the patch omits it (e.g. an intermediate phase-status update)', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'active-duration-untouched',
+      baseUrl: 'https://active-duration-untouched.test',
+    });
+    const run = s.createRun(project.id);
+    s.updateRunStatus(run.id, 'passed', { finishedAt: new Date().toISOString(), activeDurationMs: 5_000 });
+    s.updateRunStatus(run.id, 'generating'); // no activeDurationMs in this patch
+    expect(s.getRun(run.id)?.activeDurationMs).toBe(5_000);
   });
 });
 

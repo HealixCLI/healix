@@ -58,6 +58,52 @@ function findLoginSubmitButton(elements: InteractiveElement[]): InteractiveEleme
 }
 
 /**
+ * Same three-tier logic as `findLoginSubmitButton`, but WITHOUT the `!el.disabled` filter —
+ * a candidate worth waiting for, not necessarily clickable yet. Many real login forms
+ * disable their submit button until client-side validation passes (a snapshot taken right
+ * before typing credentials, as `submitLoginAttempt` takes, will always see it disabled) —
+ * discarding it outright here would permanently lose a real, specific button in favor of a
+ * blind Enter-key press, even when the button reliably becomes enabled moments after fill.
+ * See `waitForCandidateEnabled`, which gives a candidate found here a bounded chance to
+ * become enabled before `submitLoginAttempt` decides whether to click it or fall back.
+ */
+function findLoginSubmitButtonCandidate(elements: InteractiveElement[]): InteractiveElement | undefined {
+  const buttons = elements.filter((el) => el.role === 'button');
+  return (
+    buttons.find((el) => el.inForm && el.buttonType === 'submit') ??
+    buttons.find((el) => SELECTOR_SUBMIT_HINT_RE.test(el.selector)) ??
+    buttons.find((el) => NAME_SUBMIT_HINT_RE.test(el.name))
+  );
+}
+
+/** Bounds for waiting out a submit button's own post-fill validation/enablement delay —
+ * see `waitForCandidateEnabled`. Mirrors templates.ts's `waitForSubmitEnabled` (used by the
+ * REPLAY fixture) so EXPLORE's own crawl-time login attempt gets the same chance to see a
+ * button settle before falling back to Enter. */
+const SUBMIT_ENABLE_TIMEOUT_MS = 5_000;
+const SUBMIT_ENABLE_POLL_MS = 200;
+
+/**
+ * Polls fresh snapshots until `selector` resolves to a non-disabled button, or `timeoutMs`
+ * elapses. Fail-open: a selector that never appears, or never stops being disabled, simply
+ * returns false — the caller falls back to Enter exactly as it did before this existed.
+ */
+async function waitForCandidateEnabled(
+  browser: BrowserSurface,
+  selector: string,
+  timeoutMs: number,
+): Promise<boolean> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    const snap = await browser.snapshot();
+    const el = snap.interactiveElements.find((e) => e.selector === selector);
+    if (el && !el.disabled) return true;
+    if (Date.now() >= deadline) return false;
+    await new Promise((resolve) => setTimeout(resolve, SUBMIT_ENABLE_POLL_MS));
+  }
+}
+
+/**
  * The username/email field for a login form is the non-password textbox
  * CLOSEST to the password field in DOM order — not just the first textbox
  * anywhere on the page. A real page can have unrelated textboxes ahead of
@@ -283,7 +329,25 @@ async function submitLoginAttempt(
       }
     }
 
-    const submit = findLoginSubmitButton(before.interactiveElements);
+    // Prefer an ALREADY-enabled candidate first, exactly as before — a weaker-tier button
+    // that's already clickable beats waiting on a stronger-tier one that might never enable.
+    let submit = findLoginSubmitButton(before.interactiveElements);
+    if (!submit) {
+      // Nothing currently enabled. The strongest candidate — even if disabled right now — is
+      // still worth a bounded wait: most real login forms gate submit until client-side
+      // validation passes, and `before`'s snapshot predates typing, so a real, specific button
+      // like this is often disabled here purely because of timing, not because it's broken.
+      // Only reached when findLoginSubmitButton found nothing usable, so this can never steal
+      // a click away from an already-working weaker-tier button. See
+      // findLoginSubmitButtonCandidate's doc comment.
+      const candidate = findLoginSubmitButtonCandidate(before.interactiveElements);
+      if (
+        candidate &&
+        (await waitForCandidateEnabled(browser, candidate.selector, SUBMIT_ENABLE_TIMEOUT_MS))
+      ) {
+        submit = candidate;
+      }
+    }
     if (submit) {
       await browser.click(submit.selector);
       finalSubmitSelector = submit.selector;

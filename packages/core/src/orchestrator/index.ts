@@ -176,6 +176,19 @@ const PLAN_BATCH_MAX_UNITS = 10;
 const PLAN_MAX_SPLIT_DEPTH = 3;
 
 /**
+ * Reuse mode skips EXPLORE entirely (see the `suiteMode === 'reuse'` branch below), so
+ * `ctx.exploration` is normally rehydrated from the cached artifact of the run being reused
+ * instead. When no cache exists (cleared, expired, or the project never had a real EXPLORE
+ * pass), falling straight back to guessed Tier B login selectors reproduces the exact bug this
+ * budget exists to prevent: a guess can fail exactly like the missing-grounding case did,
+ * mass-blocking every Tier B test and silently tanking the reuse run's pass rate. Instead, this
+ * bounds a REAL (not guessed) single-page login discovery via `runExplorePhase` with
+ * `maxRoutes: 1` — a small fraction of a full EXPLORE crawl's `DEFAULT_BUDGET_MS` (240_000, see
+ * browser/crawler.ts), since it never needs to visit more than the login page itself.
+ */
+const REUSE_LOGIN_DISCOVERY_BUDGET_MS = 60_000;
+
+/**
  * Run state machine for the Healix orchestrator. Every phase transition is
  * checkpointed to SQLite (run status + events), so an interrupted run is fully
  * inspectable after the fact. A run can also PAUSE — manually, or automatically
@@ -327,7 +340,7 @@ async function regenerateDroppedAndExecutePending(params: {
       items: droppedItems,
     });
     for (const spec of newSpecs)
-      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure);
+      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure, mode);
   }
 
   // Reconstruct still-pending (generated but never executed) specs from
@@ -2166,8 +2179,72 @@ async function runPipeline(
     if (checkCancelled()) return await pauseOrCancel('explore');
     if (suiteMode === 'reuse') {
       // No new specs are ever generated in reuse mode, so there is nothing for
-      // a DOM snapshot to ground — skip the live browser pass entirely.
+      // a DOM snapshot to ground for GENERATE — skip the live full-crawl pass
+      // entirely. BUT Tier B auth setup during EXECUTE still needs the real,
+      // previously-verified login selectors (ctx.exploration.crawl.verifiedLogin /
+      // ctx.exploration.loginCandidates — see modes/playwright/execute.ts) to log
+      // in; without them it falls back to guessed selectors, which can genuinely
+      // fail on a real app and mass-block every Tier B outcome (the exact bug this
+      // block exists to prevent — see docs/design/reuse-mode-exploration-inheritance-fix.md).
       emit('explore', 'debug', 'Skipping exploration (reuse mode).');
+      if (effectiveBaseUrl) {
+        try {
+          // Tier 1: cheap — reuse the cached artifact from the run being reused.
+          // Infinity bypasses the normal 24h staleness window: reuse mode is
+          // explicitly re-running the SAME prior suite against the SAME app, not
+          // doing a drift-sensitive fresh crawl, so "how old is this crawl" isn't
+          // the relevant question here the way it is for a fresh EXPLORE pass.
+          const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl, Infinity);
+          if (cachedExploration) {
+            ctx.exploration = cachedExploration;
+            emit('explore', 'debug', 'Rehydrated cached exploration artifact for reuse-mode Tier B login.');
+          } else {
+            const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            if (defaultCredential) {
+              // Tier 2: no cache — run a REAL, bounded, single-page login discovery
+              // instead of guessing. maxRoutes: 1 stops the crawl's BFS after the
+              // first page, so this is a small fraction of a full EXPLORE pass, but
+              // it still gets genuinely VERIFIED selectors (runExplorePhase's
+              // crawlWithAuth actually submits and confirms the login), not a guess.
+              emit(
+                'explore',
+                'info',
+                'No cached exploration artifact for reuse mode; running a bounded login-only discovery.',
+              );
+              const discovery = await runExplorePhase({
+                browser,
+                baseUrl: effectiveBaseUrl,
+                credentials: { username: defaultCredential.username, password: defaultCredential.password },
+                crawlOptions: { maxRoutes: 1, wallClockBudgetMs: REUSE_LOGIN_DISCOVERY_BUDGET_MS },
+                emit,
+              }).catch((err) => {
+                emit('explore', 'debug', `Reuse-mode login discovery failed (continuing): ${errMsg(err)}`);
+                return null;
+              });
+              if (discovery?.crawl.verifiedLogin) {
+                ctx.exploration = discovery;
+              } else {
+                // Tier 3: last resort, unchanged from today's existing fallback behavior.
+                emit(
+                  'explore',
+                  'warn',
+                  'Reuse-mode login discovery could not verify a login; Tier B login will use guessed selectors.',
+                );
+              }
+            } else {
+              emit(
+                'explore',
+                'warn',
+                'No cached exploration artifact and no test credentials configured for reuse mode; Tier B login will use guessed selectors.',
+              );
+            }
+          }
+        } catch (err) {
+          // Fail-open, matching this whole block's posture: any unexpected error here must
+          // degrade to today's pre-fix behavior (guessed selectors), never abort the run.
+          emit('explore', 'debug', `Reuse-mode exploration inheritance failed (continuing): ${errMsg(err)}`);
+        }
+      }
     } else if (effectiveBaseUrl) {
       // Black-box projects (a user-supplied baseUrl with no locally-spawned
       // dev server) never had that URL verified reachable — white-box
@@ -2514,6 +2591,9 @@ async function runPipeline(
             `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
+          if (!ctx.mockExternalDependencies) {
+            await hydrateCarriedMockFixture(ctx, project.id, baseRun!.id, emit);
+          }
         } else if (suiteMode === 'topup') {
           // Retry-pass/Repair (results-page actions): a retryItemIds-targeted item
           // must be regenerated even when it already has a covering test — that's
@@ -2534,6 +2614,9 @@ async function runPipeline(
           newSpecItems = diff.toGenerate;
           trackGeneration(diff.toGenerate.length, newSpecs.length);
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
+          if (!ctx.mockExternalDependencies) {
+            await hydrateCarriedMockFixture(ctx, project.id, baseRun!.id, emit);
+          }
         } else {
           emit('generate', 'info', 'Generating specs.');
           newSpecs = await mode.generate(ctx, planForGeneration);
@@ -2652,9 +2735,18 @@ async function runPipeline(
         // Carried-forward specs (copied bytes from a prior run, already at
         // whatever granularity that run used) get a single row, as before.
         for (const spec of newSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey, noteStoreFailure);
+          registerSpecRows(
+            store,
+            runId,
+            ctx.projectDir,
+            spec,
+            newSpecItems,
+            testIdByKey,
+            noteStoreFailure,
+            mode,
+          );
         for (const spec of carriedSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure);
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure, mode);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
 
         // ---- 7b. DIRECTED RE-EXPLORATION (bounded, always-on, fail-open) ----
@@ -3949,6 +4041,7 @@ function registerSpecRows(
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
   noteStoreFailure: (op: string, err: unknown) => void,
+  mode: TestMode,
 ): void {
   // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
   // deliberately never persists the per-run synthetic tag — see persistedReqTag
@@ -4026,7 +4119,18 @@ function registerSpecRows(
     return;
   }
 
-  item.scenarios.forEach((s, i) => {
+  // A pruned spec (validate.ts's auditAndMaybePrune, already run by the time this is
+  // called — see runPipeline's contentsByPath pass) may have fewer real test() blocks
+  // than the plan originally called for. Registering one row per PLANNED scenario
+  // regardless left the excess permanently orphaned at 'pending' — never receiving a
+  // result, since persistResults only ever sees however many blocks actually survived
+  // — inflating this run's own Total with phantom rows (see
+  // docs/design/pruned-block-orphaned-test-row-fix.md). Capping registration to the
+  // number of blocks that actually exist keeps row count in lockstep with real,
+  // executable test count. mode.countScenarios is optional — a mode without it falls
+  // back to item.scenarios.length unchanged, exactly today's behavior.
+  const survivingCount = mode.countScenarios?.(spec.contents) ?? item.scenarios.length;
+  item.scenarios.slice(0, survivingCount).forEach((s, i) => {
     const test = store.insertTest({
       runId,
       title: `${spec.title} — ${s.kind}: ${s.description}`,
@@ -4441,6 +4545,41 @@ async function hydrateCarriedSpecs(
     }
   }
   return specs;
+}
+
+/**
+ * Copies the base run's fixtures/mock.fixture.ts forward when THIS run's own scaffold
+ * pass didn't write one (ctx.mockExternalDependencies is falsy) — covers reuse mode
+ * (which never re-runs dependency detection at all, see the suiteMode === 'reuse'
+ * short-circuit at plan time) and the rarer top-up case where this run's own
+ * redetection came back empty while the base run's didn't. Carried-forward spec files
+ * (hydrateCarriedSpecs, copied byte-for-byte above) still `import` this fixture
+ * whenever the BASE run had external dependencies to mock — without this, every one of
+ * them fails with "Cannot find module '.../fixtures/mock.fixture'" and the whole suite
+ * reports a structurally-empty result (see
+ * docs/design/execute-suite-deps-silent-failure-fix.md). Deliberately does NOT re-run
+ * detectExternalDependencies/generateMockResponses here — that would spend real AI
+ * tokens and violate reuse mode's "zero AI calls" guarantee. Best-effort: a missing
+ * base fixture (base run had no external deps either) is not an error — it matches
+ * scaffold()'s own no-mock behavior for this run, just carried forward instead of
+ * freshly decided.
+ */
+async function hydrateCarriedMockFixture(
+  ctx: TestModeContext,
+  projectId: string,
+  baseRunId: string,
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<void> {
+  const srcAbs = join(projectsDir(), projectId, 'runs', baseRunId, 'suite', 'fixtures', 'mock.fixture.ts');
+  const destAbs = join(ctx.projectDir, 'fixtures', 'mock.fixture.ts');
+  try {
+    await mkdir(dirname(destAbs), { recursive: true });
+    await copyFile(srcAbs, destAbs);
+    emit('generate', 'debug', 'Carried forward mock.fixture.ts from base run.');
+  } catch {
+    // Base run had no mock fixture (no external deps) — nothing to carry, matches
+    // scaffold.ts's own no-mock behavior for this run; not an error.
+  }
 }
 
 /**

@@ -1,10 +1,11 @@
-import { mkdtempSync, rmSync } from 'node:fs';
+import { existsSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from 'node:fs';
 import { mkdir, readFile, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join } from 'node:path';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
 
 import { createOrchestrator } from './index.js';
+import { clearExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { getStore, resetStoreForTests, type HealixStore } from '../storage/store.js';
 import type {
   CompleteOptions,
@@ -16,6 +17,7 @@ import type {
 } from '../providers/types.js';
 import type {
   ExecOutcome,
+  ExplorationArtifact,
   GeneratedSpec,
   SuiteBundle,
   TestMode,
@@ -96,11 +98,27 @@ function fakeProviderWithPlan(items: PlanItemSeed[], completeCalls: CompleteOpti
 function makeRealisticFakeMode(
   generateCalls: TestPlan[],
   failReqTags: ReadonlySet<string> = new Set(),
+  // Simulates validate.ts's real pruning: for a given reqTag, write fewer test()
+  // markers than the plan actually called for — models a low-quality block getting
+  // spliced out of otherwise-accepted content. See
+  // docs/design/pruned-block-orphaned-test-row-fix.md.
+  pruneToCounts: ReadonlyMap<string, number> = new Map(),
+  // Whether this fake mode implements the optional countScenarios capability at
+  // all — false models an older/other TestMode that doesn't, exercising
+  // registerSpecRows' fallback-to-plan-count path unchanged.
+  implementsCountScenarios = true,
 ): TestMode {
   return {
     id: 'playwright',
-    async scaffold(_ctx: TestModeContext): Promise<void> {
-      /* noop */
+    async scaffold(ctx: TestModeContext): Promise<void> {
+      // Mirrors scaffold.ts's real conditional write (only when THIS run detected
+      // external dependencies to mock) — needed so tests can exercise
+      // hydrateCarriedMockFixture's carry-forward behavior realistically.
+      if (ctx.mockExternalDependencies) {
+        const fixturesDir = join(ctx.projectDir, 'fixtures');
+        await mkdir(fixturesDir, { recursive: true });
+        await writeFile(join(fixturesDir, 'mock.fixture.ts'), '// fake mock fixture content\n', 'utf-8');
+      }
     },
     async generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]> {
       generateCalls.push(plan);
@@ -127,9 +145,16 @@ function makeRealisticFakeMode(
         const scenarios = item.scenarios?.length
           ? item.scenarios
           : [{ kind: 'positive', description: 'default' }];
+        // Simulates pruning: writes fewer test() markers than the plan called for,
+        // modeling validate.ts splicing a low-quality block out of the final content
+        // BEFORE registerSpecRows ever sees it (matches the real call order).
+        const prunedCount = pruneToCounts.get(specReqTag);
+        const survivingScenarios = prunedCount !== undefined ? scenarios.slice(0, prunedCount) : scenarios;
         const contents =
           `// spec for ${item.title} (${specReqTag})\n` +
-          scenarios.map((s) => `test('[REQ:${specReqTag}] ${s.kind}: ${s.description}');\n`).join('');
+          survivingScenarios
+            .map((s) => `test('[REQ:${specReqTag}] ${s.kind}: ${s.description}');\n`)
+            .join('');
         await writeFile(absPath, contents, 'utf-8');
         specs.push({
           path: absPath,
@@ -168,6 +193,13 @@ function makeRealisticFakeMode(
     async export(_ctx: TestModeContext): Promise<SuiteBundle> {
       return { dir: 'export', files: [] };
     },
+    ...(implementsCountScenarios
+      ? {
+          countScenarios(contents: string): number {
+            return (contents.match(/^test\(/gm) ?? []).length;
+          },
+        }
+      : {}),
   };
 }
 
@@ -920,5 +952,519 @@ describe('orchestrator top-up / reuse suite modes', () => {
     for (const t of run2Tests) {
       expect(run2Results.filter((r) => r.testId === t.id)).toHaveLength(1);
     }
+  });
+});
+
+/**
+ * See docs/design/reuse-mode-exploration-inheritance-fix.md. Reuse mode always skips the full
+ * EXPLORE crawl (asserted elsewhere), but ctx.exploration still needs SOME source of Tier B
+ * login selectors or auth setup silently guesses and can mass-block every Tier B outcome. These
+ * tests exercise the 3-tier fallback added to fix that: (1) cached artifact, (2) a bounded real
+ * login-only discovery when no cache exists, (3) today's pre-fix guessed-selector behavior as
+ * the last resort only.
+ */
+function sampleExplorationArtifact(overrides: Partial<ExplorationArtifact> = {}): ExplorationArtifact {
+  return {
+    crawl: {
+      routes: [],
+      visitedCount: 1,
+      budgetExhausted: false,
+      redirectLoopsDetected: [],
+      shellCollapsed: false,
+      degenerateRedirectsSkipped: [],
+      authAttempted: true,
+      authVerified: true,
+      verifiedLogin: {
+        pageUrl: 'https://app.example.test/login',
+        identifierSelector: '#email',
+        passwordSelector: '#password',
+        submitSelector: '#submit',
+      },
+    },
+    routing: { hashRouted: false },
+    loginCandidates: [],
+    useful: true,
+    observedEndpoints: [],
+    ...overrides,
+  };
+}
+
+describe('reuse-mode exploration inheritance (3-tier Tier B login fallback)', () => {
+  it('TIER 1 (cache hit): rehydrates ctx.exploration from the cached artifact, no live discovery attempted', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Tier1 Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      credentials: [{ role: null, username: 'user@example.test', password: 'pw' }],
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+
+    // Pre-populate the cache the run-1 EXPLORE phase would normally have written.
+    persistExplorationCache(project.id, 'https://app.example.test', sampleExplorationArtifact());
+
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+    const events = store.listEvents(run2.runId).map((e) => e.message);
+    expect(events).toContain('Rehydrated cached exploration artifact for reuse-mode Tier B login.');
+    // Tier 2/3 must never fire on a cache hit.
+    expect(events.some((m) => m.includes('running a bounded login-only discovery'))).toBe(false);
+    expect(events.some((m) => m.includes('Tier B login will use guessed selectors'))).toBe(false);
+  });
+
+  it('TIER 2 (cache miss, credentials configured): attempts a bounded real login discovery instead of guessing immediately', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Tier2 Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      credentials: [{ role: null, username: 'user@example.test', password: 'pw' }],
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    // run1's own fresh EXPLORE phase persists a cache entry — clear it to simulate a genuine
+    // cache miss for the reuse run below (e.g. cache expired, or was explicitly cleared).
+    clearExplorationCache(project.id);
+
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser, // returns an empty snapshot — no login form is ever "found"
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    // Fail-open: even though discovery can't verify a login against fakeBrowser's blank
+    // snapshot, the run must still complete normally, never crash or hang.
+    expect(run2.status).toBe('passed');
+    const events = store.listEvents(run2.runId).map((e) => e.message);
+    expect(events).toContain(
+      'No cached exploration artifact for reuse mode; running a bounded login-only discovery.',
+    );
+    // Falls through to tier 3 only because the fake browser has no real login form —
+    // this is the "discovery genuinely couldn't verify anything" path, still cheaper and more
+    // honest than guessing immediately on a bare cache miss.
+    expect(events).toContain(
+      'Reuse-mode login discovery could not verify a login; Tier B login will use guessed selectors.',
+    );
+  });
+
+  it("TIER 3 (cache miss, no credentials configured): falls straight to today's guessed-selector behavior, no discovery attempted", async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Reuse Tier3 Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+      // No credentials at all — nothing to discover a login with.
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    // run1's own fresh EXPLORE phase persists a cache entry — clear it to simulate a genuine
+    // cache miss for the reuse run below (e.g. cache expired, or was explicitly cleared).
+    clearExplorationCache(project.id);
+
+    const run2Orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+    const run2 = await run2Orchestrator.run({
+      projectId: project.id,
+      suiteMode: 'reuse',
+      autoApprove: true,
+    });
+
+    expect(run2.status).toBe('passed');
+    const events = store.listEvents(run2.runId).map((e) => e.message);
+    expect(events).toContain(
+      'No cached exploration artifact and no test credentials configured for reuse mode; Tier B login will use guessed selectors.',
+    );
+    // Tier 2 must never even attempt a discovery crawl when there's nothing to log in with.
+    expect(events.some((m) => m.includes('running a bounded login-only discovery'))).toBe(false);
+  });
+});
+
+/**
+ * See docs/design/reuse-mode-mock-fixture-carry-forward-fix.md. Reuse/top-up carry
+ * forward spec FILES byte-for-byte (hydrateCarriedSpecs), but a base run's
+ * fixtures/mock.fixture.ts — written by scaffold() only when THIS run detected
+ * external dependencies — was never carried forward at all, breaking every carried
+ * spec that imports it whenever the current run doesn't independently rediscover the
+ * same dependencies (always true for reuse, which never redetects at all).
+ */
+describe('reuse/top-up mock-fixture carry-forward (hydrateCarriedMockFixture)', () => {
+  it('REUSE: carries fixtures/mock.fixture.ts forward from the base run when this run detected no dependencies of its own', async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-mockfixture-'));
+    writeFileSync(join(repoPath, 'package.json'), JSON.stringify({ dependencies: { twilio: '^4.0.0' } }));
+    mkdirSync(join(repoPath, 'src'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'src', 'sms.js'),
+      "import twilio from 'twilio';\nconst client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Mock Fixture Carry-Forward Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    try {
+      // ---- Run 1: fresh — real dependency detection finds twilio, scaffold() (the
+      // fake mode above) writes fixtures/mock.fixture.ts because ctx.mockExternalDependencies
+      // is true this run. ----
+      const run1 = await createOrchestrator({
+        provider: fakeProviderWithPlan(
+          [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+          [],
+        ),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+      expect(run1.status).toBe('passed');
+
+      const run1Fixture = join(
+        dataDir,
+        'projects',
+        project.id,
+        'runs',
+        run1.runId,
+        'suite',
+        'fixtures',
+        'mock.fixture.ts',
+      );
+      expect(existsSync(run1Fixture)).toBe(true);
+
+      // ---- Run 2: reuse — never redetects dependencies at all (ctx.mockExternalDependencies
+      // stays falsy), so hydrateCarriedMockFixture must carry the base run's fixture forward. ----
+      const run2 = await createOrchestrator({
+        provider: fakeProviderWithPlan([], []),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, suiteMode: 'reuse', autoApprove: true });
+      expect(run2.status).toBe('passed');
+
+      const run2Fixture = join(
+        dataDir,
+        'projects',
+        project.id,
+        'runs',
+        run2.runId,
+        'suite',
+        'fixtures',
+        'mock.fixture.ts',
+      );
+      expect(existsSync(run2Fixture)).toBe(true);
+      expect(await readFile(run2Fixture, 'utf-8')).toBe(await readFile(run1Fixture, 'utf-8'));
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+
+  it('REGRESSION: a project with no external dependencies at all — reuse mode stays a clean no-op, no fixture file, no error', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No Dependencies Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan(
+        [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+        [],
+      ),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+    expect(run1.status).toBe('passed');
+    const run1Fixture = join(
+      dataDir,
+      'projects',
+      project.id,
+      'runs',
+      run1.runId,
+      'suite',
+      'fixtures',
+      'mock.fixture.ts',
+    );
+    expect(existsSync(run1Fixture)).toBe(false);
+
+    const events: Array<{ message: string }> = [];
+    const run2 = await createOrchestrator({
+      provider: fakeProviderWithPlan([], []),
+      getMode: () => makeRealisticFakeMode([]),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run(
+      { projectId: project.id, suiteMode: 'reuse', autoApprove: true },
+      { onEvent: (e) => events.push({ message: e.message }) },
+    );
+
+    expect(run2.status).toBe('passed');
+    const run2Fixture = join(
+      dataDir,
+      'projects',
+      project.id,
+      'runs',
+      run2.runId,
+      'suite',
+      'fixtures',
+      'mock.fixture.ts',
+    );
+    expect(existsSync(run2Fixture)).toBe(false);
+    // Best-effort no-op: no warn/error emitted for the (correctly) missing base fixture.
+    expect(events.some((e) => /mock\.fixture/i.test(e.message) && !/carried forward/i.test(e.message))).toBe(
+      false,
+    );
+  });
+
+  it("TOP-UP: this run's own freshly-scaffolded mock.fixture.ts is never clobbered by the carry-forward copy", async () => {
+    const repoPath = mkdtempSync(join(tmpdir(), 'healix-orch-mockfixture-topup-'));
+    writeFileSync(join(repoPath, 'package.json'), JSON.stringify({ dependencies: { twilio: '^4.0.0' } }));
+    mkdirSync(join(repoPath, 'src'), { recursive: true });
+    writeFileSync(
+      join(repoPath, 'src', 'sms.js'),
+      "import twilio from 'twilio';\nconst client = twilio(process.env.TWILIO_SID, process.env.TWILIO_TOKEN);\n",
+    );
+
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Top-up Mock Fixture Demo',
+      mode: 'playwright',
+      repoPath,
+      baseUrl: 'https://app.example.test',
+    });
+
+    try {
+      const run1 = await createOrchestrator({
+        provider: fakeProviderWithPlan(
+          [{ title: 'Home loads', reqTag: 'REQ-001', tier: 'tierA-public', intent: 'x' }],
+          [],
+        ),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, autoApprove: true });
+      expect(run1.status).toBe('passed');
+
+      // Top-up: same repoPath, so its OWN dependency redetection also finds twilio and
+      // this run's own scaffold() writes a fresh mock.fixture.ts — the carry-forward
+      // copy must be skipped (gated on !ctx.mockExternalDependencies), never overwriting it.
+      const run2 = await createOrchestrator({
+        provider: fakeProviderWithPlan(
+          [{ title: 'Settings works', reqTag: 'REQ-002', tier: 'tierA-public', intent: 'new' }],
+          [],
+        ),
+        getMode: () => makeRealisticFakeMode([]),
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).run({ projectId: project.id, suiteMode: 'topup', autoApprove: true });
+      expect(run2.status).toBe('passed');
+
+      const run2Fixture = join(
+        dataDir,
+        'projects',
+        project.id,
+        'runs',
+        run2.runId,
+        'suite',
+        'fixtures',
+        'mock.fixture.ts',
+      );
+      // Still exactly the fake mode's own freshly-written content — never touched by carry-forward.
+      expect(await readFile(run2Fixture, 'utf-8')).toBe('// fake mock fixture content\n');
+    } finally {
+      rmSync(repoPath, { recursive: true, force: true });
+    }
+  });
+});
+
+/**
+ * See docs/design/pruned-block-orphaned-test-row-fix.md. registerSpecRows used to
+ * insert one row per PLANNED scenario regardless of how many test() blocks actually
+ * survived validate.ts's pruning — the excess sat at status: 'pending' forever,
+ * inflating a run's own Total count with phantom rows that could never receive a
+ * result. mode.countScenarios (new, optional TestMode capability) lets
+ * registerSpecRows cap registration to what actually exists.
+ */
+describe('registerSpecRows — caps row count to surviving test() blocks after pruning', () => {
+  it('registers only as many rows as test() blocks survive, not the full planned scenario count', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Pruned Block Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const plan: TestPlan = {
+      summary: 'one item, 3 scenarios, 1 pruned',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Delete a todo',
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent: 'x',
+          scenarios: [
+            { kind: 'positive', description: 'succeeds' },
+            { kind: 'negative', description: 'todo not found' },
+            { kind: 'edge', description: 'double-click race' },
+          ],
+        },
+      ],
+    };
+
+    // Simulates validate.ts pruning 1 of the 3 blocks (e.g. the "edge" scenario) —
+    // only 2 test() markers actually survive into the written spec file.
+    const orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan(plan.items, []),
+      getMode: () => makeRealisticFakeMode([], new Set(), new Map([['REQ-1', 2]])),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(summary.status).toBe('passed');
+
+    const tests = store.listTests(summary.runId);
+    // Exactly 2 rows — not 3 — and none left dangling at 'pending'.
+    expect(tests).toHaveLength(2);
+    expect(tests.every((t) => t.status === 'passed')).toBe(true);
+  });
+
+  it('falls back to the full planned scenario count when the mode has no countScenarios at all (unchanged prior behavior)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No countScenarios Capability Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const plan: TestPlan = {
+      summary: 'one item, 3 scenarios, 1 pruned, but mode has no countScenarios',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Delete a todo',
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent: 'x',
+          scenarios: [
+            { kind: 'positive', description: 'succeeds' },
+            { kind: 'negative', description: 'todo not found' },
+            { kind: 'edge', description: 'double-click race' },
+          ],
+        },
+      ],
+    };
+
+    // Same pruning-to-2 simulation as above, but this mode doesn't implement
+    // countScenarios at all — registerSpecRows must fall back to the plan's full
+    // scenario count (3), exactly matching today's pre-fix behavior for a mode
+    // that doesn't opt into the new capability. (This reproduces the ORIGINAL bug
+    // shape for a mode without countScenarios — an orphaned 3rd row stays 'pending'
+    // forever, which is the accepted, unchanged fallback behavior, not a fix regression.)
+    const orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan(plan.items, []),
+      getMode: () => makeRealisticFakeMode([], new Set(), new Map([['REQ-1', 2]]), false),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+
+    const tests = store.listTests(summary.runId);
+    expect(tests).toHaveLength(3);
+    expect(tests.filter((t) => t.status === 'pending')).toHaveLength(1);
+  });
+
+  it('registers every scenario unchanged when nothing was pruned (normal case)', async () => {
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'No Pruning Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const plan: TestPlan = {
+      summary: 'one item, 3 scenarios, none pruned',
+      items: [
+        {
+          id: 'REQ-1',
+          title: 'Delete a todo',
+          reqTag: 'REQ-1',
+          tier: 'tierA-public',
+          intent: 'x',
+          scenarios: [
+            { kind: 'positive', description: 'succeeds' },
+            { kind: 'negative', description: 'todo not found' },
+            { kind: 'edge', description: 'double-click race' },
+          ],
+        },
+      ],
+    };
+
+    const orchestrator = createOrchestrator({
+      provider: fakeProviderWithPlan(plan.items, []),
+      getMode: () => makeRealisticFakeMode([]), // no pruning map — full scenario count written
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    });
+
+    const summary = await orchestrator.run({ projectId: project.id, autoApprove: true });
+    expect(summary.status).toBe('passed');
+
+    const tests = store.listTests(summary.runId);
+    expect(tests).toHaveLength(3);
+    expect(tests.every((t) => t.status === 'passed')).toBe(true);
   });
 });

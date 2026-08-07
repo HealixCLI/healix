@@ -14,6 +14,7 @@ import { scaffold } from './scaffold.js';
 import { generate } from './generate.js';
 import { execute } from './execute.js';
 import { validateSuite } from './validate.js';
+import { splitTestBlocks } from './quality-audit.js';
 
 /** Directories whose presence is purely build/runtime noise — never traversed for export. */
 const EXPORT_IGNORE_DIRS = new Set(['node_modules', '.git', 'test-results', 'playwright-report']);
@@ -77,6 +78,10 @@ export function createPlaywrightMode(): TestMode {
 
     validate(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult> {
       return validateSuite(ctx, specs);
+    },
+
+    countScenarios(contents: string): number {
+      return splitTestBlocks(contents).length;
     },
 
     execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {

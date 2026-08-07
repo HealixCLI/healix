@@ -493,6 +493,16 @@ export interface TestModeContext {
    * "no credentials configured" throw as an ordinary test failure.
    */
   hasTierBAuthPlanItems?: boolean;
+  /**
+   * True while a generate() call is regenerating item(s) on behalf of directed
+   * re-exploration's pre-healing pass (see orchestrator/directed-reexplore.ts) —
+   * set on the shared ctx immediately before that `mode.generate` call and
+   * cleared immediately after, since ctx is otherwise reused unchanged across
+   * the whole run. Modes read this to route their codegen provider.complete()
+   * call through the 'reexplore-codegen' task-type/model-effort config instead
+   * of plain 'codegen', so pre-healing can be tuned independently in Settings.
+   */
+  preHealingRegen?: boolean;
 }
 
 /** Pluggable test engine. PlaywrightMode ships first; Selenium/XYZ follow. */

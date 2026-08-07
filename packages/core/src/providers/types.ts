@@ -32,7 +32,8 @@ export type TaskType =
   | 'triage'
   | 'triage-summary'
   | 'health-probe'
-  | 'explore-gapfill';
+  | 'explore-gapfill'
+  | 'reexplore-codegen';
 
 export interface DetectResult {
   installed: boolean;

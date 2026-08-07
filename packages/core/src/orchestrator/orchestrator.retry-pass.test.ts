@@ -732,6 +732,81 @@ describe('Retry-pass (orchestrator.retryPass(runId) — the NEW same-run Knowled
     expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(0);
   });
 
+  it('a KB read failure building fresh-triage evidence degrades to empty KB context instead of aborting the whole retry-pass (regression)', async () => {
+    // Root-cause regression: loadKbRunContext's call here used to be bare (no
+    // try/catch), unlike its sibling in runPipeline's own inline TRIAGE phase,
+    // which already defaults to an empty KbRunContext on failure and keeps
+    // going. Because this whole function body is wrapped in ONE outer
+    // try/catch, an unguarded throw here doesn't crash the process — but it
+    // DOES abort everything after it (triage, report finalization) and mark
+    // the entire pass 'error', even though the regenerated item's test
+    // actually executed and produced a real result. The fix scopes the
+    // failure to just this one lookup, same as the inline TRIAGE phase.
+    const store = (await getStore()) as HealixStore;
+    const project = store.createProject({
+      name: 'Retry-pass KB Read Failure Demo',
+      mode: 'playwright',
+      baseUrl: 'https://app.example.test',
+    });
+
+    const run1 = await createOrchestrator({
+      provider: fakeProviderWithPlan([]),
+      getMode: () => makeFakeMode([], new Set(['REQ-B'])),
+      makeTarget: () => fakeTarget,
+      makeBrowser: () => fakeBrowser,
+    }).run({ projectId: project.id, autoApprove: true });
+
+    expect(run1.status).toBe('passed');
+    expect(store.listDroppedPlanKbItems(run1.runId)).toHaveLength(1);
+
+    // The regenerated item FAILS this time, so retry-pass's fresh-triage step
+    // (the one that calls loadKbRunContext) actually has work to do.
+    const failingMode: TestMode = {
+      ...makeFakeMode([]),
+      async execute(_ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome> {
+        const results = specs.map((s) => ({
+          title: s.title,
+          status: 'failed' as const,
+          durationMs: 5,
+          error: 'simulated failure needing triage',
+        }));
+        return { passed: 0, failed: results.length, blocked: 0, flaky: 0, results };
+      },
+    };
+
+    const listRequirementsSpy = vi.spyOn(store, 'listRequirements');
+    listRequirementsSpy.mockImplementation(() => {
+      throw new Error('simulated store corruption reading requirements');
+    });
+
+    try {
+      const summary = await createOrchestrator({
+        provider: fakeProviderWithPlan([]),
+        getMode: () => failingMode,
+        makeTarget: () => fakeTarget,
+        makeBrowser: () => fakeBrowser,
+      }).retryPass(run1.runId);
+
+      // Reflects the REAL outcome (the regenerated item failed) — not the
+      // coarse 'error' the old bare call would have produced by aborting
+      // into the outer catch before finalStatus/finalizeReport ever ran.
+      expect(summary.status).toBe('failed');
+      expect(summary.reportPath).toBeTruthy();
+
+      // Triage still ran and persisted a verdict — degraded (no KB evidence
+      // for this one lookup), not skipped entirely.
+      const triageRows = store.listTriageResults(run1.runId);
+      expect(triageRows.length).toBeGreaterThan(0);
+
+      const report = JSON.parse(await readFile(summary.reportPath!, 'utf-8')) as {
+        triage: Array<{ title: string }>;
+      };
+      expect(report.triage.length).toBeGreaterThan(0);
+    } finally {
+      listRequirementsSpy.mockRestore();
+    }
+  });
+
   it("retry-pass a long time after the original run completed does NOT count that idle gap as active time — 'Total time' reflects only genuine processing (regression)", async () => {
     // Root-cause regression: "Total time" in the desktop UI used to be computed as
     // finishedAt - startedAt. retryPass() never touched startedAt and only ever

@@ -24,6 +24,7 @@ import {
 } from './prompt.js';
 
 export * from './types.js';
+export * from './evidence.js';
 
 /**
  * Provider call budget for a single triage analysis — passed as the hard

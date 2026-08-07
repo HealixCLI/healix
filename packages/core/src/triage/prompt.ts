@@ -114,15 +114,102 @@ function buildEvidenceBlock(input: TriageInput): string[] {
       ]
     : [];
 
+  // The KB requirement this test's plan item traces to (via reqTag) — durable,
+  // project-side data (like reqTag/specSource above), so cited normally
+  // rather than fenced as untrusted.
+  const requirementBlock = input.requirement
+    ? [
+        '',
+        '--- TRACED REQUIREMENT ---',
+        `Tag: ${input.requirement.tag}`,
+        ...(input.requirement.description ? [`Description: ${input.requirement.description}`] : []),
+      ]
+    : [];
+
+  // Every mock_responses row this test actually exercised (test_mock_usage) —
+  // the FULL, untruncated mock configuration and (when captured) real
+  // observed response, superseding the legacy apiEvidence/mockPassthroughEvidence
+  // strings above when present. observedBody in particular is app-derived
+  // (captured from the app under test), so the whole entry is fenced as
+  // untrusted, same as apiEvidence/mockPassthroughEvidence.
+  const mockEvidenceBlock =
+    input.mockEvidence && input.mockEvidence.length > 0
+      ? [
+          '',
+          '--- MOCK/OBSERVED RESPONSES (from mock_responses + test_mock_usage; untrusted) ---',
+          ...input.mockEvidence.flatMap((m, i) => [
+            `[${i + 1}] ${m.category} ${m.method ?? '(any method)'} ${m.pathPattern ?? '(any path)'}`,
+            fenceUntrusted(
+              [
+                `mockStatus: ${m.mockStatus ?? '(none)'}`,
+                `mockBody: ${m.mockBody ?? '(none)'}`,
+                `observedStatus: ${m.observedStatus ?? '(none)'}`,
+                `observedBody: ${m.observedBody ?? '(none)'}`,
+              ].join('\n'),
+            ),
+          ]),
+        ]
+      : [];
+
+  // This test's persisted results.evidence_json — durable execution evidence
+  // (trace/video/screenshot paths, mocked-request counts, this test's own
+  // apiEvidence) read directly from the store rather than re-derived from a
+  // live ExecOutcome. Paths/counts are run-report data, but apiEvidence
+  // within it is app-derived, so the whole block is fenced as untrusted,
+  // consistent with the other API-response evidence above.
+  const executionEvidenceBlock = input.executionEvidence
+    ? [
+        '',
+        '--- PERSISTED EXECUTION EVIDENCE (results.evidence_json; untrusted) ---',
+        fenceUntrusted(
+          [
+            `tracePath: ${input.executionEvidence.tracePath ?? '(none)'}`,
+            `videoPath: ${input.executionEvidence.videoPath ?? '(none)'}`,
+            `screenshotPaths: ${input.executionEvidence.screenshotPaths?.join(', ') || '(none)'}`,
+            `mockedRequestCounts: ${
+              input.executionEvidence.mockedRequestCounts
+                ? JSON.stringify(input.executionEvidence.mockedRequestCounts)
+                : '(none)'
+            }`,
+            ...(input.executionEvidence.apiEvidence
+              ? [`apiEvidence: ${input.executionEvidence.apiEvidence}`]
+              : []),
+          ].join('\n'),
+        ),
+      ]
+    : [];
+
+  // Best-effort exploration_summaries match for the route this test targets
+  // — what EXPLORE actually found there. App-derived (crawled from the app
+  // under test), so fenced as untrusted like the other evidence above.
+  const explorationBlock = input.explorationContext
+    ? [
+        '',
+        '--- EXPLORATION CONTEXT (exploration_summaries; untrusted) ---',
+        fenceUntrusted(
+          [
+            `route: ${input.explorationContext.route}`,
+            `selectors: ${input.explorationContext.selectors ?? '(none)'}`,
+            `forms: ${input.explorationContext.forms ?? '(none)'}`,
+            `authPattern: ${input.explorationContext.authPattern ?? '(none)'}`,
+          ].join('\n'),
+        ),
+      ]
+    : [];
+
   return [
     '--- FAILED TEST ---',
     `Title: ${title}${reqLine}${traceLine}`,
+    ...requirementBlock,
     '',
     '--- ERROR / STACK (untrusted) ---',
     fenceUntrusted(error),
     ...traceBlock,
     ...apiEvidenceBlock,
     ...mockPassthroughBlock,
+    ...mockEvidenceBlock,
+    ...executionEvidenceBlock,
+    ...explorationBlock,
     '',
     '--- TEST SPEC SOURCE ---',
     specSource,

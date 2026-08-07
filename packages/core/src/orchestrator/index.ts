@@ -50,6 +50,8 @@ import { loadExplorationCache, persistExplorationCache } from './exploration-cac
 import { exportSuite } from '../export/index.js';
 import { createTriageEngine } from '../triage/index.js';
 import type { TriageBatchItem, TriageInput, TriageResult } from '../triage/types.js';
+import { buildKbTriageEvidence, loadKbRunContext } from '../triage/evidence.js';
+import type { KbRunContext } from '../triage/evidence.js';
 import { summarizeTriageGroups } from '../triage/grouping.js';
 import type { GroupingSummaryUnavailableReason } from '../triage/grouping.js';
 import { correlateBySignature } from '../triage/correlate.js';
@@ -756,6 +758,27 @@ async function retryPassPipeline(
     const testIdByTitleForTriage = new Map(testsAll.map((t) => [t.title, t.id]));
     const resultByTestIdForTriage = new Map(store.listResults(runId).map((r) => [r.testId, r]));
     const alreadyTriagedIds = new Set(store.listTriageResults(runId).map((row) => row.testId));
+    // Same shared KB lookup the inline TRIAGE phase uses — see
+    // triage/evidence.ts's doc comment: reading from the SAME durable tables
+    // is what makes this fresh-triage step's TriageInput equivalent in
+    // richness to inline TRIAGE, not a hollowed-down copy of it. Guarded the
+    // same way that inline TRIAGE phase's own copy of this call is (see
+    // runPipeline's kbRunContext a few thousand lines down): a failure here
+    // must degrade to empty KB evidence for this pass's triage step, not
+    // abort report finalization for tests that already ran successfully —
+    // this whole function's outer try/catch would otherwise turn one bad KB
+    // row into a coarse whole-pass 'error', wiping out real results.
+    let kbRunContextForRetryTriage: KbRunContext = {
+      requirements: [],
+      mockResponsesById: new Map(),
+      explorationSummaries: [],
+    };
+    try {
+      kbRunContextForRetryTriage = loadKbRunContext(store, runId);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('loadKbRunContext', err);
+    }
 
     // Best-effort triage for whatever THIS retry-pass newly failed/blocked —
     // old verdicts are preserved below regardless, but without this step a
@@ -777,12 +800,22 @@ async function retryPassPipeline(
       for (const r of newlyFailed) {
         const spec = allSpecs.find((s) => stableKey(undefined, s.title) === stableKey(undefined, r.title));
         const tracePath = (r.artifacts ?? []).find((a) => a.endsWith('.zip')) ?? r.artifacts?.[0];
+        const testIdForEvidence = testIdByTitleForTriage.get(r.title);
+        const kbEvidence = buildKbTriageEvidence(store, kbRunContextForRetryTriage, {
+          reqTag: spec?.reqTag,
+          testId: testIdForEvidence,
+          evidenceJson: testIdForEvidence
+            ? resultByTestIdForTriage.get(testIdForEvidence)?.evidenceJson
+            : undefined,
+          routeHaystacks: [spec?.contents, r.error],
+        });
         const input: TriageInput = {
           title: r.title,
           error: r.error ?? '',
           ...(spec?.reqTag ? { reqTag: spec.reqTag } : {}),
           ...(spec?.contents ? { specSource: spec.contents } : {}),
           ...(tracePath ? { tracePath } : {}),
+          ...kbEvidence,
         };
         const controller = new AbortController();
         let result: TriageResult;
@@ -3079,11 +3112,32 @@ async function runPipeline(
         // failures a prior crashed TRIAGE pass already recorded a verdict
         // for (per-batch persistence, see recordTriageResult below).
         let testIdByTitle: Map<string, string> | null = null;
+        // This test's persisted results.evidence_json, by testId — read once
+        // up front (same store call TRIAGE already needed for testIdByTitle's
+        // sibling data) so buildKbTriageEvidence below reads the SAME durable
+        // execution evidence Retry-pass's own fresh-triage step (§7a) reads,
+        // rather than re-deriving it from the live execOutcome in memory.
+        let evidenceJsonByTestId: Map<string, string | null> = new Map();
         try {
           testIdByTitle = new Map(store.listTests(runId).map((t) => [t.title, t.id]));
+          evidenceJsonByTestId = new Map(store.listResults(runId).map((r) => [r.testId, r.evidenceJson]));
           noteStoreOk();
         } catch (err) {
           noteStoreFailure('recordTriageResult', err);
+        }
+        // Requirements/mock_responses/exploration_summaries are run-scoped —
+        // loaded ONCE for the whole batch rather than per failure (see
+        // triage/evidence.ts's KbRunContext doc comment).
+        let kbRunContext: KbRunContext = {
+          requirements: [],
+          mockResponsesById: new Map(),
+          explorationSummaries: [],
+        };
+        try {
+          kbRunContext = loadKbRunContext(store, runId);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('loadKbRunContext', err);
         }
 
         // Resume support: skip re-triaging (and re-spending AI budget on) a
@@ -3168,6 +3222,13 @@ async function runPipeline(
             const unit = planItem?.unitKey
               ? sourceContext?.units.find((u) => u.key === planItem.unitKey)
               : undefined;
+            const testId = testIdByTitle?.get(r.title);
+            const kbEvidence = buildKbTriageEvidence(store, kbRunContext, {
+              reqTag: spec?.reqTag,
+              testId,
+              evidenceJson: testId ? evidenceJsonByTestId.get(testId) : undefined,
+              routeHaystacks: [spec?.contents, r.error],
+            });
             const input: TriageInput = {
               title: r.title,
               error: r.error ?? '',
@@ -3177,6 +3238,7 @@ async function runPipeline(
               ...(apiEvidence ? { apiEvidence } : {}),
               ...(mockPassthroughEvidence ? { mockPassthroughEvidence } : {}),
               ...(effectiveBaseUrl ? { baseUrl: effectiveBaseUrl } : {}),
+              ...kbEvidence,
             };
             let triage: ReportTriageEntry['triage'] | null = null;
             try {

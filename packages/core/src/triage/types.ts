@@ -1,7 +1,39 @@
 import type { ProviderAdapter } from '../providers/types.js';
 import type { UsageRecorder } from '../providers/usage.js';
+import type { ResultEvidence } from '../storage/types.js';
 
 export type Verdict = 'test_is_wrong' | 'app_is_wrong' | 'environment' | 'flaky' | 'ambiguous';
+
+/** The KB `requirements` row (by tag) this test's plan item traces to, when it has a reqTag. */
+export interface TriageRequirementContext {
+  tag: string;
+  description?: string;
+}
+
+/**
+ * One `mock_responses` row this test actually exercised (joined through
+ * `test_mock_usage` for its test_id) — the generated mock's own configured
+ * response alongside whatever real/observed response was captured for it,
+ * replacing the old truncated apiEvidence/mockPassthroughEvidence strings
+ * with the full, structured record.
+ */
+export interface TriageMockEvidence {
+  category: string;
+  method: string | null;
+  pathPattern: string | null;
+  mockStatus: number | null;
+  mockBody: string | null;
+  observedStatus: number | null;
+  observedBody: string | null;
+}
+
+/** Best-effort `exploration_summaries` row matching the route this failing test targets. */
+export interface TriageExplorationContext {
+  route: string;
+  selectors?: string;
+  forms?: string;
+  authPattern?: string;
+}
 
 export interface TriageInput {
   title: string;
@@ -45,6 +77,39 @@ export interface TriageInput {
    * resulting "content never appeared" symptom.
    */
   baseUrl?: string;
+  /**
+   * The KB requirement this test's plan item traces to (via its reqTag),
+   * when one was seeded during PLAN. Project-configured/durable data — like
+   * reqTag/specSource, cited normally rather than fenced as untrusted.
+   */
+  requirement?: TriageRequirementContext;
+  /**
+   * Every `mock_responses` row this test actually exercised, joined through
+   * `test_mock_usage` for its test_id — the full, untruncated mock
+   * configuration and (when captured) real observed response, superseding
+   * `apiEvidence`/`mockPassthroughEvidence` above for a test with durable KB
+   * usage rows. App/mock-derived (observedBody in particular reflects the
+   * app under test), so fenced as untrusted in the prompt like `error`.
+   * Absent when the test used no tracked mock, or predates KB persistence.
+   */
+  mockEvidence?: TriageMockEvidence[];
+  /**
+   * This test's persisted `results.evidence_json` — trace/video/screenshot
+   * paths and mocked-request counts recorded durably at EXECUTE time, read
+   * directly from the store rather than re-derived from a live in-memory
+   * ExecOutcome. Lets triage work identically whether run inline or later
+   * (e.g. Retry-pass's fresh-triage step) against a completed run's data.
+   * Absent for an older result row predating this column, or one with
+   * nothing to record.
+   */
+  executionEvidence?: ResultEvidence;
+  /**
+   * Best-effort `exploration_summaries` match for the route this failing
+   * test targets — what EXPLORE found there (selectors/forms/auth pattern).
+   * App-derived (captured from the app under test), so fenced as untrusted
+   * in the prompt like `error`. Absent when no exploration row matched.
+   */
+  explorationContext?: TriageExplorationContext;
 }
 
 export interface TriageResult {

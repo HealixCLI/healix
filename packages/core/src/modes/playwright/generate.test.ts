@@ -1016,6 +1016,26 @@ describe('generate — forbidden-API gate + read-only provider calls', () => {
     expect(calls[0].opts?.taskType).toBe('codegen');
   });
 
+  it('routes the codegen call through the reexplore-codegen task type when ctx.preHealingRegen is set (directed re-exploration), and back to plain codegen once it is cleared', async () => {
+    const ctx = makeCtx(makeProvider([CLEAN_SPEC, CLEAN_SPEC], calls));
+    ctx.preHealingRegen = true;
+
+    await generate(ctx, PLAN);
+
+    expect(calls).toHaveLength(1);
+    expect(calls[0].opts?.taskType).toBe('reexplore-codegen');
+
+    // The prior call marked PLAN's item as done in the on-disk checkpoint — forget it so
+    // the second call actually re-invokes the provider instead of skipping (see the
+    // checkpoint-skip tests above) and we can observe this call's taskType too.
+    await forgetGenerateCheckpointEntries(projectDir, [PLAN.items[0].id]);
+    ctx.preHealingRegen = false;
+    await generate(ctx, PLAN);
+
+    expect(calls).toHaveLength(2);
+    expect(calls[1].opts?.taskType).toBe('codegen');
+  });
+
   it('grounds a login-page tierA-public prompt in the real credential env vars when the project has one configured', async () => {
     const loginPlan: TestPlan = {
       summary: 'login',

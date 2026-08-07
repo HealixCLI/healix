@@ -867,6 +867,57 @@ describe('runDirectedReexplore — bounded loop: resolve -> re-crawl -> regenera
     expect(result.gapsRemaining).toBe(0);
   });
 
+  it('sets ctx.preHealingRegen for the regeneration call and clears it afterward, so the codegen call routes through the reexplore-codegen model/effort tier instead of plain codegen', async () => {
+    const target = `${BASE_URL}/forgot-password`;
+    const { browser } = makeFakeBrowser({ [target]: { interactiveElements: [] } });
+    const ctx = makeCtx({ browser, exploration: makeExploration([thinRoute(target)]) });
+    const plan: TestPlan = { summary: 's', items: [planItem('a', 'route:/forgot-password')] };
+    let sawFlagDuringGenerate = false;
+    const generate = vi.fn().mockImplementation(async (calledCtx: TestModeContext) => {
+      sawFlagDuringGenerate = calledCtx.preHealingRegen === true;
+      return [cleanSpec('a')];
+    });
+    const mode = { generate } as unknown as TestMode;
+
+    await runDirectedReexplore({
+      ctx,
+      mode,
+      plan,
+      specs: [specWithEscapeHatch('a')],
+      routing: NO_HASH,
+      baseUrl: BASE_URL,
+      reregisterSpecRows: vi.fn(),
+      emit: noopEmit(),
+      forgetCheckpointEntries: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(sawFlagDuringGenerate).toBe(true);
+    expect(ctx.preHealingRegen).toBe(false);
+  });
+
+  it('clears ctx.preHealingRegen even when the regeneration call throws (finally runs on the error path too)', async () => {
+    const target = `${BASE_URL}/forgot-password`;
+    const { browser } = makeFakeBrowser({ [target]: { interactiveElements: [] } });
+    const ctx = makeCtx({ browser, exploration: makeExploration([thinRoute(target)]) });
+    const plan: TestPlan = { summary: 's', items: [planItem('a', 'route:/forgot-password')] };
+    const generate = vi.fn().mockRejectedValue(new Error('provider hiccup'));
+    const mode = { generate } as unknown as TestMode;
+
+    await runDirectedReexplore({
+      ctx,
+      mode,
+      plan,
+      specs: [specWithEscapeHatch('a')],
+      routing: NO_HASH,
+      baseUrl: BASE_URL,
+      reregisterSpecRows: vi.fn(),
+      emit: noopEmit(),
+      forgetCheckpointEntries: vi.fn().mockResolvedValue(undefined),
+    });
+
+    expect(ctx.preHealingRegen).toBe(false);
+  });
+
   it('never throws when the crawl fails mid-loop — degrades to a warn emit and leaves specs unchanged for that gap', async () => {
     // crawl() itself swallows a single dead-link goto() failure internally (dead link handling) —
     // to exercise OUR OWN try/catch around the crawl call, fail at a point crawl() does NOT

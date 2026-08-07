@@ -49,6 +49,10 @@ export const DEFAULT_MODEL_CONFIG: ModelEffortConfig = {
   // Bounded, mechanical per-turn action selection (click/type/pressKey/done) from a fixed
   // vocabulary over a small text summary — not open-ended reasoning, so the cheap tier fits.
   'explore-gapfill': { model: 'haiku', effort: 'low' },
+  // Pre-healing regeneration: directed re-exploration's targeted spec regen after re-crawling
+  // just the affected route/state (see orchestrator/directed-reexplore.ts). Same output bar as
+  // first-pass codegen (strictly parseable, no further fallback), so it stays on the capable tier.
+  'reexplore-codegen': { model: 'sonnet', effort: 'high' },
 };
 
 /** Merge the user's last-used per-task setting over the recommended seed for that one task type. */

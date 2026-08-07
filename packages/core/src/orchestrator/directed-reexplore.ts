@@ -480,6 +480,12 @@ export async function runDirectedReexplore(
       // naturally bounded by DIRECTED_REEXPLORE_MAX_ITERATIONS, so this can't loop unboundedly, and
       // a persistently broken provider still gives up after the same 3-iteration ceiling as before.
       let regenerated: GeneratedSpec[];
+      // Routes this regeneration's codegen call through the 'reexplore-codegen' task-type
+      // config (see modes/types.ts's TestModeContext.preHealingRegen) instead of plain
+      // 'codegen', so pre-healing can be tuned independently in Settings. ctx is the single
+      // shared context for the whole run — clear the flag right after so anything else that
+      // reads ctx (or a later, ordinary generate() call) isn't misattributed as pre-healing.
+      ctx.preHealingRegen = true;
       try {
         regenerated = await mode.generate(ctx, { ...plan, items: affectedItems });
       } catch (err) {
@@ -489,6 +495,8 @@ export async function runDirectedReexplore(
           `Directed re-exploration regeneration failed on iteration ${iteration}/${DIRECTED_REEXPLORE_MAX_ITERATIONS} (retrying next iteration if any remain): ${errMsg(err)}`,
         );
         continue;
+      } finally {
+        ctx.preHealingRegen = false;
       }
       if (regenerated.length === 0) break;
 

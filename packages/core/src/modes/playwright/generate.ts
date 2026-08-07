@@ -2029,7 +2029,7 @@ async function generateOne(
         // US below — the provider only ever needs to return text.
         readOnly: true,
         signal: ctx.signal,
-        taskType: 'codegen',
+        taskType: ctx.preHealingRegen ? 'reexplore-codegen' : 'codegen',
       });
       ctx.onUsage?.('generate', item.title, ctx.provider.id, res.raw);
       if (!res.ok) {
@@ -2425,7 +2425,7 @@ async function generateBatch(
       timeoutMs: ABSOLUTE_BACKSTOP_MS,
       readOnly: true,
       signal: ctx.signal,
-      taskType: 'codegen',
+      taskType: ctx.preHealingRegen ? 'reexplore-codegen' : 'codegen',
     });
     ctx.onUsage?.('generate', `batch of ${batchItems.length}`, ctx.provider.id, res.raw);
     if (!res.ok) {

@@ -398,6 +398,26 @@ describe('ClaudeProvider — per-task-type model/effort routing', () => {
     expect(res.effort).toBe('high');
   });
 
+  it('complete() resolves reexplore-codegen (directed re-exploration pre-healing) to its own hardcoded default, distinct from plain codegen', async () => {
+    const res = await provider.complete('prompt', { taskType: 'reexplore-codegen' });
+    const [, args] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(expect.arrayContaining(['--model', 'sonnet', '--effort', 'high']));
+    expect(res.model).toBe('sonnet');
+    expect(res.effort).toBe('high');
+  });
+
+  it('complete() honors a reexplore-codegen-specific override without falling back to a sibling codegen override', async () => {
+    readOverridesMock.mockResolvedValue({
+      codegen: { model: 'opus', effort: 'max' },
+      'reexplore-codegen': { model: 'haiku', effort: 'low' },
+    });
+    const res = await provider.complete('prompt', { taskType: 'reexplore-codegen' });
+    const [, args] = runCliMock.mock.calls[0]!;
+    expect(args).toEqual(expect.arrayContaining(['--model', 'haiku', '--effort', 'low']));
+    expect(res.model).toBe('haiku');
+    expect(res.effort).toBe('low');
+  });
+
   it('plan() resolves model/effort from taskType the same way complete() does', async () => {
     const res = await provider.plan('task', { taskType: 'plan-generate' });
     const [, args] = runCliMock.mock.calls[0]!;

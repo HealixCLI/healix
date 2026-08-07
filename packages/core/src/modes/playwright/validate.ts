@@ -180,7 +180,7 @@ async function auditAndMaybePrune(
   | { outcome: 'ok'; spec: GeneratedSpec; warnings: QualityWarning[] }
   | { outcome: 'quarantine'; reason: string }
 > {
-  const findings = auditSpecQuality(contents);
+  const findings = auditSpecQuality(contents, { hasCredentials: (ctx.credentials ?? []).length > 0 });
   const hard = findings.filter((f) => f.severity === 'hard');
   const soft = findings.filter((f) => f.severity === 'warn');
 

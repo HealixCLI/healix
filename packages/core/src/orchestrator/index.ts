@@ -32,7 +32,7 @@ import type {
   TestPlan,
   TestPlanItem,
 } from '../modes/types.js';
-import { isPlanItemIncluded, tiersForScope } from '../modes/types.js';
+import { isPlanItemIncluded, mockResponseTupleKey, tiersForScope } from '../modes/types.js';
 import { createTargetAdapter } from '../target/index.js';
 import { findFreePort } from '../target/launcher.js';
 import { detectExternalDependencies } from '../target/dependencies.js';
@@ -44,6 +44,7 @@ import { createBrowserSurface } from '../browser/index.js';
 import { runExplorePhase, splitStaticUnitsForExplore, assessExplorationUsefulness } from './explore.js';
 import { deriveRegionCodesFromText } from '../browser/seed-discovery.js';
 import { identifyExplorationGaps, runGapFillingPass } from './gap-fill.js';
+import { runDirectedReexplore } from './directed-reexplore.js';
 import { mergeCrawlResults } from '../browser/crawler.js';
 import { loadExplorationCache, persistExplorationCache } from './exploration-cache.js';
 import { exportSuite } from '../export/index.js';
@@ -171,6 +172,19 @@ const PLAN_BATCH_MAX_UNITS = 10;
 
 /** Max recursive halvings of a still-truncating batch before its units are left uncovered. */
 const PLAN_MAX_SPLIT_DEPTH = 3;
+
+/**
+ * Reuse mode skips EXPLORE entirely (see the `suiteMode === 'reuse'` branch below), so
+ * `ctx.exploration` is normally rehydrated from the cached artifact of the run being reused
+ * instead. When no cache exists (cleared, expired, or the project never had a real EXPLORE
+ * pass), falling straight back to guessed Tier B login selectors reproduces the exact bug this
+ * budget exists to prevent: a guess can fail exactly like the missing-grounding case did,
+ * mass-blocking every Tier B test and silently tanking the reuse run's pass rate. Instead, this
+ * bounds a REAL (not guessed) single-page login discovery via `runExplorePhase` with
+ * `maxRoutes: 1` — a small fraction of a full EXPLORE crawl's `DEFAULT_BUDGET_MS` (240_000, see
+ * browser/crawler.ts), since it never needs to visit more than the login page itself.
+ */
+const REUSE_LOGIN_DISCOVERY_BUDGET_MS = 60_000;
 
 /**
  * Run state machine for the Healix orchestrator. Every phase transition is
@@ -324,7 +338,7 @@ async function regenerateDroppedAndExecutePending(params: {
       items: droppedItems,
     });
     for (const spec of newSpecs)
-      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure);
+      registerSpecRows(store, runId, ctx.projectDir, spec, droppedItems, testIdByKey, noteStoreFailure, mode);
   }
 
   // Reconstruct still-pending (generated but never executed) specs from
@@ -530,6 +544,20 @@ async function retryPassPipeline(
     emit('plan', 'error', `Run not found: ${runId}`);
     return { runId, status: 'error' };
   }
+  // Active-duration tracking (see runs.active_duration_ms's own schema comment): this
+  // retry-pass's own elapsed processing time gets ADDED to whatever the run already
+  // accrued, rather than letting "Total time" fall back to finishedAt - startedAt — the
+  // original startedAt could be days old by the time a retry-pass runs, which would count
+  // that entire idle gap as "active" time. run.activeDurationMs is null for a run that
+  // predates this column (or has never been retried before); fall back to that run's own
+  // single-pass wall-clock time as the best available baseline for it specifically —
+  // accurate for exactly one pass, which is all such a run has had so far.
+  const passStartedAtMs = Date.now();
+  const baselineActiveDurationMs =
+    run.activeDurationMs ??
+    (run.startedAt && run.finishedAt
+      ? Math.max(0, new Date(run.finishedAt).getTime() - new Date(run.startedAt).getTime())
+      : 0);
   const project = store.getProject(run.projectId);
   if (!project) {
     emit('plan', 'error', `Project not found: ${run.projectId}`);
@@ -630,6 +658,14 @@ async function retryPassPipeline(
         noteStoreOk();
       } catch (err) {
         noteStoreFailure('updatePlanKbItemStatus', err);
+      }
+    },
+    onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+      try {
+        store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('insertEscapeHatchGap', err);
       }
     },
     signal,
@@ -796,7 +832,8 @@ async function retryPassPipeline(
     });
 
     try {
-      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso() });
+      const activeDurationMs = baselineActiveDurationMs + Math.max(0, Date.now() - passStartedAtMs);
+      store.updateRunStatus(runId, finalStatus, { finishedAt: nowIso(), activeDurationMs });
       noteStoreOk();
     } catch (err) {
       noteStoreFailure('updateRunStatus', err);
@@ -824,7 +861,8 @@ async function retryPassPipeline(
   } catch (err) {
     emit('generate', 'error', `Retry-pass failed: ${errMsg(err)}`, { stack: errStack(err) });
     try {
-      store.updateRunStatus(runId, 'error', { finishedAt: nowIso() });
+      const activeDurationMs = baselineActiveDurationMs + Math.max(0, Date.now() - passStartedAtMs);
+      store.updateRunStatus(runId, 'error', { finishedAt: nowIso(), activeDurationMs });
     } catch {
       /* best-effort */
     }
@@ -939,6 +977,17 @@ async function runPipeline(
   // Mutable status mirror so the returned summary always reflects the latest phase.
   let currentStatus: RunStatus = 'pending';
 
+  // Active-duration tracking (see runs.active_duration_ms's own schema comment): a paused
+  // run resumed later, or a retry-pass run days after the original completed, must not have
+  // its "Total time" stat include the idle gap in between — only genuinely active processing
+  // time should accumulate. activeStartedAtMs marks when the CURRENT active segment began
+  // (reset on every startedAt patch — a fresh run's initial 'pending' transition, or a
+  // resume-from-pause); accumulatedActiveDurationMs is the running total, seeded from
+  // whatever this run already accrued across any PRIOR pass (a resume continuing a paused
+  // run created earlier in this same process).
+  let activeStartedAtMs: number | null = run.startedAt ? new Date(run.startedAt).getTime() : null;
+  let accumulatedActiveDurationMs = run.activeDurationMs ?? 0;
+
   // Persistence health tracking. Best-effort store writes still swallow their
   // errors (a DB fault must never abort the run), but we count *consecutive*
   // failures and surface at least one warn via the DB-independent onEvent path
@@ -972,8 +1021,20 @@ async function runPipeline(
     patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
   ): void => {
     currentStatus = status;
+    if (patch.startedAt !== undefined) {
+      activeStartedAtMs = new Date(patch.startedAt).getTime();
+    }
+    // finishedAt marks the end of the CURRENT active segment (a terminal status, or a
+    // pause) — fold its elapsed time into the running total. A patch with finishedAt but
+    // no known segment start (shouldn't happen in practice, since every terminal/pause
+    // patch follows an earlier startedAt patch) is skipped rather than guessed at.
+    const fullPatch: typeof patch & { activeDurationMs?: number } = { ...patch };
+    if (patch.finishedAt !== undefined && activeStartedAtMs !== null) {
+      accumulatedActiveDurationMs += Math.max(0, new Date(patch.finishedAt).getTime() - activeStartedAtMs);
+      fullPatch.activeDurationMs = accumulatedActiveDurationMs;
+    }
     try {
-      store.updateRunStatus(runId, status, patch);
+      store.updateRunStatus(runId, status, fullPatch);
       noteStoreOk();
     } catch (err) {
       /* persistence best-effort; never abort the pipeline on a status write */
@@ -2053,6 +2114,14 @@ async function runPipeline(
           noteStoreFailure('updatePlanKbItemStatus', err);
         }
       },
+      onEscapeHatchGap: (planItemId, unitKey, reasons) => {
+        try {
+          store.insertEscapeHatchGap({ runId, planItemId, unitKey, reasonsJson: JSON.stringify(reasons) });
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('insertEscapeHatchGap', err);
+        }
+      },
       // Long mode phases (generate/execute) receive the run's abort signal so
       // in-flight provider/suite work is killed on cancellation, not just
       // skipped at the next phase boundary.
@@ -2093,8 +2162,72 @@ async function runPipeline(
     if (checkCancelled()) return await pauseOrCancel('explore');
     if (suiteMode === 'reuse') {
       // No new specs are ever generated in reuse mode, so there is nothing for
-      // a DOM snapshot to ground — skip the live browser pass entirely.
+      // a DOM snapshot to ground for GENERATE — skip the live full-crawl pass
+      // entirely. BUT Tier B auth setup during EXECUTE still needs the real,
+      // previously-verified login selectors (ctx.exploration.crawl.verifiedLogin /
+      // ctx.exploration.loginCandidates — see modes/playwright/execute.ts) to log
+      // in; without them it falls back to guessed selectors, which can genuinely
+      // fail on a real app and mass-block every Tier B outcome (the exact bug this
+      // block exists to prevent — see docs/design/reuse-mode-exploration-inheritance-fix.md).
       emit('explore', 'debug', 'Skipping exploration (reuse mode).');
+      if (effectiveBaseUrl) {
+        try {
+          // Tier 1: cheap — reuse the cached artifact from the run being reused.
+          // Infinity bypasses the normal 24h staleness window: reuse mode is
+          // explicitly re-running the SAME prior suite against the SAME app, not
+          // doing a drift-sensitive fresh crawl, so "how old is this crawl" isn't
+          // the relevant question here the way it is for a fresh EXPLORE pass.
+          const cachedExploration = loadExplorationCache(project.id, effectiveBaseUrl, Infinity);
+          if (cachedExploration) {
+            ctx.exploration = cachedExploration;
+            emit('explore', 'debug', 'Rehydrated cached exploration artifact for reuse-mode Tier B login.');
+          } else {
+            const defaultCredential = ctx.credentials?.find((c) => c.role === null) ?? ctx.credentials?.[0];
+            if (defaultCredential) {
+              // Tier 2: no cache — run a REAL, bounded, single-page login discovery
+              // instead of guessing. maxRoutes: 1 stops the crawl's BFS after the
+              // first page, so this is a small fraction of a full EXPLORE pass, but
+              // it still gets genuinely VERIFIED selectors (runExplorePhase's
+              // crawlWithAuth actually submits and confirms the login), not a guess.
+              emit(
+                'explore',
+                'info',
+                'No cached exploration artifact for reuse mode; running a bounded login-only discovery.',
+              );
+              const discovery = await runExplorePhase({
+                browser,
+                baseUrl: effectiveBaseUrl,
+                credentials: { username: defaultCredential.username, password: defaultCredential.password },
+                crawlOptions: { maxRoutes: 1, wallClockBudgetMs: REUSE_LOGIN_DISCOVERY_BUDGET_MS },
+                emit,
+              }).catch((err) => {
+                emit('explore', 'debug', `Reuse-mode login discovery failed (continuing): ${errMsg(err)}`);
+                return null;
+              });
+              if (discovery?.crawl.verifiedLogin) {
+                ctx.exploration = discovery;
+              } else {
+                // Tier 3: last resort, unchanged from today's existing fallback behavior.
+                emit(
+                  'explore',
+                  'warn',
+                  'Reuse-mode login discovery could not verify a login; Tier B login will use guessed selectors.',
+                );
+              }
+            } else {
+              emit(
+                'explore',
+                'warn',
+                'No cached exploration artifact and no test credentials configured for reuse mode; Tier B login will use guessed selectors.',
+              );
+            }
+          }
+        } catch (err) {
+          // Fail-open, matching this whole block's posture: any unexpected error here must
+          // degrade to today's pre-fix behavior (guessed selectors), never abort the run.
+          emit('explore', 'debug', `Reuse-mode exploration inheritance failed (continuing): ${errMsg(err)}`);
+        }
+      }
     } else if (effectiveBaseUrl) {
       // Black-box projects (a user-supplied baseUrl with no locally-spawned
       // dev server) never had that URL verified reachable — white-box
@@ -2441,6 +2574,9 @@ async function runPipeline(
             `Copying ${baseTestsWithSpec.length} test(s) forward from run ${baseRun!.id} (entire suite, as-is).`,
           );
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, baseTestsWithSpec, emit);
+          if (!ctx.mockExternalDependencies) {
+            await hydrateCarriedMockFixture(ctx, project.id, baseRun!.id, emit);
+          }
         } else if (suiteMode === 'topup') {
           // Retry-pass/Repair (results-page actions): a retryItemIds-targeted item
           // must be regenerated even when it already has a covering test — that's
@@ -2461,6 +2597,9 @@ async function runPipeline(
           newSpecItems = diff.toGenerate;
           trackGeneration(diff.toGenerate.length, newSpecs.length);
           carriedSpecs = await hydrateCarriedSpecs(ctx, project.id, baseRun!.id, diff.carried, emit);
+          if (!ctx.mockExternalDependencies) {
+            await hydrateCarriedMockFixture(ctx, project.id, baseRun!.id, emit);
+          }
         } else {
           emit('generate', 'info', 'Generating specs.');
           newSpecs = await mode.generate(ctx, planForGeneration);
@@ -2579,10 +2718,68 @@ async function runPipeline(
         // Carried-forward specs (copied bytes from a prior run, already at
         // whatever granularity that run used) get a single row, as before.
         for (const spec of newSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, newSpecItems, testIdByKey, noteStoreFailure);
+          registerSpecRows(
+            store,
+            runId,
+            ctx.projectDir,
+            spec,
+            newSpecItems,
+            testIdByKey,
+            noteStoreFailure,
+            mode,
+          );
         for (const spec of carriedSpecs)
-          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure);
+          registerSpecRows(store, runId, ctx.projectDir, spec, [], testIdByKey, noteStoreFailure, mode);
         emit('generate', 'info', `Generated ${specs.length} spec(s).`);
+
+        // ---- 7b. DIRECTED RE-EXPLORATION (bounded, always-on, fail-open) ----
+        // When GENERATE couldn't find a real selector for something a scenario needs, it emits an
+        // escape hatch demoted to test.fixme(...) (generate.ts's ESCAPE_HATCH_MARKER) — today a
+        // permanent dead end. This re-crawls ONLY the specific route(s) those gaps resolve to
+        // (never the whole app again), regenerates ONLY the affected item(s), and merges the
+        // richer crawl data back into ctx.exploration before EXECUTE ever runs. Distinct from the
+        // KB/retry-pass/coverage-feedback-loop below (that recovers generation/execution
+        // FAILURES; this recovers items that generated fine but only by guessing) and from
+        // gap-fill.ts's EXPLORE-phase mechanism (proactive/content-coverage, runs before
+        // generate; this is reactive/selector-failure-based, after generate). No opt-in flag,
+        // unlike coverageLoopEnabled below — gated only on there being real work to do. Never
+        // runs for suiteMode 'reuse' (no new generation happens there at all). Wrapped in its own
+        // try/catch even though runDirectedReexplore never throws internally — belt-and-suspenders,
+        // mirroring EXPLORE's own two-layer try/catch around its gap-fill pass.
+        if (ctx.exploration && effectiveBaseUrl && suiteMode !== 'reuse') {
+          try {
+            // Captured as a local: `ctx` is a `let` binding, so TS can't carry this block's own
+            // narrowing (ctx.exploration truthy) into a closure that could in principle run later.
+            const reexploreCtx = ctx;
+            const reexploreProjectDir = ctx.projectDir;
+            const reexplore = await runDirectedReexplore({
+              ctx: reexploreCtx,
+              mode,
+              plan: planForGeneration,
+              specs,
+              routing: reexploreCtx.exploration!.routing,
+              baseUrl: effectiveBaseUrl,
+              reregisterSpecRows: (spec, items) =>
+                reregisterSpecRows(store, reexploreProjectDir, spec, items, testIdByKey, noteStoreFailure),
+              emit,
+            });
+            specs = reexplore.specs;
+            if (reexplore.iterations > 0) {
+              emit(
+                'generate',
+                'info',
+                `Directed re-exploration: ${reexplore.iterations} iteration(s), closed ${reexplore.gapsClosed} gap(s), ${reexplore.gapsRemaining} unresolved-selector gap(s) remain.`,
+              );
+            }
+          } catch (err) {
+            emit(
+              'generate',
+              'warn',
+              `Directed re-exploration failed (continuing without it): ${errMsg(err)}`,
+            );
+          }
+        }
+
         // Checkpoint immediately: if the process dies between here and EXECUTE
         // finishing, resume skips straight to EXECUTE with zero regeneration.
         await writeCheckpoint(runDir, buildCheckpoint(false));
@@ -3798,6 +3995,7 @@ function registerSpecRows(
   items: TestPlanItem[],
   testIdByKey: Map<string, string>,
   noteStoreFailure: (op: string, err: unknown) => void,
+  mode: TestMode,
 ): void {
   // A carried-forward, reqTag-less spec has spec.reqTag === undefined (the DB
   // deliberately never persists the per-run synthetic tag — see persistedReqTag
@@ -3875,7 +4073,18 @@ function registerSpecRows(
     return;
   }
 
-  item.scenarios.forEach((s, i) => {
+  // A pruned spec (validate.ts's auditAndMaybePrune, already run by the time this is
+  // called — see runPipeline's contentsByPath pass) may have fewer real test() blocks
+  // than the plan originally called for. Registering one row per PLANNED scenario
+  // regardless left the excess permanently orphaned at 'pending' — never receiving a
+  // result, since persistResults only ever sees however many blocks actually survived
+  // — inflating this run's own Total with phantom rows (see
+  // docs/design/pruned-block-orphaned-test-row-fix.md). Capping registration to the
+  // number of blocks that actually exist keeps row count in lockstep with real,
+  // executable test count. mode.countScenarios is optional — a mode without it falls
+  // back to item.scenarios.length unchanged, exactly today's behavior.
+  const survivingCount = mode.countScenarios?.(spec.contents) ?? item.scenarios.length;
+  item.scenarios.slice(0, survivingCount).forEach((s, i) => {
     const test = store.insertTest({
       runId,
       title: `${spec.title} — ${s.kind}: ${s.description}`,
@@ -3902,6 +4111,58 @@ function registerSpecRows(
 }
 
 /**
+ * Like registerSpecRows, but for a spec regenerated by directed re-exploration
+ * (directed-reexplore.ts) to close an escape-hatch gap for an item that ALREADY has row(s) from
+ * this same GENERATE pass — updates the existing row(s) in place via store.updateTestSpec instead
+ * of inserting, which would create a duplicate row for the same scenario (EXECUTE hasn't run yet;
+ * nothing has removed the original). Resolves each scenario's existing test id the SAME way
+ * registerSpecRows populated testIdByKey moments earlier: the item-scoped `item:${item.id}#${i}`
+ * key first (never ambiguous across two items sharing a reqTag, and stable even if the
+ * regenerated spec's title changed), falling back to the reqTag/title-keyed `${base}#${i}` key.
+ */
+function reregisterSpecRows(
+  store: HealixStore,
+  projectDir: string,
+  spec: GeneratedSpec,
+  items: TestPlanItem[],
+  testIdByKey: Map<string, string>,
+  noteStoreFailure: (op: string, err: unknown) => void,
+): void {
+  const reqTag = (spec.reqTag ?? extractReqTag(spec.contents) ?? '').trim();
+  const item =
+    (spec.planItemId ? items.find((it) => it.id === spec.planItemId) : undefined) ??
+    (reqTag.length > 0 ? items.find((it) => (it.reqTag ?? it.id) === reqTag) : undefined);
+  if (!item) {
+    noteStoreFailure(
+      'reregisterSpecRows',
+      new Error(`no plan item resolved for regenerated spec ${spec.path}`),
+    );
+    return;
+  }
+  const specPath = relative(projectDir, spec.path);
+  const base = stableKey(reqTag, spec.title);
+  const itemBase = `item:${item.id}`;
+  const scenarios = item.scenarios.length > 0 ? item.scenarios : [undefined];
+
+  scenarios.forEach((s, i) => {
+    const testId = testIdByKey.get(`${itemBase}#${i}`) ?? testIdByKey.get(`${base}#${i}`);
+    if (!testId) {
+      noteStoreFailure(
+        'reregisterSpecRows',
+        new Error(`no existing test row found for item ${item.id} scenario ${i}`),
+      );
+      return;
+    }
+    const title = s ? `${spec.title} — ${s.kind}: ${s.description}` : spec.title;
+    try {
+      store.updateTestSpec(testId, { title, specPath, specCode: spec.contents });
+    } catch (err) {
+      noteStoreFailure('updateTestSpec', err);
+    }
+  });
+}
+
+/**
  * Persist execution results. Each spec's scenario results are matched back, IN
  * ENCOUNTER ORDER, to the positionally-keyed rows registerSpecRows inserted for
  * that reqTag — the first scenario result for a reqTag maps to `#0`, the second
@@ -3919,6 +4180,34 @@ function persistResults(
   noteStoreFailure: (op: string, err: unknown) => void,
 ): void {
   const scenarioIndexByKey = new Map<string, number>();
+
+  // KB foundation: test_mock_usage / mock_responses.observed_*. Built once, up front, rather
+  // than re-querying per result — maps the EXACT (dependency, method, pathPattern) tuple each
+  // mock_responses row was seeded with (see upsertMockResponse) to that row's real id, using
+  // the SAME tuple-keying scheme execute.ts's readMockRequestCountsByTest/
+  // readObservedMockResponses use for the hits/observed responses they report. This resolves
+  // the precise row a hit belongs to even when a dependency has multiple endpoint-level rows
+  // — no attribution is lost to a coarse "only when exactly one row" fallback.
+  const mockResponseIdByTuple = new Map<string, string>();
+  for (const m of store.listMockResponses(runId)) {
+    mockResponseIdByTuple.set(mockResponseTupleKey(m.dependencyId, m.method, m.pathPattern), m.id);
+  }
+
+  // KB foundation: mock_responses.observed_* — dependency-level (not per-test), so this
+  // runs once per (dependency, method, pathPattern) tuple rather than once per result.
+  for (const observed of outcome.observedMockResponses ?? []) {
+    const mockResponseId = mockResponseIdByTuple.get(
+      mockResponseTupleKey(observed.dependencyId, observed.method, observed.pathPattern),
+    );
+    if (mockResponseId) {
+      try {
+        store.recordObservedMockResponse(mockResponseId, observed);
+        noteStoreOk();
+      } catch (err) {
+        noteStoreFailure('recordObservedMockResponse', err);
+      }
+    }
+  }
 
   for (const r of outcome.results) {
     // The generated test titles are the model's own words, but they are guaranteed
@@ -3999,6 +4288,10 @@ function persistResults(
       }
     }
 
+    // Shared by both try blocks below (evidence_json AND test_mock_usage) — same identity
+    // apiEvidence/execute.ts's own dedup keyOf() use.
+    const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
+
     try {
       // Copy the parent test row's description/details onto its result — results
       // have no independent source for this content, so it just mirrors the
@@ -4008,18 +4301,15 @@ function persistResults(
       // — classify this result's own artifacts by extension (same
       // trace.zip heuristic used for kb_execution_artifacts just below,
       // plus .webm/.mp4 → video, remainder → screenshots), and merge in
-      // this test's own apiEvidence slice (per-test, keyed by
-      // `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
-      // comment) alongside the run-level mockedRequestCounts aggregate
-      // (NOT test-specific — see ResultEvidence.mockedRequestCounts's own
-      // doc comment). mockPassthrough is part of the documented shape but
-      // never populated; no such mechanism exists in the codebase today.
-      // See docs/design/kb-foundation-evidence-persistence.md.
+      // this test's own apiEvidence/mockPassthrough slices (per-test, keyed
+      // by `${specFile}#${title}` — see ExecOutcome.apiEvidence's own doc
+      // comment) alongside the run-level mockedRequestCounts aggregate (NOT
+      // test-specific — see ResultEvidence.mockedRequestCounts's own doc
+      // comment).
       const artifacts = r.artifacts ?? [];
       const traceArtifact = artifacts.find((a) => /trace\.zip$/i.test(a));
       const videoArtifact = artifacts.find((a) => /\.(webm|mp4)$/i.test(a));
       const screenshotArtifacts = artifacts.filter((a) => a !== traceArtifact && a !== videoArtifact);
-      const apiEvidenceKey = r.specFile ? `${r.specFile}#${r.title}` : r.title;
       const evidence: ResultEvidence = {
         ...(traceArtifact ? { tracePath: traceArtifact } : {}),
         ...(videoArtifact ? { videoPath: videoArtifact } : {}),
@@ -4029,6 +4319,9 @@ function persistResults(
           : {}),
         ...(outcome.apiEvidence?.[apiEvidenceKey]
           ? { apiEvidence: outcome.apiEvidence[apiEvidenceKey] }
+          : {}),
+        ...(outcome.mockPassthrough?.[apiEvidenceKey]
+          ? { mockPassthrough: outcome.mockPassthrough[apiEvidenceKey] }
           : {}),
       };
       store.insertResult({
@@ -4048,6 +4341,26 @@ function persistResults(
     } catch (err) {
       /* best-effort persistence */
       noteStoreFailure('insertResult', err);
+    }
+    const mockUsage = outcome.mockedRequestCountsByTest?.[apiEvidenceKey];
+    if (mockUsage) {
+      // One try/catch PER tally, matching the sibling observedMockResponses loop above —
+      // sharing a single try/catch across every tuple meant one recordMockUsage failure (e.g.
+      // a constraint violation) silently aborted every LATER tuple for this test too, while
+      // noteStoreFailure only ever recorded the one exception that stopped the loop, masking
+      // how many rows actually never got written.
+      for (const tally of mockUsage) {
+        const mockResponseId = mockResponseIdByTuple.get(
+          mockResponseTupleKey(tally.dependencyId, tally.method, tally.pathPattern),
+        );
+        if (!mockResponseId) continue;
+        try {
+          store.recordMockUsage(testId, mockResponseId, tally.count);
+          noteStoreOk();
+        } catch (err) {
+          noteStoreFailure('recordMockUsage', err);
+        }
+      }
     }
     try {
       // Keep the test row's status in sync — readers of `tests` (e.g. the CLI
@@ -4186,6 +4499,41 @@ async function hydrateCarriedSpecs(
     }
   }
   return specs;
+}
+
+/**
+ * Copies the base run's fixtures/mock.fixture.ts forward when THIS run's own scaffold
+ * pass didn't write one (ctx.mockExternalDependencies is falsy) — covers reuse mode
+ * (which never re-runs dependency detection at all, see the suiteMode === 'reuse'
+ * short-circuit at plan time) and the rarer top-up case where this run's own
+ * redetection came back empty while the base run's didn't. Carried-forward spec files
+ * (hydrateCarriedSpecs, copied byte-for-byte above) still `import` this fixture
+ * whenever the BASE run had external dependencies to mock — without this, every one of
+ * them fails with "Cannot find module '.../fixtures/mock.fixture'" and the whole suite
+ * reports a structurally-empty result (see
+ * docs/design/execute-suite-deps-silent-failure-fix.md). Deliberately does NOT re-run
+ * detectExternalDependencies/generateMockResponses here — that would spend real AI
+ * tokens and violate reuse mode's "zero AI calls" guarantee. Best-effort: a missing
+ * base fixture (base run had no external deps either) is not an error — it matches
+ * scaffold()'s own no-mock behavior for this run, just carried forward instead of
+ * freshly decided.
+ */
+async function hydrateCarriedMockFixture(
+  ctx: TestModeContext,
+  projectId: string,
+  baseRunId: string,
+  emit: (phase: string, level: OrchestratorEvent['level'], message: string, data?: unknown) => void,
+): Promise<void> {
+  const srcAbs = join(projectsDir(), projectId, 'runs', baseRunId, 'suite', 'fixtures', 'mock.fixture.ts');
+  const destAbs = join(ctx.projectDir, 'fixtures', 'mock.fixture.ts');
+  try {
+    await mkdir(dirname(destAbs), { recursive: true });
+    await copyFile(srcAbs, destAbs);
+    emit('generate', 'debug', 'Carried forward mock.fixture.ts from base run.');
+  } catch {
+    // Base run had no mock fixture (no external deps) — nothing to carry, matches
+    // scaffold.ts's own no-mock behavior for this run; not an error.
+  }
 }
 
 /**

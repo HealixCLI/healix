@@ -1,4 +1,4 @@
-import { appendFile, mkdir, readFile, unlink, writeFile } from 'node:fs/promises';
+import { appendFile, mkdir, readFile, rename, unlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 
 import type { Tier } from '../../storage/types.js';
@@ -153,6 +153,107 @@ function matchRoleForItem(item: TestPlanItem, roles: string[]): string | null {
     if (new RegExp(`\\b${escaped}\\b`).test(haystack)) return role;
   }
   return null;
+}
+
+/**
+ * Reference expressions the model should write into generated code to pull the real configured
+ * credential(s) at RUNTIME — never the literal values themselves (see suiteEnv() in execute.ts:
+ * these env vars are injected into the spec's own process env, never sent to the AI provider).
+ * `matchedRole` narrows to one specific role's account (via the JSON blob every credential is
+ * also exposed in, see HEALIX_TIERB_CREDENTIALS_JSON at execute.ts:114); omitted, the reference
+ * falls back to the plain default-credential env vars — correct for both the common
+ * single-credential case and a multi-credential project's default/roleless account.
+ */
+function credentialFieldRefs(matchedRole: string | null): { identifier: string; password: string } {
+  if (matchedRole === null) {
+    return { identifier: 'process.env.HEALIX_TIERB_EMAIL!', password: 'process.env.HEALIX_TIERB_PASSWORD!' };
+  }
+  const find = `JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON!).find((c: { role: string | null }) => c.role === ${JSON.stringify(matchedRole)})`;
+  return { identifier: `${find}.username`, password: `${find}.password` };
+}
+
+/**
+ * When the project has a configured test credential, ground any login/sign-in FORM the model
+ * might generate a tierA-public spec for, so it never invents its own email/password literal
+ * where a real one is available — applies only conditionally, from the model's own read of
+ * whether this particular feature IS a login form; a feature that merely "requires no auth" but
+ * isn't a login page ignores this note entirely. `item` is passed only from the single-item
+ * prompt builder, where the plan item's own title/intent can be deterministically checked against
+ * the project's configured roles (see matchRoleForItem) — the batch builder covers several
+ * distinct items under one shared prompt, so it lists the available roles instead and leaves the
+ * per-item choice to the model's own read of each feature's title within the batch, exactly like
+ * formatRoleGuidance already does for tierB-auth's role routing.
+ */
+function formatLoginCredentialGuidance(ctx: TestModeContext, item?: TestPlanItem): string {
+  const credentials = ctx.credentials ?? [];
+  if (credentials.length === 0) return '';
+  const roles = [...new Set(credentials.map((c) => c.role).filter((r): r is string => !!r))];
+
+  const negativeCarveOut =
+    'This does NOT apply to a scenario that deliberately tests INVALID credentials (wrong ' +
+    'password, unregistered email, empty field) — there, use whatever literal the negative case ' +
+    'actually needs (e.g. the real identifier paired with an obviously wrong password literal) to ' +
+    'exercise the failure path.';
+
+  if (roles.length === 0 || !item) {
+    const refs = credentialFieldRefs(item ? matchRoleForItem(item, roles) : null);
+    const roleListNote =
+      roles.length > 0
+        ? ` This project has multiple test accounts with roles (${roles.join(', ')}) — if the ` +
+          "feature is clearly about ONE of these roles' own login, fill the fields from that " +
+          `role's entry instead: \`JSON.parse(process.env.HEALIX_TIERB_CREDENTIALS_JSON!).find((c) => c.role === '<role>').username\` / \`.password\`. Otherwise use the default account shown below.`
+        : '';
+    return (
+      ' If (and only if) this feature IS the login/sign-in form itself: for any scenario that is ' +
+      'meant to submit VALID credentials and succeed (a positive login, or a negative/edge case ' +
+      'that still expects sign-in to succeed), you MUST fill the identifier and password fields ' +
+      `with \`${refs.identifier}\` and \`${refs.password}\` respectively — the real configured test ` +
+      `account is injected into these at runtime.${roleListNote} Do NOT invent, guess, or hardcode ` +
+      'ANY other email/password literal for these fields, even one that looks like a plausible ' +
+      'real account (e.g. "user@example.com") — it will not match the real account and will fail ' +
+      `the test against an otherwise-correctly-behaving app. ${negativeCarveOut}`
+    );
+  }
+
+  const matchedRole = matchRoleForItem(item, roles);
+  const refs = credentialFieldRefs(matchedRole);
+  const roleNote = matchedRole
+    ? ` This feature is clearly about the "${matchedRole}" role, so use THAT role's account, not the default one.`
+    : ' Use the default (roleless) account below unless this feature clearly names one of the project’s other configured roles.';
+  return (
+    ' If (and only if) this feature IS the login/sign-in form itself: for any scenario that is ' +
+    'meant to submit VALID credentials and succeed (a positive login, or a negative/edge case ' +
+    'that still expects sign-in to succeed), you MUST fill the identifier and password fields ' +
+    `with \`${refs.identifier}\` and \`${refs.password}\` respectively — the real configured test ` +
+    `account is injected into these at runtime.${roleNote} Do NOT invent, guess, or hardcode ANY ` +
+    'other email/password literal for these fields, even one that looks like a plausible real ' +
+    'account (e.g. "user@example.com") — it will not match the real account and will fail the ' +
+    `test against an otherwise-correctly-behaving app. ${negativeCarveOut}`
+  );
+}
+
+/**
+ * Same rule as formatLoginCredentialGuidance, for a tierC-api spec that hits an authentication
+ * endpoint directly (a login/token/session POST) instead of driving a browser form — the request
+ * BODY must reference the real credential the same way a form fill would, never an invented one.
+ */
+function formatApiCredentialGuidance(ctx: TestModeContext, item?: TestPlanItem): string {
+  const credentials = ctx.credentials ?? [];
+  if (credentials.length === 0) return '';
+  const roles = [...new Set(credentials.map((c) => c.role).filter((r): r is string => !!r))];
+  const matchedRole = item ? matchRoleForItem(item, roles) : null;
+  const refs = credentialFieldRefs(matchedRole);
+  const roleNote =
+    roles.length > 0 && !matchedRole
+      ? ` (this project has multiple test accounts with roles ${roles.join(', ')} — if this endpoint's own scenario is clearly about one of them, select that role's entry from the same JSON instead of the default)`
+      : '';
+  return (
+    ' If (and only if) this endpoint IS an authentication/login/token endpoint: for any scenario ' +
+    'that is meant to authenticate successfully, send the real configured test credential in the ' +
+    `request body — \`${refs.identifier}\` and \`${refs.password}\`${roleNote} — never an invented ` +
+    'email/password. This does NOT apply to a scenario deliberately testing invalid credentials, ' +
+    'where a literal wrong value is correct.'
+  );
 }
 
 /**
@@ -437,6 +538,49 @@ const REASON_CONTINUATION_RE = /^\/\/[ \t]*(.*)$/;
 const SKIP_REASON_MAX_LENGTH = 300;
 
 /**
+ * Walks a flagged block's body forward from its ESCAPE_HATCH_REASON_RE match through any
+ * word-wrapped continuation `//` comment lines directly below it, joining them into one raw
+ * detail string — no "unobserved element —" prefix, no length cap; callers apply their own
+ * formatting. Shared by escapeHatchReasonText (annotation/KB text) AND extractEscapeHatchReasons
+ * (directed re-exploration's structured reasons) so neither can independently regress into only
+ * capturing the marker's first line (GAP-062) — that already happened once, when
+ * extractEscapeHatchReasons called ESCAPE_HATCH_REASON_RE directly instead of going through this.
+ * Returns '' when no marker matches at all.
+ */
+function extractRawEscapeHatchDetail(body: string): string {
+  const match = ESCAPE_HATCH_REASON_RE.exec(body);
+  if (!match) return '';
+  const firstLine = match[1]?.trim() ?? '';
+  const continuationLines: string[] = [];
+  const rest = body.slice(match.index + match[0].length);
+  // The first split segment is the (already-empty) remainder of the TODO line itself, up to
+  // its own trailing newline — real continuation lines start at index 1.
+  for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
+    const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
+    if (!contMatch) break;
+    continuationLines.push(contMatch[1].trim());
+  }
+  return [firstLine, ...continuationLines].filter(Boolean).join(' ');
+}
+
+/**
+ * Extracts the model's own explanation for a single flagged block's escape-hatch marker(s),
+ * as plain text (no annotation wrapping/truncation) — shared by escapeHatchDetails (which
+ * turns this into a Playwright annotation) and extractEscapeHatchReasonTexts (which persists it
+ * to the Knowledge Base), so the two can never drift apart.
+ *
+ * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
+ * than one long line — see extractRawEscapeHatchDetail, which does the actual continuation-line
+ * walking this relies on. Without that, everything past the first line was silently dropped
+ * with no indication truncation happened (GAP-062).
+ */
+function escapeHatchReasonText(body: string): string {
+  const detail = extractRawEscapeHatchDetail(body);
+  const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
+  return full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
+}
+
+/**
  * Builds the `TestDetails` argument carrying the skip reason as a real Playwright annotation.
  *
  * The reason has to reach Playwright's ANNOTATIONS, not just a source comment: execute.ts's
@@ -444,33 +588,31 @@ const SKIP_REASON_MAX_LENGTH = 300;
  * marker leaves the report's "why was this skipped" column blank — for what is, in practice,
  * the most common skip cause there is. `JSON.stringify` does the embedding because the text is
  * model-authored and can hold quotes, backslashes, or newlines.
- *
- * The model often writes its reason as a naturally word-wrapped multi-line `//` comment rather
- * than one long line. ESCAPE_HATCH_REASON_RE only ever captures the first line (deliberately, so
- * it can't cross into following test code) — so once it matches, this walks forward through the
- * remaining `//`-prefixed lines directly below it and appends them, stopping at the first
- * non-comment line. Without this, everything past the first line was silently dropped with no
- * indication truncation happened (GAP-062).
  */
 function escapeHatchDetails(body: string): string {
-  const match = ESCAPE_HATCH_REASON_RE.exec(body);
-  const firstLine = match?.[1]?.trim() ?? '';
-  const continuationLines: string[] = [];
-  if (match) {
-    const rest = body.slice(match.index + match[0].length);
-    // The first split segment is the (already-empty) remainder of the TODO line itself, up to
-    // its own trailing newline — real continuation lines start at index 1.
-    for (const line of rest.split(/\r\n|\r|\n/).slice(1)) {
-      const contMatch = REASON_CONTINUATION_RE.exec(line.trim());
-      if (!contMatch) break;
-      continuationLines.push(contMatch[1].trim());
-    }
-  }
-  const detail = [firstLine, ...continuationLines].filter(Boolean).join(' ');
-  const full = detail ? `unobserved element — ${detail}` : 'unobserved element — needs review';
-  const description =
-    full.length > SKIP_REASON_MAX_LENGTH ? `${full.slice(0, SKIP_REASON_MAX_LENGTH - 1)}…` : full;
+  const description = escapeHatchReasonText(body);
   return `, { annotation: { type: 'fixme', description: ${JSON.stringify(description)} } }`;
+}
+
+/**
+ * All escape-hatch reasons found in a spec's flagged test blocks — one entry per flagged
+ * block, using the same extraction logic demoteEscapeHatchBlocks/escapeHatchDetails use to
+ * build the Playwright annotation, but returned to the caller instead of being consumed only
+ * for that inline string. Feeds escape_hatch_gaps (see storage/schema.ts) via
+ * ctx.onEscapeHatchGap, giving the Knowledge Base durable, queryable history of what was left
+ * unobserved, instead of only a source comment/report annotation that's discarded once the
+ * run ends. Returns [] when the spec has no flagged blocks.
+ *
+ * Named distinctly from extractEscapeHatchReasons below (which returns one
+ * `{ testTitle, reason }` per block, for directed re-exploration's target-resolution needs) —
+ * both were built independently against the same marker for two different consumers with
+ * different shape needs, and are kept as two functions rather than one, to avoid either
+ * consumer reshaping the other's return value.
+ */
+export function extractEscapeHatchReasonTexts(source: string): string[] {
+  return splitTestBlocks(source)
+    .filter((b) => b.body.includes(ESCAPE_HATCH_MARKER))
+    .map((b) => escapeHatchReasonText(b.body));
 }
 
 /**
@@ -511,6 +653,33 @@ export function demoteEscapeHatchBlocks(source: string): string {
       result.slice(block.start + m[0].length);
   }
   return result;
+}
+
+/** One escape-hatch marker found in a spec's source, keyed to the test block that carried it. */
+export interface EscapeHatchReason {
+  testTitle: string;
+  reason: string;
+}
+
+/**
+ * Finds every escape-hatch marker still present in a spec's source (pre- or post-demotion — see
+ * demoteEscapeHatchBlocks above, which never strips the marker comment itself, only rewrites the
+ * enclosing `test(` call). Used by directed re-exploration (orchestrator/directed-reexplore.ts) to
+ * discover which scenarios need a targeted re-crawl, without needing a stored/cached field on
+ * GeneratedSpec — the marker text durably survives on disk, so this is always re-derivable from
+ * `contents` alone.
+ */
+export function extractEscapeHatchReasons(source: string): EscapeHatchReason[] {
+  const out: EscapeHatchReason[] = [];
+  for (const block of splitTestBlocks(source)) {
+    if (!block.body.includes(ESCAPE_HATCH_MARKER)) continue;
+    // Goes through extractRawEscapeHatchDetail (not a raw ESCAPE_HATCH_REASON_RE.exec) so a
+    // word-wrapped, multi-line reason is fully captured instead of silently truncated to its
+    // first line — see that function's doc comment (GAP-062 regressed once already here).
+    const detail = extractRawEscapeHatchDetail(block.body);
+    out.push({ testTitle: block.title, reason: detail || 'needs review' });
+  }
+  return out;
 }
 
 export interface GroundTruth {
@@ -1161,7 +1330,7 @@ function formatObservedRoutes(ctx: TestModeContext, item?: TestPlanItem): string
   const more = omitted > 0 ? ` (+${omitted} more not shown)` : '';
   return `
 
-Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), use one of these real observed URLs/paths, or a regex scoped only to what you're sure of (e.g. that the path changed away from the current one) — do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
+Real URLs observed during exploration${more}: ${shown.join(', ')}. RULE: when asserting a navigation target (toHaveURL, expect(page).toHaveURL, etc.), check this list FIRST — if the scenario's actual destination appears here (even under a name you wouldn't have guessed), you MUST assert that exact URL/path, e.g. \`toHaveURL(/\\/dashboard\\/vouchers/)\`. The coarser "the path merely changed away from the current one" fallback (e.g. \`not.toHaveURL(/\\/login$/)\`) is ONLY for when the true destination is genuinely NOT in this list — it is not an acceptable substitute for a real URL you do have, even for a scenario you're otherwise confident about. Asserting only "no longer on the old page" when a specific real destination was available proves far less than it looks like it does: it also passes on a mid-navigation blank frame or a wrong intermediate route, and — since Playwright's own test recording stops the moment this coarse check resolves — the run's video can end up showing nothing past the click, not the actual destination. Do NOT guess a conventional path (e.g. "/register", "/login", "/") for a concept the app might name differently (e.g. it actually uses "/signup", "/signin"); this list is authoritative over any naming convention.`;
 }
 
 /**
@@ -1326,10 +1495,10 @@ function buildPrompt(
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}`
+      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}${formatApiCredentialGuidance(ctx, item)}`
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
-        : 'This is a public flow requiring no authentication.';
+        : `This is a public flow requiring no authentication.${formatLoginCredentialGuidance(ctx, item)}`;
 
   const importSource = ctx.mockExternalDependencies
     ? MOCK_FIXTURE_IMPORT_PATH
@@ -1438,6 +1607,8 @@ interface GenOneOutcome {
    * treats very differently from an ordinary content-validation skip).
    */
   providerFailureDetail?: string;
+  /** Escape-hatch reasons extracted from the persisted spec's flagged blocks, if any — see extractEscapeHatchReasons. Only ever set alongside a non-null `spec`. */
+  escapeHatchReasons?: string[];
 }
 
 // ---- Write-through per-item checkpoint (mirrors execute.ts's write-through
@@ -1526,6 +1697,52 @@ export async function clearGenerateCheckpoint(projectDir: string): Promise<void>
 }
 
 /**
+ * Selectively drops specific item ids' entries from the ndjson checkpoint — unlike
+ * clearGenerateCheckpoint (which wipes the whole file), this lets a caller force ONLY certain
+ * items to be re-generated on the next generate() call while every other item's checkpoint entry
+ * (and therefore its "already done, skip" status at the readGenerateCheckpointEntries-based filter
+ * generate() applies) is left completely alone. Directed re-exploration
+ * (orchestrator/directed-reexplore.ts) needs this: without it, regenerating an item that already
+ * has a 'generated' entry would silently no-op.
+ *
+ * Rewrites via write-to-temp-then-rename rather than truncate-and-rewrite-in-place: a crash
+ * mid-write leaves either the OLD file fully intact or the NEW file fully in place, never a
+ * half-written ndjson line. Routed through the same appendQueues serialization
+ * appendGenerateCheckpointEntry already uses for this projectDir, so a rewrite can never race an
+ * in-flight append.
+ */
+export async function forgetGenerateCheckpointEntries(
+  projectDir: string,
+  itemIds: ReadonlySet<string> | readonly string[],
+): Promise<void> {
+  const forget = itemIds instanceof Set ? itemIds : new Set(itemIds);
+  if (forget.size === 0) return;
+
+  const prior = appendQueues.get(projectDir) ?? Promise.resolve();
+  const next = prior
+    .then(async () => {
+      const entries = await readGenerateCheckpointEntries(projectDir);
+      const remaining = entries.filter((e) => !forget.has(e.itemId));
+      if (remaining.length === entries.length) return; // nothing matched — file untouched
+      const filePath = genCheckpointFilePath(projectDir);
+      if (remaining.length === 0) {
+        await unlink(filePath).catch(() => {});
+        return;
+      }
+      const tmpPath = `${filePath}.tmp-${process.pid}-${Math.random().toString(36).slice(2)}`;
+      const body = remaining.map((e) => `${JSON.stringify(e)}\n`).join('');
+      await writeFile(tmpPath, body, 'utf-8');
+      await rename(tmpPath, filePath);
+    })
+    .catch(() => {
+      // best-effort — same tolerance as appendGenerateCheckpointEntry/clearGenerateCheckpoint;
+      // worst case, an item is regenerated even though it wasn't strictly necessary to.
+    });
+  appendQueues.set(projectDir, next);
+  await next;
+}
+
+/**
  * Records an item's outcome as FINAL, unless a pause/abort is the reason
  * we're looking at it right now — in which case nothing is written, so the
  * item is retried fresh (not written off as permanently skipped) the next
@@ -1553,6 +1770,12 @@ async function recordGenOutcome(
   // funnel, so the KB inherits "don't record an in-flight item as
   // permanently dropped on pause/abort" for free.
   ctx.onKbItemOutcome?.(item.id, outcome.spec ? 'generated' : 'dropped');
+  // Same funnel, same abort guard — an item still in flight when a pause/abort hits never
+  // reaches here at all (the check above returns first), so there's no risk of recording a
+  // gap for a spec that never actually finished generating.
+  if (outcome.escapeHatchReasons && outcome.escapeHatchReasons.length > 0) {
+    ctx.onEscapeHatchGap?.(item.id, item.unitKey ?? null, outcome.escapeHatchReasons);
+  }
 }
 
 /** Reconstructs a GeneratedSpec for an already-finished item from an earlier, interrupted generate() call — by re-reading its spec file rather than re-asking the AI. Returns null (best-effort) if the file is gone or the entry wasn't a 'generated' one. */
@@ -1617,6 +1840,8 @@ interface ValidationOutcome {
    * thin/truncated inventory is just as plausibly the root cause of any other rejection reason.
    */
   inventoryTruncated?: boolean;
+  /** Escape-hatch reasons extracted from the persisted spec's flagged blocks, if any — see extractEscapeHatchReasons. Only ever set alongside a non-null `spec`. */
+  escapeHatchReasons?: string[];
 }
 
 /**
@@ -1742,6 +1967,7 @@ async function validateAndPersist(
 
   source = ensureReqTag(source, reqTag);
   source = demoteEscapeHatchBlocks(source);
+  const escapeHatchReasons = extractEscapeHatchReasonTexts(source);
   if (tier === 'tierB-auth') {
     const roles = [...new Set((ctx.credentials ?? []).map((c) => c.role).filter((r): r is string => !!r))];
     const matchedRole = roles.length > 0 ? matchRoleForItem(item, roles) : null;
@@ -1760,6 +1986,7 @@ async function validateAndPersist(
   return {
     spec: { path: absPath, title, reqTag, tier, contents: source, planItemId: item.id },
     ungroundedWarn: ungroundedWarn.length > 0 ? ungroundedWarn : undefined,
+    escapeHatchReasons: escapeHatchReasons.length > 0 ? escapeHatchReasons : undefined,
   };
 }
 
@@ -1826,7 +2053,7 @@ async function generateOne(
       );
     }
     if (validated.spec) {
-      return { spec: validated.spec };
+      return { spec: validated.spec, escapeHatchReasons: validated.escapeHatchReasons };
     }
 
     emit(ctx, `Output for "${item.title}" rejected (attempt ${attempt + 1}): ${validated.reason}; retrying`, {
@@ -2023,10 +2250,10 @@ function buildBatchPrompt(items: TestPlanItem[], ctx: TestModeContext, tier: Tie
 
   const tierGuidance =
     tier === 'tierC-api'
-      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}`
+      ? `This is an API/backend test: use the \`request\` fixture (e.g. \`await request.get(...)\`) and assert on response status/body. Do NOT drive a browser page. NEVER assert a specific status code (2xx, 3xx, 4xx, or 5xx) for ANY endpoint unless it is directly grounded — by the source/schema grounding below, by a real observed request/response in the routes or mock content above, or by an explicit statement in the feature intent/scenario description. A guessed status code is one of the single biggest causes of false test failures. In particular: (1) For a negative/invalid-input/unauthorized scenario, do NOT assume a "success-shaped" status (e.g. 200 with an error body) — many apps respond to a failed form-based auth with a redirect (302/303) rather than 200, and to a failed API auth with 401/403. (2) Do NOT assume a bare path triggers special behavior (a redirect, a specific response) that actually requires a query string, request body, or header seen only on a DIFFERENT observed URL for the same feature — a redirect/action endpoint commonly only activates with specific parameters, and the bare path just serves a normal 200 page; use the exact URL (including its query string) from the observed routes above, never a stripped-down guess. When you lack real grounding for the exact status, assert what you can be sure of instead (e.g. \`expect(response.status()).not.toBe(200)\`, a 3xx/4xx range check, or a documented error field) rather than guessing one fixed status code. For a file-upload endpoint, use the \`multipart\` option on the request call (e.g. \`await request.post(url, { multipart: { file: { name: "x.txt", mimeType: "text/plain", buffer: Buffer.from("...") } } })\`) — never pass a raw Node stream/fs.ReadStream or a hand-built multipart body as the request payload, which throws at runtime rather than failing a real assertion.${formatLocalBackendGuidance(ctx)}${formatApiCredentialGuidance(ctx)}`
       : tier === 'tierB-auth'
         ? `This is an authenticated flow: assume the user is already logged in via the configured storageState; verify authenticated UI/behaviour.${formatRoleGuidance(ctx, tier)}`
-        : 'This is a public flow requiring no authentication.';
+        : `This is a public flow requiring no authentication.${formatLoginCredentialGuidance(ctx)}`;
 
   const mockNote = ctx.mockExternalDependencies
     ? `\n- This run mocks some external dependencies; importing test/expect from '${importSource}' (instead of '@playwright/test') already wires up the necessary network interception — use test/expect exactly as you normally would. For a test that needs a SPECIFIC failure scenario for one call (e.g. a 500/401/403/timeout), request the \`mockOverride\` fixture and call it before triggering the request: \`mockOverride('GET', '/the/path', { status: 500, body: {} })\` — do not expect a fixed success response to also produce your error scenario. CRITICAL: the mock matches ONLY by method + path — it never inspects headers, tokens, or the request body, so it CANNOT organically reject a missing/invalid Authorization header, an unauthorized role, or cross-tenant/ownership access with a 401/403/404. If a scenario asserts that kind of rejection, you MUST call \`mockOverride(...)\` with that exact status first, or the mock will silently return its default success response and the assertion will fail every time — this is true even for a request you never customized before.${formatMockContent(ctx)}`
@@ -2251,9 +2478,12 @@ async function generateBatch(
       );
     }
     if (validated.spec) {
-      const outcome: GenOneOutcome = { spec: validated.spec };
+      const outcome: GenOneOutcome = {
+        spec: validated.spec,
+        escapeHatchReasons: validated.escapeHatchReasons,
+      };
       await recordGenOutcome(ctx, item, outcome);
-      results.push({ item, spec: validated.spec });
+      results.push({ item, ...outcome });
       continue;
     }
     emit(

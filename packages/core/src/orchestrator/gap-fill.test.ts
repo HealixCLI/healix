@@ -1010,6 +1010,61 @@ describe('runGapFillingPass()', () => {
     expect(result.newRoutes).toHaveLength(1);
   });
 
+  it("scopes each micro-agent complete() call's timeoutMs to the gap's own remaining budget, never Claude's generic 25-minute backstop (regression: a slow-but-live call used to ride out the full hard timeout instead of the intended per-gap deadline)", async () => {
+    const selector = '[data-testid=slow-btn]';
+    const browser = makeFakeBrowser({
+      pages: { 'https://a.test/#/SK/dashboard': [button('Slow', selector)] },
+    });
+
+    const seenTimeouts: (number | undefined)[] = [];
+    const provider: ProviderAdapter = {
+      id: 'claude',
+      label: 'fake',
+      capabilities: ['plan'],
+      detect: async () => ({ installed: true, binPath: null, version: null }),
+      health: async () => {
+        throw new Error('unused');
+      },
+      plan: async () => {
+        throw new Error('unused');
+      },
+      complete: async (_prompt, opts): Promise<CompletionResult> => {
+        seenTimeouts.push(opts?.timeoutMs);
+        return { provider: 'claude', ok: true, text: 'done()', raw: null, detail: '' };
+      },
+    };
+
+    const gaps = [
+      {
+        id: 'click:dashboard>>slow',
+        kind: 'unclicked-affordance' as const,
+        description: 'slow gap',
+        parentRouteUrl: 'https://a.test/#/SK/dashboard',
+        targetSelectorGuess: selector,
+        targetName: 'Slow',
+      },
+    ];
+
+    await runGapFillingPass({
+      browser,
+      baseUrl: 'https://a.test/',
+      gaps,
+      emit: () => {},
+      gapFillProvider: { provider },
+      totalBudgetMs: 5_000,
+      perGapBudgetMs: 2_000,
+    });
+
+    expect(seenTimeouts.length).toBeGreaterThan(0);
+    // Scoped to (well under) this gap's own budget — never left undefined (which would fall back
+    // to complete()'s internal ABSOLUTE_BACKSTOP_MS, 25 minutes) and never anywhere near it.
+    for (const t of seenTimeouts) {
+      expect(t).toBeDefined();
+      expect(t as number).toBeLessThanOrEqual(2_000);
+      expect(t as number).toBeGreaterThan(0);
+    }
+  });
+
   it('unmet-content-need: tries each candidate route in turn, stopping at the first that reveals content, without visiting the rest', async () => {
     const revealed = [button('A'), button('B'), button('C'), button('D'), button('E'), button('F')];
     const browser = makeFakeBrowser({

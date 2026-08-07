@@ -3,6 +3,7 @@ import { attemptLogin, attemptLoginViaToggle } from './login.js';
 import type {
   BrowserSurface,
   BrowserSurfaceOptions,
+  CapturedNetworkEvent,
   DomSnapshot,
   InteractiveElement,
   Point,
@@ -25,8 +26,13 @@ function makeFakeBrowser(config: {
   throwOnClick?: boolean;
   /** Selectors whose click() call throws, instead of every click (throwOnClick). */
   throwOnSelector?: Set<string>;
+  /** Successive drainNetworkEvents() calls pop one entry each (FIFO), defaulting to `[]` once
+   * exhausted — lets a test model "these events accumulated between the previous drain and
+   * this one" without needing a real browser. */
+  networkEventsQueue?: CapturedNetworkEvent[][];
 }): BrowserSurface {
   let currentUrl = '';
+  const networkEventsQueue = [...(config.networkEventsQueue ?? [])];
   return {
     async start(_opts?: BrowserSurfaceOptions): Promise<void> {},
     async goto(url: string): Promise<void> {
@@ -65,7 +71,7 @@ function makeFakeBrowser(config: {
       return () => {};
     },
     drainNetworkEvents() {
-      return [];
+      return networkEventsQueue.shift() ?? [];
     },
     async exportStorageState() {
       return {};
@@ -103,6 +109,35 @@ describe('attemptLogin()', () => {
     expect(result.ok).toBe(true);
     expect(result.landingUrl).toBe('https://a.test/dashboard');
     expect(result.selectors).toEqual({ identifier: '#email', password: '#password', submit: '#submit' });
+  });
+
+  it('captures the real login POST response into networkEvents, discarding only what accumulated BEFORE the submit attempt', async () => {
+    const staleNoise: CapturedNetworkEvent = {
+      method: 'GET',
+      url: 'https://a.test/favicon.ico',
+      status: 200,
+    };
+    const realLoginResponse: CapturedNetworkEvent = {
+      method: 'POST',
+      url: 'https://a.test/auth/token',
+      status: 200,
+      responseBody: '{"user":{"id":"81552639","email":"user@a.test"}}',
+    };
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, SUBMIT_BUTTON] },
+        'https://a.test/dashboard': { elements: [{ role: 'heading', name: 'Dashboard', selector: 'h1' }] },
+      },
+      onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      // First drain (discard-before-submit) sees the stale noise; second drain (capture-after)
+      // sees the real login response — see submitLoginAttempt's two drainNetworkEvents() calls.
+      networkEventsQueue: [[staleNoise], [realLoginResponse]],
+    });
+
+    const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'correct-pw');
+
+    expect(result.ok).toBe(true);
+    expect(result.networkEvents).toEqual([realLoginResponse]);
   });
 
   it('omits `selectors.submit` when submission falls back to pressing Enter (no submit button found)', async () => {
@@ -556,6 +591,76 @@ describe('attemptLogin()', () => {
       expect(clicked).toEqual(['#enabled-fallback']);
       expect(result.selectors?.submit).toBe('#enabled-fallback');
     });
+
+    // See docs/design/login-submit-button-disabled-at-fill-time-fix.md. Many real login forms
+    // disable submit until client-side validation settles — the pre-fill snapshot always sees
+    // it disabled, and discarding it outright forced a blind, unwaited Enter press even when
+    // the button reliably becomes clickable moments later.
+    it('waits for a submit button disabled at fill-time to become enabled, then clicks it (not Enter)', async () => {
+      const submitButton: InteractiveElement = {
+        role: 'button',
+        name: 'Pokračovať',
+        selector: 'button[data-testid="login-submit"]',
+        inForm: true,
+        buttonType: 'submit',
+        disabled: true,
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, submitButton] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+      // Simulates the app's own async validation enabling the button shortly after fill —
+      // well within the fix's bounded poll window.
+      setTimeout(() => {
+        submitButton.disabled = false;
+      }, 250);
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(result.ok).toBe(true);
+      expect(clicked).toEqual(['button[data-testid="login-submit"]']);
+      expect(result.selectors?.submit).toBe('button[data-testid="login-submit"]');
+    });
+
+    it('falls back to Enter when the only candidate never becomes enabled (unchanged final outcome)', async () => {
+      const submitButton: InteractiveElement = {
+        role: 'button',
+        name: 'Pokračovať',
+        selector: 'button[data-testid="login-submit"]',
+        inForm: true,
+        buttonType: 'submit',
+        disabled: true, // never flips — models a genuinely broken/dead button
+      };
+      const clicked: string[] = [];
+      const browser = makeFakeBrowser({
+        pages: {
+          'https://a.test/login': { elements: [EMAIL_FIELD, PASSWORD_FIELD, submitButton] },
+          'https://a.test/dashboard': { elements: [] },
+        },
+        // Enter is the only thing that can navigate here — proves the fallback itself ran.
+        onSubmitGoTo: { 'https://a.test/login': 'https://a.test/dashboard' },
+      });
+      const originalClick = browser.click.bind(browser);
+      browser.click = async (selector: string) => {
+        clicked.push(selector);
+        return originalClick(selector);
+      };
+
+      const result = await attemptLogin(browser, 'https://a.test/login', 'user@a.test', 'pw');
+
+      expect(clicked).toEqual([]); // never clicked — the disabled candidate was never used
+      expect(result.ok).toBe(true); // Enter still worked (this fake browser's onSubmitGoTo fires on pressKey too)
+      expect(result.selectors?.submit).toBeUndefined();
+    }, 8000);
   });
 });
 

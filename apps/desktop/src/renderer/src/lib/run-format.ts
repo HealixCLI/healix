@@ -165,11 +165,22 @@ export function computeStageDurations(events: AgentEvent[]): StageDuration[] {
   });
 }
 
-/** Total run duration: prefers the run's own started/finished timestamps, falling back to the event span. */
+/**
+ * Total run duration: prefers activeDurationMs — cumulative ACTIVE processing time across
+ * every pass this run has gone through (the original run, plus any retry-pass or
+ * resume-from-pause) — over the run's raw started/finished timestamps, which are
+ * wall-clock and include any idle gap between passes (e.g. retrying a day after the
+ * original run completed showed ~24h of "Total time" before this field existed). Falls
+ * back to startedAt/finishedAt (correct for a single, never-retried pass) for a run
+ * predating this column, then to the event span as a last resort.
+ */
 export function computeTotalDurationMs(
-  run: Pick<Run, 'startedAt' | 'finishedAt'>,
+  run: Pick<Run, 'startedAt' | 'finishedAt' | 'activeDurationMs'>,
   events: AgentEvent[],
 ): number | null {
+  if (typeof run.activeDurationMs === 'number' && !Number.isNaN(run.activeDurationMs)) {
+    return Math.max(0, run.activeDurationMs);
+  }
   if (run.startedAt && run.finishedAt) {
     const start = new Date(run.startedAt).getTime();
     const end = new Date(run.finishedAt).getTime();

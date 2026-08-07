@@ -2046,6 +2046,33 @@ describe('crawl() network capture (GAP-046)', () => {
     expect(result.routes[0]?.networkEvents).toEqual([]);
   });
 
+  it('attributes seedNetworkEvents to route 0 (ahead of whatever that route itself captures) instead of discarding them, and does not carry them into route 1', async () => {
+    const seedEvent: CapturedNetworkEvent = {
+      method: 'POST',
+      url: 'https://a.test/auth/token',
+      status: 200,
+      responseBody: '{"user":{"id":"81552639"}}',
+    };
+    const homeOwnEvent: CapturedNetworkEvent = {
+      method: 'GET',
+      url: 'https://a.test/api/profile',
+      status: 200,
+    };
+    const browser = makeFakeBrowser({
+      pages: {
+        'https://a.test/': { elements: [link('https://a.test/about')], network: [homeOwnEvent] },
+        'https://a.test/about': { elements: [] },
+      },
+    });
+
+    const result = await crawl(browser, 'https://a.test/', { seedNetworkEvents: [seedEvent] });
+
+    const home = result.routes.find((r) => r.url === 'https://a.test/');
+    const about = result.routes.find((r) => r.url === 'https://a.test/about');
+    expect(home?.networkEvents).toEqual([seedEvent, homeOwnEvent]);
+    expect(about?.networkEvents).toEqual([]);
+  });
+
   it('discards traffic from a failed navigation instead of attributing it to the next successful route', async () => {
     const deadEvents: CapturedNetworkEvent[] = [
       { method: 'GET', url: 'https://a.test/api/dead', status: 500 },

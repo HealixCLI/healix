@@ -52,6 +52,8 @@ import {
   clearExecCheckpoint,
   playwrightProjectArgs,
   readMockRequestCounts,
+  readMockRequestCountsByTest,
+  readObservedMockResponses,
   readApiEvidence,
   readMockPassthroughLog,
   type AuthSignals,
@@ -1308,6 +1310,222 @@ describe("readMockRequestCounts — F-15: tallies the mock fixture's write-throu
   });
 });
 
+describe('readMockRequestCountsByTest — same log, broken out per test (feeds test_mock_usage)', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-mock-request-log-by-test-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns {} when no log file exists', async () => {
+    expect(await readMockRequestCountsByTest(dir)).toEqual({});
+  });
+
+  it('groups hits by test key first, then tallies per EXACT (dependency, method, pathPattern) tuple', async () => {
+    const lines = [
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send' },
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send' },
+      { key: 'tests/b.spec.ts#test B', id: 'pkg:stripe', method: null, pathPattern: null },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': [
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 2 },
+      ],
+      'tests/b.spec.ts#test B': [{ dependencyId: 'pkg:stripe', method: null, pathPattern: null, count: 1 }],
+    });
+  });
+
+  it('keeps two DIFFERENT endpoints under the SAME dependency as separate tallies, not one merged count', async () => {
+    const lines = [
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send' },
+      { key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify' },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': expect.arrayContaining([
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/send', count: 1 },
+        { dependencyId: 'pkg:twilio', method: 'POST', pathPattern: '/v1/otp/verify', count: 1 },
+      ]),
+    });
+    expect(await readMockRequestCountsByTest(dir)).toHaveProperty(['tests/a.spec.ts#test A', 'length'], 2);
+  });
+
+  it('omits a line with no key (an older log from before this field existed) rather than crashing or mis-grouping it', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio' })}\n${JSON.stringify({ key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: null, pathPattern: null })}\n`,
+    );
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 1 }],
+    });
+  });
+
+  it('omits a hit with no resolvable dependency id entirely — there is no row an "override" tally could ever attribute to', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ key: 'tests/a.spec.ts#test A' })}\n`,
+    );
+    expect(await readMockRequestCountsByTest(dir)).toEqual({});
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ key: 'tests/a.spec.ts#test A', id: 'pkg:twilio', method: null, pathPattern: null })}\nnot valid json\n\n`,
+    );
+    expect(await readMockRequestCountsByTest(dir)).toEqual({
+      'tests/a.spec.ts#test A': [{ dependencyId: 'pkg:twilio', method: null, pathPattern: null, count: 1 }],
+    });
+  });
+});
+
+describe('readObservedMockResponses — grounds mock_responses.observed_* with the actually-served response', () => {
+  let dir: string;
+
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), 'healix-observed-mock-log-'));
+  });
+
+  afterEach(() => {
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  it('returns [] when no log file exists', async () => {
+    expect(await readObservedMockResponses(dir)).toEqual([]);
+  });
+
+  it('folds a hit down to its (dependency, method, pathPattern) tuple with the served status/body/headers', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({
+        id: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/send',
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({ message: 'OTP sent' }),
+      })}\n`,
+    );
+    expect(await readObservedMockResponses(dir)).toEqual([
+      {
+        dependencyId: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/send',
+        status: 200,
+        bodyJson: JSON.stringify({ message: 'OTP sent' }),
+        headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      },
+    ]);
+  });
+
+  it('keeps two DIFFERENT endpoints under the SAME dependency as separate entries', async () => {
+    const lines = [
+      {
+        id: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/send',
+        status: 200,
+        contentType: 'application/json',
+        body: '{}',
+      },
+      {
+        id: 'pkg:twilio',
+        method: 'POST',
+        pathPattern: '/v1/otp/verify',
+        status: 400,
+        contentType: 'application/json',
+        body: '{}',
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    const result = await readObservedMockResponses(dir);
+    expect(result).toHaveLength(2);
+    expect(result).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ pathPattern: '/v1/otp/send', status: 200 }),
+        expect.objectContaining({ pathPattern: '/v1/otp/verify', status: 400 }),
+      ]),
+    );
+  });
+
+  it('keeps only the LAST response for a repeated (dependency, method, pathPattern) tuple, reflecting a mid-run mockOverride()', async () => {
+    const lines = [
+      {
+        id: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 200,
+        contentType: 'application/json',
+        body: 'first',
+      },
+      {
+        id: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 500,
+        contentType: 'application/json',
+        body: 'second',
+      },
+    ]
+      .map((e) => JSON.stringify(e))
+      .join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readObservedMockResponses(dir)).toEqual([
+      {
+        dependencyId: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 500,
+        bodyJson: 'second',
+        headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      },
+    ]);
+  });
+
+  it('omits a hit with no resolvable dependency id ("override") or no logged status (an older log line)', async () => {
+    const lines = [
+      JSON.stringify({ status: 200, contentType: 'application/json', body: '{}' }),
+      JSON.stringify({
+        id: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        contentType: 'application/json',
+        body: '{}',
+      }),
+    ].join('\n');
+    writeFileSync(join(dir, MOCK_REQUEST_LOG_FILENAME), `${lines}\n`);
+    expect(await readObservedMockResponses(dir)).toEqual([]);
+  });
+
+  it('skips a malformed line instead of losing every other entry in the file', async () => {
+    writeFileSync(
+      join(dir, MOCK_REQUEST_LOG_FILENAME),
+      `${JSON.stringify({ id: 'pkg:twilio', method: null, pathPattern: null, status: 200, contentType: 'application/json', body: '{}' })}\nnot valid json\n\n`,
+    );
+    expect(await readObservedMockResponses(dir)).toEqual([
+      {
+        dependencyId: 'pkg:twilio',
+        method: null,
+        pathPattern: null,
+        status: 200,
+        bodyJson: '{}',
+        headersJson: JSON.stringify({ 'content-type': 'application/json' }),
+      },
+    ]);
+  });
+});
+
 describe('readApiEvidence — per-test summary of actual request-fixture calls', () => {
   let dir: string;
 
@@ -1925,6 +2143,111 @@ describe('execute() — write-through checkpoint wired end-to-end', () => {
 
     // Exactly 3 spawns total — original, one recovery install, one retry — never a second recovery round.
     expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
+  });
+
+  // See docs/design/execute-suite-deps-silent-failure-fix.md — the reinstall's exit code was
+  // previously captured but never checked, so a broken/no-op `npm install` was reported as
+  // "complete" and Playwright was unconditionally re-invoked against still-broken deps.
+  it('does NOT re-run Playwright when the recovery npm install itself fails (no doomed retry, no silent 0/0)', async () => {
+    const spawnedCommands: string[] = [];
+    const events: Array<{ message: string; data?: unknown }> = [];
+
+    // 1st spawn: `npx playwright test` fails with a "Cannot find module" signature.
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module '@playwright/test'\n");
+    });
+    // 2nd spawn: the recovery `npm install` — itself fails (e.g. no network, broken lockfile).
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, 'npm ERR! network request failed\n');
+    });
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      [{ path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' }],
+    );
+
+    // Exactly 2 spawns — original run + the failed reinstall — Playwright is never
+    // re-invoked a third time against dependencies known to still be broken.
+    expect(spawnedCommands).toEqual(['npx', 'npm']);
+    // No silent clean-looking empty success: the failure is visible in both the
+    // emitted events and the returned outcome.
+    expect(events.some((e) => /npm install failed/i.test(e.message))).toBe(true);
+    expect(events.some((e) => /could not parse playwright results/i.test(e.message))).toBe(true);
+    expect(outcome.passed).toBe(0);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('DOES re-run Playwright once the recovery npm install genuinely succeeds (unchanged prior behavior)', async () => {
+    const spawnedCommands: string[] = [];
+
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeFailingProcess(1, "Error: Cannot find module '@playwright/test'\n");
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakeChildProcess(0); // install succeeds
+    });
+    vi.mocked(spawn).mockImplementationOnce((cmd) => {
+      spawnedCommands.push(String(cmd));
+      return fakePassingRun('a');
+    });
+
+    const outcome = await execute(makeCtx({ projectDir: dir }), [
+      { path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' },
+    ]);
+
+    expect(spawnedCommands).toEqual(['npx', 'npm', 'npx']);
+    expect(outcome.passed).toBe(1);
+    expect(outcome.failed).toBe(0);
+  });
+
+  it('treats a syntactically valid but structurally EMPTY results.json the same as no report at all (not a silent 0/0)', async () => {
+    const events: Array<{ message: string; data?: unknown }> = [];
+
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      // A real, parseable Playwright report — but it discovered zero specs anywhere
+      // (e.g. broken node_modules let Playwright start and flush an empty JSON
+      // reporter file, but it never actually collected any tests).
+      writeFileSync(join(dir, 'results.json'), JSON.stringify(report([])), 'utf-8');
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      [{ path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' }],
+    );
+
+    expect(outcome.passed).toBe(0);
+    expect(outcome.failed).toBe(0);
+    const diagnostic = events.find((e) => /could not parse playwright results/i.test(e.message));
+    expect(diagnostic).toBeDefined();
+    expect(
+      (diagnostic?.data as { structurallyEmptyReport?: boolean } | undefined)?.structurallyEmptyReport,
+    ).toBe(true);
+  });
+
+  it('regression: a report with a real result is NEVER misclassified as structurally empty', async () => {
+    const events: Array<{ message: string; data?: unknown }> = [];
+
+    vi.mocked(spawn).mockImplementationOnce(() => {
+      writeFileSync(
+        join(dir, 'results.json'),
+        JSON.stringify(report([{ title: 'a', projectName: 'tierA-public', status: 'passed' }])),
+        'utf-8',
+      );
+      return fakeChildProcess(0);
+    });
+
+    const outcome = await execute(
+      makeCtx({ projectDir: dir, emit: (_phase, message, data) => events.push({ message, data }) }),
+      [{ path: 'tests/tierA-public/a.spec.ts', title: 'a', tier: 'tierA-public', contents: '' }],
+    );
+
+    expect(outcome.passed).toBe(1);
+    expect(events.some((e) => /could not parse playwright results/i.test(e.message))).toBe(false);
   });
 
   it('clears the checkpoint after a full, successful (non-aborted) completion', async () => {

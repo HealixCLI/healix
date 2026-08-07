@@ -209,7 +209,9 @@ export type QualityFindingCode =
   | 'unvalidated-status-code-assumption'
   | 'unattended-destructive-action'
   | 'unscoped-modal-assertion'
-  | 'unblurred-validation-assertion';
+  | 'unblurred-validation-assertion'
+  | 'invented-login-credential'
+  | 'weak-positive-navigation-assertion';
 
 export interface QualityFinding {
   code: QualityFindingCode;
@@ -295,6 +297,40 @@ export interface ExecResultItem {
  */
 export const UNEXPLAINED_MISSING_VIDEO_REASON = 'No video recorded.';
 
+/**
+ * A (dependency, method, path) tuple identifying exactly one mock_responses row — the SAME
+ * identity that table's own UNIQUE(run_id, dependency_id, method, path_pattern) index uses.
+ * method/pathPattern are null when a hit matched no SPECIFIC statically-detected endpoint
+ * (an override with no corresponding registered endpoint, or a dependency's coarse
+ * per-dependency generic default) — there's no single row those unambiguously belong to.
+ * Lives here (not execute.ts) so coverage.ts's mergeExecOutcomes and orchestrator/index.ts
+ * can use it without importing a Playwright-mode-specific module.
+ */
+export interface MockHitTuple {
+  dependencyId: string;
+  method: string | null;
+  pathPattern: string | null;
+}
+
+/**
+ * Stable string key for a MockHitTuple, normalizing null the same way store.ts's
+ * upsertMockResponse does ('' — SQLite can't use null in a UNIQUE-index equality match) so a
+ * caller building a lookup map from real mock_responses rows (store.listMockResponses) and a
+ * caller building one from execute.ts's log-derived tuples always produce IDENTICAL keys for
+ * the same real row, regardless of which side null vs. '' originated from.
+ */
+export function mockResponseTupleKey(
+  dependencyId: string,
+  method: string | null,
+  pathPattern: string | null,
+): string {
+  return `${dependencyId} ${method ?? ''} ${pathPattern ?? ''}`;
+}
+
+export interface MockHitTally extends MockHitTuple {
+  count: number;
+}
+
 export interface ExecOutcome {
   passed: number;
   failed: number;
@@ -329,6 +365,21 @@ export interface ExecOutcome {
    */
   mockedRequestCounts?: Record<string, number>;
   /**
+   * Same browser-level mock hits as mockedRequestCounts, but broken out per test — keyed by
+   * `${specFile}#${title}` (the same identity apiEvidence/this file's own dedup keyOf() use)
+   * — and tallied per EXACT (dependency, method, pathPattern) tuple rather than just
+   * dependency id, from execute.ts's readMockRequestCountsByTest(). Feeds test_mock_usage
+   * (see storage/schema.ts) — mockedRequestCounts above stays a run-level total for backward
+   * compatibility (existing readers are untouched); this is the additional per-test
+   * breakdown needed to resolve the specific mock_responses row a hit belongs to. Optional: a
+   * mode with no fixture-level mocking (or an older log with no key on a line) simply omits
+   * the affected entries.
+   */
+  mockedRequestCountsByTest?: Record<
+    string,
+    Array<{ dependencyId: string; method: string | null; pathPattern: string | null; count: number }>
+  >;
+  /**
    * Compact, prompt-ready summary of the actual HTTP call(s) a test made via
    * the `request` fixture — keyed by `${specFile}#${title}` (the same
    * identity execute.ts's own dedup keyOf() uses), from execute.ts's
@@ -350,6 +401,26 @@ export interface ExecOutcome {
    * Optional: a test with no unintercepted call simply has no entry.
    */
   mockPassthrough?: Record<string, string>;
+  /**
+   * Each (dependency, method, pathPattern) tuple's LAST actually-served response —
+   * status/body/headers as truly fulfilled by page.route()/the request fixture, not the
+   * originally-generated mock_status/mock_body_json (which can differ per-call via a
+   * per-test mockOverride()) — one entry per exact endpoint, from execute.ts's
+   * readObservedMockResponses(). Feeds mock_responses.observed_* (see storage/schema.ts),
+   * resolved to the EXACT row via the tuple, not just the dependency. "Observed" here means
+   * "proven to have actually been served during this run," not a comparison against a
+   * genuinely different real backend — tests run fully offline, so there is no live upstream
+   * to compare against. Optional: a mode with no fixture-level mocking (or no mock hit at
+   * all) simply omits it.
+   */
+  observedMockResponses?: Array<{
+    dependencyId: string;
+    method: string | null;
+    pathPattern: string | null;
+    status: number;
+    bodyJson: string | null;
+    headersJson: string | null;
+  }>;
 }
 
 export interface SuiteBundle {
@@ -386,6 +457,16 @@ export interface TestModeContext {
    * for callers/tests that don't need KB tracking (e.g. bare test contexts).
    */
   onKbItemOutcome?: (planItemId: string, status: 'generated' | 'dropped') => void;
+  /**
+   * Reports one plan item's escape-hatch reasons (the model's own explanation
+   * for each `// TODO: unobserved element` marker left in its generated spec)
+   * back to the run's Knowledge Base — see storage/schema.ts's
+   * escape_hatch_gaps table. Called from generate.ts's recordGenOutcome, the
+   * same funnel onKbItemOutcome uses, only when at least one reason was
+   * extracted. Optional: undefined for callers/tests that don't need this
+   * tracked (e.g. bare test contexts).
+   */
+  onEscapeHatchGap?: (planItemId: string, unitKey: string | null, reasons: string[]) => void;
   /** Cooperative cancellation for long mode phases (generate/execute). */
   signal?: AbortSignal;
   /**
@@ -421,6 +502,17 @@ export interface TestMode {
   generate(ctx: TestModeContext, plan: TestPlan): Promise<GeneratedSpec[]>;
   /** Pre-execution parse-check gate. Optional — a mode without one is treated as always-valid. */
   validate?(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ValidationResult>;
+  /**
+   * Counts the real, executable test cases present in a spec's CURRENT (possibly
+   * pruned) contents — used by orchestrator/index.ts's registerSpecRows to cap DB row
+   * registration to what actually exists, instead of blindly trusting the plan's
+   * original scenario count (see docs/design/pruned-block-orphaned-test-row-fix.md —
+   * pruning a low-quality block out of an accepted spec previously left its DB row
+   * orphaned at 'pending' forever). Optional: a mode without one falls back to
+   * today's plan-driven count unchanged — never a behavior change for a mode that
+   * doesn't implement it.
+   */
+  countScenarios?(contents: string): number;
   execute(ctx: TestModeContext, specs: GeneratedSpec[]): Promise<ExecOutcome>;
   collectArtifacts(ctx: TestModeContext): Promise<{ dir: string; files: string[] }>;
   export(ctx: TestModeContext): Promise<SuiteBundle>;

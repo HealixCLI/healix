@@ -256,6 +256,7 @@ export class HealixStore {
       suiteMode: opts.suiteMode ?? null,
       baseRunId: opts.baseRunId ?? null,
       pauseReason: null,
+      activeDurationMs: null,
     };
     this.db
       .prepare(
@@ -328,7 +329,12 @@ export class HealixStore {
   updateRunStatus(
     id: string,
     status: RunStatus,
-    patch: { startedAt?: string; finishedAt?: string; pauseReason?: PauseReason | null } = {},
+    patch: {
+      startedAt?: string;
+      finishedAt?: string;
+      pauseReason?: PauseReason | null;
+      activeDurationMs?: number | null;
+    } = {},
   ): void {
     const fields: string[] = ['status = ?'];
     const values: unknown[] = [status];
@@ -343,6 +349,10 @@ export class HealixStore {
     if (patch.pauseReason !== undefined) {
       fields.push('pause_reason = ?');
       values.push(patch.pauseReason);
+    }
+    if (patch.activeDurationMs !== undefined) {
+      fields.push('active_duration_ms = ?');
+      values.push(patch.activeDurationMs);
     }
     values.push(id);
     this.db.prepare(`UPDATE runs SET ${fields.join(', ')} WHERE id = ?`).run(...values);
@@ -475,6 +485,19 @@ export class HealixStore {
    */
   updateTestTitle(id: string, title: string): void {
     this.db.prepare('UPDATE tests SET title = ? WHERE id = ?').run(title, id);
+  }
+
+  /**
+   * Overwrite a regenerated spec's title/path/code onto an EXISTING row — used by directed
+   * re-exploration (orchestrator/directed-reexplore.ts's reregisterSpecRows) when a scenario that
+   * already has a row from this same GENERATE pass gets re-generated after a targeted re-crawl.
+   * Leaves status/req_tag/tier untouched: re-registration happens before EXECUTE ever runs
+   * against this row, so there's nothing to reconcile there yet.
+   */
+  updateTestSpec(id: string, fields: { title: string; specPath: string; specCode: string }): void {
+    this.db
+      .prepare('UPDATE tests SET title = ?, spec_path = ?, spec_code = ? WHERE id = ?')
+      .run(fields.title, fields.specPath, fields.specCode, id);
   }
 
   /**
@@ -890,8 +913,11 @@ export class HealixStore {
 
   /**
    * Insert (or, on a resumed run, refresh) one mock target's generated
-   * mock_* fields. observed_* fields are never written here — see this
-   * table's own schema comment for why. Returns the row's persisted id.
+   * mock_* fields. observed_* fields are never written here — they're
+   * written later, post-execution, via recordObservedMockResponse (see this
+   * table's own schema comment for why the timing differs: mock_* is the
+   * plan resolved BEFORE any test ran, observed_* is what actually shipped).
+   * Returns the row's persisted id.
    */
   upsertMockResponse(input: {
     runId: string;
@@ -949,6 +975,25 @@ export class HealixStore {
     return row?.id ?? id;
   }
 
+  /**
+   * Ground one mock_responses row's observed_* fields — the response ACTUALLY served during
+   * execution (from ExecOutcome.observedMockResponses), distinct from mock_status/mock_body_json
+   * (the originally-generated, pre-execution values, which can differ per-call via a per-test
+   * mockOverride()). See this table's own schema comment for what "observed" deliberately means
+   * here — proof of what was served during THIS run, not a comparison against a genuinely
+   * different real backend (tests run fully offline).
+   */
+  recordObservedMockResponse(
+    mockResponseId: string,
+    observed: { status: number; bodyJson: string | null; headersJson: string | null },
+  ): void {
+    this.db
+      .prepare(
+        "UPDATE mock_responses SET observed_status = ?, observed_body_json = ?, observed_headers_json = ?, updated_at = datetime('now') WHERE id = ?",
+      )
+      .run(observed.status, observed.bodyJson, observed.headersJson, mockResponseId);
+  }
+
   listMockResponses(runId: string): MockResponseRow[] {
     return (
       this.db.prepare('SELECT * FROM mock_responses WHERE run_id = ?').all(runId) as Array<
@@ -958,10 +1003,10 @@ export class HealixStore {
   }
 
   /**
-   * Record a test's usage of a mock target. NOT called anywhere yet — see
-   * test_mock_usage's own schema comment: there is no honest per-test
-   * request_count to write until per-test mock-count tracking is built.
-   * Exists so that future work can populate it without another migration.
+   * Record a test's usage of a mock target — called from persistResults
+   * (orchestrator/index.ts) using ExecOutcome.mockedRequestCountsByTest,
+   * resolved to the exact mock_responses row via its (dependency, method,
+   * pathPattern) tuple (see mockResponseTupleKey in modes/types.ts).
    */
   recordMockUsage(testId: string, mockResponseId: string, requestCount: number): void {
     this.db
@@ -1013,10 +1058,11 @@ export class HealixStore {
   }
 
   /**
-   * Record one escape-hatch gap. NOT called anywhere yet — the
-   * extractEscapeHatchReasons function this depends on does not exist (see
-   * this table's own schema comment). Exists so the (still unbuilt) directed
-   * re-exploration loop has somewhere real to write into once it lands.
+   * Record one escape-hatch gap — called from orchestrator/index.ts's
+   * onEscapeHatchGap callback whenever generate.ts's extractEscapeHatchReasons
+   * finds at least one flagged block in a persisted spec. `status`/`iteration`
+   * stay at their defaults ('open'/0) until a directed re-exploration loop
+   * (not yet implemented) exists to update them.
    */
   insertEscapeHatchGap(input: {
     runId: string;
@@ -1376,6 +1422,7 @@ function rowToRun(r: Record<string, unknown>): Run {
     suiteMode: s(r.suite_mode) as Run['suiteMode'],
     baseRunId: s(r.base_run_id),
     pauseReason: s(r.pause_reason) as Run['pauseReason'],
+    activeDurationMs: n(r.active_duration_ms),
   };
 }
 

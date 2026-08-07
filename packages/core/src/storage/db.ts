@@ -180,6 +180,15 @@ function migrate(db: DatabaseSync): void {
     // NOT EXISTS can't retrofit a column onto a table that already exists:
     ensureColumn(db, 'plan_kb_items', 'requirement_id', 'TEXT');
     ensureColumn(db, 'results', 'evidence_json', 'TEXT');
+    // v22: runs.active_duration_ms — cumulative ACTIVE processing time across every
+    // pass (the original run, plus any retry-pass/resume-from-pause), as opposed to
+    // finished_at - started_at, which is wall-clock and includes idle time between
+    // passes (e.g. a retry-pass run a day after the original completed showed ~24h of
+    // "Total time" — see setStatus's own comment in orchestrator/index.ts). Null for
+    // rows that predate this column; readers fall back to finished_at - started_at for
+    // those (correct for a single, never-retried pass — the bug only appears once a
+    // SECOND pass follows a gap).
+    ensureColumn(db, 'runs', 'active_duration_ms', 'INTEGER');
     // v7: multiple named test credentials per project (project_credentials
     // table, created above via SCHEMA_SQL) replacing the single
     // test_username/test_password pair. Copy any existing single credential

@@ -13,7 +13,8 @@ import type {
   TestingScope,
   TestModeContext,
 } from '../types.js';
-import { tiersForScope, UNEXPLAINED_MISSING_VIDEO_REASON } from '../types.js';
+import { mockResponseTupleKey, tiersForScope, UNEXPLAINED_MISSING_VIDEO_REASON } from '../types.js';
+import type { MockHitTally, MockHitTuple } from '../types.js';
 import {
   API_EVIDENCE_LOG_FILENAME,
   EXEC_CHECKPOINT_FILENAME,
@@ -584,6 +585,25 @@ interface PwReport {
   suites?: PwSuite[];
 }
 
+/**
+ * A syntactically valid but structurally empty report — Playwright loaded its config fine
+ * but discovered zero specs anywhere (as opposed to legitimately discovering specs that are
+ * simply all skipped/pending). Distinct from `!report` (no report at all): a broken/partial
+ * `node_modules` can let Playwright start, write an empty JSON reporter file, and exit
+ * "successfully" from its own CLI's perspective — which previously took the `if (report)`
+ * branch straight into `parseReport`, producing a silent, legitimate-looking `0 passed / 0
+ * failed` with no indication anything was ever wrong (see
+ * docs/design/execute-suite-deps-silent-failure-fix.md). Recurses into nested `suites` so a
+ * real, non-empty report (including one where every individual tier/project happens to have
+ * no specs) is never misclassified — only a report with literally zero specs ANYWHERE counts
+ * as structurally empty.
+ */
+function reportIsStructurallyEmpty(report: PwReport): boolean {
+  const hasAnySpec = (suites: PwSuite[] | undefined): boolean =>
+    (suites ?? []).some((s) => (s.specs?.length ?? 0) > 0 || hasAnySpec(s.suites));
+  return !hasAnySpec(report.suites);
+}
+
 const STATUS_PRIORITY: Record<string, number> = {
   failed: 5,
   blocked: 4,
@@ -893,6 +913,129 @@ export async function readMockRequestCounts(projectDir: string): Promise<Record<
     }
   }
   return counts;
+}
+
+// MockHitTuple/mockResponseTupleKey/MockHitTally live in modes/types.ts (imported above) --
+// shared with coverage.ts's mergeExecOutcomes and orchestrator/index.ts, neither of which
+// should import from this Playwright-specific file for a plain string-keying helper.
+
+/**
+ * Same write-through log as readMockRequestCounts, but grouped by the test-identity `key`
+ * (`${specFile}#${title}`, same identity as readApiEvidence/this file's own checkpoint
+ * keyOf()) each log line now also carries (see templates.ts's logMockHit), and tallied per
+ * EXACT (dependency, method, pathPattern) tuple rather than just dependency id — the KB's
+ * test_mock_usage table needs to resolve the specific mock_responses row a hit belongs to,
+ * not just its dependency. Additive: does not change readMockRequestCounts' own behavior or
+ * return shape at all. A hit with no resolvable dependency id ('override', from a call
+ * matchAnyRoute couldn't attribute at all) is omitted — there's no row to attribute it to,
+ * same treatment readObservedMockResponses gives it. Tolerates OLDER log lines with no `key`
+ * field (an in-flight run resumed across this change) by simply omitting them — they still
+ * count toward the existing run-level aggregate above, so no data is lost, only the newer
+ * per-test attribution is unavailable for that one line.
+ */
+export async function readMockRequestCountsByTest(
+  projectDir: string,
+): Promise<Record<string, MockHitTally[]>> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_REQUEST_LOG_FILENAME), 'utf-8');
+  } catch {
+    return {};
+  }
+  const byKey: Record<string, Map<string, MockHitTally>> = {};
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as {
+        key?: unknown;
+        id?: unknown;
+        method?: unknown;
+        pathPattern?: unknown;
+      };
+      if (typeof entry.key !== 'string' || !entry.key) continue;
+      const dependencyId = typeof entry.id === 'string' && entry.id ? entry.id : null;
+      if (!dependencyId || dependencyId === 'override') continue;
+      const method = typeof entry.method === 'string' ? entry.method : null;
+      const pathPattern = typeof entry.pathPattern === 'string' ? entry.pathPattern : null;
+      const tupleKey = mockResponseTupleKey(dependencyId, method, pathPattern);
+      const perTest = byKey[entry.key] ?? new Map<string, MockHitTally>();
+      const existing = perTest.get(tupleKey);
+      if (existing) existing.count += 1;
+      else perTest.set(tupleKey, { dependencyId, method, pathPattern, count: 1 });
+      byKey[entry.key] = perTest;
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  const out: Record<string, MockHitTally[]> = {};
+  for (const [key, tallies] of Object.entries(byKey)) out[key] = [...tallies.values()];
+  return out;
+}
+
+export interface ObservedMockResponse extends MockHitTuple {
+  status: number;
+  bodyJson: string | null;
+  headersJson: string | null;
+}
+
+/**
+ * Same write-through hit log as readMockRequestCounts/readMockRequestCountsByTest, but
+ * folded down to each (dependency, method, pathPattern) tuple's LAST actually-served response
+ * (status/body, from templates.ts's logMockHit, which now logs the response post-
+ * serializeBody() — i.e. what really shipped for that hit, not the originally-generated
+ * mock_status/mock_body_json, which can differ per-call via a per-test mockOverride()). Feeds
+ * mock_responses.observed_* (see storage/schema.ts), resolved to the EXACT row via the same
+ * tuple identity, not just the dependency. "Observed" here deliberately means "proven to have
+ * actually been served during this run" — NOT a comparison against a genuinely different real
+ * backend; tests run fully offline against this same fixture, so there is no live upstream to
+ * compare against (see this table's own schema comment). "Last" (not first) so a later
+ * mockOverride() mid-run reflects what a subsequent reader would actually see if they re-ran
+ * the same call. An entry with no dependency id (an unattributed 'override'-only hit) or no
+ * logged status (an older log line from before this field existed) is simply omitted — same
+ * best-effort contract as readMockRequestCounts.
+ */
+export async function readObservedMockResponses(projectDir: string): Promise<ObservedMockResponse[]> {
+  let raw: string;
+  try {
+    raw = await readFile(join(projectDir, MOCK_REQUEST_LOG_FILENAME), 'utf-8');
+  } catch {
+    return [];
+  }
+  const byTuple = new Map<string, ObservedMockResponse>();
+  for (const line of raw.split('\n')) {
+    const trimmed = line.trim();
+    if (!trimmed) continue;
+    try {
+      const entry = JSON.parse(trimmed) as {
+        id?: unknown;
+        method?: unknown;
+        pathPattern?: unknown;
+        status?: unknown;
+        contentType?: unknown;
+        body?: unknown;
+      };
+      const dependencyId =
+        typeof entry.id === 'string' && entry.id && entry.id !== 'override' ? entry.id : null;
+      if (!dependencyId || typeof entry.status !== 'number') continue;
+      const method = typeof entry.method === 'string' ? entry.method : null;
+      const pathPattern = typeof entry.pathPattern === 'string' ? entry.pathPattern : null;
+      byTuple.set(mockResponseTupleKey(dependencyId, method, pathPattern), {
+        dependencyId,
+        method,
+        pathPattern,
+        status: entry.status,
+        bodyJson: typeof entry.body === 'string' ? entry.body : null,
+        headersJson:
+          typeof entry.contentType === 'string'
+            ? JSON.stringify({ 'content-type': entry.contentType })
+            : null,
+      });
+    } catch {
+      // one malformed line (e.g. a write truncated by a crash) must not lose every other entry
+    }
+  }
+  return [...byTuple.values()];
 }
 
 interface ApiEvidenceLogEntry {
@@ -1535,6 +1678,13 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
       const browserInstall = await runCommand(ctx, 'npx', ['playwright', 'install'], INSTALL_TIMEOUT_MS);
       emit(ctx, '[execute] browser install complete', { code: browserInstall.code });
     }
+    // Tracks whether a suite-deps reinstall was attempted and genuinely failed —
+    // previously this exit code was captured but never checked, so a broken/no-op
+    // `npm install` was reported as "complete" and Playwright was unconditionally
+    // re-invoked against still-broken dependencies, eventually surfacing as a
+    // silent "0 passed, 0 failed" instead of a real error (see
+    // docs/design/execute-suite-deps-silent-failure-fix.md).
+    let depsInstallFailed = false;
     if (looksLikeMissingSuiteDeps(cmd)) {
       emit(ctx, '[execute] missing suite dependency; re-running npm install…');
       const depsInstall = await runCommand(
@@ -1543,16 +1693,39 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
         ['install', '--no-audit', '--no-fund', '--silent'],
         INSTALL_TIMEOUT_MS,
       );
-      emit(ctx, '[execute] npm install complete', { code: depsInstall.code });
+      if (depsInstall.code === 0) {
+        emit(ctx, '[execute] npm install complete');
+      } else {
+        depsInstallFailed = true;
+        const tail = stripAnsi(depsInstall.stderr || depsInstall.stdout)
+          .split(/\r?\n/)
+          .filter(Boolean)
+          .slice(-8)
+          .join(' | ');
+        emit(
+          ctx,
+          '[execute] npm install failed; suite dependencies remain broken — not re-running against them',
+          {
+            code: depsInstall.code,
+            tail,
+          },
+        );
+      }
     }
-    emit(ctx, '[execute] re-running suite after dependency install');
-    startedAt = Date.now();
-    cmd = await runPlaywright(ctx, invertFile);
+    // Only retry Playwright when we have real reason to believe it can now
+    // succeed — re-running against dependencies we KNOW are still broken can
+    // only fail the same way, and previously masked that failure as a clean
+    // empty result instead of a visible error.
+    if (!depsInstallFailed) {
+      emit(ctx, '[execute] re-running suite after dependency install');
+      startedAt = Date.now();
+      cmd = await runPlaywright(ctx, invertFile);
 
-    // The retry run can be cancelled too (as can the install(s) before it).
-    if (cmd.aborted || ctx.signal?.aborted) {
-      emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
-      return abortedOutcome(cmd.code);
+      // The retry run can be cancelled too (as can the install(s) before it).
+      if (cmd.aborted || ctx.signal?.aborted) {
+        emit(ctx, 'Execution aborted; discarding partial results', { exitCode: cmd.code, aborted: true });
+        return abortedOutcome(cmd.code);
+      }
     }
   }
   emit(ctx, '[execute] Playwright run finished', { exitCode: cmd.code, timedOut: cmd.timedOut });
@@ -1581,7 +1754,7 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   }
 
   let parsed: ParsedReport;
-  if (report) {
+  if (report && !reportIsStructurallyEmpty(report)) {
     parsed = parseReport(report, auth);
   } else {
     parsed = parseSummaryText(`${cmd.stdout}\n${cmd.stderr}`);
@@ -1599,6 +1772,10 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
       emit(ctx, 'Could not parse Playwright results; suite may have failed to start', {
         exitCode: cmd.code,
         timedOut: cmd.timedOut,
+        // Distinguishes "Playwright produced a valid report with literally nothing in it"
+        // (e.g. broken deps let it start but discover zero specs) from "no report at all"
+        // (e.g. it crashed before writing anything) — same underlying diagnostic either way.
+        structurallyEmptyReport: !!report,
         tail,
       });
     }
@@ -1639,6 +1816,11 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
   // of results.json/steps.json — present regardless of whether the report
   // parsed, since the fixture logs a hit the moment it fulfills a request.
   const mockedRequestCounts = await readMockRequestCounts(ctx.projectDir);
+  // Same log, broken out per test — feeds test_mock_usage (KB foundation).
+  const mockedRequestCountsByTest = await readMockRequestCountsByTest(ctx.projectDir);
+  // Same log again, folded to each dependency's last actually-served response — feeds
+  // mock_responses.observed_* (KB foundation).
+  const observedMockResponses = await readObservedMockResponses(ctx.projectDir);
   // Same rationale as mockedRequestCounts above: present regardless of
   // whether results.json parsed, since the request fixture logs a call the
   // moment it resolves.
@@ -1655,6 +1837,8 @@ export async function execute(ctx: TestModeContext, specs: GeneratedSpec[]): Pro
     skipped: parsed.skipped,
     results: parsed.results,
     ...(Object.keys(mockedRequestCounts).length > 0 ? { mockedRequestCounts } : {}),
+    ...(Object.keys(mockedRequestCountsByTest).length > 0 ? { mockedRequestCountsByTest } : {}),
+    ...(Object.keys(observedMockResponses).length > 0 ? { observedMockResponses } : {}),
     ...(Object.keys(apiEvidence).length > 0 ? { apiEvidence } : {}),
     ...(Object.keys(mockPassthrough).length > 0 ? { mockPassthrough } : {}),
     raw: {

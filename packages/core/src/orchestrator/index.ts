@@ -761,8 +761,24 @@ async function retryPassPipeline(
     // Same shared KB lookup the inline TRIAGE phase uses — see
     // triage/evidence.ts's doc comment: reading from the SAME durable tables
     // is what makes this fresh-triage step's TriageInput equivalent in
-    // richness to inline TRIAGE, not a hollowed-down copy of it.
-    const kbRunContextForRetryTriage = loadKbRunContext(store, runId);
+    // richness to inline TRIAGE, not a hollowed-down copy of it. Guarded the
+    // same way that inline TRIAGE phase's own copy of this call is (see
+    // runPipeline's kbRunContext a few thousand lines down): a failure here
+    // must degrade to empty KB evidence for this pass's triage step, not
+    // abort report finalization for tests that already ran successfully —
+    // this whole function's outer try/catch would otherwise turn one bad KB
+    // row into a coarse whole-pass 'error', wiping out real results.
+    let kbRunContextForRetryTriage: KbRunContext = {
+      requirements: [],
+      mockResponsesById: new Map(),
+      explorationSummaries: [],
+    };
+    try {
+      kbRunContextForRetryTriage = loadKbRunContext(store, runId);
+      noteStoreOk();
+    } catch (err) {
+      noteStoreFailure('loadKbRunContext', err);
+    }
 
     // Best-effort triage for whatever THIS retry-pass newly failed/blocked —
     // old verdicts are preserved below regardless, but without this step a

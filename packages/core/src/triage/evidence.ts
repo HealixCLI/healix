@@ -85,6 +85,17 @@ export function buildExecutionEvidence(evidenceJson: string | null | undefined):
   return undefined;
 }
 
+/** Escapes regex metacharacters so a route string can be embedded literally in a RegExp — same small helper duplicated locally in target/dependencies.ts and export/sanitize.ts. */
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
+/**
+ * Routes at or below this length (in practice, just "/") are too generic for
+ * a bare substring check — see buildExplorationContext's doc comment.
+ */
+const SHORT_ROUTE_LENGTH = 2;
+
 /**
  * Best-effort match of a failing test to the exploration_summaries row for
  * the route it targets. There is no explicit test→route link anywhere in
@@ -93,6 +104,17 @@ export function buildExecutionEvidence(evidenceJson: string | null | undefined):
  * longest exploration route string it contains; the longest match wins so a
  * short, generic route (e.g. "/") never shadows a more specific one also
  * present in the text.
+ *
+ * A normal, specific route (length > SHORT_ROUTE_LENGTH, e.g. "/login") keeps
+ * the plain substring check — a coincidental exact match of a real multi-
+ * character path is already vanishingly rare. A short, generic route like
+ * "/" is a different story: a bare slash shows up constantly in text that
+ * has nothing to do with navigation (file paths, imports, unrelated URLs, a
+ * stack frame), so `text.includes(route)` alone makes it a near-universal
+ * false positive. For routes this short, require it to appear as an actual
+ * quoted literal instead — `page.goto('/')`, `navigate("/")`, an error like
+ * `Expected URL: '/'` — which a genuine navigation reference always is, but
+ * a coincidental slash elsewhere in the text never is.
  */
 export function buildExplorationContext(
   ctx: KbRunContext,
@@ -104,7 +126,12 @@ export function buildExplorationContext(
     if (!text) continue;
     for (const summary of ctx.explorationSummaries) {
       const route = summary.route.trim();
-      if (route.length > bestLen && text.includes(route)) {
+      if (route.length === 0 || route.length <= bestLen) continue;
+      const isMatch =
+        route.length > SHORT_ROUTE_LENGTH
+          ? text.includes(route)
+          : new RegExp(`['"\`]\\s*${escapeRegExp(route)}`).test(text);
+      if (isMatch) {
         best = summary;
         bestLen = route.length;
       }

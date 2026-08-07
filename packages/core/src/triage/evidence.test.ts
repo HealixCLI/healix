@@ -216,6 +216,63 @@ describe('buildExplorationContext', () => {
     const ctx = loadKbRunContext(s, run.id);
     expect(buildExplorationContext(ctx, ["await page.goto('/dashboard')", null, undefined])).toBeUndefined();
   });
+
+  it('a genuine homepage test still matches the short route "/" via a quoted navigation reference', async () => {
+    const s = await store();
+    const project = s.createProject({
+      name: 'ev-explore-home-project',
+      baseUrl: 'https://ev-explore-home.test',
+    });
+    const run = s.createRun(project.id);
+    s.insertExplorationSummary({
+      runId: run.id,
+      route: '/',
+      selectorsJson: JSON.stringify([{ selector: '#welcome-heading' }]),
+      formsJson: null,
+      authPattern: null,
+      stateProbeCount: null,
+    });
+
+    const ctx = loadKbRunContext(s, run.id);
+    // A real Playwright home-page test — quoted navigation call.
+    expect(buildExplorationContext(ctx, ["await page.goto('/');"])).toEqual({
+      route: '/',
+      selectors: JSON.stringify([{ selector: '#welcome-heading' }]),
+    });
+    // Also matches a quoted mention in error text, with double quotes and
+    // extra whitespace inside the quote (the "optional whitespace" case).
+    expect(buildExplorationContext(ctx, ['Expected URL: "  /"'])).toEqual({
+      route: '/',
+      selectors: JSON.stringify([{ selector: '#welcome-heading' }]),
+    });
+  });
+
+  it('an unrelated failure with an incidental slash does NOT spuriously match the short route "/" (regression)', async () => {
+    // Root-cause regression: `text.includes(route)` alone made a bare "/"
+    // match almost any real spec/error text, since a slash shows up
+    // constantly in file paths, imports, and unrelated URLs that have
+    // nothing to do with navigating to the root route.
+    const s = await store();
+    const project = s.createProject({
+      name: 'ev-explore-false-positive-project',
+      baseUrl: 'https://ev-explore-false-positive.test',
+    });
+    const run = s.createRun(project.id);
+    s.insertExplorationSummary({
+      runId: run.id,
+      route: '/',
+      selectorsJson: JSON.stringify([{ selector: '#welcome-heading' }]),
+      formsJson: null,
+      authPattern: null,
+      stateProbeCount: null,
+    });
+
+    const ctx = loadKbRunContext(s, run.id);
+    // An unrelated failure's error text mentions a path with a slash, but
+    // never as a quoted navigation reference to the root route.
+    const unrelatedError = 'GET /api/users returned 500 at handleClick (/app/src/components/Login.tsx:42:10)';
+    expect(buildExplorationContext(ctx, [unrelatedError])).toBeUndefined();
+  });
 });
 
 describe('buildKbTriageEvidence', () => {
